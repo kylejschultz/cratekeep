@@ -1,4 +1,7 @@
+import sqlite3
 from pathlib import Path
+
+from beets.library import Item, Library
 
 from beets_mvp import _format_bytes, create_app
 
@@ -285,15 +288,94 @@ def test_normal_settings_renders_in_app_page_and_beets_editor(tmp_path):
     assert page.status_code == 200
     assert b'--font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI"' in page.data
     assert b'--page: #e7e9ec;' in page.data
-    assert b'class="app-mode"' in page.data
+    assert b'id="sidebar"' in page.data
+    assert b'class="content"' in page.data
     assert b'aria-label="Primary navigation"' in page.data
-    assert b'aria-current="page">Settings' in page.data
+    assert b'aria-current="page"' in page.data
+    assert b'<span class="nav-label">Settings</span>' in page.data
+    assert b'id="theme-toggle"' in page.data
+    assert b'title="Build SHA"' in page.data
+    assert b'id="open-sidebar"' in page.data
     assert b'<h1>Settings</h1>' in page.data
     assert b'Set up Cratekeep' not in page.data
     assert b'id="beets_config"' in page.data
     assert b'core import safety settings' in page.data
     assert b'name="fetch_art"' in page.data
     assert b'name="fetch_art" type="checkbox" value="1" checked' not in page.data
+    assert b'id="inventory-preview"' in page.data
+    assert b'never changes music files or runs beets import' in page.data
+
+
+def test_library_inventory_preview_is_bounded_non_mutating_and_persisted(tmp_path):
+    app = make_app(tmp_path)
+    library_root = tmp_path / "library"
+    files = []
+    for number in range(55):
+        path = library_root / f"album-{number:02d}" / f"track-{number:02d}.mp3"
+        path.parent.mkdir()
+        path.write_bytes(f"synthetic-{number}".encode())
+        files.append(path)
+    (library_root / "album-00" / "notes.txt").write_text("ignored")
+    original = {path: path.read_bytes() for path in files}
+
+    beets_library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    tracked = Item(title="Canonical title", path=str(files[0]))
+    beets_library.add(tracked)
+
+    client = app.test_client()
+    preview = client.post("/api/library/inventory/preview")
+
+    assert preview.status_code == 201
+    assert preview.json["status"] == "complete"
+    assert preview.json["files"] == 55
+    assert preview.json["tracked"] == 1
+    assert preview.json["untracked"] == 54
+    assert preview.json["missing"] == 0
+    assert len(preview.json["sample"]) == 50
+    assert preview.json["sample_truncated"] is True
+    assert all(path.read_bytes() == original[path] for path in files)
+
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM adoption_jobs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM library_inventory").fetchone()[0] == 55
+        assert db.execute("SELECT COUNT(*) FROM adoption_reviews").fetchone()[0] == 55
+        row = db.execute(
+            "SELECT beets_item_id, size_bytes, mtime_ns, inode, present FROM library_inventory WHERE relative_path = ?",
+            (files[0].relative_to(library_root).as_posix(),),
+        ).fetchone()
+        assert row[0] == tracked.id
+        assert row[1] == files[0].stat().st_size
+        assert row[2] == files[0].stat().st_mtime_ns
+        assert row[3] == files[0].stat().st_ino
+        assert row[4] == 1
+
+    files[-1].unlink()
+    second = client.post("/api/library/inventory/preview")
+    assert second.status_code == 201
+    assert second.json["files"] == 54
+    assert second.json["missing"] == 1
+    assert client.get("/api/library/inventory").json == second.json
+
+
+def test_inventory_requires_setup_and_ignores_library_symlinks(tmp_path):
+    unconfigured = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "test",
+        "STATE_PATH": str(tmp_path / "unconfigured"),
+        "BROWSE_ROOTS": [str(tmp_path)],
+    })
+    assert unconfigured.test_client().post("/api/library/inventory/preview").status_code == 503
+
+    app = make_app(tmp_path)
+    outside = tmp_path / "outside.mp3"
+    outside.write_bytes(b"outside")
+    link = tmp_path / "library" / "outside-link.mp3"
+    link.symlink_to(outside)
+
+    preview = app.test_client().post("/api/library/inventory/preview")
+    assert preview.status_code == 201
+    assert preview.json["files"] == 0
+    assert outside.read_bytes() == b"outside"
 
 
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):

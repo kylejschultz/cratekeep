@@ -27,7 +27,9 @@
       --modal-subtle: #edf1f3;
       --modal-accent: #4f7185;
       --modal-accent-hover: #3f6073;
+      --soft: #dde1e5; --side-text:#343a40; --side-muted:#7b838b;
     }
+    body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --accent-hover:#b6ccda; --focus:#b9d6e7; --success:#294337; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; --modal-surface:#2b3138; --modal-panel:#343b43; --modal-border:#4b5661; --modal-subtle:#343b43; }
     * { box-sizing: border-box; }
     body { font: 16px/1.5 var(--font-sans); max-width: 720px; margin: 2rem auto; padding: 1.5rem; color: var(--text); background: var(--page); }
     main { padding: clamp(1.25rem, 4vw, 2.5rem); border: 1px solid var(--border); border-radius: .75rem; background: var(--surface); box-shadow: 0 .35rem 1.5rem rgb(32 56 72 / 10%); }
@@ -81,15 +83,30 @@
     .browser-actions .secondary { border-color: var(--modal-border); background: var(--modal-panel); color: var(--text); }
     .browser-actions .secondary:hover { background: var(--modal-surface); }
     body.modal-open { overflow: hidden; }
-    .app-mode { max-width:none; margin:0; padding:0 0 0 13.5rem; min-height:100vh; }
-    .app-mode .app-sidebar { position:fixed; inset:0 auto 0 0; width:13.5rem; padding:1.1rem .8rem; border-right:1px solid var(--border); background:var(--sidebar); }
-    .side-brand { display:flex; align-items:center; gap:.65rem; padding:.2rem .45rem 1rem; font-weight:700; }
-    .side-brand img { width:2rem; height:2rem; object-fit:contain; }
-    .side-nav { display:grid; gap:.2rem; }
-    .side-nav a { padding:.55rem .65rem; border-radius:.3rem; color:var(--muted); text-decoration:none; font-size:.9rem; }
-    .side-nav a:hover,.side-nav a[aria-current=page] { color:var(--text); background:var(--active); }
-    .app-mode main { width:min(960px,100%); margin:0 auto; padding:2rem; border:0; border-radius:0; background:transparent; box-shadow:none; }
-    .app-mode .logo { display:none; }
+    .skip-link { position:fixed; z-index:20; top:.5rem; left:.5rem; padding:.55rem .8rem; background:var(--surface); transform:translateY(-150%); }
+    .skip-link:focus { transform:translateY(0); }
+    .sidebar { position:fixed; z-index:10; inset:0 auto 0 0; display:flex; flex-direction:column; width:13.5rem; padding:1rem .8rem; color:var(--side-text); background:var(--sidebar); border-right:1px solid var(--soft); transition:width .2s,transform .2s; }
+    .collapse-button { position:absolute; top:5.5rem; right:-.8rem; display:grid; place-items:center; width:1.6rem; height:1.6rem; min-height:0; margin:0; padding:0; border:1px solid var(--soft); border-radius:50%; color:var(--side-muted); background:var(--sidebar); }
+    .brand { display:flex; align-items:center; gap:.65rem; padding:.15rem .4rem 1rem; border-bottom:1px solid var(--soft); }
+    .brand img,.mobile-header img { width:2rem; height:2rem; object-fit:contain; }
+    .brand-copy { overflow:hidden; white-space:nowrap; }
+    .brand-name { display:block; font-size:1.05rem; font-weight:750; }
+    .brand-tagline { display:block; color:var(--side-muted); font-size:.75rem; }
+    .nav-list { display:grid; gap:.2rem; margin:1rem 0; padding:0; list-style:none; }
+    .nav-link { display:flex; align-items:center; gap:.7rem; min-height:2.35rem; padding:.45rem .65rem; border-radius:.3rem; color:var(--side-text); text-decoration:none; white-space:nowrap; font-size:.9rem; }
+    .nav-link:hover,.nav-link[aria-current=page] { background:var(--active); }
+    .nav-icon { flex:0 0 1.35rem; text-align:center; }.nav-label { overflow:hidden; }
+    .sidebar-footer { display:grid; gap:.7rem; margin-top:auto; padding:.8rem .15rem 0; border-top:1px solid var(--soft); }
+    .utility-link,.theme-toggle { display:flex; align-items:center; gap:.55rem; color:var(--side-muted); font-size:.78rem; }
+    .utility-link { text-decoration:none; }.theme-toggle { justify-content:space-between; }
+    .theme-toggle button { width:2rem; height:1.5rem; margin:0; padding:0; border:1px solid var(--soft); border-radius:999px; color:var(--side-text); background:var(--active); }
+    .build-sha { overflow:hidden; color:var(--side-muted); font:.7rem ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+    .content { min-width:0; margin-left:13.5rem; transition:margin-left .2s; }.mobile-header { display:none; }
+    .content main { width:min(960px,100%); margin:0 auto; padding:2rem; border:0; border-radius:0; background:transparent; box-shadow:none; }
+    .scrim { display:none; }
+    body.sidebar-collapsed .sidebar { width:5rem; } body.sidebar-collapsed .content { margin-left:5rem; }
+    body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+    body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:center; padding-inline:0; }
     .page-head { margin-bottom:1.25rem; }
     .page-head h1 { margin:0; color:var(--text); font-size:1.65rem; }
     .page-head p { margin:.3rem 0 0; color:var(--muted); }
@@ -98,9 +115,21 @@
     .settings-section > p { margin:.25rem 0 0; color:var(--muted); font-size:.9rem; }
     textarea { min-height:19rem; resize:vertical; font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
     .check-label { display:flex; align-items:flex-start; gap:.55rem; font-weight:500; }
+    .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
+    .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
+    @media (max-width: 760px) {
+      .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
+      .content,body.sidebar-collapsed .content { margin-left:0; }
+      .mobile-header { position:sticky; z-index:8; top:0; display:flex; align-items:center; gap:.7rem; padding:.55rem 1rem; border-bottom:1px solid var(--soft); background:var(--surface); }
+      .menu-button { width:2.5rem; height:2.5rem; margin:0; padding:0; border:1px solid var(--border); border-radius:.35rem; color:var(--text); background:var(--surface); }
+      .collapse-button { display:none; } body.sidebar-open .sidebar { transform:translateX(0); }
+      body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:static; width:auto; height:auto; overflow:visible; clip-path:none; }
+      body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:flex-start; padding-inline:.75rem; }
+      .scrim { position:fixed; z-index:9; inset:0; margin:0; border:0; border-radius:0; background:rgb(8 19 26 / 62%); } body.sidebar-open .scrim { display:block; }
+    }
     @media (max-width: 520px) {
       body { margin: 0; padding: .75rem; }
-      .app-mode { padding:.75rem; } .app-mode .app-sidebar { position:static; width:auto; margin:-.75rem -.75rem 1rem; border-right:0; border-bottom:1px solid var(--border); } .app-mode main { padding:0; }
+      body:not(.setup-mode) { padding:0; } .content main { padding:1rem; }
       .path-picker { align-items: stretch; flex-direction: column; }
       .browser { padding: .4rem; }
       .browser-dialog { max-height: calc(100vh - .8rem); }
@@ -109,17 +138,22 @@
     }
   </style>
 </head>
-<body class="{{ 'setup-mode' if first_run else 'app-mode' }}">
+<body{% if first_run %} class="setup-mode"{% endif %}>
 {% if not first_run %}
-<aside class="app-sidebar" aria-label="Application sidebar">
-  <div class="side-brand"><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><span>Cratekeep</span></div>
-  <nav class="side-nav" aria-label="Primary navigation">
-    <a href="{{ url_for('index') }}">Overview</a>
-    <a href="{{ url_for('index') }}#inbox">Inbox</a>
-    <a href="{{ url_for('index') }}#library">Library</a>
-    <a href="{{ url_for('settings') }}" aria-current="page">Settings</a>
-  </nav>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<aside class="sidebar" id="sidebar" aria-label="Application sidebar">
+  <div class="brand"><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><div class="brand-copy"><span class="brand-name">Cratekeep</span><span class="brand-tagline">Music library manager</span></div></div>
+  <nav aria-label="Primary navigation"><ul class="nav-list">
+    <li><a class="nav-link" href="{{ url_for('index') }}#overview"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('index') }}#inbox"><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('index') }}#library"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('settings') }}" aria-current="page"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></a></li>
+  </ul></nav>
+  <div class="sidebar-footer"><div class="theme-toggle"><span>Dark mode</span><button id="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">☾</button></div><a class="utility-link" href="https://github.com/kylejschultz/cratekeep" target="_blank" rel="noreferrer"><span aria-hidden="true">↗</span><span class="nav-label">GitHub</span></a><span class="build-sha" title="Build SHA">build {{ build_sha[:7] if build_sha else 'unknown' }}</span></div>
+  <button class="collapse-button" id="collapse-sidebar" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><span class="collapse-icon" aria-hidden="true">‹</span></button>
 </aside>
+<button class="scrim" id="sidebar-scrim" type="button" aria-label="Close navigation" tabindex="-1"></button>
+<div class="content"><header class="mobile-header"><button class="menu-button" id="open-sidebar" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">☰</button><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><strong>Cratekeep</strong></header>
 {% endif %}
 <main id="main-content">
   {% if first_run %}
@@ -159,6 +193,13 @@
       <label for="beets_config">YAML configuration</label>
       <textarea id="beets_config" name="beets_config" spellcheck="false">{{ beets_config }}</textarea>
     </section>
+    <section class="settings-section" aria-labelledby="adoption-title">
+      <h2 id="adoption-title">Library adoption preview</h2>
+      <p>Inventory audio file paths and file stats, then compare them with the canonical beets library. This preview never changes music files or runs beets import.</p>
+      <button id="inventory-preview" type="button">Run inventory preview</button>
+      <p id="inventory-status" role="status">No preview run in this browser session.</p>
+      <div id="inventory-summary" class="inventory-summary" hidden></div>
+    </section>
     {% endif %}
     <button type="submit">{{ 'Finish setup' if first_run else 'Save settings' }}</button>
     {% if not first_run %}<a href="{{ url_for('index') }}">Cancel</a>{% endif %}
@@ -189,6 +230,7 @@
     </section>
   </div>
 </main>
+{% if not first_run %}</div>{% endif %}
   <script>
     const browser = document.getElementById('browser');
     const dialog = browser.querySelector('.browser-dialog');
@@ -337,6 +379,72 @@
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     });
+
+    const inventoryButton = document.getElementById('inventory-preview');
+    if (inventoryButton) inventoryButton.addEventListener('click', async () => {
+      const inventoryStatus = document.getElementById('inventory-status');
+      const inventorySummary = document.getElementById('inventory-summary');
+      inventoryButton.disabled = true;
+      inventoryStatus.textContent = 'Scanning file names and stats…';
+      try {
+        const response = await fetch('/api/library/inventory/preview', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || data.description || 'Inventory preview failed.');
+        inventorySummary.replaceChildren(...[
+          ['Files', data.files], ['Tracked by beets', data.tracked],
+          ['Needs review', data.untracked], ['Previously seen, now missing', data.missing],
+        ].map(([label, value]) => {
+          const cell = document.createElement('span');
+          cell.textContent = `${label}: ${value}`;
+          return cell;
+        }));
+        inventorySummary.hidden = false;
+        inventoryStatus.textContent = `Preview #${data.id} complete. No music files were changed.`;
+      } catch (error) {
+        inventoryStatus.textContent = error.message || 'Inventory preview failed.';
+      } finally {
+        inventoryButton.disabled = false;
+      }
+    });
+
+    {% if not first_run %}
+    (() => {
+      const body = document.body;
+      const sidebar = document.getElementById('sidebar');
+      const collapseButton = document.getElementById('collapse-sidebar');
+      const openButton = document.getElementById('open-sidebar');
+      const scrim = document.getElementById('sidebar-scrim');
+      const themeButton = document.getElementById('theme-toggle');
+      const mobileQuery = window.matchMedia('(max-width: 760px)');
+      let lastFocused = null;
+      if (localStorage.getItem('cratekeep-theme') === 'dark') {
+        body.classList.add('dark-mode'); themeButton.setAttribute('aria-pressed', 'true'); themeButton.textContent = '☀';
+      }
+      if (localStorage.getItem('cratekeep-sidebar') === 'collapsed') {
+        body.classList.add('sidebar-collapsed'); collapseButton.setAttribute('aria-expanded', 'false');
+      }
+      function closeMobileSidebar() {
+        body.classList.remove('sidebar-open'); openButton.setAttribute('aria-expanded', 'false'); scrim.tabIndex = -1;
+        if (lastFocused) lastFocused.focus();
+      }
+      collapseButton.addEventListener('click', () => {
+        const collapsed = body.classList.toggle('sidebar-collapsed');
+        collapseButton.setAttribute('aria-expanded', String(!collapsed));
+        localStorage.setItem('cratekeep-sidebar', collapsed ? 'collapsed' : 'expanded');
+      });
+      themeButton.addEventListener('click', () => {
+        const dark = body.classList.toggle('dark-mode'); themeButton.setAttribute('aria-pressed', String(dark));
+        themeButton.textContent = dark ? '☀' : '☾'; localStorage.setItem('cratekeep-theme', dark ? 'dark' : 'light');
+      });
+      openButton.addEventListener('click', () => {
+        lastFocused = openButton; body.classList.add('sidebar-open'); openButton.setAttribute('aria-expanded', 'true');
+        scrim.tabIndex = 0; sidebar.querySelector('a').focus();
+      });
+      scrim.addEventListener('click', closeMobileSidebar);
+      document.addEventListener('keydown', event => { if (event.key === 'Escape' && body.classList.contains('sidebar-open')) closeMobileSidebar(); });
+      mobileQuery.addEventListener('change', event => { if (!event.matches) closeMobileSidebar(); });
+    })();
+    {% endif %}
   </script>
 </body>
 </html>

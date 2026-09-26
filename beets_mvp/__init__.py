@@ -20,6 +20,7 @@ AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", "
 EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
 SETTING_KEYS = ("inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art")
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
+MAX_INVENTORY_SAMPLE = 50
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -103,6 +104,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/api/items")
     def items():
         return jsonify(_items(app))
+
+    @app.post("/api/library/inventory/preview")
+    def preview_library_inventory():
+        try:
+            summary = _preview_library_inventory(app)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(summary), 201
+
+    @app.get("/api/library/inventory")
+    def latest_library_inventory():
+        summary = _latest_inventory_summary(app)
+        if summary is None:
+            return jsonify(error="no library inventory has been run"), 404
+        return jsonify(summary)
 
     @app.post("/api/imports/preview")
     def preview_import():
@@ -287,6 +303,37 @@ def _init_db(path: str) -> None:
             created_at TEXT NOT NULL,
             finished_at TEXT
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS adoption_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS library_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            device INTEGER NOT NULL,
+            inode INTEGER NOT NULL,
+            beets_item_id INTEGER,
+            present INTEGER NOT NULL DEFAULT 1,
+            first_seen_job_id INTEGER NOT NULL REFERENCES adoption_jobs(id),
+            last_seen_job_id INTEGER NOT NULL REFERENCES adoption_jobs(id),
+            UNIQUE(root_path, relative_path)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS adoption_reviews (
+            inventory_id INTEGER PRIMARY KEY REFERENCES library_inventory(id),
+            state TEXT NOT NULL DEFAULT 'pending',
+            candidates_json TEXT NOT NULL DEFAULT '[]',
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )""")
 
 
 def _load_settings(path: str) -> dict[str, str]:
@@ -390,6 +437,7 @@ def _settings_response(app: Flask, first_run: bool):
         default_library=defaults["library_path"],
         has_token=bool(current.get("navidrome_token")),
         beets_config=config_text,
+        build_sha=app.config["BUILD_SHA"],
     )
 
 
@@ -444,6 +492,113 @@ def _library(app: Flask) -> Library:
 
 def _items(app: Flask) -> list[dict]:
     return [_serialize_item(item) for item in _library(app).items()]
+
+
+def _preview_library_inventory(app: Flask) -> dict:
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    created_at = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('inventory_preview', ?, 'running', ?)",
+            (str(root), created_at),
+        ).lastrowid
+
+    try:
+        discovered = _library_audio_stats(root)
+        beets_paths = {}
+        for item in _library(app).items():
+            item_path = item.get("path")
+            if item_path:
+                beets_paths[str(Path(os.fsdecode(item_path)).resolve())] = item.id
+    except (OSError, sqlite3.Error) as exc:
+        message = f"library inventory failed: {exc}"
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?",
+                (message, _now(), job_id),
+            )
+        raise ValueError(message) from exc
+
+    tracked = 0
+    total_bytes = 0
+    sample = []
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute("UPDATE library_inventory SET present = 0, beets_item_id = NULL WHERE root_path = ?", (str(root),))
+        for path, stat in discovered:
+            relative = path.relative_to(root).as_posix()
+            item_id = beets_paths.get(str(path))
+            tracked += item_id is not None
+            total_bytes += stat.st_size
+            db.execute(
+                """INSERT INTO library_inventory(
+                       root_path, relative_path, size_bytes, mtime_ns, device, inode, beets_item_id,
+                       present, first_seen_job_id, last_seen_job_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                   ON CONFLICT(root_path, relative_path) DO UPDATE SET
+                       size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns,
+                       device = excluded.device, inode = excluded.inode,
+                       beets_item_id = excluded.beets_item_id, present = 1,
+                       last_seen_job_id = excluded.last_seen_job_id""",
+                (str(root), relative, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino, item_id, job_id, job_id),
+            )
+            inventory_id = db.execute(
+                "SELECT id FROM library_inventory WHERE root_path = ? AND relative_path = ?", (str(root), relative)
+            ).fetchone()["id"]
+            db.execute(
+                "INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
+                (inventory_id, created_at),
+            )
+            if item_id is None and len(sample) < MAX_INVENTORY_SAMPLE:
+                sample.append(relative)
+
+        missing = db.execute(
+            "SELECT COUNT(*) AS count FROM library_inventory WHERE root_path = ? AND present = 0", (str(root),)
+        ).fetchone()["count"]
+        summary = {
+            "id": job_id,
+            "status": "complete",
+            "root": str(root),
+            "files": len(discovered),
+            "tracked": tracked,
+            "untracked": len(discovered) - tracked,
+            "missing": missing,
+            "bytes": total_bytes,
+            "sample": sample,
+            "sample_truncated": len(discovered) - tracked > len(sample),
+            "created_at": created_at,
+            "finished_at": _now(),
+        }
+        db.execute(
+            "UPDATE adoption_jobs SET status = 'complete', summary_json = ?, finished_at = ? WHERE id = ?",
+            (json.dumps(summary), summary["finished_at"], job_id),
+        )
+    return summary
+
+
+def _library_audio_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
+    if not root.is_dir():
+        raise OSError("configured library path is not a directory")
+    files = []
+    for directory, names, filenames in os.walk(root, followlinks=False, onerror=_raise_os_error):
+        names[:] = sorted(name for name in names if not (Path(directory) / name).is_symlink())
+        for name in sorted(filenames):
+            path = Path(directory) / name
+            if path.is_symlink() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+                continue
+            files.append((path.resolve(), path.stat()))
+    return files
+
+
+def _raise_os_error(error: OSError) -> None:
+    raise error
+
+
+def _latest_inventory_summary(app: Flask) -> dict | None:
+    with _connect(app.config["APP_DB"]) as db:
+        row = db.execute(
+            "SELECT summary_json FROM adoption_jobs WHERE kind = 'inventory_preview' AND status = 'complete' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return json.loads(row["summary_json"]) if row else None
 
 
 def _serialize_item(item) -> dict:
