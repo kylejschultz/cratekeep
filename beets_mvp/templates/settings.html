@@ -123,6 +123,14 @@
     .check-label { display:flex; align-items:flex-start; gap:.55rem; font-weight:500; }
     .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
     .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
+    .review-list { display:grid; gap:.5rem; margin-top:.75rem; }
+    .review-item { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; width:100%; margin:0; text-align:left; }
+    .review-item-path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .review-item-status,.review-item-decision { color:var(--muted); font-size:.82rem; }
+    .review-detail { display:grid; gap:.75rem; margin:0; }
+    .review-detail div { padding:.65rem; border:1px solid var(--modal-border); border-radius:.3rem; background:var(--modal-panel); }
+    .review-detail dt { color:var(--muted); font-size:.8rem; font-weight:650; }
+    .review-detail dd { margin:.15rem 0 0; overflow-wrap:anywhere; }
     @media (max-width: 760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
       .content,body.sidebar-collapsed .content { margin-left:0; }
@@ -175,7 +183,7 @@
     <div class="settings-tabs" role="tablist" aria-label="Settings sections">
       <button class="settings-tab" id="settings-tab-general" type="button" role="tab" aria-selected="true" aria-controls="settings-panel-general" tabindex="0" data-settings-tab="general">General</button>
       <button class="settings-tab" id="settings-tab-metadata" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-metadata" tabindex="-1" data-settings-tab="metadata">Metadata</button>
-      <button class="settings-tab" id="settings-tab-adoption" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-adoption" tabindex="-1" data-settings-tab="adoption">Adoption</button>
+      <button class="settings-tab" id="settings-tab-library-import" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-library-import" tabindex="-1" data-settings-tab="library-import">Library import</button>
     </div>
     <div class="settings-panel" id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" data-settings-panel="general">
     {% endif %}
@@ -208,13 +216,16 @@
       <textarea id="beets_config" name="beets_config" spellcheck="false">{{ beets_config }}</textarea>
     </section>
     </div>
-    <div class="settings-panel" id="settings-panel-adoption" role="tabpanel" aria-labelledby="settings-tab-adoption" data-settings-panel="adoption" hidden>
-    <section class="settings-section" aria-labelledby="adoption-title">
-      <h2 id="adoption-title">Library adoption preview</h2>
+    <div class="settings-panel" id="settings-panel-library-import" role="tabpanel" aria-labelledby="settings-tab-library-import" data-settings-panel="library-import" hidden>
+    <section class="settings-section" aria-labelledby="library-import-title">
+      <h2 id="library-import-title">Library import preview</h2>
       <p>Inventory audio file paths and file stats, then compare them with the canonical beets library. This preview never changes music files or runs beets import.</p>
       <button id="inventory-preview" type="button">Run inventory preview</button>
       <p id="inventory-status" role="status">No preview run in this browser session.</p>
       <div id="inventory-summary" class="inventory-summary" hidden></div>
+      <h3>Review inventory items</h3>
+      <p id="library-import-review-status" role="status">Run an inventory preview to create review items.</p>
+      <div id="library-import-review-list" class="review-list"></div>
     </section>
     </div>
     {% endif %}
@@ -246,6 +257,30 @@
       </footer>
     </section>
   </div>
+  {% if not first_run %}
+  <div id="library-import-modal" class="browser" hidden>
+    <section class="browser-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1">
+      <header class="browser-header">
+        <h2 id="library-import-modal-title">Review library import item</h2>
+        <button type="button" class="browser-close" id="library-import-modal-close-icon" aria-label="Close review">&times;</button>
+      </header>
+      <div class="browser-body">
+        <dl class="review-detail">
+          <div><dt>Path</dt><dd id="library-import-modal-path"></dd></div>
+          <div><dt>Status</dt><dd id="library-import-modal-status"></dd></div>
+          <div><dt>Candidate</dt><dd id="library-import-modal-candidate"></dd></div>
+        </dl>
+        <p id="library-import-modal-message" class="browser-status" role="status"></p>
+      </div>
+      <footer class="browser-actions">
+        <button type="button" class="secondary" id="library-import-modal-close">Cancel</button>
+        <button type="button" data-review-decision="skipped">Skip</button>
+        <button type="button" data-review-decision="rejected">Reject</button>
+        <button type="button" data-review-decision="approved">Approve</button>
+      </footer>
+    </section>
+  </div>
+  {% endif %}
 </main>
 {% if not first_run %}</div>{% endif %}
   <script>
@@ -432,6 +467,86 @@
     });
 
     const inventoryButton = document.getElementById('inventory-preview');
+    const reviewList = document.getElementById('library-import-review-list');
+    const reviewStatus = document.getElementById('library-import-review-status');
+    const reviewModal = document.getElementById('library-import-modal');
+    let reviewItems = [], activeReview = null, reviewReturnFocus = null;
+
+    function renderReviewItems() {
+      if (!reviewList) return;
+      reviewList.replaceChildren(...reviewItems.map(item => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'review-item';
+        const path = document.createElement('span');
+        path.className = 'review-item-path'; path.textContent = item.path;
+        const status = document.createElement('span');
+        status.className = 'review-item-status'; status.textContent = item.status;
+        const decision = document.createElement('span');
+        decision.className = 'review-item-decision'; decision.textContent = item.decision;
+        button.append(path, status, decision);
+        button.addEventListener('click', () => openReview(item, button));
+        return button;
+      }));
+      reviewStatus.textContent = reviewItems.length ? `${reviewItems.length} review items shown.` : 'No current inventory review items.';
+    }
+
+    async function loadReviewItems() {
+      if (!reviewList) return;
+      try {
+        const response = await fetch('/api/library-import/reviews?limit=50');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
+        reviewItems = data.items;
+        renderReviewItems();
+        if (data.has_more) reviewStatus.textContent += ' More items are available.';
+      } catch (error) {
+        reviewStatus.textContent = error.message || 'Unable to load review items.';
+      }
+    }
+
+    function openReview(item, button) {
+      activeReview = item; reviewReturnFocus = button;
+      document.getElementById('library-import-modal-path').textContent = item.path;
+      document.getElementById('library-import-modal-status').textContent = `${item.status}; decision: ${item.decision}`;
+      document.getElementById('library-import-modal-candidate').textContent = item.candidate?.kind === 'beets-item'
+        ? `Existing beets item #${item.candidate.beets_item_id}` : 'No external match proposed.';
+      document.getElementById('library-import-modal-message').textContent = '';
+      reviewModal.hidden = false;
+      document.body.classList.add('modal-open');
+      reviewModal.querySelector('.browser-dialog').focus();
+    }
+
+    function closeReview() {
+      reviewModal.hidden = true;
+      document.body.classList.remove('modal-open');
+      if (reviewReturnFocus) reviewReturnFocus.focus();
+    }
+
+    if (reviewModal) {
+      document.getElementById('library-import-modal-close').addEventListener('click', closeReview);
+      document.getElementById('library-import-modal-close-icon').addEventListener('click', closeReview);
+      reviewModal.addEventListener('mousedown', event => { if (event.target === reviewModal) closeReview(); });
+      reviewModal.addEventListener('keydown', event => { if (event.key === 'Escape') closeReview(); });
+      reviewModal.querySelectorAll('[data-review-decision]').forEach(button => button.addEventListener('click', async () => {
+        const message = document.getElementById('library-import-modal-message');
+        try {
+          const response = await fetch(`/api/library-import/reviews/${activeReview.id}`, {
+            method: 'PATCH', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({decision: button.dataset.reviewDecision}),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || data.description || 'Unable to save review decision.');
+          reviewItems = reviewItems.map(item => item.id === data.id ? data : item);
+          renderReviewItems();
+          closeReview();
+        } catch (error) {
+          message.textContent = error.message || 'Unable to save review decision.';
+        }
+      }));
+      loadReviewItems();
+    }
+
     if (inventoryButton) inventoryButton.addEventListener('click', async () => {
       const inventoryStatus = document.getElementById('inventory-status');
       const inventorySummary = document.getElementById('inventory-summary');
@@ -451,6 +566,7 @@
         }));
         inventorySummary.hidden = false;
         inventoryStatus.textContent = `Preview #${data.id} complete. No music files were changed.`;
+        await loadReviewItems();
       } catch (error) {
         inventoryStatus.textContent = error.message || 'Inventory preview failed.';
       } finally {

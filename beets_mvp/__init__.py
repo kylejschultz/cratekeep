@@ -21,6 +21,8 @@ EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "
 SETTING_KEYS = ("inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art")
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
+MAX_LIBRARY_IMPORT_REVIEWS = 100
+LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -119,6 +121,40 @@ def create_app(test_config: dict | None = None) -> Flask:
         if summary is None:
             return jsonify(error="no library inventory has been run"), 404
         return jsonify(summary)
+
+    @app.get("/api/library-import/reviews")
+    def library_import_reviews():
+        try:
+            limit = int(request.args.get("limit", "50"))
+        except ValueError:
+            return jsonify(error="limit must be an integer"), 400
+        if not 1 <= limit <= MAX_LIBRARY_IMPORT_REVIEWS:
+            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_REVIEWS}"), 400
+        items, has_more = _library_import_review_items(app, limit)
+        return jsonify(items=items, limit=limit, has_more=has_more)
+
+    @app.patch("/api/library-import/reviews/<int:inventory_id>")
+    def update_library_import_review(inventory_id: int):
+        values = request.get_json(silent=True) or {}
+        decision = values.get("decision")
+        if decision not in LIBRARY_IMPORT_DECISIONS:
+            return jsonify(error="decision must be approved, rejected, or skipped"), 400
+        root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+        with _connect(app.config["APP_DB"]) as db:
+            row = db.execute(
+                """SELECT reviews.inventory_id
+                     FROM adoption_reviews AS reviews
+                     JOIN library_inventory AS inventory ON inventory.id = reviews.inventory_id
+                    WHERE reviews.inventory_id = ? AND inventory.root_path = ? AND inventory.present = 1""",
+                (inventory_id, root),
+            ).fetchone()
+            if row is None:
+                abort(404)
+            db.execute(
+                "UPDATE adoption_reviews SET state = ?, updated_at = ? WHERE inventory_id = ?",
+                (decision, _now(), inventory_id),
+            )
+        return jsonify(_library_import_review_item(app, inventory_id))
 
     @app.post("/api/imports/preview")
     def preview_import():
@@ -548,6 +584,15 @@ def _preview_library_inventory(app: Flask) -> dict:
                 "INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
                 (inventory_id, created_at),
             )
+            candidates = (
+                [{"kind": "beets-item", "beets_item_id": item_id}]
+                if item_id is not None
+                else [{"kind": "needs-review", "match": None}]
+            )
+            db.execute(
+                "UPDATE adoption_reviews SET candidates_json = ?, updated_at = ? WHERE inventory_id = ?",
+                (json.dumps(candidates), created_at, inventory_id),
+            )
             if item_id is None and len(sample) < MAX_INVENTORY_SAMPLE:
                 sample.append(relative)
 
@@ -599,6 +644,51 @@ def _latest_inventory_summary(app: Flask) -> dict | None:
             "SELECT summary_json FROM adoption_jobs WHERE kind = 'inventory_preview' AND status = 'complete' ORDER BY id DESC LIMIT 1"
         ).fetchone()
     return json.loads(row["summary_json"]) if row else None
+
+
+def _library_import_review_items(app: Flask, limit: int) -> tuple[list[dict], bool]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                      reviews.state, reviews.candidates_json, reviews.updated_at
+                 FROM library_inventory AS inventory
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                WHERE inventory.root_path = ? AND inventory.present = 1
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id
+                LIMIT ?""",
+            (root, limit + 1),
+        ).fetchall()
+    return [_serialize_library_import_review(row) for row in rows[:limit]], len(rows) > limit
+
+
+def _library_import_review_item(app: Flask, inventory_id: int) -> dict:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        row = db.execute(
+            """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                      reviews.state, reviews.candidates_json, reviews.updated_at
+                 FROM library_inventory AS inventory
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                WHERE inventory.id = ? AND inventory.root_path = ? AND inventory.present = 1""",
+            (inventory_id, root),
+        ).fetchone()
+    if row is None:
+        abort(404)
+    return _serialize_library_import_review(row)
+
+
+def _serialize_library_import_review(row: sqlite3.Row) -> dict:
+    candidates = json.loads(row["candidates_json"])
+    return {
+        "id": row["id"],
+        "path": row["relative_path"],
+        "status": "tracked" if row["beets_item_id"] is not None else "needs-review",
+        "decision": row["state"],
+        "candidate": candidates[0] if candidates else None,
+        "candidates": candidates,
+        "updated_at": row["updated_at"],
+    }
 
 
 def _serialize_item(item) -> dict:

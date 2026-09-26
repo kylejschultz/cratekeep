@@ -310,7 +310,7 @@ def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
     page = make_app(tmp_path).test_client().get("/settings")
     html = page.data
 
-    for name, label in (("general", "General"), ("metadata", "Metadata"), ("adoption", "Adoption")):
+    for name, label in (("general", "General"), ("metadata", "Metadata"), ("library-import", "Library import")):
         assert f'id="settings-tab-{name}"'.encode() in html
         assert b'role="tab" aria-selected=' in html
         assert f'aria-controls="settings-panel-{name}"'.encode() in html
@@ -318,11 +318,14 @@ def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
         assert f'id="settings-panel-{name}" role="tabpanel" aria-labelledby="settings-tab-{name}"'.encode() in html
 
     general = html[html.index(b'id="settings-panel-general"'):html.index(b'id="settings-panel-metadata"')]
-    metadata = html[html.index(b'id="settings-panel-metadata"'):html.index(b'id="settings-panel-adoption"')]
-    adoption = html[html.index(b'id="settings-panel-adoption"'):html.index(b'<button type="submit">')]
+    metadata = html[html.index(b'id="settings-panel-metadata"'):html.index(b'id="settings-panel-library-import"')]
+    library_import = html[html.index(b'id="settings-panel-library-import"'):html.index(b'<button type="submit">')]
     assert b'id="storage-title"' in general and b'id="navidrome-title"' in general
     assert b'id="artwork-title"' in metadata and b'id="beets_config"' in metadata
-    assert b'id="inventory-preview"' in adoption and b'id="inventory-status"' in adoption
+    assert b'id="inventory-preview"' in library_import and b'id="inventory-status"' in library_import
+    assert b'id="library-import-review-list"' in library_import
+    assert b'id="library-import-modal"' in html
+    assert b"Adoption" not in html and b"adoption" not in html
     assert b'name="inbox_path"' in general and b'name="navidrome_token"' in general
     assert b'name="fetch_art"' in metadata and b'name="beets_config"' in metadata
     assert b"event.key === 'ArrowRight'" in html
@@ -399,6 +402,58 @@ def test_inventory_requires_setup_and_ignores_library_symlinks(tmp_path):
     assert preview.status_code == 201
     assert preview.json["files"] == 0
     assert outside.read_bytes() == b"outside"
+
+
+def test_library_import_reviews_are_bounded_deterministic_and_decisions_only_update_workflow(tmp_path):
+    app = make_app(tmp_path)
+    library_root = tmp_path / "library"
+    tracked_path = library_root / "a-tracked.mp3"
+    review_path = library_root / "b-review.mp3"
+    tracked_path.write_bytes(b"tracked-audio")
+    review_path.write_bytes(b"review-audio")
+    original = {path: path.read_bytes() for path in (tracked_path, review_path)}
+
+    beets_library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    tracked = Item(title="Already tracked", path=str(tracked_path))
+    beets_library.add(tracked)
+
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+
+    bounded = client.get("/api/library-import/reviews?limit=1")
+    assert bounded.status_code == 200
+    assert bounded.json["limit"] == 1
+    assert bounded.json["has_more"] is True
+    assert bounded.json["items"] == [{
+        "id": bounded.json["items"][0]["id"],
+        "path": "a-tracked.mp3",
+        "status": "tracked",
+        "decision": "pending",
+        "candidate": {"kind": "beets-item", "beets_item_id": tracked.id},
+        "candidates": [{"kind": "beets-item", "beets_item_id": tracked.id}],
+        "updated_at": bounded.json["items"][0]["updated_at"],
+    }]
+
+    reviews = client.get("/api/library-import/reviews").json["items"]
+    needs_review = next(item for item in reviews if item["path"] == "b-review.mp3")
+    assert needs_review["status"] == "needs-review"
+    assert needs_review["candidate"] == {"kind": "needs-review", "match": None}
+
+    updated = client.patch(
+        f'/api/library-import/reviews/{needs_review["id"]}', json={"decision": "approved"}
+    )
+    assert updated.status_code == 200
+    assert updated.json["decision"] == "approved"
+    assert client.patch(
+        f'/api/library-import/reviews/{needs_review["id"]}', json={"decision": "import-now"}
+    ).status_code == 400
+    assert client.get("/api/library-import/reviews?limit=0").status_code == 400
+
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute(
+            "SELECT state FROM adoption_reviews WHERE inventory_id = ?", (needs_review["id"],)
+        ).fetchone()[0] == "approved"
+    assert all(path.read_bytes() == contents for path, contents in original.items())
 
 
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
