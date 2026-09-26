@@ -26,6 +26,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__)
     app.add_template_filter(_format_bytes, "format_bytes")
     app.config.from_mapping(
+        BUILD_SHA=os.getenv("BUILD_SHA", os.getenv("GITHUB_SHA", "unknown")),
         SECRET_KEY=os.getenv("SECRET_KEY", ""),
         STATE_PATH=os.getenv("STATE_PATH", str(Path.cwd() / "data/config")),
     )
@@ -64,7 +65,12 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/")
     def index():
-        return render_template("index.html", candidates=_inbox_candidates(app), items=_items(app))
+        return render_template(
+            "index.html",
+            build_sha=app.config["BUILD_SHA"],
+            candidates=_inbox_candidates(app),
+            items=_items(app),
+        )
 
     @app.get("/healthz")
     def healthz():

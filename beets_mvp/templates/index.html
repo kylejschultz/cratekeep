@@ -12,6 +12,7 @@
       --border:#c9ced4; --soft:#dde1e5; --accent:#475569; --hover:#334155; --focus:#64748b;
       --success:#e8f3ec; --sidebar:#f7f7f8; --side-text:#343a40; --side-muted:#7b838b; --active:#e8eaed;
     }
+    body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --subtle:#343b43; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --hover:#b6ccda; --focus:#b9d6e7; --success:#294337; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; }
     * { box-sizing:border-box; }
     html { scroll-behavior:smooth; }
     body { margin:0; color:var(--text); background:var(--page); font:16px/1.5 var(--font-sans); }
@@ -21,6 +22,7 @@
     .skip-link { position:fixed; z-index:20; top:.5rem; left:.5rem; padding:.55rem .8rem; background:var(--surface); transform:translateY(-150%); }
     .skip-link:focus { transform:translateY(0); }
     .sidebar { position:fixed; z-index:10; inset:0 auto 0 0; display:flex; flex-direction:column; width:13.5rem; padding:1rem .8rem; color:var(--side-text); background:var(--sidebar); border-right:1px solid var(--soft); transition:width .2s,transform .2s; }
+    .collapse-button { position:absolute; top:5.5rem; right:-.8rem; display:grid; place-items:center; width:1.6rem; height:1.6rem; min-height:0; padding:0; border:1px solid var(--soft); border-radius:50%; color:var(--side-muted); background:var(--sidebar); cursor:pointer; box-shadow:0 1px 3px rgb(15 23 42 / 10%); }
     .brand { display:flex; align-items:center; gap:.65rem; padding:.15rem .4rem 1rem; border-bottom:1px solid var(--soft); }
     .brand img { flex:none; width:2rem; height:2rem; object-fit:contain; }
     .brand-copy { overflow:hidden; white-space:nowrap; }
@@ -31,10 +33,14 @@
     .nav-link:hover,.nav-link[aria-current="page"] { background:var(--active); }
     .nav-icon { flex:0 0 1.35rem; text-align:center; }
     .nav-label { overflow:hidden; }
-    .sidebar-footer { margin-top:auto; }
-    .collapse-button { width:100%; min-height:2.35rem; border:1px solid var(--soft); border-radius:.3rem; color:var(--side-text); background:transparent; cursor:pointer; }
-    .collapse-button:hover { background:var(--active); }
-    .collapse-icon { display:inline-block; margin-right:.45rem; transition:transform .2s; }
+    .sidebar-footer { display:grid; gap:.7rem; margin-top:auto; padding:.8rem .15rem 0; border-top:1px solid var(--soft); }
+    .utility-link,.theme-toggle { display:flex; align-items:center; gap:.55rem; color:var(--side-muted); font-size:.78rem; }
+    .utility-link { text-decoration:none; }
+    .utility-link:hover { color:var(--side-text); }
+    .theme-toggle { justify-content:space-between; }
+    .theme-toggle button { width:2rem; height:1.5rem; padding:0; border:1px solid var(--soft); border-radius:999px; color:var(--side-text); background:var(--active); cursor:pointer; }
+    .build-sha { overflow:hidden; color:var(--side-muted); font: .7rem ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+    .collapse-button:hover,.theme-toggle button:hover { color:var(--side-text); background:var(--active); }
     .content { min-width:0; margin-left:13.5rem; transition:margin-left .2s; }
     .mobile-header { display:none; }
     main { width:min(1180px,100%); margin:0 auto; padding:clamp(1.25rem,3vw,2.25rem); }
@@ -85,7 +91,10 @@
     body.sidebar-collapsed .content { margin-left:5rem; }
     body.sidebar-collapsed :is(.brand-copy,.nav-label,.collapse-label) { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
     body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:center; padding-inline:0; }
-    body.sidebar-collapsed .collapse-icon { margin:0; transform:rotate(180deg); }
+    body.sidebar-collapsed .collapse-button { right:-.8rem; }
+    body.sidebar-collapsed .collapse-icon { transform:rotate(180deg); }
+    body.sidebar-collapsed .sidebar-footer { align-items:center; }
+    body.sidebar-collapsed .theme-toggle { justify-content:center; }
     @media (max-width:900px) { .metadata-form { grid-template-columns:repeat(2,minmax(0,1fr)); } }
     @media (max-width:760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
@@ -125,10 +134,11 @@
       </ul>
     </nav>
     <div class="sidebar-footer">
-      <button class="collapse-button" id="collapse-sidebar" type="button" aria-controls="sidebar" aria-expanded="true">
-        <span class="collapse-icon" aria-hidden="true">‹</span><span class="collapse-label">Collapse sidebar</span>
-      </button>
+      <div class="theme-toggle"><span>Dark mode</span><button id="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">☾</button></div>
+      <a class="utility-link" href="https://github.com/kylejschultz/cratekeep" target="_blank" rel="noreferrer"><span aria-hidden="true">↗</span><span class="nav-label">GitHub</span></a>
+      <span class="build-sha" title="Build SHA">build {{ build_sha[:7] if build_sha else 'unknown' }}</span>
     </div>
+    <button class="collapse-button" id="collapse-sidebar" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><span class="collapse-icon" aria-hidden="true">‹</span></button>
   </aside>
   <button class="scrim" id="sidebar-scrim" type="button" aria-label="Close navigation" tabindex="-1"></button>
   <div class="content">
@@ -193,8 +203,14 @@
       const collapseButton = document.getElementById('collapse-sidebar');
       const openButton = document.getElementById('open-sidebar');
       const scrim = document.getElementById('sidebar-scrim');
+      const themeButton = document.getElementById('theme-toggle');
       const mobileQuery = window.matchMedia('(max-width: 760px)');
       let lastFocused = null;
+      if (localStorage.getItem('cratekeep-theme') === 'dark') {
+        body.classList.add('dark-mode');
+        themeButton.setAttribute('aria-pressed', 'true');
+        themeButton.textContent = '☀';
+      }
       if (localStorage.getItem('cratekeep-sidebar') === 'collapsed') {
         body.classList.add('sidebar-collapsed');
         collapseButton.setAttribute('aria-expanded', 'false');
@@ -211,6 +227,12 @@
         collapseButton.setAttribute('aria-expanded', String(!collapsed));
         collapseButton.querySelector('.collapse-label').textContent = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
         localStorage.setItem('cratekeep-sidebar', collapsed ? 'collapsed' : 'expanded');
+      });
+      themeButton.addEventListener('click', () => {
+        const dark = body.classList.toggle('dark-mode');
+        themeButton.setAttribute('aria-pressed', String(dark));
+        themeButton.textContent = dark ? '☀' : '☾';
+        localStorage.setItem('cratekeep-theme', dark ? 'dark' : 'light');
       });
       openButton.addEventListener('click', () => {
         lastFocused = openButton;

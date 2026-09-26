@@ -43,6 +43,10 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     assert b'Library is empty' in page.data
     assert b'src="/static/cratekeep-logo.png"' in page.data
     assert b'aria-controls="sidebar"' in page.data
+    assert b'id="theme-toggle"' in page.data
+    assert b'build unknown' in page.data
+    assert b'https://github.com/kylejschultz/cratekeep' in page.data
+    assert b'body.dark-mode' in page.data
 
 def test_index_renders_inbox_data_and_library_edit_form(tmp_path, monkeypatch):
     app = make_app(tmp_path)
