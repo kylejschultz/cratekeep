@@ -131,7 +131,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not 1 <= limit <= MAX_LIBRARY_IMPORT_REVIEWS:
             return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_REVIEWS}"), 400
         items, has_more = _library_import_review_items(app, limit)
-        return jsonify(items=items, limit=limit, has_more=has_more)
+        return jsonify(items=items, groups=_group_library_import_review_items(items), limit=limit, has_more=has_more)
 
     @app.patch("/api/library-import/reviews/<int:inventory_id>")
     def update_library_import_review(inventory_id: int):
@@ -659,7 +659,11 @@ def _library_import_review_items(app: Flask, limit: int) -> tuple[list[dict], bo
                 LIMIT ?""",
             (root, limit + 1),
         ).fetchall()
-    return [_serialize_library_import_review(row) for row in rows[:limit]], len(rows) > limit
+    library = _library(app)
+    return [
+        _serialize_library_import_review(row, library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None)
+        for row in rows[:limit]
+    ], len(rows) > limit
 
 
 def _library_import_review_item(app: Flask, inventory_id: int) -> dict:
@@ -675,20 +679,45 @@ def _library_import_review_item(app: Flask, inventory_id: int) -> dict:
         ).fetchone()
     if row is None:
         abort(404)
-    return _serialize_library_import_review(row)
+    item = _library(app).get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+    return _serialize_library_import_review(row, item)
 
 
-def _serialize_library_import_review(row: sqlite3.Row) -> dict:
+def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:
     candidates = json.loads(row["candidates_json"])
+    path = Path(row["relative_path"])
+    parts = path.parts
+    fallback_artist = parts[0] if len(parts) >= 3 else "Unknown artist"
+    fallback_album = parts[1] if len(parts) >= 3 else (parts[0] if len(parts) == 2 else "Unknown album")
     return {
         "id": row["id"],
         "path": row["relative_path"],
+        "artist": (item.get("albumartist") or item.get("artist") or fallback_artist) if item else fallback_artist,
+        "album": item.get("album") if item and item.get("album") else fallback_album,
+        "title": item.get("title") if item and item.get("title") else path.stem,
         "status": "tracked" if row["beets_item_id"] is not None else "needs-review",
         "decision": row["state"],
         "candidate": candidates[0] if candidates else None,
         "candidates": candidates,
         "updated_at": row["updated_at"],
     }
+
+
+def _group_library_import_review_items(items: list[dict]) -> list[dict]:
+    groups: dict[str, dict[str, list[dict]]] = {}
+    for item in items:
+        albums = groups.setdefault(item["artist"], {})
+        albums.setdefault(item["album"], []).append(item)
+    return [
+        {
+            "artist": artist,
+            "albums": [
+                {"album": album, "songs": songs}
+                for album, songs in albums.items()
+            ],
+        }
+        for artist, albums in groups.items()
+    ]
 
 
 def _serialize_item(item) -> dict:

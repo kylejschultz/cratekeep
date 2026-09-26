@@ -3,7 +3,7 @@ from pathlib import Path
 
 from beets.library import Item, Library
 
-from beets_mvp import _format_bytes, create_app
+from beets_mvp import _format_bytes, _group_library_import_review_items, create_app
 
 def make_app(tmp_path: Path):
     app = create_app({
@@ -414,7 +414,10 @@ def test_library_import_reviews_are_bounded_deterministic_and_decisions_only_upd
     original = {path: path.read_bytes() for path in (tracked_path, review_path)}
 
     beets_library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
-    tracked = Item(title="Already tracked", path=str(tracked_path))
+    tracked = Item(
+        title="Already tracked", artist="Track Artist", albumartist="Album Artist",
+        album="Tracked Album", path=str(tracked_path),
+    )
     beets_library.add(tracked)
 
     client = app.test_client()
@@ -427,6 +430,9 @@ def test_library_import_reviews_are_bounded_deterministic_and_decisions_only_upd
     assert bounded.json["items"] == [{
         "id": bounded.json["items"][0]["id"],
         "path": "a-tracked.mp3",
+        "artist": "Album Artist",
+        "album": "Tracked Album",
+        "title": "Already tracked",
         "status": "tracked",
         "decision": "pending",
         "candidate": {"kind": "beets-item", "beets_item_id": tracked.id},
@@ -454,6 +460,48 @@ def test_library_import_reviews_are_bounded_deterministic_and_decisions_only_upd
             "SELECT state FROM adoption_reviews WHERE inventory_id = ?", (needs_review["id"],)
         ).fetchone()[0] == "approved"
     assert all(path.read_bytes() == contents for path, contents in original.items())
+
+
+def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    paths = [
+        root / "Artist One" / "Album A" / "01 First.mp3",
+        root / "Artist One" / "Album A" / "02 Second.mp3",
+        root / "Artist One" / "Album B" / "01 Other.mp3",
+        root / "Artist Two" / "Album C" / "01 Last.mp3",
+    ]
+    paths.extend(
+        root / "Bulk Artist" / f"Album {number // 10}" / f"{number:02d} Song.mp3"
+        for number in range(50)
+    )
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    payload = client.get("/api/library-import/reviews?limit=100").json
+
+    assert [(group["artist"], len(group["albums"])) for group in payload["groups"]] == [
+        ("Artist One", 2), ("Artist Two", 1), ("Bulk Artist", 5),
+    ]
+    assert [song["title"] for song in payload["groups"][0]["albums"][0]["songs"]] == [
+        "01 First", "02 Second",
+    ]
+    assert sum(len(album["songs"]) for album in payload["groups"][2]["albums"]) == 50
+    assert _group_library_import_review_items(payload["items"]) == payload["groups"]
+
+
+def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b"document.createElement('details')" in html
+    assert b"document.createElement('summary')" in html
+    assert b"review-artist" in html and b"review-album" in html
+    assert b"groups.length === 1 && artistCount <= 12" in html
+    assert b"reviewList.replaceChildren(...reviewItems.map" not in html
+    assert b"reviews?limit=50" not in html
 
 
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
