@@ -279,6 +279,8 @@ def test_normal_settings_renders_in_app_page_and_beets_editor(tmp_path):
     page = make_app(tmp_path).test_client().get("/settings")
 
     assert page.status_code == 200
+    assert b'--font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI"' in page.data
+    assert b'--page: #e7e9ec;' in page.data
     assert b'class="app-mode"' in page.data
     assert b'aria-label="Primary navigation"' in page.data
     assert b'aria-current="page">Settings' in page.data
@@ -345,6 +347,9 @@ def test_dashboard_uses_compact_light_admin_visual_contract(tmp_path):
     page = make_app(tmp_path).test_client().get("/")
 
     assert b"color-scheme:light" in page.data
+    assert b'--font-sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI"' in page.data
+    assert b"--page:#e7e9ec" in page.data
+    assert b"font:16px/1.5 var(--font-sans)" in page.data
     assert b"width:13.5rem" in page.data
     assert b"border-right:1px solid var(--soft)" in page.data
     assert b"box-shadow:0 1px 2px" in page.data
