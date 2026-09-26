@@ -306,6 +306,29 @@ def test_normal_settings_renders_in_app_page_and_beets_editor(tmp_path):
     assert b'never changes music files or runs beets import' in page.data
 
 
+def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
+    page = make_app(tmp_path).test_client().get("/settings")
+    html = page.data
+
+    for name, label in (("general", "General"), ("metadata", "Metadata"), ("adoption", "Adoption")):
+        assert f'id="settings-tab-{name}"'.encode() in html
+        assert b'role="tab" aria-selected=' in html
+        assert f'aria-controls="settings-panel-{name}"'.encode() in html
+        assert f'>{label}</button>'.encode() in html
+        assert f'id="settings-panel-{name}" role="tabpanel" aria-labelledby="settings-tab-{name}"'.encode() in html
+
+    general = html[html.index(b'id="settings-panel-general"'):html.index(b'id="settings-panel-metadata"')]
+    metadata = html[html.index(b'id="settings-panel-metadata"'):html.index(b'id="settings-panel-adoption"')]
+    adoption = html[html.index(b'id="settings-panel-adoption"'):html.index(b'<button type="submit">')]
+    assert b'id="storage-title"' in general and b'id="navidrome-title"' in general
+    assert b'id="artwork-title"' in metadata and b'id="beets_config"' in metadata
+    assert b'id="inventory-preview"' in adoption and b'id="inventory-status"' in adoption
+    assert b'name="inbox_path"' in general and b'name="navidrome_token"' in general
+    assert b'name="fetch_art"' in metadata and b'name="beets_config"' in metadata
+    assert b"event.key === 'ArrowRight'" in html
+    assert b"window.addEventListener('hashchange'" in html
+
+
 def test_library_inventory_preview_is_bounded_non_mutating_and_persisted(tmp_path):
     app = make_app(tmp_path)
     library_root = tmp_path / "library"
