@@ -504,6 +504,37 @@ def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tm
     assert b"reviews?limit=50" not in html
 
 
+def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_contract(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b".review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }" in html
+    assert b".review-album { margin:.5rem .75rem .75rem; }" in html
+    assert b".review-item { display:grid;" in html
+    assert b"color:var(--text); border:1px solid var(--border); border-radius:.3rem; background:transparent; text-align:left;" in html
+    assert b".review-item:hover { color:var(--text); border-color:var(--accent); background:transparent; }" in html
+    assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
+    assert b"const artist = document.createElement('details');" in html
+    assert b"const album = document.createElement('details');" in html
+
+
+def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
+    app = make_app(tmp_path)
+    app.config["BUILD_SHA"] = "build-one"
+    first = app.test_client().get("/settings").data
+    app.config["BUILD_SHA"] = "build-two"
+    second = app.test_client().get("/settings").data
+
+    assert b"const inventoryStorageKey = 'cratekeep-inventory-preview:' + \"build-one\";" in first
+    assert b"const inventoryStorageKey = 'cratekeep-inventory-preview:' + \"build-two\";" in second
+    assert b"sessionStorage.setItem(inventoryStorageKey, JSON.stringify({" in first
+    assert b"preview: latestInventoryPreview" in first
+    assert b"reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore}" in first
+    assert b"sessionStorage.getItem(inventoryStorageKey)" in first
+    assert b"renderInventoryPreview(latestInventoryPreview);" in first
+    assert b"if (restoreInventoryPreview()) loadReviewItems();" in first
+    assert b"latestInventoryPreview = data;" in first
+
+
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()

@@ -46,7 +46,7 @@
     button:disabled { cursor: not-allowed; opacity: .55; }
     .path-picker button, .browser button { margin-top: 0; }
     a { color: var(--accent); }
-    :is(a, button, input, select):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+    :is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
     .flash { padding: .75rem; border-radius: .3rem; background: var(--success); }
     .error { background: var(--error); }
     .browser[hidden] { display: none; }
@@ -124,13 +124,14 @@
     .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
     .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
     .review-list { display:grid; gap:.65rem; margin-top:.75rem; }
-    .review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
-    .review-album { margin:.5rem .75rem .75rem; background:var(--page); }
+    .review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }
+    .review-album { margin:.5rem .75rem .75rem; }
     .review-group-summary { cursor:pointer; padding:.7rem .85rem; font-weight:700; }
     .review-album > .review-group-summary { font-size:.9rem; font-weight:650; }
     .review-group-count { margin-left:.4rem; color:var(--muted); font-size:.8rem; font-weight:500; }
     .review-songs { display:grid; gap:.35rem; padding:0 .65rem .65rem; }
-    .review-item { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; width:100%; margin:0; text-align:left; }
+    .review-item { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; width:100%; margin:0; padding:.55rem .65rem; color:var(--text); border:1px solid var(--border); border-radius:.3rem; background:transparent; text-align:left; }
+    .review-item:hover { color:var(--text); border-color:var(--accent); background:transparent; }
     .review-item-path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .review-item-status,.review-item-decision { color:var(--muted); font-size:.82rem; }
     .review-detail { display:grid; gap:.75rem; margin:0; }
@@ -476,7 +477,55 @@
     const reviewList = document.getElementById('library-import-review-list');
     const reviewStatus = document.getElementById('library-import-review-status');
     const reviewModal = document.getElementById('library-import-modal');
+    const inventoryStatus = document.getElementById('inventory-status');
+    const inventorySummary = document.getElementById('inventory-summary');
+    const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
     let reviewItems = [], reviewGroups = [], activeReview = null, reviewReturnFocus = null;
+    let latestInventoryPreview = null, reviewHasMore = false;
+
+    function renderInventoryPreview(data) {
+      inventorySummary.replaceChildren(...[
+        ['Files', data.files], ['Tracked by beets', data.tracked],
+        ['Needs review', data.untracked], ['Previously seen, now missing', data.missing],
+      ].map(([label, value]) => {
+        const cell = document.createElement('span');
+        cell.textContent = `${label}: ${value}`;
+        return cell;
+      }));
+      inventorySummary.hidden = false;
+      inventoryStatus.textContent = `Preview #${data.id} complete. No music files were changed.`;
+    }
+
+    function persistInventoryPreview() {
+      if (!latestInventoryPreview) return;
+      try {
+        sessionStorage.setItem(inventoryStorageKey, JSON.stringify({
+          preview: latestInventoryPreview,
+          reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore},
+        }));
+      } catch (error) {
+        // Storage can be unavailable in privacy-restricted browser contexts.
+      }
+    }
+
+    function restoreInventoryPreview() {
+      try {
+        const stored = JSON.parse(sessionStorage.getItem(inventoryStorageKey) || 'null');
+        if (!stored?.preview || !Number.isFinite(stored.preview.id)) return false;
+        latestInventoryPreview = stored.preview;
+        renderInventoryPreview(latestInventoryPreview);
+        if (Array.isArray(stored.reviews?.items) && Array.isArray(stored.reviews?.groups)) {
+          reviewItems = stored.reviews.items;
+          reviewGroups = stored.reviews.groups;
+          reviewHasMore = Boolean(stored.reviews.has_more);
+          renderReviewItems();
+          if (reviewHasMore) reviewStatus.textContent += ' More items are available.';
+        }
+        return true;
+      } catch (error) {
+        return false;
+      }
+    }
 
     function reviewSummary(label, count) {
       const summary = document.createElement('summary');
@@ -538,8 +587,10 @@
         if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
         reviewItems = data.items;
         reviewGroups = data.groups;
+        reviewHasMore = Boolean(data.has_more);
         renderReviewItems();
-        if (data.has_more) reviewStatus.textContent += ' More items are available.';
+        if (reviewHasMore) reviewStatus.textContent += ' More items are available.';
+        persistInventoryPreview();
       } catch (error) {
         reviewStatus.textContent = error.message || 'Unable to load review items.';
       }
@@ -590,28 +641,19 @@
           message.textContent = error.message || 'Unable to save review decision.';
         }
       }));
-      loadReviewItems();
+      if (restoreInventoryPreview()) loadReviewItems();
     }
 
     if (inventoryButton) inventoryButton.addEventListener('click', async () => {
-      const inventoryStatus = document.getElementById('inventory-status');
-      const inventorySummary = document.getElementById('inventory-summary');
       inventoryButton.disabled = true;
       inventoryStatus.textContent = 'Scanning file names and stats…';
       try {
         const response = await fetch('/api/library/inventory/preview', { method: 'POST' });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || data.description || 'Inventory preview failed.');
-        inventorySummary.replaceChildren(...[
-          ['Files', data.files], ['Tracked by beets', data.tracked],
-          ['Needs review', data.untracked], ['Previously seen, now missing', data.missing],
-        ].map(([label, value]) => {
-          const cell = document.createElement('span');
-          cell.textContent = `${label}: ${value}`;
-          return cell;
-        }));
-        inventorySummary.hidden = false;
-        inventoryStatus.textContent = `Preview #${data.id} complete. No music files were changed.`;
+        latestInventoryPreview = data;
+        renderInventoryPreview(data);
+        persistInventoryPreview();
         await loadReviewItems();
       } catch (error) {
         inventoryStatus.textContent = error.message || 'Inventory preview failed.';
