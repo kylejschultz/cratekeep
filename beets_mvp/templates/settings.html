@@ -31,7 +31,8 @@
     }
     body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --accent-hover:#b6ccda; --focus:#b9d6e7; --success:#294337; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; --modal-surface:#2b3138; --modal-panel:#343b43; --modal-border:#4b5661; --modal-subtle:#343b43; }
     * { box-sizing: border-box; }
-    body { font: 16px/1.5 var(--font-sans); max-width: 720px; margin: 2rem auto; padding: 1.5rem; color: var(--text); background: var(--page); }
+    body { margin: 0; color: var(--text); background: var(--page); font: 16px/1.5 var(--font-sans); }
+    body.setup-mode { max-width: 720px; margin: 2rem auto; padding: 1.5rem; }
     main { padding: clamp(1.25rem, 4vw, 2.5rem); border: 1px solid var(--border); border-radius: .75rem; background: var(--surface); box-shadow: 0 .35rem 1.5rem rgb(32 56 72 / 10%); }
     .logo { display: block; width: 112px; height: auto; margin: 0 auto 1rem; }
     h1 { margin-top: 0; color: var(--accent); }
@@ -102,7 +103,7 @@
     .theme-toggle button { width:2rem; height:1.5rem; margin:0; padding:0; border:1px solid var(--soft); border-radius:999px; color:var(--side-text); background:var(--active); }
     .build-sha { overflow:hidden; color:var(--side-muted); font:.7rem ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
     .content { min-width:0; margin-left:13.5rem; transition:margin-left .2s; }.mobile-header { display:none; }
-    .content main { width:min(960px,100%); margin:0 auto; padding:2rem; border:0; border-radius:0; background:transparent; box-shadow:none; }
+    .content main { width:min(1180px,100%); margin:0 auto; padding:clamp(1.25rem,3vw,2.25rem); border:0; border-radius:0; background:transparent; box-shadow:none; }
     .scrim { display:none; }
     body.sidebar-collapsed .sidebar { width:5rem; } body.sidebar-collapsed .content { margin-left:5rem; }
     body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
