@@ -44,7 +44,7 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     assert b'src="/static/cratekeep-logo.png"' in page.data
     assert b'aria-controls="sidebar"' in page.data
     assert b'id="theme-toggle"' in page.data
-    assert b'build unknown' in page.data
+    assert b'title="Build SHA"' in page.data
     assert b'https://github.com/kylejschultz/cratekeep' in page.data
     assert b'body.dark-mode' in page.data
 
