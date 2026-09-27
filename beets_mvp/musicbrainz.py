@@ -23,14 +23,20 @@ class ProviderError(RuntimeError):
 def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[dict]:
     """Return normalized MusicBrainz release candidates for one album query."""
     limit = max(1, min(int(limit), 10))
-    terms = []
-    if query.get("album"):
-        terms.append(f'release:"{_escape(query["album"])}"')
-    if query.get("artist"):
-        terms.append(f'artist:"{_escape(query["artist"])}"')
-    params = urllib.parse.urlencode({"query": " AND ".join(terms), "fmt": "json", "limit": limit})
+    musicbrainz_id = query.get("musicbrainz_id")
+    if musicbrainz_id:
+        params = urllib.parse.urlencode({"inc": "artist-credits+recordings", "fmt": "json"})
+        url = f"https://musicbrainz.org/ws/2/release/{urllib.parse.quote(str(musicbrainz_id))}?{params}"
+    else:
+        terms = []
+        if query.get("album"):
+            terms.append(f'release:"{_escape(query["album"])}"')
+        if query.get("artist"):
+            terms.append(f'artist:"{_escape(query["artist"])}"')
+        params = urllib.parse.urlencode({"query": " AND ".join(terms), "fmt": "json", "limit": limit})
+        url = f"https://musicbrainz.org/ws/2/release/?{params}"
     request = urllib.request.Request(
-        f"https://musicbrainz.org/ws/2/release/?{params}",
+        url,
         headers={"Accept": "application/json", "User-Agent": "Cratekeep/0.1 (https://github.com/kylejschultz/cratekeep)"},
     )
     try:
@@ -47,17 +53,24 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProviderError("MusicBrainz returned an invalid response") from exc
 
+    releases = [document] if musicbrainz_id and document.get("id") else document.get("releases", [])[:limit]
     results = []
-    for release in document.get("releases", [])[:limit]:
+    for release in releases:
         artist_credit = release.get("artist-credit") or []
         artist = "".join(part.get("name", "") if isinstance(part, dict) else str(part) for part in artist_credit)
+        tracks = [
+            track.get("recording", {}).get("title") or track.get("title", "")
+            for medium in release.get("media", [])
+            for track in medium.get("tracks", [])
+        ]
         results.append({
             "provider_id": release.get("id", ""),
             "artist": artist,
             "album": release.get("title", ""),
             "year": str(release.get("date", ""))[:4] or None,
             "track_count": release.get("track-count"),
-            "score": release.get("score", 0),
+            "score": release.get("score", 100 if musicbrainz_id else 0),
+            "tracks": tracks,
         })
     return [result for result in results if result["provider_id"]]
 

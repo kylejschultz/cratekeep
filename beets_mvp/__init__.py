@@ -30,6 +30,10 @@ MAX_LIBRARY_IMPORT_REVIEWS = 100
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
+MUSICBRAINZ_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -163,6 +167,24 @@ def create_app(test_config: dict | None = None) -> Flask:
             item = _update_album_review(app, album_review_id, values)
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
+        if item is None:
+            abort(404)
+        return jsonify(item)
+
+    @app.post("/api/library-import/albums/<int:album_review_id>/rematch")
+    def rematch_library_import_album(album_review_id: int):
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or set(values) != {"musicbrainz_id"}:
+            return jsonify(error="request must contain only musicbrainz_id"), 400
+        musicbrainz_id = values.get("musicbrainz_id")
+        if not isinstance(musicbrainz_id, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(musicbrainz_id):
+            return jsonify(error="musicbrainz_id must be a canonical MusicBrainz UUID"), 400
+        try:
+            item = _rematch_album_by_musicbrainz_id(app, album_review_id, musicbrainz_id.lower())
+        except ProviderError as exc:
+            return jsonify(error=str(exc), retryable=exc.retryable), (503 if exc.retryable else 422)
+        except (OSError, ValueError, TypeError) as exc:
+            return jsonify(error=str(exc) or "candidate provider failed"), 422
         if item is None:
             abort(404)
         return jsonify(item)
@@ -885,6 +907,97 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
     return proposed
 
 
+def _candidate_reasons(query: dict, candidate: dict) -> list[str]:
+    reasons = []
+    try:
+        score = max(0, min(int(candidate.get("score", 0)), 100))
+    except (TypeError, ValueError):
+        score = 0
+    reasons.append(f"MusicBrainz search score: {score}%")
+    for label, key in (("Artist", "artist"), ("Album", "album")):
+        similarity = SequenceMatcher(None, _metadata_key(query[key]), _metadata_key(candidate.get(key))).ratio()
+        reasons.append(f"{label} similarity: {round(similarity * 100)}%")
+    candidate_tracks = candidate.get("tracks")
+    if isinstance(candidate_tracks, list):
+        reasons.append(
+            "Track count matches"
+            if len(candidate_tracks) == len(query["tracks"])
+            else f"Track count differs ({len(query['tracks'])} local, {len(candidate_tracks)} proposed)"
+        )
+    return reasons
+
+
+def _candidate_track_details(query: dict, candidate: dict) -> list[dict]:
+    proposed = candidate.get("tracks") if isinstance(candidate.get("tracks"), list) else []
+    details = []
+    for index in range(max(len(query["tracks"]), len(proposed))):
+        local = query["tracks"][index] if index < len(query["tracks"]) else None
+        match = _normalize_track_title(proposed[index]) if index < len(proposed) else None
+        if local is None or match is None:
+            status = "unmatched"
+        elif _metadata_key(local) == _metadata_key(match):
+            status = "matched"
+        else:
+            status = "changed"
+        details.append({"position": index + 1, "local": local, "proposed": match, "status": status})
+    return details
+
+
+def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrainz_id: str) -> dict | None:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            "SELECT id, artist, album FROM album_reviews WHERE id = ? AND root_path = ?",
+            (album_review_id, root),
+        ).fetchone()
+    if album is None:
+        return None
+    query = _album_query(app, album)
+    provider_query = {**query, "musicbrainz_id": musicbrainz_id}
+    raw = app.config["MUSICBRAINZ_PROVIDER"](provider_query, limit=1)
+    if not isinstance(raw, list):
+        raise ProviderError("MusicBrainz provider returned invalid candidates")
+    candidate = next(
+        (value for value in raw if isinstance(value, dict) and str(value.get("provider_id", "")).lower() == musicbrainz_id),
+        None,
+    )
+    if candidate is None:
+        raise ProviderError("No MusicBrainz release found for that ID")
+    now = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute("UPDATE metadata_candidates SET rank = rank + 1 WHERE album_review_id = ?", (album_review_id,))
+        existing = db.execute(
+            "SELECT id FROM metadata_candidates WHERE album_review_id = ? AND provider = 'musicbrainz' AND provider_id = ?",
+            (album_review_id, musicbrainz_id),
+        ).fetchone()
+        values = (
+            1, _candidate_confidence(query, candidate), _normalize_metadata(candidate.get("artist")),
+            _normalize_metadata(candidate.get("album")), str(candidate.get("year")) if candidate.get("year") else None,
+            json.dumps(_candidate_diff(query, candidate), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
+        )
+        if existing:
+            candidate_id = existing["id"]
+            db.execute(
+                """UPDATE metadata_candidates SET rank = ?, confidence = ?, artist = ?, album = ?, year = ?,
+                          proposed_diff_json = ?, provider_data_json = ?, created_at = ? WHERE id = ?""",
+                (*values, candidate_id),
+            )
+        else:
+            candidate_id = db.execute(
+                """INSERT INTO metadata_candidates(
+                       album_review_id, provider, provider_id, rank, confidence, artist, album, year,
+                       proposed_diff_json, provider_data_json, created_at
+                   ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (album_review_id, musicbrainz_id, *values),
+            ).lastrowid
+        db.execute(
+            """UPDATE album_reviews SET selected_candidate_id = ?, candidate_status = 'complete',
+                      candidate_error = '', updated_at = ? WHERE id = ?""",
+            (candidate_id, now, album_review_id),
+        )
+    return next((value for value in _album_review_payloads(app) if value["id"] == album_review_id), None)
+
+
 def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
     provider = app.config["MUSICBRAINZ_PROVIDER"]
     albums = _candidate_album_rows(app, limit)
@@ -954,6 +1067,7 @@ def _album_review_payloads(app: Flask) -> list[dict]:
         ).fetchall()
         payloads = []
         for row in rows:
+            query = _album_query(app, row)
             tracks = db.execute(
                 """SELECT inventory.id, inventory.relative_path, tracks.exception_state
                      FROM album_review_tracks AS tracks
@@ -963,20 +1077,32 @@ def _album_review_payloads(app: Flask) -> list[dict]:
             candidates = db.execute(
                 "SELECT * FROM metadata_candidates WHERE album_review_id = ? ORDER BY rank, id", (row["id"],)
             ).fetchall()
-            payloads.append({
-                "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
-                "selected_candidate_id": row["selected_candidate_id"], "candidate_status": row["candidate_status"],
-                "candidate_error": row["candidate_error"],
-                "tracks": [{"id": track["id"], "path": track["relative_path"],
-                            "exception": track["exception_state"],
-                            "effective_decision": track["exception_state"] or row["state"]} for track in tracks],
-                "candidates": [{
+            serialized_candidates = []
+            for candidate in candidates:
+                provider_data = json.loads(candidate["provider_data_json"])
+                serialized_candidates.append({
                     "id": candidate["id"], "provider": candidate["provider"],
                     "provider_id": candidate["provider_id"], "rank": candidate["rank"],
-                    "confidence": candidate["confidence"], "artist": candidate["artist"],
-                    "album": candidate["album"], "year": candidate["year"],
+                    "confidence": candidate["confidence"], "confidence_reasons": _candidate_reasons(query, provider_data),
+                    "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
                     "proposed_diff": json.loads(candidate["proposed_diff_json"]),
-                } for candidate in candidates],
+                    "track_details": _candidate_track_details(query, provider_data),
+                })
+            selected_id = row["selected_candidate_id"]
+            proposed_match = next((candidate for candidate in serialized_candidates if candidate["id"] == selected_id), None)
+            if proposed_match is None and serialized_candidates:
+                proposed_match = serialized_candidates[0]
+            payloads.append({
+                "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
+                "selected_candidate_id": selected_id, "proposed_match": proposed_match,
+                "candidate_status": row["candidate_status"],
+                "candidate_error": row["candidate_error"],
+                "tracks": [{"id": track["id"], "path": track["relative_path"],
+                            "title": query["tracks"][index],
+                            "exception": track["exception_state"],
+                            "effective_decision": track["exception_state"] or row["state"]}
+                           for index, track in enumerate(tracks)],
+                "candidates": serialized_candidates,
                 "updated_at": row["updated_at"],
             })
     return payloads

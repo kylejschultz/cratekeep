@@ -589,6 +589,82 @@ def test_album_decision_candidate_and_track_exception_persist_across_group_sync(
     }).status_code == 400
 
 
+def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tmp_path):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174000",
+        "artist": "Artist", "album": "Renamed Album", "year": "2024", "score": 96,
+        "tracks": ["First", "Changed title"], "track_count": 2,
+    }]
+    root = tmp_path / "library" / "Artist" / "Album"
+    root.mkdir(parents=True)
+    (root / "01 First.mp3").write_bytes(b"first")
+    (root / "02 Second.mp3").write_bytes(b"second")
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+
+    assert album["proposed_match"]["provider_id"] == "123e4567-e89b-42d3-a456-426614174000"
+    assert album["proposed_match"]["proposed_diff"]["album"] == {"from": "Album", "to": "Renamed Album"}
+    assert album["proposed_match"]["confidence_reasons"] == [
+        "MusicBrainz search score: 96%", "Artist similarity: 100%", "Album similarity: 56%", "Track count matches",
+    ]
+    assert [track["status"] for track in album["proposed_match"]["track_details"]] == ["matched", "changed"]
+    assert [track["title"] for track in album["tracks"]] == ["First", "Second"]
+
+
+def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
+    calls = []
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: calls.append((query, limit)) or [{
+        "provider_id": query["musicbrainz_id"], "artist": query["artist"], "album": query["album"],
+        "score": 100, "tracks": query["tracks"],
+    }]
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album_id = client.get("/api/library-import/reviews").json["albums"][0]["id"]
+
+    for body in ({}, {"musicbrainz_id": "not-a-uuid"}, {
+        "musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000", "extra": True,
+    }, {"musicbrainz_id": " 123e4567-e89b-42d3-a456-426614174000"}):
+        assert client.post(f"/api/library-import/albums/{album_id}/rematch", json=body).status_code == 400
+    assert calls == []
+
+    response = client.post(f"/api/library-import/albums/{album_id}/rematch", json={
+        "musicbrainz_id": "123E4567-E89B-42D3-A456-426614174000",
+    })
+
+    assert response.status_code == 200
+    assert response.json["selected_candidate_id"] == response.json["proposed_match"]["id"]
+    assert calls[0][0]["musicbrainz_id"] == "123e4567-e89b-42d3-a456-426614174000"
+    assert calls[0][1] == 1
+
+
+def test_album_review_actions_and_rematch_are_metadata_only(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": query["musicbrainz_id"], "artist": query["artist"], "album": query["album"], "score": 100,
+    }]
+    path = tmp_path / "library" / "Artist" / "Album" / "Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"do-not-touch")
+    original = path.read_bytes()
+    monkeypatch.setattr("beets_mvp.subprocess.run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not execute")))
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert client.post(f'/api/library-import/albums/{album["id"]}/rematch', json={
+        "musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000",
+    }).status_code == 200
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={"decision": "approved"}).status_code == 200
+    assert path.exists() and path.read_bytes() == original
+
+
 def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
     seen = {}
 
@@ -638,13 +714,25 @@ def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_co
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b".review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }" in html
-    assert b".review-album { margin:.5rem .75rem .75rem; }" in html
-    assert b".review-item { display:grid;" in html
-    assert b"color:var(--text); border:1px solid var(--border); border-radius:.3rem; background:transparent; text-align:left;" in html
-    assert b".review-item:hover { color:var(--text); border-color:var(--accent); background:transparent; }" in html
+    assert b".review-album { display:flex; width:calc(100% - 1.5rem);" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     assert b"const artist = document.createElement('details');" in html
-    assert b"const album = document.createElement('details');" in html
+    assert b"const album = document.createElement('button');" in html
+
+
+def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b'id="library-import-modal-proposed"' in html
+    assert b'id="library-import-modal-candidates"' in html
+    assert b'id="library-import-modal-diff"' in html
+    assert b'id="library-import-modal-tracks"' in html
+    assert b'id="library-import-rematch-form"' in html
+    assert b'aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1"' in html
+    assert b"if (event.key === 'Escape')" in html
+    assert b"input:not(:disabled)" in html
+    assert b"album.addEventListener('click', () => openReview(albumReview, album));" in html
+    assert b"albumGroup.songs.forEach(item" not in html
 
 
 def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):

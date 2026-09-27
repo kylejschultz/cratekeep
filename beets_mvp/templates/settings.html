@@ -125,7 +125,7 @@
     .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
     .review-list { display:grid; gap:.65rem; margin-top:.75rem; }
     .review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }
-    .review-album { margin:.5rem .75rem .75rem; }
+    .review-album { display:flex; width:calc(100% - 1.5rem); margin:.5rem .75rem .75rem; padding:.7rem .85rem; align-items:center; justify-content:space-between; gap:.75rem; color:var(--text); text-align:left; }
     .review-group-summary { cursor:pointer; padding:.7rem .85rem; font-weight:700; }
     .review-album > .review-group-summary { font-size:.9rem; font-weight:650; }
     .review-group-count { margin-left:.4rem; color:var(--muted); font-size:.8rem; font-weight:500; }
@@ -140,6 +140,18 @@
     .review-detail div { padding:.65rem; border:1px solid var(--modal-border); border-radius:.3rem; background:var(--modal-panel); }
     .review-detail dt { color:var(--muted); font-size:.8rem; font-weight:650; }
     .review-detail dd { margin:.15rem 0 0; overflow-wrap:anywhere; }
+    .album-modal-dialog { width:min(900px,100%); }
+    .album-modal-section { margin-bottom:1rem; padding:.8rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
+    .album-modal-section h3 { margin:0 0 .55rem; font-size:.95rem; }
+    .candidate-list { display:grid; gap:.45rem; }
+    .candidate-option { display:grid; grid-template-columns:1fr auto; gap:.5rem; width:100%; margin:0; text-align:left; }
+    .candidate-option[aria-pressed="true"] { outline:3px solid var(--focus); }
+    .metadata-diff,.track-match-table { width:100%; border-collapse:collapse; font-size:.85rem; }
+    .metadata-diff th,.metadata-diff td,.track-match-table th,.track-match-table td { padding:.4rem; border-bottom:1px solid var(--modal-border); text-align:left; }
+    .match-status { font-weight:650; text-transform:capitalize; }
+    .override-form { display:flex; flex-wrap:wrap; align-items:end; gap:.5rem; }
+    .override-form label { flex:1 1 24rem; }
+    .override-form input { margin-top:.25rem; }
     @media (max-width: 760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
       .content,body.sidebar-collapsed .content { margin-left:0; }
@@ -269,17 +281,36 @@
   </div>
   {% if not first_run %}
   <div id="library-import-modal" class="browser" hidden>
-    <section class="browser-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1">
+    <section class="browser-dialog album-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1">
       <header class="browser-header">
-        <h2 id="library-import-modal-title">Review library import item</h2>
+        <h2 id="library-import-modal-title">Review album match</h2>
         <button type="button" class="browser-close" id="library-import-modal-close-icon" aria-label="Close review">&times;</button>
       </header>
       <div class="browser-body">
-        <dl class="review-detail">
-          <div><dt>Path</dt><dd id="library-import-modal-path"></dd></div>
-          <div><dt>Status</dt><dd id="library-import-modal-status"></dd></div>
-          <div><dt>Candidate</dt><dd id="library-import-modal-candidate"></dd></div>
-        </dl>
+        <section class="album-modal-section" aria-labelledby="proposed-match-title">
+          <h3 id="proposed-match-title">Proposed MusicBrainz match</h3>
+          <div id="library-import-modal-proposed"></div>
+          <ul id="library-import-modal-reasons"></ul>
+        </section>
+        <section class="album-modal-section" aria-labelledby="candidate-alternatives-title">
+          <h3 id="candidate-alternatives-title">Candidate alternatives</h3>
+          <div id="library-import-modal-candidates" class="candidate-list"></div>
+        </section>
+        <section class="album-modal-section" aria-labelledby="metadata-diff-title">
+          <h3 id="metadata-diff-title">Album metadata changes</h3>
+          <table class="metadata-diff"><thead><tr><th>Field</th><th>Current</th><th>Proposed</th></tr></thead><tbody id="library-import-modal-diff"></tbody></table>
+        </section>
+        <section class="album-modal-section" aria-labelledby="track-details-title">
+          <h3 id="track-details-title">Track matching details</h3>
+          <table class="track-match-table"><thead><tr><th>#</th><th>Library track</th><th>Proposed track</th><th>Status</th></tr></thead><tbody id="library-import-modal-tracks"></tbody></table>
+        </section>
+        <form id="library-import-rematch-form" class="override-form">
+          <label for="library-import-mbid">MusicBrainz release ID override
+            <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
+          </label>
+          <button type="submit">Rematch</button>
+          <small id="library-import-mbid-help">Enter a canonical MusicBrainz release UUID.</small>
+        </form>
         <p id="library-import-modal-message" class="browser-status" role="status"></p>
       </div>
       <footer class="browser-actions">
@@ -484,7 +515,7 @@
     const inventoryStatus = document.getElementById('inventory-status');
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
-    let reviewItems = [], reviewGroups = [], albumReviews = [], activeReview = null, activeAlbum = null, reviewReturnFocus = null;
+    let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null;
     let latestInventoryPreview = null, reviewHasMore = false;
 
     function renderInventoryPreview(data) {
@@ -552,55 +583,17 @@
         artist.open = groups.length === 1 && artistCount <= 12;
         artist.append(reviewSummary(group.artist, artistCount));
         group.albums.forEach(albumGroup => {
-          const album = document.createElement('details');
+          const album = document.createElement('button');
+          album.type = 'button';
           album.className = 'review-album';
-          album.open = artist.open && group.albums.length === 1;
-          album.append(reviewSummary(albumGroup.album, albumGroup.songs.length));
           const albumReview = albumReviews.find(review => review.artist === group.artist && review.album === albumGroup.album);
-          if (albumReview) {
-            const controls = document.createElement('div'); controls.className = 'album-review-controls';
-            const best = albumReview.candidates[0];
-            const summary = document.createElement('span');
-            summary.textContent = best
-              ? `Best: ${best.artist} — ${best.album} (${Math.round(best.confidence * 100)}%)`
-              : (albumReview.candidate_error || `Candidates: ${albumReview.candidate_status}; album: ${albumReview.decision}`);
-            controls.append(summary);
-            ['approved', 'rejected', 'skipped'].forEach(decision => {
-              const button = document.createElement('button'); button.type = 'button'; button.textContent = decision;
-              button.addEventListener('click', async event => {
-                event.stopPropagation();
-                const response = await fetch(`/api/library-import/albums/${albumReview.id}`, {
-                  method: 'PATCH', headers: {'Content-Type': 'application/json'},
-                  body: JSON.stringify({decision, candidate_id: best?.id || null}),
-                });
-                const data = await response.json();
-                if (!response.ok) { reviewStatus.textContent = data.error || 'Unable to save album decision.'; return; }
-                await loadReviewItems();
-              });
-              controls.append(button);
-            });
-            album.append(controls);
-          }
-          const songs = document.createElement('div');
-          songs.className = 'review-songs';
-          albumGroup.songs.forEach(item => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'review-item';
-            button.setAttribute('aria-label', `Review ${item.title || item.path}`);
-            const title = document.createElement('span');
-            title.className = 'review-item-path'; title.textContent = item.title || item.path;
-            const status = document.createElement('span');
-            status.className = 'review-item-status'; status.textContent = item.status;
-            const decision = document.createElement('span');
-            const albumTrack = albumReview?.tracks.find(track => track.id === item.id);
-            decision.className = 'review-item-decision';
-            decision.textContent = albumTrack?.exception ? `exception: ${albumTrack.exception}` : (albumTrack ? `album: ${albumTrack.effective_decision}` : item.decision);
-            button.append(title, status, decision);
-            button.addEventListener('click', () => openReview(item, button));
-            songs.append(button);
-          });
-          album.append(songs);
+          const label = document.createElement('span'); label.textContent = albumGroup.album;
+          const status = document.createElement('span'); status.className = 'review-item-decision';
+          status.textContent = `${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'song' : 'songs'} · ${albumReview?.decision || 'pending'}`;
+          album.append(label, status);
+          album.setAttribute('aria-label', `Review album ${albumGroup.album} by ${group.artist}`);
+          if (albumReview) album.addEventListener('click', () => openReview(albumReview, album));
+          else album.disabled = true;
           artist.append(album);
         });
         return artist;
@@ -628,15 +621,50 @@
       }
     }
 
-    function openReview(item, button) {
-      activeReview = item; reviewReturnFocus = button;
-      activeAlbum = albumReviews.find(album => album.tracks.some(track => track.id === item.id)) || null;
-      const albumTrack = activeAlbum?.tracks.find(track => track.id === item.id);
-      document.getElementById('library-import-modal-path').textContent = item.path;
-      document.getElementById('library-import-modal-status').textContent = `${item.status}; decision: ${albumTrack?.effective_decision || item.decision}`;
-      document.getElementById('library-import-modal-candidate').textContent = item.candidate?.kind === 'beets-item'
-        ? `Existing beets item #${item.candidate.beets_item_id}` : 'No external match proposed.';
+    function renderAlbumMatch() {
+      const candidate = activeAlbum?.candidates.find(value => value.id === activeCandidateId) || activeAlbum?.proposed_match || null;
+      const proposed = document.getElementById('library-import-modal-proposed');
+      proposed.textContent = candidate
+        ? `${candidate.artist} — ${candidate.album}${candidate.year ? ` (${candidate.year})` : ''} · ${Math.round(candidate.confidence * 100)}% confidence · MBID ${candidate.provider_id}`
+        : (activeAlbum?.candidate_error || 'No MusicBrainz match proposed.');
+      const reasons = document.getElementById('library-import-modal-reasons');
+      reasons.replaceChildren(...(candidate?.confidence_reasons || []).map(reason => {
+        const item = document.createElement('li'); item.textContent = reason; return item;
+      }));
+      const candidates = document.getElementById('library-import-modal-candidates');
+      candidates.replaceChildren(...(activeAlbum?.candidates || []).map(value => {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'candidate-option';
+        button.setAttribute('aria-pressed', String(value.id === candidate?.id));
+        const name = document.createElement('span'); name.textContent = `${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
+        const confidence = document.createElement('span'); confidence.textContent = `${Math.round(value.confidence * 100)}%`;
+        button.append(name, confidence);
+        button.addEventListener('click', () => { activeCandidateId = value.id; renderAlbumMatch(); });
+        return button;
+      }));
+      if (!candidates.children.length) candidates.textContent = 'No alternatives available.';
+      const diff = document.getElementById('library-import-modal-diff');
+      const changes = Object.entries(candidate?.proposed_diff || {}).filter(([field]) => field !== 'tracks');
+      diff.replaceChildren(...changes.map(([field, values]) => {
+        const row = document.createElement('tr');
+        [field.replace('_', ' '), values.from, values.to].forEach(value => { const cell = document.createElement('td'); cell.textContent = String(value); row.append(cell); });
+        return row;
+      }));
+      if (!changes.length) { const row = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 3; cell.textContent = 'No album-level metadata changes proposed.'; row.append(cell); diff.append(row); }
+      const trackBody = document.getElementById('library-import-modal-tracks');
+      const trackDetails = candidate?.track_details?.length ? candidate.track_details : (activeAlbum?.tracks || []).map((track, index) => ({position:index + 1, local:track.title, proposed:null, status:'unmatched'}));
+      trackBody.replaceChildren(...trackDetails.map(track => {
+        const row = document.createElement('tr');
+        [track.position, track.local || '—', track.proposed || '—', track.status].forEach((value, index) => { const cell = document.createElement('td'); cell.textContent = String(value); if (index === 3) cell.className = 'match-status'; row.append(cell); });
+        return row;
+      }));
+    }
+
+    function openReview(album, button) {
+      activeAlbum = album; activeCandidateId = album.selected_candidate_id || album.proposed_match?.id || null; reviewReturnFocus = button;
+      document.getElementById('library-import-modal-title').textContent = `${album.artist} — ${album.album}`;
       document.getElementById('library-import-modal-message').textContent = '';
+      document.getElementById('library-import-mbid').value = '';
+      renderAlbumMatch();
       reviewModal.hidden = false;
       document.body.classList.add('modal-open');
       reviewModal.querySelector('.browser-dialog').focus();
@@ -655,7 +683,7 @@
       reviewModal.addEventListener('keydown', event => {
         if (event.key === 'Escape') { event.preventDefault(); closeReview(); return; }
         if (event.key !== 'Tab') return;
-        const focusable = [...reviewModal.querySelectorAll('button:not(:disabled), [tabindex]:not([tabindex="-1"])')];
+        const focusable = [...reviewModal.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])')];
         const first = focusable[0], last = focusable[focusable.length - 1];
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
@@ -663,11 +691,9 @@
       reviewModal.querySelectorAll('[data-review-decision]').forEach(button => button.addEventListener('click', async () => {
         const message = document.getElementById('library-import-modal-message');
         try {
-          const response = await fetch(activeAlbum ? `/api/library-import/albums/${activeAlbum.id}` : `/api/library-import/reviews/${activeReview.id}`, {
+          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}`, {
             method: 'PATCH', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(activeAlbum
-              ? {track_exceptions: {[activeReview.id]: button.dataset.reviewDecision}}
-              : {decision: button.dataset.reviewDecision}),
+            body: JSON.stringify({decision: button.dataset.reviewDecision, candidate_id: activeCandidateId}),
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || data.description || 'Unable to save review decision.');
@@ -677,6 +703,27 @@
           message.textContent = error.message || 'Unable to save review decision.';
         }
       }));
+      document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
+        event.preventDefault();
+        const input = document.getElementById('library-import-mbid');
+        const message = document.getElementById('library-import-modal-message');
+        if (!input.reportValidity()) return;
+        message.textContent = 'Rematching through the configured MusicBrainz provider…';
+        try {
+          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/rematch`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({musicbrainz_id: input.value}),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Unable to rematch this album.');
+          activeAlbum = data; activeCandidateId = data.selected_candidate_id; input.value = '';
+          const index = albumReviews.findIndex(album => album.id === data.id);
+          if (index >= 0) albumReviews[index] = data;
+          renderAlbumMatch(); message.textContent = 'MusicBrainz override matched. No files were changed.';
+        } catch (error) {
+          message.textContent = error.message || 'Unable to rematch this album.';
+        }
+      });
       if (restoreInventoryPreview()) loadReviewItems();
     }
 

@@ -90,6 +90,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `GET /api/library-import/reviews` — list persisted track groups and album review records
 - `POST /api/library-import/candidates` — generate and persist bounded MusicBrainz release candidates
 - `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, and track exceptions
+- `POST /api/library-import/albums/<id>/rematch` — validate a MusicBrainz release UUID and rematch through the configured provider
 - `POST /api/imports/preview` — snapshot an inbox selection for review
 - `POST /api/imports/<id>/execute` — execute a reviewed import
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
