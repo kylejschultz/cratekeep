@@ -6,6 +6,7 @@ from beets.library import Item, Library
 
 from beets_mvp import _format_bytes, _group_library_import_review_items, create_app
 from beets_mvp.musicbrainz import ProviderError, search_releases
+from beets_mvp.matching import score_release
 
 def make_app(tmp_path: Path):
     app = create_app({
@@ -524,8 +525,12 @@ def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
     def provider(query, *, limit):
         seen.append((query, limit))
         return [
-            {"provider_id": "weaker", "artist": "Other Artist", "album": "Album A", "score": 90, "track_count": 7},
-            {"provider_id": "best", "artist": "Artist One", "album": "Album A", "score": 100, "track_count": 2, "year": 2020},
+            {"provider_id": "weaker", "artist": "Other Artist", "album": "Album A", "track_count": 7,
+             "tracks": [{"title": f"Other {number}", "position": number} for number in range(1, 8)],
+             "retrieval": {"search_score": 100, "source": "musicbrainz-search"}},
+            {"provider_id": "best", "artist": "Artist One", "album": "Album A", "track_count": 2, "year": 2020,
+             "tracks": [{"title": "First Song", "position": 1}, {"title": "Second Song", "position": 2}],
+             "retrieval": {"search_score": 1, "source": "musicbrainz-search"}},
         ]
 
     app = make_app(tmp_path)
@@ -542,11 +547,13 @@ def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
     assert generated.status_code == 201
     assert generated.json["albums"] == 1
     assert generated.json["candidates"] == 2
-    assert seen == [({"artist": "Artist One", "album": "Album A", "tracks": ["First Song", "Second Song"]}, 5)]
+    assert [track["title"] for track in seen[0][0]["tracks"]] == ["First Song", "Second Song"]
+    assert seen[0][1] == 5
     album = client.get("/api/library-import/reviews").json["albums"][0]
     assert [candidate["provider_id"] for candidate in album["candidates"]] == ["best", "weaker"]
-    assert album["candidates"][0]["confidence"] == 1.0
-    assert album["candidates"][1]["proposed_diff"] == {
+    assert album["candidates"][0]["confidence"] > .9
+    assert album["candidates"][0]["retrieval"]["search_score"] == 1
+    assert {key: album["candidates"][1]["proposed_diff"][key] for key in ("artist", "track_count")} == {
         "artist": {"from": "Artist One", "to": "Other Artist"},
         "track_count": {"from": 2, "to": 7},
     }
@@ -631,10 +638,9 @@ def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tm
 
     assert album["proposed_match"]["provider_id"] == "123e4567-e89b-42d3-a456-426614174000"
     assert album["proposed_match"]["proposed_diff"]["album"] == {"from": "Album", "to": "Renamed Album"}
-    assert album["proposed_match"]["confidence_reasons"] == [
-        "MusicBrainz search score: 96%", "Artist similarity: 100%", "Album similarity: 56%", "Track count matches",
-    ]
-    assert [track["status"] for track in album["proposed_match"]["track_details"]] == ["matched", "changed"]
+    assert all("search score" not in reason.lower() for reason in album["proposed_match"]["confidence_reasons"])
+    assert album["proposed_match"]["recommendation"] in {"strong", "medium", "low", "none"}
+    assert [track["status"] for track in album["proposed_match"]["track_details"]] == ["matched", "title-mismatch"]
     assert [track["title"] for track in album["tracks"]] == ["First", "Second"]
 
 
@@ -692,21 +698,27 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
     seen = {}
 
     class Response:
+        def __init__(self, payload): self.payload = payload
         def __enter__(self): return self
         def __exit__(self, *args): return None
         def read(self, size):
             seen["read_size"] = size
-            return b'{"releases": [{"id": "id-1", "title": "Album", "score": 99, "artist-credit": [{"name": "Artist"}]}]}'
+            return self.payload
 
     def urlopen(request, timeout):
         seen["url"] = request.full_url
         seen["timeout"] = timeout
-        return Response()
+        if "/release/id-1" in request.full_url:
+            return Response(b'{"id":"id-1","title":"Album","date":"2024-03-02","release-group":{"id":"group-1"},"artist-credit":[{"name":"Artist"}],"media":[{"position":1,"format":"CD","track-count":1,"tracks":[{"position":1,"number":"1","length":123000,"recording":{"id":"recording-1","title":"Song"}}]}]}')
+        return Response(b'{"releases": [{"id": "id-1", "score": 99}]}')
 
     monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", urlopen)
     result = search_releases({"artist": "Artist", "album": "Album"}, limit=100)
     assert result[0]["provider_id"] == "id-1"
-    assert "limit=10" in seen["url"]
+    assert result[0]["release_group_id"] == "group-1"
+    assert result[0]["tracks"][0] == {"medium_position": 1, "position": 1, "number": "1", "title": "Song", "recording_id": "recording-1", "length_ms": 123000}
+    assert result[0]["retrieval"] == {"search_score": 99, "source": "musicbrainz-search"}
+    assert "/release/id-1" in seen["url"]
     assert seen == {**seen, "timeout": 10, "read_size": 512 * 1024}
 
     def limited(request, timeout):
@@ -720,6 +732,40 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
         assert "rate limit" in str(exc)
     else:
         raise AssertionError("expected ProviderError")
+
+
+def test_matching_assigns_tracks_reports_explicit_mismatches_and_bounds_count_confidence():
+    query = {"artist": "Artist", "album": "Album", "year": 2024, "tracks": [
+        {"title": "First", "duration": 120, "disc": 1, "track": 1},
+        {"title": "Second", "duration": 180, "disc": 1, "track": 2},
+    ]}
+    candidate = {"provider_id": "release", "artist": "Artist", "album": "Album", "year": 2024, "tracks": [
+        {"title": "Second", "length_ms": 181000, "medium_position": 1, "position": 1, "recording_id": "r2"},
+        {"title": "First renamed", "length_ms": 150000, "medium_position": 1, "position": 2, "recording_id": "r1"},
+        {"title": "Bonus", "length_ms": 90000, "medium_position": 1, "position": 3, "recording_id": "r3"},
+    ], "retrieval": {"search_score": 100, "source": "musicbrainz-search"}}
+
+    match = score_release(query, candidate)
+
+    statuses = {detail["status"] for detail in match["track_details"]}
+    issues = {issue for detail in match["track_details"] for issue in detail["issues"]}
+    assert "order-mismatch" in statuses
+    assert {"title-mismatch", "duration-mismatch", "order-mismatch", "extra"} <= issues
+    assert match["track_count_mismatch"] is True
+    assert match["confidence"] < .95
+    assert match["recommendation"] in {"strong", "medium", "low", "none"}
+    assert {penalty["field"] for penalty in match["penalties"]} == {"artist", "album", "date", "tracks"}
+
+
+def test_exact_release_id_override_is_strongest_even_with_count_mismatch():
+    result = score_release({"artist": "Wrong", "album": "Wrong", "tracks": [{"title": "One"}]}, {
+        "provider_id": "release", "artist": "Canonical", "album": "Canonical", "tracks": [],
+    }, exact_mbid=True)
+
+    assert result["confidence"] == .99
+    assert result["distance"] == .01
+    assert result["recommendation"] == "strong"
+    assert result["reasons"][0] == "Exact MusicBrainz release ID override"
 
 
 def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tmp_path):

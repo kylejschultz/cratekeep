@@ -663,8 +663,8 @@
       proposed.replaceChildren();
       if (candidate) {
         const name = document.createElement('div'); name.className = 'match-summary-name'; name.textContent = `${candidate.artist} — ${candidate.album}`;
-        const metadata = document.createElement('div'); metadata.className = 'match-summary-meta'; metadata.textContent = `${candidate.year ? `${candidate.year} · ` : ''}MusicBrainz release ${candidate.provider_id}`;
-        const confidence = document.createElement('span'); confidence.className = 'confidence-badge'; confidence.textContent = `${Math.round(candidate.confidence * 100)}% match`;
+        const metadata = document.createElement('div'); metadata.className = 'match-summary-meta'; metadata.textContent = `${candidate.date || candidate.year ? `${candidate.date || candidate.year} · ` : ''}MusicBrainz release ${candidate.provider_id}${candidate.release_group_id ? ` · group ${candidate.release_group_id}` : ''}`;
+        const confidence = document.createElement('span'); confidence.className = 'confidence-badge'; confidence.textContent = `${Math.round(candidate.confidence * 100)}% · ${candidate.recommendation} recommendation`;
         proposed.append(name, metadata, confidence);
       } else {
         proposed.textContent = activeAlbum?.candidate_error || 'No MusicBrainz match proposed.';
@@ -678,7 +678,7 @@
         const button = document.createElement('button'); button.type = 'button'; button.className = 'candidate-option';
         button.setAttribute('aria-pressed', String(value.id === candidate?.id));
         const name = document.createElement('span'); name.textContent = `${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
-        const confidence = document.createElement('span'); confidence.className = 'candidate-confidence'; confidence.textContent = `${Math.round(value.confidence * 100)}%`;
+        const confidence = document.createElement('span'); confidence.className = 'candidate-confidence'; confidence.textContent = `${Math.round(value.confidence * 100)}% · ${value.recommendation}`;
         button.append(name, confidence);
         button.addEventListener('click', () => { activeCandidateId = value.id; renderAlbumMatch(); });
         return button;
@@ -696,7 +696,7 @@
       const trackDetails = candidate?.track_details?.length ? candidate.track_details : (activeAlbum?.tracks || []).map((track, index) => ({position:index + 1, local:track.title, proposed:null, status:'unmatched'}));
       trackBody.replaceChildren(...trackDetails.map(track => {
         const row = document.createElement('tr');
-        [track.position, track.local || '—', track.proposed || '—', track.status].forEach((value, index) => { const cell = document.createElement('td'); cell.textContent = String(value); if (index === 3) cell.className = 'match-status'; row.append(cell); });
+        [track.position, track.local || '—', track.proposed || '—', String(track.status).replaceAll('-', ' ')].forEach((value, index) => { const cell = document.createElement('td'); cell.textContent = String(value); if (index === 3) cell.className = 'match-status'; row.append(cell); });
         return row;
       }));
     }

@@ -7,7 +7,6 @@ import sqlite3
 import subprocess
 import re
 import unicodedata
-from difflib import SequenceMatcher
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,6 +19,7 @@ from beets.library import Library
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
 
 from .musicbrainz import ProviderError, search_releases
+from .matching import score_release
 
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
 EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
@@ -873,21 +873,46 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
         ).fetchall()
     library = _library(app)
     tracks = []
+    years = []
+    dates = []
+    release_ids = []
     for row in rows:
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
         title = item.get("title") if item and item.get("title") else Path(row["relative_path"]).stem
-        tracks.append(_normalize_track_title(title))
-    return {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
+        track = {"title": _normalize_track_title(title), "path": row["relative_path"]}
+        if item:
+            for source, target in (("length", "duration"), ("disc", "disc"), ("track", "track"),
+                                   ("mb_trackid", "recording_id")):
+                if item.get(source) not in (None, "", 0):
+                    track[target] = item.get(source)
+            if item.get("year"):
+                years.append(item.get("year"))
+                month = int(item.get("month") or 0)
+                day = int(item.get("day") or 0)
+                dates.append(f"{int(item.get('year')):04d}" + (f"-{month:02d}" if month else "")
+                             + (f"-{day:02d}" if month and day else ""))
+            if item.get("mb_albumid"):
+                release_ids.append(str(item.get("mb_albumid")).lower())
+        tracks.append(track)
+    query = {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
+    if years:
+        query["year"] = years[0]
+        query["date"] = dates[0]
+    if release_ids and len(set(release_ids)) == 1:
+        query["release_mbid"] = release_ids[0]
+    return query
 
 
-def _candidate_confidence(query: dict, candidate: dict) -> float:
-    try:
-        provider_score = max(0.0, min(float(candidate.get("score", 0)) / 100, 1.0))
-    except (TypeError, ValueError):
-        provider_score = 0.0
-    artist_similarity = SequenceMatcher(None, _metadata_key(query["artist"]), _metadata_key(candidate.get("artist"))).ratio()
-    album_similarity = SequenceMatcher(None, _metadata_key(query["album"]), _metadata_key(candidate.get("album"))).ratio()
-    return round((provider_score * 0.6) + (artist_similarity * 0.15) + (album_similarity * 0.25), 4)
+def _candidate_match(query: dict, candidate: dict, *, exact_mbid: bool = False) -> dict:
+    exact = exact_mbid or bool(query.get("release_mbid") and
+                               str(candidate.get("provider_id", "")).lower() == query["release_mbid"])
+    retrieval = candidate.get("retrieval") if isinstance(candidate.get("retrieval"), dict) else {}
+    exact = exact or retrieval.get("source") == "release-id"
+    return score_release(query, candidate, exact_mbid=exact)
+
+
+def _candidate_confidence(query: dict, candidate: dict, *, exact_mbid: bool = False) -> float:
+    return _candidate_match(query, candidate, exact_mbid=exact_mbid)["confidence"]
 
 
 def _candidate_diff(query: dict, candidate: dict) -> dict:
@@ -901,46 +926,21 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
         proposed["track_count"] = {"from": len(query["tracks"]), "to": count}
     candidate_tracks = candidate.get("tracks")
     if isinstance(candidate_tracks, list):
-        normalized_tracks = [_normalize_track_title(track) for track in candidate_tracks]
-        if [_metadata_key(track) for track in normalized_tracks] != [_metadata_key(track) for track in query["tracks"]]:
-            proposed["tracks"] = {"from": query["tracks"], "to": normalized_tracks}
+        normalized_tracks = [_normalize_track_title(track.get("title") if isinstance(track, dict) else track)
+                             for track in candidate_tracks]
+        local_tracks = [_normalize_track_title(track.get("title") if isinstance(track, dict) else track)
+                        for track in query["tracks"]]
+        if [_metadata_key(track) for track in normalized_tracks] != [_metadata_key(track) for track in local_tracks]:
+            proposed["tracks"] = {"from": local_tracks, "to": normalized_tracks}
     return proposed
 
 
 def _candidate_reasons(query: dict, candidate: dict) -> list[str]:
-    reasons = []
-    try:
-        score = max(0, min(int(candidate.get("score", 0)), 100))
-    except (TypeError, ValueError):
-        score = 0
-    reasons.append(f"MusicBrainz search score: {score}%")
-    for label, key in (("Artist", "artist"), ("Album", "album")):
-        similarity = SequenceMatcher(None, _metadata_key(query[key]), _metadata_key(candidate.get(key))).ratio()
-        reasons.append(f"{label} similarity: {round(similarity * 100)}%")
-    candidate_tracks = candidate.get("tracks")
-    if isinstance(candidate_tracks, list):
-        reasons.append(
-            "Track count matches"
-            if len(candidate_tracks) == len(query["tracks"])
-            else f"Track count differs ({len(query['tracks'])} local, {len(candidate_tracks)} proposed)"
-        )
-    return reasons
+    return _candidate_match(query, candidate)["reasons"]
 
 
 def _candidate_track_details(query: dict, candidate: dict) -> list[dict]:
-    proposed = candidate.get("tracks") if isinstance(candidate.get("tracks"), list) else []
-    details = []
-    for index in range(max(len(query["tracks"]), len(proposed))):
-        local = query["tracks"][index] if index < len(query["tracks"]) else None
-        match = _normalize_track_title(proposed[index]) if index < len(proposed) else None
-        if local is None or match is None:
-            status = "unmatched"
-        elif _metadata_key(local) == _metadata_key(match):
-            status = "matched"
-        else:
-            status = "changed"
-        details.append({"position": index + 1, "local": local, "proposed": match, "status": status})
-    return details
+    return _candidate_match(query, candidate)["track_details"]
 
 
 def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrainz_id: str) -> dict | None:
@@ -963,6 +963,8 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
     )
     if candidate is None:
         raise ProviderError("No MusicBrainz release found for that ID")
+    candidate = dict(candidate)
+    candidate["retrieval"] = {**(candidate.get("retrieval") or {}), "source": "release-id", "search_score": None}
     now = _now()
     with _connect(app.config["APP_DB"]) as db:
         db.execute("UPDATE metadata_candidates SET rank = rank + 1 WHERE album_review_id = ?", (album_review_id,))
@@ -971,7 +973,7 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
             (album_review_id, musicbrainz_id),
         ).fetchone()
         values = (
-            1, _candidate_confidence(query, candidate), _normalize_metadata(candidate.get("artist")),
+            1, _candidate_confidence(query, candidate, exact_mbid=True), _normalize_metadata(candidate.get("artist")),
             _normalize_metadata(candidate.get("album")), str(candidate.get("year")) if candidate.get("year") else None,
             json.dumps(_candidate_diff(query, candidate), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
         )
@@ -1080,13 +1082,19 @@ def _album_review_payloads(app: Flask) -> list[dict]:
             serialized_candidates = []
             for candidate in candidates:
                 provider_data = json.loads(candidate["provider_data_json"])
+                match = _candidate_match(query, provider_data)
                 serialized_candidates.append({
                     "id": candidate["id"], "provider": candidate["provider"],
                     "provider_id": candidate["provider_id"], "rank": candidate["rank"],
-                    "confidence": candidate["confidence"], "confidence_reasons": _candidate_reasons(query, provider_data),
+                    "confidence": match["confidence"], "distance": match["distance"],
+                    "recommendation": match["recommendation"], "confidence_reasons": match["reasons"],
+                    "penalties": match["penalties"], "track_count_mismatch": match["track_count_mismatch"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
+                    "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
+                    "media": provider_data.get("media", []), "recordings": provider_data.get("tracks", []),
+                    "retrieval": provider_data.get("retrieval", {}),
                     "proposed_diff": json.loads(candidate["proposed_diff_json"]),
-                    "track_details": _candidate_track_details(query, provider_data),
+                    "track_details": match["track_details"],
                 })
             selected_id = row["selected_candidate_id"]
             proposed_match = next((candidate for candidate in serialized_candidates if candidate["id"] == selected_id), None)
@@ -1098,7 +1106,11 @@ def _album_review_payloads(app: Flask) -> list[dict]:
                 "candidate_status": row["candidate_status"],
                 "candidate_error": row["candidate_error"],
                 "tracks": [{"id": track["id"], "path": track["relative_path"],
-                            "title": query["tracks"][index],
+                            "title": query["tracks"][index]["title"],
+                            "duration": query["tracks"][index].get("duration"),
+                            "disc": query["tracks"][index].get("disc"),
+                            "position": query["tracks"][index].get("track"),
+                            "recording_id": query["tracks"][index].get("recording_id"),
                             "exception": track["exception_state"],
                             "effective_decision": track["exception_state"] or row["state"]}
                            for index, track in enumerate(tracks)],
