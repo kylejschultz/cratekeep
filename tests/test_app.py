@@ -334,6 +334,29 @@ def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
     assert b"window.addEventListener('hashchange'" in html
 
 
+def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+    modal = html[html.index(b'id="library-import-modal"'):]
+
+    assert b'role="dialog" aria-modal="true"' in modal
+    assert b'aria-labelledby="library-import-modal-title"' in modal
+    assert b'aria-describedby="library-import-modal-description"' in modal
+    assert b'This decision does not change music files.' in modal
+    assert b'class="match-summary"' in modal
+    assert b'class="album-modal-section alternatives-section"' in modal
+    assert b'class="comparison-grid"' in modal
+    assert modal.count(b'<caption class="visually-hidden">') == 2
+    assert b'<th scope="col">Current</th>' in modal
+    assert b'Rematch with MusicBrainz release ID' in modal
+    assert b'class="browser-actions review-footer"' in modal
+    assert b'class="secondary danger-button" data-review-decision="rejected"' in modal
+    assert b'class="approve-button" data-review-decision="approved">Approve match' in modal
+    assert b"if (event.key === 'Escape')" in modal
+    assert b"event.key !== 'Tab'" in modal
+    assert b"reviewReturnFocus.focus()" in modal
+    assert b'.comparison-grid { grid-template-columns:1fr;' in html
+
+
 def test_library_inventory_preview_is_bounded_non_mutating_and_persisted(tmp_path):
     app = make_app(tmp_path)
     library_root = tmp_path / "library"

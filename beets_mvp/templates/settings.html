@@ -140,18 +140,41 @@
     .review-detail div { padding:.65rem; border:1px solid var(--modal-border); border-radius:.3rem; background:var(--modal-panel); }
     .review-detail dt { color:var(--muted); font-size:.8rem; font-weight:650; }
     .review-detail dd { margin:.15rem 0 0; overflow-wrap:anywhere; }
-    .album-modal-dialog { width:min(900px,100%); }
-    .album-modal-section { margin-bottom:1rem; padding:.8rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
-    .album-modal-section h3 { margin:0 0 .55rem; font-size:.95rem; }
+    .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    .album-modal-dialog { width:min(920px,100%); }
+    .album-modal-dialog .browser-header { padding:.8rem 1rem; }
+    .album-modal-dialog .browser-body { padding:.8rem 1rem; }
+    .album-modal-section { margin-bottom:.7rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
+    .album-modal-section h3 { margin:0 0 .45rem; font-size:.88rem; }
+    .match-summary { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.25rem .75rem; align-items:start; }
+    .match-summary-name { font-size:1rem; font-weight:750; line-height:1.3; }
+    .match-summary-meta { color:var(--muted); font-size:.78rem; overflow-wrap:anywhere; }
+    .confidence-badge { grid-column:2; grid-row:1 / span 2; padding:.25rem .5rem; border-radius:999px; color:var(--modal-accent-hover); background:var(--modal-subtle); font-size:.78rem; font-weight:750; white-space:nowrap; }
+    .match-reasons { display:flex; flex-wrap:wrap; gap:.3rem; margin:.55rem 0 0; padding:0; list-style:none; }
+    .match-reasons li { padding:.18rem .4rem; border-radius:999px; color:var(--muted); background:var(--modal-subtle); font-size:.72rem; }
+    .alternatives-section { background:var(--modal-subtle); }
     .candidate-list { display:grid; gap:.45rem; }
-    .candidate-option { display:grid; grid-template-columns:1fr auto; gap:.5rem; width:100%; margin:0; text-align:left; }
-    .candidate-option[aria-pressed="true"] { outline:3px solid var(--focus); }
+    .browser-body button.candidate-option { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.5rem; width:100%; margin:0; padding:.45rem .55rem; border:1px solid transparent; background:transparent; color:var(--text); text-align:left; }
+    .browser-body button.candidate-option:hover { border-color:var(--modal-border); background:var(--modal-panel); }
+    .candidate-option[aria-pressed="true"] { border-color:var(--modal-accent); background:var(--modal-panel); box-shadow:inset 3px 0 var(--modal-accent); }
+    .candidate-confidence { color:var(--muted); font-size:.8rem; font-weight:650; }
+    .comparison-grid { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,3fr); gap:.7rem; }
+    .comparison-grid .album-modal-section { min-width:0; margin-bottom:.7rem; }
+    .compact-table { overflow-x:auto; }
     .metadata-diff,.track-match-table { width:100%; border-collapse:collapse; font-size:.85rem; }
     .metadata-diff th,.metadata-diff td,.track-match-table th,.track-match-table td { padding:.4rem; border-bottom:1px solid var(--modal-border); text-align:left; }
+    .metadata-diff tbody tr:last-child td,.track-match-table tbody tr:last-child td { border-bottom:0; }
     .match-status { font-weight:650; text-transform:capitalize; }
-    .override-form { display:flex; flex-wrap:wrap; align-items:end; gap:.5rem; }
-    .override-form label { flex:1 1 24rem; }
+    .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
+    .override-form label { margin:0; font-size:.86rem; }
     .override-form input { margin-top:.25rem; }
+    .override-form small { grid-column:1 / -1; margin:0; }
+    .review-footer { position:sticky; bottom:0; justify-content:space-between; flex-wrap:nowrap; padding:.7rem 1rem; }
+    .review-footer-group { display:flex; flex-wrap:wrap; gap:.5rem; }
+    .review-footer button { margin:0; padding:.55rem .8rem; }
+    .browser-actions .danger-button { border-color:#b64b55; background:transparent; color:#a52b35; }
+    .browser-actions .danger-button:hover { background:var(--error); color:#8d2029; }
+    .browser-actions .approve-button { min-width:6.5rem; font-weight:750; }
     @media (max-width: 760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
       .content,body.sidebar-collapsed .content { margin-left:0; }
@@ -161,6 +184,7 @@
       body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:static; width:auto; height:auto; overflow:visible; clip-path:none; }
       body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:flex-start; padding-inline:.75rem; }
       .scrim { position:fixed; z-index:9; inset:0; margin:0; border:0; border-radius:0; background:rgb(8 19 26 / 62%); } body.sidebar-open .scrim { display:block; }
+      .comparison-grid { grid-template-columns:1fr; gap:0; }
     }
     @media (max-width: 520px) {
       body { margin: 0; padding: .75rem; }
@@ -170,6 +194,11 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
+      .match-summary { grid-template-columns:minmax(0,1fr); }
+      .confidence-badge { grid-column:1; grid-row:auto; justify-self:start; }
+      .review-footer { align-items:stretch; flex-direction:column-reverse; }
+      .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
+      .review-footer button { width:100%; }
     }
   </style>
 </head>
@@ -281,43 +310,50 @@
   </div>
   {% if not first_run %}
   <div id="library-import-modal" class="browser" hidden>
-    <section class="browser-dialog album-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1">
+    <section class="browser-dialog album-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1" aria-describedby="library-import-modal-description">
       <header class="browser-header">
         <h2 id="library-import-modal-title">Review album match</h2>
         <button type="button" class="browser-close" id="library-import-modal-close-icon" aria-label="Close review">&times;</button>
       </header>
       <div class="browser-body">
+        <p id="library-import-modal-description" class="visually-hidden">Review and choose one metadata match for this album. This decision does not change music files.</p>
         <section class="album-modal-section" aria-labelledby="proposed-match-title">
           <h3 id="proposed-match-title">Proposed MusicBrainz match</h3>
-          <div id="library-import-modal-proposed"></div>
-          <ul id="library-import-modal-reasons"></ul>
+          <div id="library-import-modal-proposed" class="match-summary"></div>
+          <ul id="library-import-modal-reasons" class="match-reasons" aria-label="Match confidence reasons"></ul>
         </section>
-        <section class="album-modal-section" aria-labelledby="candidate-alternatives-title">
+        <section class="album-modal-section alternatives-section" aria-labelledby="candidate-alternatives-title">
           <h3 id="candidate-alternatives-title">Candidate alternatives</h3>
           <div id="library-import-modal-candidates" class="candidate-list"></div>
         </section>
-        <section class="album-modal-section" aria-labelledby="metadata-diff-title">
-          <h3 id="metadata-diff-title">Album metadata changes</h3>
-          <table class="metadata-diff"><thead><tr><th>Field</th><th>Current</th><th>Proposed</th></tr></thead><tbody id="library-import-modal-diff"></tbody></table>
-        </section>
-        <section class="album-modal-section" aria-labelledby="track-details-title">
-          <h3 id="track-details-title">Track matching details</h3>
-          <table class="track-match-table"><thead><tr><th>#</th><th>Library track</th><th>Proposed track</th><th>Status</th></tr></thead><tbody id="library-import-modal-tracks"></tbody></table>
-        </section>
+        <div class="comparison-grid">
+          <section class="album-modal-section" aria-labelledby="metadata-diff-title">
+            <h3 id="metadata-diff-title">Album changes</h3>
+            <div class="compact-table"><table class="metadata-diff"><caption class="visually-hidden">Current and proposed album metadata</caption><thead><tr><th scope="col">Field</th><th scope="col">Current</th><th scope="col">Proposed</th></tr></thead><tbody id="library-import-modal-diff"></tbody></table></div>
+          </section>
+          <section class="album-modal-section" aria-labelledby="track-details-title">
+            <h3 id="track-details-title">Track matching</h3>
+            <div class="compact-table"><table class="track-match-table"><caption class="visually-hidden">Library and proposed track matches</caption><thead><tr><th scope="col">#</th><th scope="col">Library</th><th scope="col">Proposed</th><th scope="col">Status</th></tr></thead><tbody id="library-import-modal-tracks"></tbody></table></div>
+          </section>
+        </div>
         <form id="library-import-rematch-form" class="override-form">
-          <label for="library-import-mbid">MusicBrainz release ID override
+          <label for="library-import-mbid">Rematch with MusicBrainz release ID
             <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
           </label>
           <button type="submit">Rematch</button>
-          <small id="library-import-mbid-help">Enter a canonical MusicBrainz release UUID.</small>
+          <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
         </form>
         <p id="library-import-modal-message" class="browser-status" role="status"></p>
       </div>
-      <footer class="browser-actions">
-        <button type="button" class="secondary" id="library-import-modal-close">Cancel</button>
-        <button type="button" data-review-decision="skipped">Skip</button>
-        <button type="button" data-review-decision="rejected">Reject</button>
-        <button type="button" data-review-decision="approved">Approve</button>
+      <footer class="browser-actions review-footer">
+        <div class="review-footer-group">
+          <button type="button" class="secondary" id="library-import-modal-close">Cancel</button>
+          <button type="button" class="secondary" data-review-decision="skipped">Skip for now</button>
+        </div>
+        <div class="review-footer-group">
+          <button type="button" class="secondary danger-button" data-review-decision="rejected">Reject</button>
+          <button type="button" class="approve-button" data-review-decision="approved">Approve match</button>
+        </div>
       </footer>
     </section>
   </div>
@@ -624,9 +660,15 @@
     function renderAlbumMatch() {
       const candidate = activeAlbum?.candidates.find(value => value.id === activeCandidateId) || activeAlbum?.proposed_match || null;
       const proposed = document.getElementById('library-import-modal-proposed');
-      proposed.textContent = candidate
-        ? `${candidate.artist} — ${candidate.album}${candidate.year ? ` (${candidate.year})` : ''} · ${Math.round(candidate.confidence * 100)}% confidence · MBID ${candidate.provider_id}`
-        : (activeAlbum?.candidate_error || 'No MusicBrainz match proposed.');
+      proposed.replaceChildren();
+      if (candidate) {
+        const name = document.createElement('div'); name.className = 'match-summary-name'; name.textContent = `${candidate.artist} — ${candidate.album}`;
+        const metadata = document.createElement('div'); metadata.className = 'match-summary-meta'; metadata.textContent = `${candidate.year ? `${candidate.year} · ` : ''}MusicBrainz release ${candidate.provider_id}`;
+        const confidence = document.createElement('span'); confidence.className = 'confidence-badge'; confidence.textContent = `${Math.round(candidate.confidence * 100)}% match`;
+        proposed.append(name, metadata, confidence);
+      } else {
+        proposed.textContent = activeAlbum?.candidate_error || 'No MusicBrainz match proposed.';
+      }
       const reasons = document.getElementById('library-import-modal-reasons');
       reasons.replaceChildren(...(candidate?.confidence_reasons || []).map(reason => {
         const item = document.createElement('li'); item.textContent = reason; return item;
@@ -636,7 +678,7 @@
         const button = document.createElement('button'); button.type = 'button'; button.className = 'candidate-option';
         button.setAttribute('aria-pressed', String(value.id === candidate?.id));
         const name = document.createElement('span'); name.textContent = `${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
-        const confidence = document.createElement('span'); confidence.textContent = `${Math.round(value.confidence * 100)}%`;
+        const confidence = document.createElement('span'); confidence.className = 'candidate-confidence'; confidence.textContent = `${Math.round(value.confidence * 100)}%`;
         button.append(name, confidence);
         button.addEventListener('click', () => { activeCandidateId = value.id; renderAlbumMatch(); });
         return button;
