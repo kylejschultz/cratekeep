@@ -26,7 +26,7 @@ EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "
 SETTING_KEYS = ("inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art")
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
-MAX_LIBRARY_IMPORT_REVIEWS = 100
+MAX_LIBRARY_IMPORT_ALBUMS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
@@ -138,15 +138,20 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/api/library-import/reviews")
     def library_import_reviews():
         try:
-            limit = int(request.args.get("limit", "50"))
+            limit = int(request.args.get("limit", "25"))
+            offset = int(request.args.get("offset", "0"))
         except ValueError:
-            return jsonify(error="limit must be an integer"), 400
-        if not 1 <= limit <= MAX_LIBRARY_IMPORT_REVIEWS:
-            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_REVIEWS}"), 400
-        _sync_album_reviews(app)
-        items, has_more = _library_import_review_items(app, limit)
+            return jsonify(error="limit and offset must be integers"), 400
+        if not 1 <= limit <= MAX_LIBRARY_IMPORT_ALBUMS:
+            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_ALBUMS}"), 400
+        if offset < 0:
+            return jsonify(error="offset must be zero or greater"), 400
+        album_ids, has_more, total_albums = _library_import_review_album_page(app, limit, offset)
+        items = _library_import_review_items(app, album_ids)
         return jsonify(items=items, groups=_group_library_import_review_items(items),
-                       albums=_album_review_payloads(app), limit=limit, has_more=has_more)
+                       albums=_album_review_payloads(app, album_ids), limit=limit, offset=offset,
+                       album_count=len(album_ids), total_albums=total_albums, has_more=has_more,
+                       next_offset=(offset + len(album_ids)) if has_more else None)
 
     @app.post("/api/library-import/candidates")
     def generate_library_import_candidates():
@@ -738,24 +743,50 @@ def _latest_inventory_summary(app: Flask) -> dict | None:
     return json.loads(row["summary_json"]) if row else None
 
 
-def _library_import_review_items(app: Flask, limit: int) -> tuple[list[dict], bool]:
+def _library_import_review_album_page(app: Flask, limit: int, offset: int) -> tuple[list[int], bool, int]:
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
     with _connect(app.config["APP_DB"]) as db:
         rows = db.execute(
-            """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
-                      reviews.state, reviews.candidates_json, reviews.updated_at
-                 FROM library_inventory AS inventory
-                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
-                WHERE inventory.root_path = ? AND inventory.present = 1
-                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id
-                LIMIT ?""",
-            (root, limit + 1),
+            """SELECT albums.id FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                ORDER BY albums.artist_key, albums.album_key, albums.id
+                LIMIT ? OFFSET ?""",
+            (root, limit + 1, offset),
+        ).fetchall()
+        total = db.execute(
+            """SELECT COUNT(*) FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)""",
+            (root,),
+        ).fetchone()[0]
+    return [row["id"] for row in rows[:limit]], len(rows) > limit, total
+
+
+def _library_import_review_items(app: Flask, album_ids: list[int]) -> list[dict]:
+    if not album_ids:
+        return []
+    placeholders = ", ".join("?" for _ in album_ids)
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            f"""SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                       reviews.state, reviews.candidates_json, reviews.updated_at
+                  FROM album_review_tracks AS tracks
+                  JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                  JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                  JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                 WHERE albums.root_path = ? AND albums.id IN ({placeholders})
+                   AND inventory.present = 1
+                 ORDER BY albums.artist_key, albums.album_key, albums.id,
+                          inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (root, *album_ids),
         ).fetchall()
     library = _library(app)
     return [
         _serialize_library_import_review(row, library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None)
-        for row in rows[:limit]
-    ], len(rows) > limit
+        for row in rows
+    ]
 
 
 def _library_import_review_item(app: Flask, inventory_id: int) -> dict:
@@ -997,7 +1028,7 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
                       candidate_error = '', updated_at = ? WHERE id = ?""",
             (candidate_id, now, album_review_id),
         )
-    return next((value for value in _album_review_payloads(app) if value["id"] == album_review_id), None)
+    return next(iter(_album_review_payloads(app, [album_review_id])), None)
 
 
 def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
@@ -1058,14 +1089,22 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
     return result
 
 
-def _album_review_payloads(app: Flask) -> list[dict]:
+def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> list[dict]:
+    if album_ids == []:
+        return []
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    album_filter = ""
+    parameters: tuple = (root,)
+    if album_ids is not None:
+        album_filter = f" AND albums.id IN ({', '.join('?' for _ in album_ids)})"
+        parameters = (root, *album_ids)
     with _connect(app.config["APP_DB"]) as db:
         rows = db.execute(
-            """SELECT albums.* FROM album_reviews AS albums
+            f"""SELECT albums.* FROM album_reviews AS albums
                 WHERE albums.root_path = ?
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
-                ORDER BY albums.artist_key, albums.album_key, albums.id""", (root,)
+                  {album_filter}
+                ORDER BY albums.artist_key, albums.album_key, albums.id""", parameters
         ).fetchall()
         payloads = []
         for row in rows:
@@ -1164,7 +1203,7 @@ def _update_album_review(app: Flask, album_review_id: int, values: dict) -> dict
         if assignments or exceptions:
             assignments.append("updated_at = ?"); parameters.append(_now())
             db.execute(f"UPDATE album_reviews SET {', '.join(assignments)} WHERE id = ?", (*parameters, album_review_id))
-    return next((album for album in _album_review_payloads(app) if album["id"] == album_review_id), None)
+    return next(iter(_album_review_payloads(app, [album_review_id])), None)
 
 
 def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:

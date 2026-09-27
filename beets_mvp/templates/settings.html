@@ -124,6 +124,8 @@
     .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
     .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
     .review-list { display:grid; gap:.65rem; margin-top:.75rem; }
+    .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
+    .review-pagination button { margin:0; }
     .review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }
     .review-album { display:flex; width:calc(100% - 1.5rem); margin:.5rem .75rem .75rem; padding:.7rem .85rem; align-items:center; justify-content:space-between; gap:.75rem; color:var(--text); text-align:left; }
     .review-group-summary { cursor:pointer; padding:.7rem .85rem; font-weight:700; }
@@ -277,6 +279,11 @@
       <h3>Review inventory items</h3>
       <p id="library-import-review-status" role="status">Run an inventory preview to create review items.</p>
       <div id="library-import-review-list" class="review-list"></div>
+      <nav class="review-pagination" aria-label="Library import review pages">
+        <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous albums</button>
+        <span id="library-import-review-page" aria-live="polite"></span>
+        <button id="library-import-review-next" class="secondary" type="button" disabled>Next albums</button>
+      </nav>
     </section>
     </div>
     {% endif %}
@@ -547,12 +554,16 @@
     const candidateButton = document.getElementById('candidate-generate');
     const reviewList = document.getElementById('library-import-review-list');
     const reviewStatus = document.getElementById('library-import-review-status');
+    const reviewPrevious = document.getElementById('library-import-review-previous');
+    const reviewNext = document.getElementById('library-import-review-next');
+    const reviewPage = document.getElementById('library-import-review-page');
     const reviewModal = document.getElementById('library-import-modal');
     const inventoryStatus = document.getElementById('inventory-status');
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
     let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null;
-    let latestInventoryPreview = null, reviewHasMore = false;
+    const reviewAlbumLimit = 25;
+    let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalAlbums = 0;
 
     function renderInventoryPreview(data) {
       inventorySummary.replaceChildren(...[
@@ -572,7 +583,8 @@
       try {
         sessionStorage.setItem(inventoryStorageKey, JSON.stringify({
           preview: latestInventoryPreview,
-          reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore},
+          reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore,
+                    offset: reviewOffset, total_albums: reviewTotalAlbums},
         }));
       } catch (error) {
         // Storage can be unavailable in privacy-restricted browser contexts.
@@ -589,8 +601,9 @@
           reviewItems = stored.reviews.items;
           reviewGroups = stored.reviews.groups;
           reviewHasMore = Boolean(stored.reviews.has_more);
+          reviewOffset = Number.isInteger(stored.reviews.offset) ? stored.reviews.offset : 0;
+          reviewTotalAlbums = Number.isInteger(stored.reviews.total_albums) ? stored.reviews.total_albums : 0;
           renderReviewItems();
-          if (reviewHasMore) reviewStatus.textContent += ' More items are available.';
         }
         return true;
       } catch (error) {
@@ -635,27 +648,37 @@
         return artist;
       }));
       reviewStatus.textContent = reviewItems.length
-        ? `${reviewItems.length} review items in ${groups.length} artist ${groups.length === 1 ? 'group' : 'groups'}.`
+        ? `${reviewItems.length} review items in ${albumReviews.length} complete ${albumReviews.length === 1 ? 'album' : 'albums'}.`
         : 'No current inventory review items.';
+      const pageStart = reviewTotalAlbums ? reviewOffset + 1 : 0;
+      const pageEnd = Math.min(reviewOffset + albumReviews.length, reviewTotalAlbums);
+      reviewPage.textContent = `${pageStart}–${pageEnd} of ${reviewTotalAlbums} albums`;
+      reviewPrevious.disabled = reviewOffset === 0;
+      reviewNext.disabled = !reviewHasMore;
     }
 
-    async function loadReviewItems() {
+    async function loadReviewItems(offset = reviewOffset) {
       if (!reviewList) return;
       try {
-        const response = await fetch('/api/library-import/reviews?limit=100');
+        reviewPrevious.disabled = true; reviewNext.disabled = true;
+        const response = await fetch(`/api/library-import/reviews?limit=${reviewAlbumLimit}&offset=${offset}`);
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
         reviewItems = data.items;
         reviewGroups = data.groups;
         albumReviews = data.albums || [];
         reviewHasMore = Boolean(data.has_more);
+        reviewOffset = data.offset;
+        reviewTotalAlbums = data.total_albums;
         renderReviewItems();
-        if (reviewHasMore) reviewStatus.textContent += ' More items are available.';
         persistInventoryPreview();
       } catch (error) {
         reviewStatus.textContent = error.message || 'Unable to load review items.';
       }
     }
+
+    reviewPrevious.addEventListener('click', () => loadReviewItems(Math.max(0, reviewOffset - reviewAlbumLimit)));
+    reviewNext.addEventListener('click', () => { if (reviewHasMore) loadReviewItems(reviewOffset + albumReviews.length); });
 
     function renderAlbumMatch() {
       const candidate = activeAlbum?.candidates.find(value => value.id === activeCandidateId) || activeAlbum?.proposed_match || null;
@@ -779,7 +802,7 @@
         latestInventoryPreview = data;
         renderInventoryPreview(data);
         persistInventoryPreview();
-        await loadReviewItems();
+        await loadReviewItems(0);
       } catch (error) {
         inventoryStatus.textContent = error.message || 'Inventory preview failed.';
       } finally {

@@ -507,7 +507,7 @@ def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path)
 
     client = app.test_client()
     assert client.post("/api/library/inventory/preview").status_code == 201
-    payload = client.get("/api/library-import/reviews?limit=100").json
+    payload = client.get("/api/library-import/reviews?limit=50").json
 
     assert [(group["artist"], len(group["albums"])) for group in payload["groups"]] == [
         ("Artist One", 2), ("Artist Two", 1), ("Bulk Artist", 5),
@@ -517,6 +517,44 @@ def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path)
     ]
     assert sum(len(album["songs"]) for album in payload["groups"][2]["albums"]) == 50
     assert _group_library_import_review_items(payload["items"]) == payload["groups"]
+
+
+def test_library_import_review_paginates_complete_albums_beyond_one_hundred_items(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    large_album = root / "000 Large Artist" / "Complete Album"
+    for number in range(125):
+        path = large_album / f"{number + 1:03d} Track.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+    for number in range(101):
+        path = root / "Paged Artist" / f"Album {number:03d}" / "01 Track.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+
+    first = client.get("/api/library-import/reviews?limit=25&offset=0")
+    assert first.status_code == 200
+    assert first.json["total_albums"] == 102
+    assert first.json["album_count"] == 25
+    assert first.json["has_more"] is True
+    assert first.json["next_offset"] == 25
+    assert len(first.json["items"]) == 149
+    complete = first.json["albums"][0]
+    assert complete["album"] == "Complete Album"
+    assert len(complete["tracks"]) == 125
+    assert len(first.json["groups"][0]["albums"][0]["songs"]) == 125
+
+    last = client.get("/api/library-import/reviews?limit=25&offset=100")
+    assert last.status_code == 200
+    assert last.json["album_count"] == 2
+    assert len(last.json["items"]) == 2
+    assert last.json["has_more"] is False
+    assert last.json["next_offset"] is None
+    assert client.get("/api/library-import/reviews?offset=-1").status_code == 400
+    assert client.get("/api/library-import/reviews?limit=51").status_code == 400
 
 
 def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
@@ -815,7 +853,10 @@ def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
     assert b"const inventoryStorageKey = 'cratekeep-inventory-preview:' + \"build-two\";" in second
     assert b"sessionStorage.setItem(inventoryStorageKey, JSON.stringify({" in first
     assert b"preview: latestInventoryPreview" in first
-    assert b"reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore}" in first
+    assert b"reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore," in first
+    assert b"/api/library-import/reviews?limit=${reviewAlbumLimit}&offset=${offset}" in first
+    assert b'id="library-import-review-previous"' in first
+    assert b'id="library-import-review-next"' in first
     assert b"sessionStorage.getItem(inventoryStorageKey)" in first
     assert b"renderInventoryPreview(latestInventoryPreview);" in first
     assert b"if (restoreInventoryPreview()) loadReviewItems();" in first
