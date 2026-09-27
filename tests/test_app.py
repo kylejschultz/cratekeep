@@ -1,9 +1,11 @@
 import sqlite3
+import urllib.error
 from pathlib import Path
 
 from beets.library import Item, Library
 
 from beets_mvp import _format_bytes, _group_library_import_review_items, create_app
+from beets_mvp.musicbrainz import ProviderError, search_releases
 
 def make_app(tmp_path: Path):
     app = create_app({
@@ -491,6 +493,134 @@ def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path)
     ]
     assert sum(len(album["songs"]) for album in payload["groups"][2]["albums"]) == 50
     assert _group_library_import_review_items(payload["items"]) == payload["groups"]
+
+
+def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
+    seen = []
+
+    def provider(query, *, limit):
+        seen.append((query, limit))
+        return [
+            {"provider_id": "weaker", "artist": "Other Artist", "album": "Album A", "score": 90, "track_count": 7},
+            {"provider_id": "best", "artist": "Artist One", "album": "Album A", "score": 100, "track_count": 2, "year": 2020},
+        ]
+
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    root = tmp_path / "library" / "  Artist One  " / "Album A"
+    root.mkdir(parents=True)
+    (root / "01 - First Song.mp3").write_bytes(b"first")
+    (root / "02 Second Song.mp3").write_bytes(b"second")
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+
+    generated = client.post("/api/library-import/candidates", json={"limit": 25})
+
+    assert generated.status_code == 201
+    assert generated.json["albums"] == 1
+    assert generated.json["candidates"] == 2
+    assert seen == [({"artist": "Artist One", "album": "Album A", "tracks": ["First Song", "Second Song"]}, 5)]
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert [candidate["provider_id"] for candidate in album["candidates"]] == ["best", "weaker"]
+    assert album["candidates"][0]["confidence"] == 1.0
+    assert album["candidates"][1]["proposed_diff"] == {
+        "artist": {"from": "Artist One", "to": "Other Artist"},
+        "track_count": {"from": 2, "to": 7},
+    }
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM metadata_candidates").fetchone()[0] == 2
+        assert db.execute("SELECT status FROM adoption_jobs WHERE kind = 'musicbrainz_candidates'").fetchone()[0] == "complete"
+
+
+def test_candidate_refresh_replaces_results_and_provider_errors_are_persisted(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"song")
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [
+        {"provider_id": "old", "artist": query["artist"], "album": query["album"], "score": 100}
+    ]
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+
+    def rate_limited(query, *, limit):
+        raise ProviderError("MusicBrainz rate limit reached; try again later", retryable=True)
+
+    app.config["MUSICBRAINZ_PROVIDER"] = rate_limited
+    failed = client.post("/api/library-import/candidates", json={})
+    assert failed.status_code == 207
+    assert failed.json["errors"][0]["retryable"] is True
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert album["candidate_status"] == "error"
+    assert "rate limit" in album["candidate_error"]
+    assert album["candidates"][0]["provider_id"] == "old"
+
+
+def test_album_decision_candidate_and_track_exception_persist_across_group_sync(tmp_path):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [
+        {"provider_id": "release-1", "artist": query["artist"], "album": query["album"], "score": 100}
+    ]
+    root = tmp_path / "library" / "Artist" / "Album"
+    root.mkdir(parents=True)
+    for name in ("01 First.mp3", "02 Second.mp3"):
+        (root / name).write_bytes(b"song")
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    exception_id = album["tracks"][1]["id"]
+
+    updated = client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved",
+        "candidate_id": album["candidates"][0]["id"],
+        "track_exceptions": {str(exception_id): "rejected"},
+    })
+
+    assert updated.status_code == 200
+    assert updated.json["decision"] == "approved"
+    assert updated.json["selected_candidate_id"] == album["candidates"][0]["id"]
+    assert [track["effective_decision"] for track in updated.json["tracks"]] == ["approved", "rejected"]
+    regrouped = client.get("/api/library-import/reviews").json["albums"][0]
+    assert next(track for track in regrouped["tracks"] if track["id"] == exception_id)["exception"] == "rejected"
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "track_exceptions": {"999999": "approved"},
+    }).status_code == 400
+
+
+def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
+    seen = {}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, size):
+            seen["read_size"] = size
+            return b'{"releases": [{"id": "id-1", "title": "Album", "score": 99, "artist-credit": [{"name": "Artist"}]}]}'
+
+    def urlopen(request, timeout):
+        seen["url"] = request.full_url
+        seen["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", urlopen)
+    result = search_releases({"artist": "Artist", "album": "Album"}, limit=100)
+    assert result[0]["provider_id"] == "id-1"
+    assert "limit=10" in seen["url"]
+    assert seen == {**seen, "timeout": 10, "read_size": 512 * 1024}
+
+    def limited(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 429, "limited", {}, None)
+
+    monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", limited)
+    try:
+        search_releases({"artist": "Artist", "album": "Album"})
+    except ProviderError as exc:
+        assert exc.retryable is True
+        assert "rate limit" in str(exc)
+    else:
+        raise AssertionError("expected ProviderError")
 
 
 def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tmp_path):

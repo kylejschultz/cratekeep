@@ -5,6 +5,9 @@ import os
 import secrets
 import sqlite3
 import subprocess
+import re
+import unicodedata
+from difflib import SequenceMatcher
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,12 +19,16 @@ from beets import config as beets_config
 from beets.library import Library
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
 
+from .musicbrainz import ProviderError, search_releases
+
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
 EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
 SETTING_KEYS = ("inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art")
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
 MAX_LIBRARY_IMPORT_REVIEWS = 100
+MAX_CANDIDATE_ALBUMS = 25
+MAX_CANDIDATES_PER_ALBUM = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 
 
@@ -32,6 +39,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         BUILD_SHA=os.getenv("BUILD_SHA", os.getenv("GITHUB_SHA", "unknown")),
         SECRET_KEY=os.getenv("SECRET_KEY", ""),
         STATE_PATH=os.getenv("STATE_PATH", str(Path.cwd() / "data/config")),
+        MUSICBRAINZ_PROVIDER=search_releases,
     )
     if test_config:
         app.config.update(test_config)
@@ -111,6 +119,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     def preview_library_inventory():
         try:
             summary = _preview_library_inventory(app)
+            _sync_album_reviews(app)
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         return jsonify(summary), 201
@@ -130,8 +139,33 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify(error="limit must be an integer"), 400
         if not 1 <= limit <= MAX_LIBRARY_IMPORT_REVIEWS:
             return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_REVIEWS}"), 400
+        _sync_album_reviews(app)
         items, has_more = _library_import_review_items(app, limit)
-        return jsonify(items=items, groups=_group_library_import_review_items(items), limit=limit, has_more=has_more)
+        return jsonify(items=items, groups=_group_library_import_review_items(items),
+                       albums=_album_review_payloads(app), limit=limit, has_more=has_more)
+
+    @app.post("/api/library-import/candidates")
+    def generate_library_import_candidates():
+        _sync_album_reviews(app)
+        try:
+            limit = int((request.get_json(silent=True) or {}).get("limit", MAX_CANDIDATE_ALBUMS))
+        except (TypeError, ValueError):
+            return jsonify(error="limit must be an integer"), 400
+        if not 1 <= limit <= MAX_CANDIDATE_ALBUMS:
+            return jsonify(error=f"limit must be between 1 and {MAX_CANDIDATE_ALBUMS}"), 400
+        result = _generate_musicbrainz_candidates(app, limit)
+        return jsonify(result), (207 if result["errors"] else 201)
+
+    @app.patch("/api/library-import/albums/<int:album_review_id>")
+    def update_library_import_album_review(album_review_id: int):
+        values = request.get_json(silent=True) or {}
+        try:
+            item = _update_album_review(app, album_review_id, values)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        if item is None:
+            abort(404)
+        return jsonify(item)
 
     @app.patch("/api/library-import/reviews/<int:inventory_id>")
     def update_library_import_review(inventory_id: int):
@@ -369,6 +403,42 @@ def _init_db(path: str) -> None:
             candidates_json TEXT NOT NULL DEFAULT '[]',
             note TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS album_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path TEXT NOT NULL,
+            artist_key TEXT NOT NULL,
+            album_key TEXT NOT NULL,
+            artist TEXT NOT NULL,
+            album TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            selected_candidate_id INTEGER,
+            candidate_status TEXT NOT NULL DEFAULT 'not-run',
+            candidate_error TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            UNIQUE(root_path, artist_key, album_key)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS album_review_tracks (
+            album_review_id INTEGER NOT NULL REFERENCES album_reviews(id) ON DELETE CASCADE,
+            inventory_id INTEGER NOT NULL REFERENCES library_inventory(id) ON DELETE CASCADE,
+            exception_state TEXT,
+            PRIMARY KEY(album_review_id, inventory_id),
+            UNIQUE(inventory_id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS metadata_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            album_review_id INTEGER NOT NULL REFERENCES album_reviews(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            artist TEXT NOT NULL,
+            album TEXT NOT NULL,
+            year TEXT,
+            proposed_diff_json TEXT NOT NULL,
+            provider_data_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(album_review_id, provider, provider_id)
         )""")
 
 
@@ -681,6 +751,282 @@ def _library_import_review_item(app: Flask, inventory_id: int) -> dict:
         abort(404)
     item = _library(app).get_item(row["beets_item_id"]) if row["beets_item_id"] else None
     return _serialize_library_import_review(row, item)
+
+
+def _normalize_metadata(value: object) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).strip()
+
+
+def _metadata_key(value: object) -> str:
+    return _normalize_metadata(value).casefold()
+
+
+def _normalize_track_title(value: object) -> str:
+    title = _normalize_metadata(value)
+    return re.sub(r"^\s*(?:\d+[.-]?\s*[-–—.]?\s*)", "", title) or title
+
+
+def _all_library_import_review_items(app: Flask) -> list[dict]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                      reviews.state, reviews.candidates_json, reviews.updated_at
+                 FROM library_inventory AS inventory
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                WHERE inventory.root_path = ? AND inventory.present = 1
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (root,),
+        ).fetchall()
+    library = _library(app)
+    return [
+        _serialize_library_import_review(row, library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None)
+        for row in rows
+    ]
+
+
+def _sync_album_reviews(app: Flask) -> None:
+    """Persist stable album groups without touching media or the beets database."""
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    groups: dict[tuple[str, str], dict] = {}
+    for item in _all_library_import_review_items(app):
+        artist = _normalize_metadata(item["artist"]) or "Unknown artist"
+        album = _normalize_metadata(item["album"]) or "Unknown album"
+        group = groups.setdefault((_metadata_key(artist), _metadata_key(album)), {"artist": artist, "album": album, "items": []})
+        group["items"].append(item)
+    now = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        exceptions = {
+            row["inventory_id"]: row["exception_state"]
+            for row in db.execute(
+                """SELECT tracks.inventory_id, tracks.exception_state
+                     FROM album_review_tracks AS tracks
+                     JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                    WHERE albums.root_path = ? AND tracks.exception_state IS NOT NULL""", (root,)
+            )
+        }
+        db.execute(
+            "DELETE FROM album_review_tracks WHERE album_review_id IN (SELECT id FROM album_reviews WHERE root_path = ?)",
+            (root,),
+        )
+        for (artist_key, album_key), group in groups.items():
+            db.execute(
+                """INSERT INTO album_reviews(root_path, artist_key, album_key, artist, album, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(root_path, artist_key, album_key) DO UPDATE SET
+                     artist = excluded.artist, album = excluded.album""",
+                (root, artist_key, album_key, group["artist"], group["album"], now),
+            )
+            album_id = db.execute(
+                "SELECT id FROM album_reviews WHERE root_path = ? AND artist_key = ? AND album_key = ?",
+                (root, artist_key, album_key),
+            ).fetchone()["id"]
+            db.executemany(
+                "INSERT INTO album_review_tracks(album_review_id, inventory_id, exception_state) VALUES (?, ?, ?)",
+                [(album_id, item["id"], exceptions.get(item["id"])) for item in group["items"]],
+            )
+
+
+def _candidate_album_rows(app: Flask, limit: int) -> list[sqlite3.Row]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        return db.execute(
+            """SELECT albums.id, albums.artist, albums.album
+                 FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                ORDER BY albums.artist_key, albums.album_key, albums.id LIMIT ?""",
+            (root, limit),
+        ).fetchall()
+
+
+def _album_query(app: Flask, album: sqlite3.Row) -> dict:
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.relative_path, inventory.beets_item_id
+                 FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE tracks.album_review_id = ? ORDER BY inventory.relative_path COLLATE NOCASE""",
+            (album["id"],),
+        ).fetchall()
+    library = _library(app)
+    tracks = []
+    for row in rows:
+        item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+        title = item.get("title") if item and item.get("title") else Path(row["relative_path"]).stem
+        tracks.append(_normalize_track_title(title))
+    return {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
+
+
+def _candidate_confidence(query: dict, candidate: dict) -> float:
+    try:
+        provider_score = max(0.0, min(float(candidate.get("score", 0)) / 100, 1.0))
+    except (TypeError, ValueError):
+        provider_score = 0.0
+    artist_similarity = SequenceMatcher(None, _metadata_key(query["artist"]), _metadata_key(candidate.get("artist"))).ratio()
+    album_similarity = SequenceMatcher(None, _metadata_key(query["album"]), _metadata_key(candidate.get("album"))).ratio()
+    return round((provider_score * 0.6) + (artist_similarity * 0.15) + (album_similarity * 0.25), 4)
+
+
+def _candidate_diff(query: dict, candidate: dict) -> dict:
+    proposed = {}
+    for key in ("artist", "album"):
+        value = _normalize_metadata(candidate.get(key))
+        if value and _metadata_key(value) != _metadata_key(query[key]):
+            proposed[key] = {"from": query[key], "to": value}
+    count = candidate.get("track_count")
+    if isinstance(count, int) and count != len(query["tracks"]):
+        proposed["track_count"] = {"from": len(query["tracks"]), "to": count}
+    candidate_tracks = candidate.get("tracks")
+    if isinstance(candidate_tracks, list):
+        normalized_tracks = [_normalize_track_title(track) for track in candidate_tracks]
+        if [_metadata_key(track) for track in normalized_tracks] != [_metadata_key(track) for track in query["tracks"]]:
+            proposed["tracks"] = {"from": query["tracks"], "to": normalized_tracks}
+    return proposed
+
+
+def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
+    provider = app.config["MUSICBRAINZ_PROVIDER"]
+    albums = _candidate_album_rows(app, limit)
+    errors = []
+    generated = 0
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('musicbrainz_candidates', ?, 'running', ?)",
+            (str(Path(app.config["LIBRARY_PATH"]).resolve()), _now()),
+        ).lastrowid
+    for album in albums:
+        query = _album_query(app, album)
+        try:
+            raw = provider(query, limit=MAX_CANDIDATES_PER_ALBUM)
+            if not isinstance(raw, list):
+                raise ProviderError("MusicBrainz provider returned invalid candidates")
+            candidates = [
+                candidate for candidate in raw[:MAX_CANDIDATES_PER_ALBUM]
+                if isinstance(candidate, dict) and candidate.get("provider_id")
+            ]
+            candidates.sort(key=lambda candidate: (-_candidate_confidence(query, candidate), str(candidate["provider_id"])))
+            with _connect(app.config["APP_DB"]) as db:
+                db.execute("UPDATE album_reviews SET selected_candidate_id = NULL WHERE id = ?", (album["id"],))
+                db.execute("DELETE FROM metadata_candidates WHERE album_review_id = ?", (album["id"],))
+                for rank, candidate in enumerate(candidates, 1):
+                    db.execute(
+                        """INSERT INTO metadata_candidates(
+                               album_review_id, provider, provider_id, rank, confidence, artist, album,
+                               year, proposed_diff_json, provider_data_json, created_at
+                           ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (album["id"], str(candidate["provider_id"]), rank, _candidate_confidence(query, candidate),
+                         _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
+                         str(candidate.get("year")) if candidate.get("year") else None,
+                         json.dumps(_candidate_diff(query, candidate), sort_keys=True),
+                         json.dumps(candidate, sort_keys=True), _now()),
+                    )
+                db.execute(
+                    "UPDATE album_reviews SET candidate_status = 'complete', candidate_error = '', updated_at = ? WHERE id = ?",
+                    (_now(), album["id"]),
+                )
+            generated += len(candidates)
+        except (ProviderError, OSError, ValueError, TypeError) as exc:
+            message = str(exc) or "candidate provider failed"
+            errors.append({"album_review_id": album["id"], "error": message, "retryable": bool(getattr(exc, "retryable", False))})
+            with _connect(app.config["APP_DB"]) as db:
+                db.execute(
+                    "UPDATE album_reviews SET candidate_status = 'error', candidate_error = ?, updated_at = ? WHERE id = ?",
+                    (message[:500], _now(), album["id"]),
+                )
+    result = {"id": job_id, "albums": len(albums), "candidates": generated, "errors": errors}
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute(
+            "UPDATE adoption_jobs SET status = ?, summary_json = ?, error = ?, finished_at = ? WHERE id = ?",
+            ("partial" if errors else "complete", json.dumps(result), "; ".join(error["error"] for error in errors)[:1000], _now(), job_id),
+        )
+    return result
+
+
+def _album_review_payloads(app: Flask) -> list[dict]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT albums.* FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                ORDER BY albums.artist_key, albums.album_key, albums.id""", (root,)
+        ).fetchall()
+        payloads = []
+        for row in rows:
+            tracks = db.execute(
+                """SELECT inventory.id, inventory.relative_path, tracks.exception_state
+                     FROM album_review_tracks AS tracks
+                     JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                    WHERE tracks.album_review_id = ? ORDER BY inventory.relative_path COLLATE NOCASE""", (row["id"],)
+            ).fetchall()
+            candidates = db.execute(
+                "SELECT * FROM metadata_candidates WHERE album_review_id = ? ORDER BY rank, id", (row["id"],)
+            ).fetchall()
+            payloads.append({
+                "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
+                "selected_candidate_id": row["selected_candidate_id"], "candidate_status": row["candidate_status"],
+                "candidate_error": row["candidate_error"],
+                "tracks": [{"id": track["id"], "path": track["relative_path"],
+                            "exception": track["exception_state"],
+                            "effective_decision": track["exception_state"] or row["state"]} for track in tracks],
+                "candidates": [{
+                    "id": candidate["id"], "provider": candidate["provider"],
+                    "provider_id": candidate["provider_id"], "rank": candidate["rank"],
+                    "confidence": candidate["confidence"], "artist": candidate["artist"],
+                    "album": candidate["album"], "year": candidate["year"],
+                    "proposed_diff": json.loads(candidate["proposed_diff_json"]),
+                } for candidate in candidates],
+                "updated_at": row["updated_at"],
+            })
+    return payloads
+
+
+def _update_album_review(app: Flask, album_review_id: int, values: dict) -> dict | None:
+    allowed = {"decision", "candidate_id", "track_exceptions"}
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported fields: {', '.join(sorted(unknown))}")
+    decision = values.get("decision")
+    if decision is not None and decision not in LIBRARY_IMPORT_DECISIONS:
+        raise ValueError("decision must be approved, rejected, or skipped")
+    exceptions = values.get("track_exceptions", {})
+    if not isinstance(exceptions, dict):
+        raise ValueError("track_exceptions must be an object keyed by track id")
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        if db.execute("SELECT id FROM album_reviews WHERE id = ? AND root_path = ?", (album_review_id, root)).fetchone() is None:
+            return None
+        candidate_id = values.get("candidate_id")
+        if candidate_id is not None and db.execute(
+            "SELECT id FROM metadata_candidates WHERE id = ? AND album_review_id = ?", (candidate_id, album_review_id)
+        ).fetchone() is None:
+            raise ValueError("candidate_id must belong to this album review")
+        for raw_id, state in exceptions.items():
+            try:
+                inventory_id = int(raw_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("track exception ids must be integers") from exc
+            if state is not None and state not in LIBRARY_IMPORT_DECISIONS:
+                raise ValueError("track exception decisions must be approved, rejected, skipped, or null")
+            if db.execute(
+                "SELECT 1 FROM album_review_tracks WHERE album_review_id = ? AND inventory_id = ?",
+                (album_review_id, inventory_id),
+            ).fetchone() is None:
+                raise ValueError("track exception must belong to this album review")
+            db.execute(
+                "UPDATE album_review_tracks SET exception_state = ? WHERE album_review_id = ? AND inventory_id = ?",
+                (state, album_review_id, inventory_id),
+            )
+        assignments, parameters = [], []
+        if decision is not None:
+            assignments.append("state = ?"); parameters.append(decision)
+        if "candidate_id" in values:
+            assignments.append("selected_candidate_id = ?"); parameters.append(candidate_id)
+        if assignments or exceptions:
+            assignments.append("updated_at = ?"); parameters.append(_now())
+            db.execute(f"UPDATE album_reviews SET {', '.join(assignments)} WHERE id = ?", (*parameters, album_review_id))
+    return next((album for album in _album_review_payloads(app) if album["id"] == album_review_id), None)
 
 
 def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:

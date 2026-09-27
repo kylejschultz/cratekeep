@@ -87,6 +87,9 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `GET /api/browse?path=/userMedia` — list directories beneath the container's browse root
 - `GET /api/inbox` — list immediate import candidates
 - `GET /api/items` — list beets library metadata
+- `GET /api/library-import/reviews` — list persisted track groups and album review records
+- `POST /api/library-import/candidates` — generate and persist bounded MusicBrainz release candidates
+- `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, and track exceptions
 - `POST /api/imports/preview` — snapshot an inbox selection for review
 - `POST /api/imports/<id>/execute` — execute a reviewed import
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
@@ -103,7 +106,8 @@ python -m compileall -q beets_mvp tests
 
 - Cratekeep is designed for one trusted user and one process. It has no authentication, authorization, CSRF protection, job queue, or background workers.
 - Imports are synchronous and may occupy the sole Gunicorn worker for up to one hour.
-- Imports use existing tags (`--noautotag`); there is no MusicBrainz matching, duplicate-resolution UI, artwork workflow, progress stream, undo, or delete endpoint.
+- MusicBrainz matching is an explicit, bounded metadata-only lookup. Candidate and review decisions are persisted, but they do not write tags, move files, or execute a beets import.
+- There is no automatic duplicate resolution, artwork workflow, progress stream, undo, or delete endpoint.
 - A metadata database update occurs before its file-tag write, so a failed tag write can leave them temporarily inconsistent. Keep backups and ensure library files are writable.
 - Navidrome integration is a generic POST with optional bearer authentication and is not automatically run after imports.
 - Artwork fetching is disabled by default and is enabled only through the Settings checkbox.

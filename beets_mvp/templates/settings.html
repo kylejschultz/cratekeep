@@ -130,6 +130,8 @@
     .review-album > .review-group-summary { font-size:.9rem; font-weight:650; }
     .review-group-count { margin-left:.4rem; color:var(--muted); font-size:.8rem; font-weight:500; }
     .review-songs { display:grid; gap:.35rem; padding:0 .65rem .65rem; }
+    .album-review-controls { display:flex; align-items:center; flex-wrap:wrap; gap:.45rem; padding:0 .65rem .65rem; color:var(--muted); font-size:.82rem; }
+    .album-review-controls button { margin:0; padding:.35rem .55rem; }
     .review-item { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; width:100%; margin:0; padding:.55rem .65rem; color:var(--text); border:1px solid var(--border); border-radius:.3rem; background:transparent; text-align:left; }
     .review-item:hover { color:var(--text); border-color:var(--accent); background:transparent; }
     .review-item-path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -228,6 +230,7 @@
       <h2 id="library-import-title">Library import preview</h2>
       <p>Inventory audio file paths and file stats, then compare them with the canonical beets library. This preview never changes music files or runs beets import.</p>
       <button id="inventory-preview" type="button">Run inventory preview</button>
+      <button id="candidate-generate" type="button">Find MusicBrainz candidates</button>
       <p id="inventory-status" role="status">No preview run in this browser session.</p>
       <div id="inventory-summary" class="inventory-summary" hidden></div>
       <h3>Review inventory items</h3>
@@ -474,13 +477,14 @@
     });
 
     const inventoryButton = document.getElementById('inventory-preview');
+    const candidateButton = document.getElementById('candidate-generate');
     const reviewList = document.getElementById('library-import-review-list');
     const reviewStatus = document.getElementById('library-import-review-status');
     const reviewModal = document.getElementById('library-import-modal');
     const inventoryStatus = document.getElementById('inventory-status');
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
-    let reviewItems = [], reviewGroups = [], activeReview = null, reviewReturnFocus = null;
+    let reviewItems = [], reviewGroups = [], albumReviews = [], activeReview = null, activeAlbum = null, reviewReturnFocus = null;
     let latestInventoryPreview = null, reviewHasMore = false;
 
     function renderInventoryPreview(data) {
@@ -552,6 +556,31 @@
           album.className = 'review-album';
           album.open = artist.open && group.albums.length === 1;
           album.append(reviewSummary(albumGroup.album, albumGroup.songs.length));
+          const albumReview = albumReviews.find(review => review.artist === group.artist && review.album === albumGroup.album);
+          if (albumReview) {
+            const controls = document.createElement('div'); controls.className = 'album-review-controls';
+            const best = albumReview.candidates[0];
+            const summary = document.createElement('span');
+            summary.textContent = best
+              ? `Best: ${best.artist} — ${best.album} (${Math.round(best.confidence * 100)}%)`
+              : (albumReview.candidate_error || `Candidates: ${albumReview.candidate_status}; album: ${albumReview.decision}`);
+            controls.append(summary);
+            ['approved', 'rejected', 'skipped'].forEach(decision => {
+              const button = document.createElement('button'); button.type = 'button'; button.textContent = decision;
+              button.addEventListener('click', async event => {
+                event.stopPropagation();
+                const response = await fetch(`/api/library-import/albums/${albumReview.id}`, {
+                  method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({decision, candidate_id: best?.id || null}),
+                });
+                const data = await response.json();
+                if (!response.ok) { reviewStatus.textContent = data.error || 'Unable to save album decision.'; return; }
+                await loadReviewItems();
+              });
+              controls.append(button);
+            });
+            album.append(controls);
+          }
           const songs = document.createElement('div');
           songs.className = 'review-songs';
           albumGroup.songs.forEach(item => {
@@ -564,7 +593,9 @@
             const status = document.createElement('span');
             status.className = 'review-item-status'; status.textContent = item.status;
             const decision = document.createElement('span');
-            decision.className = 'review-item-decision'; decision.textContent = item.decision;
+            const albumTrack = albumReview?.tracks.find(track => track.id === item.id);
+            decision.className = 'review-item-decision';
+            decision.textContent = albumTrack?.exception ? `exception: ${albumTrack.exception}` : (albumTrack ? `album: ${albumTrack.effective_decision}` : item.decision);
             button.append(title, status, decision);
             button.addEventListener('click', () => openReview(item, button));
             songs.append(button);
@@ -587,6 +618,7 @@
         if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
         reviewItems = data.items;
         reviewGroups = data.groups;
+        albumReviews = data.albums || [];
         reviewHasMore = Boolean(data.has_more);
         renderReviewItems();
         if (reviewHasMore) reviewStatus.textContent += ' More items are available.';
@@ -598,8 +630,10 @@
 
     function openReview(item, button) {
       activeReview = item; reviewReturnFocus = button;
+      activeAlbum = albumReviews.find(album => album.tracks.some(track => track.id === item.id)) || null;
+      const albumTrack = activeAlbum?.tracks.find(track => track.id === item.id);
       document.getElementById('library-import-modal-path').textContent = item.path;
-      document.getElementById('library-import-modal-status').textContent = `${item.status}; decision: ${item.decision}`;
+      document.getElementById('library-import-modal-status').textContent = `${item.status}; decision: ${albumTrack?.effective_decision || item.decision}`;
       document.getElementById('library-import-modal-candidate').textContent = item.candidate?.kind === 'beets-item'
         ? `Existing beets item #${item.candidate.beets_item_id}` : 'No external match proposed.';
       document.getElementById('library-import-modal-message').textContent = '';
@@ -629,9 +663,11 @@
       reviewModal.querySelectorAll('[data-review-decision]').forEach(button => button.addEventListener('click', async () => {
         const message = document.getElementById('library-import-modal-message');
         try {
-          const response = await fetch(`/api/library-import/reviews/${activeReview.id}`, {
+          const response = await fetch(activeAlbum ? `/api/library-import/albums/${activeAlbum.id}` : `/api/library-import/reviews/${activeReview.id}`, {
             method: 'PATCH', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({decision: button.dataset.reviewDecision}),
+            body: JSON.stringify(activeAlbum
+              ? {track_exceptions: {[activeReview.id]: button.dataset.reviewDecision}}
+              : {decision: button.dataset.reviewDecision}),
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || data.description || 'Unable to save review decision.');
@@ -660,6 +696,21 @@
       } finally {
         inventoryButton.disabled = false;
       }
+    });
+
+    if (candidateButton) candidateButton.addEventListener('click', async () => {
+      candidateButton.disabled = true; reviewStatus.textContent = 'Requesting bounded MusicBrainz matches…';
+      try {
+        const response = await fetch('/api/library-import/candidates', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({limit: 25}),
+        });
+        const data = await response.json();
+        if (!response.ok && response.status !== 207) throw new Error(data.error || 'Candidate generation failed.');
+        await loadReviewItems();
+        if (data.errors?.length) reviewStatus.textContent += ` ${data.errors.length} album lookup(s) can be retried.`;
+      } catch (error) {
+        reviewStatus.textContent = error.message || 'Candidate generation failed.';
+      } finally { candidateButton.disabled = false; }
     });
 
     {% if not first_run %}
