@@ -15,9 +15,18 @@ import urllib.request
 class ProviderError(RuntimeError):
     """A safe error suitable for persisting with a candidate-generation job."""
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        code: str = "provider_error",
+        upstream_status: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.code = code
+        self.upstream_status = upstream_status
 
 
 def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[dict]:
@@ -63,18 +72,34 @@ def _request_json(url: str, timeout: int) -> dict:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read(512 * 1024)
     except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise ProviderError(
+                "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
+                code="release_not_found",
+                upstream_status=exc.code,
+            ) from exc
         if exc.code == 429:
-            raise ProviderError("MusicBrainz rate limit reached; try again later", retryable=True) from exc
-        raise ProviderError(f"MusicBrainz returned HTTP {exc.code}", retryable=exc.code >= 500) from exc
+            raise ProviderError(
+                "MusicBrainz rate limit reached; try again later",
+                retryable=True,
+                code="provider_http_error",
+                upstream_status=exc.code,
+            ) from exc
+        raise ProviderError(
+            f"MusicBrainz returned HTTP {exc.code}",
+            retryable=exc.code >= 500,
+            code="provider_http_error",
+            upstream_status=exc.code,
+        ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise ProviderError("MusicBrainz could not be reached", retryable=True) from exc
+        raise ProviderError("MusicBrainz could not be reached", retryable=True, code="provider_unavailable") from exc
     try:
         document = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProviderError("MusicBrainz returned an invalid response") from exc
+        raise ProviderError("MusicBrainz returned an invalid response", code="provider_invalid_response") from exc
 
     if not isinstance(document, dict):
-        raise ProviderError("MusicBrainz returned an invalid response")
+        raise ProviderError("MusicBrainz returned an invalid response", code="provider_invalid_response")
     return document
 
 

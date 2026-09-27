@@ -31,7 +31,7 @@ MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 MUSICBRAINZ_ID_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 
@@ -180,18 +180,25 @@ def create_app(test_config: dict | None = None) -> Flask:
     def rematch_library_import_album(album_review_id: int):
         values = request.get_json(silent=True)
         if not isinstance(values, dict) or set(values) != {"musicbrainz_id"}:
-            return jsonify(error="request must contain only musicbrainz_id"), 400
+            return jsonify(error="request must contain only musicbrainz_id", code="invalid_request"), 400
         musicbrainz_id = values.get("musicbrainz_id")
         if not isinstance(musicbrainz_id, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(musicbrainz_id):
-            return jsonify(error="musicbrainz_id must be a canonical MusicBrainz UUID"), 400
+            return jsonify(
+                error="Enter a canonical MusicBrainz release UUID (for example, 123e4567-e89b-42d3-a456-426614174000).",
+                code="invalid_musicbrainz_id",
+            ), 400
         try:
             item = _rematch_album_by_musicbrainz_id(app, album_review_id, musicbrainz_id.lower())
         except ProviderError as exc:
-            return jsonify(error=str(exc), retryable=exc.retryable), (503 if exc.retryable else 422)
+            status = 404 if exc.code == "release_not_found" else (503 if exc.retryable else 502)
+            payload = {"error": str(exc), "code": exc.code, "retryable": exc.retryable}
+            if exc.upstream_status is not None:
+                payload["upstream_status"] = exc.upstream_status
+            return jsonify(payload), status
         except (OSError, ValueError, TypeError) as exc:
-            return jsonify(error=str(exc) or "candidate provider failed"), 422
+            return jsonify(error=str(exc) or "candidate provider failed", code="provider_error", retryable=False), 502
         if item is None:
-            abort(404)
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
         return jsonify(item)
 
     @app.patch("/api/library-import/reviews/<int:inventory_id>")
@@ -987,13 +994,18 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
     provider_query = {**query, "musicbrainz_id": musicbrainz_id}
     raw = app.config["MUSICBRAINZ_PROVIDER"](provider_query, limit=1)
     if not isinstance(raw, list):
-        raise ProviderError("MusicBrainz provider returned invalid candidates")
+        raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+    if not raw:
+        raise ProviderError(
+            "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
+            code="release_not_found",
+        )
     candidate = next(
         (value for value in raw if isinstance(value, dict) and str(value.get("provider_id", "")).lower() == musicbrainz_id),
         None,
     )
     if candidate is None:
-        raise ProviderError("No MusicBrainz release found for that ID")
+        raise ProviderError("MusicBrainz provider returned a different release ID", code="provider_invalid_response")
     candidate = dict(candidate)
     candidate["retrieval"] = {**(candidate.get("retrieval") or {}), "source": "release-id", "search_score": None}
     now = _now()

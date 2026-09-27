@@ -345,7 +345,7 @@
         </div>
         <form id="library-import-rematch-form" class="override-form">
           <label for="library-import-mbid">Rematch with MusicBrainz release ID
-            <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
+            <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
           </label>
           <button type="submit">Rematch</button>
           <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
@@ -779,8 +779,21 @@
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({musicbrainz_id: input.value}),
           });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || 'Unable to rematch this album.');
+          let data = {};
+          try { data = await response.json(); } catch (_) { /* Use the status-aware fallback below. */ }
+          if (!response.ok) {
+            const fallback = {
+              invalid_musicbrainz_id: 'Enter a canonical MusicBrainz release UUID.',
+              release_not_found: 'No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.',
+              album_review_not_found: 'This album review no longer exists. Refresh the review list.',
+              provider_http_error: data.retryable
+                ? 'MusicBrainz is temporarily unavailable. Try this release ID again later.'
+                : 'MusicBrainz rejected the lookup. Verify the release ID or try again later.',
+              provider_unavailable: 'MusicBrainz could not be reached. Try again later.',
+              provider_invalid_response: 'MusicBrainz returned an unusable response. Try again later.',
+            }[data.code];
+            throw new Error(fallback || data.error || `Unable to rematch this album (HTTP ${response.status}).`);
+          }
           activeAlbum = data; activeCandidateId = data.selected_candidate_id; input.value = '';
           const index = albumReviews.findIndex(album => album.id === data.id);
           if (index >= 0) albumReviews[index] = data;

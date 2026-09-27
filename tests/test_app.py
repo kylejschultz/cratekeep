@@ -711,6 +711,85 @@ def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
     assert calls[0][0]["musicbrainz_id"] == "123e4567-e89b-42d3-a456-426614174000"
     assert calls[0][1] == 1
 
+    # Canonical UUID text is not limited to the older RFC version/variant bit patterns.
+    response = client.post(f"/api/library-import/albums/{album_id}/rematch", json={
+        "musicbrainz_id": "AAAAAAAA-AAAA-8AAA-7AAA-AAAAAAAAAAAA",
+    })
+    assert response.status_code == 200
+    assert calls[1][0]["musicbrainz_id"] == "aaaaaaaa-aaaa-8aaa-7aaa-aaaaaaaaaaaa"
+
+
+def test_rematch_distinguishes_invalid_id_missing_release_and_provider_failure(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Alec Benjamin" / "(Un)Commentary" / "01 Dopamine Addict.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album_id = client.get("/api/library-import/reviews").json["albums"][0]["id"]
+    endpoint = f"/api/library-import/albums/{album_id}/rematch"
+
+    invalid = client.post(endpoint, json={"musicbrainz_id": "not-a-uuid"})
+    assert invalid.status_code == 400
+    assert invalid.json["code"] == "invalid_musicbrainz_id"
+
+    missing_album = client.post("/api/library-import/albums/999999/rematch", json={
+        "musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000",
+    })
+    assert missing_album.status_code == 404
+    assert missing_album.json["code"] == "album_review_not_found"
+
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: []
+    missing = client.post(endpoint, json={
+        "musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000",
+    })
+    assert missing.status_code == 404
+    assert missing.json == {
+        "code": "release_not_found",
+        "error": "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
+        "retryable": False,
+    }
+
+    def failed_provider(query, *, limit):
+        raise ProviderError(
+            "MusicBrainz returned HTTP 500",
+            retryable=True,
+            code="provider_http_error",
+            upstream_status=500,
+        )
+
+    app.config["MUSICBRAINZ_PROVIDER"] = failed_provider
+    failed = client.post(endpoint, json={
+        "musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000",
+    })
+    assert failed.status_code == 503
+    assert failed.json == {
+        "code": "provider_http_error",
+        "error": "MusicBrainz returned HTTP 500",
+        "retryable": True,
+        "upstream_status": 500,
+    }
+
+
+def test_rematch_rejects_provider_returning_a_different_release(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174001",
+    }]
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album_id = client.get("/api/library-import/reviews").json["albums"][0]["id"]
+
+    response = client.post(f"/api/library-import/albums/{album_id}/rematch", json={
+        "musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000",
+    })
+
+    assert response.status_code == 502
+    assert response.json["code"] == "provider_invalid_response"
+
 
 def test_album_review_actions_and_rematch_are_metadata_only(tmp_path, monkeypatch):
     app = make_app(tmp_path)
@@ -768,6 +847,22 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
     except ProviderError as exc:
         assert exc.retryable is True
         assert "rate limit" in str(exc)
+    else:
+        raise AssertionError("expected ProviderError")
+
+
+def test_musicbrainz_http_404_is_a_release_not_found_error(monkeypatch):
+    def missing(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+
+    monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", missing)
+    try:
+        search_releases({"musicbrainz_id": "123e4567-e89b-42d3-a456-426614174000"}, limit=1)
+    except ProviderError as exc:
+        assert exc.code == "release_not_found"
+        assert exc.upstream_status == 404
+        assert exc.retryable is False
+        assert "release-group ID" in str(exc)
     else:
         raise AssertionError("expected ProviderError")
 
