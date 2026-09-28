@@ -137,8 +137,8 @@
     .review-album-name { overflow:hidden; font-size:.88rem; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
     .review-track-count { color:var(--muted); font-size:.76rem; }
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
-    .status-pill[data-status="matched"],.status-pill[data-status="approved"],.status-pill[data-status="imported"] { border-color:#78a68a; background:var(--success); }
-    .status-pill[data-status="needs review"],.status-pill[data-status="rejected"] { border-color:#c47b82; background:var(--error); }
+    .status-pill[data-status="Matched"],.status-pill[data-status="Queued"],.status-pill[data-status="Imported"] { border-color:#78a68a; background:var(--success); }
+    .status-pill[data-status="Needs attention"] { border-color:#c47b82; background:var(--error); }
     .score-pill[data-band="low"] { border-color:#8f1d14; color:#fff; background:#b42318; }
     .score-pill[data-band="medium"] { border-color:#b54708; color:#342100; background:#fdb022; }
     .score-pill[data-band="high"] { border-color:#085d3a; color:#fff; background:#067647; }
@@ -370,7 +370,7 @@
         </div>
         <div class="review-footer-group">
           <button type="button" class="secondary danger-button" data-review-decision="rejected">Reject</button>
-          <button type="button" class="approve-button" data-review-decision="approved">Approve match</button>
+          <button type="button" class="approve-button" data-review-decision="approved">Queue import</button>
         </div>
       </footer>
     </section>
@@ -579,7 +579,7 @@
     function renderInventoryPreview(data) {
       inventorySummary.replaceChildren(...[
         ['Files', data.files], ['Tracked by beets', data.tracked],
-        ['Needs review', data.untracked], ['Previously seen, now missing', data.missing],
+        ['Needs attention', data.untracked], ['Previously seen, now missing', data.missing],
       ].map(([label, value]) => {
         const cell = document.createElement('span');
         cell.textContent = `${label}: ${value}`;
@@ -637,21 +637,17 @@
     }
 
     function albumInventoryStatus(albumReview, songs) {
-      if (albumReview?.decision && albumReview.decision !== 'pending') return albumReview.decision;
-      if (songs.length && songs.every(song => song.status === 'tracked')) return 'imported';
-      if (albumReview?.candidate_status === 'complete' && albumReview.candidates.length) return 'matched';
-      if (albumReview?.candidate_status === 'error') return 'needs review';
-      return 'pending';
+      if (songs.length && songs.every(song => song.status === 'tracked')) return 'Imported';
+      if (albumReview?.decision === 'approved') return 'Queued';
+      if (albumReview?.decision === 'pending' && albumReview?.candidate_status === 'complete' && albumReview.candidates.length) return 'Matched';
+      return 'Needs attention';
     }
 
     const inventoryStatusDescriptions = {
-      matched: 'A metadata candidate is available for review',
-      approved: 'The selected metadata candidate was approved',
-      'needs review': 'Candidate matching needs attention',
-      imported: 'Every track is already present in the library',
-      pending: 'Candidate matching has not completed',
-      rejected: 'The proposed metadata candidate was rejected',
-      skipped: 'This album was skipped during review',
+      Matched: 'A metadata candidate is available for review',
+      Queued: 'The selected metadata candidate is queued for import',
+      Imported: 'Every track is already present in the library',
+      'Needs attention': 'Matching or review needs attention',
     };
     const initialAutoImportThreshold = 0.90;
 

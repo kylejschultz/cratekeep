@@ -355,7 +355,7 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'class="secondary danger-button" data-review-decision="rejected"' in modal
-    assert b'class="approve-button" data-review-decision="approved">Approve match' in modal
+    assert b'class="approve-button" data-review-decision="approved">Queue import' in modal
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
@@ -377,6 +377,9 @@ const result = {
     albumInventoryStatus({decision: 'pending', candidate_status: 'complete', candidates: [{}]}, []),
     albumInventoryStatus({decision: 'pending', candidate_status: 'error', candidates: []}, []),
     albumInventoryStatus({decision: 'pending', candidate_status: 'not-run', candidates: []}, []),
+    albumInventoryStatus({decision: 'rejected', candidate_status: 'complete', candidates: [{}]}, []),
+    albumInventoryStatus({decision: 'skipped', candidate_status: 'complete', candidates: [{}]}, []),
+    albumInventoryStatus({decision: 'approved'}, [{status: 'tracked'}]),
   ],
 };
 console.log(JSON.stringify(result));
@@ -391,7 +394,10 @@ console.log(JSON.stringify(result));
         ("74.9%", "low"), ("75%", "medium"), ("89.9%", "medium"), ("90%", "high"),
     ]
     assert result["scores"][3]["accessibleLabel"].endswith("initial auto-import indicator threshold")
-    assert result["statuses"] == ["approved", "imported", "matched", "needs review", "pending"]
+    assert result["statuses"] == [
+        "Queued", "Imported", "Matched", "Needs attention", "Needs attention",
+        "Needs attention", "Needs attention", "Imported",
+    ]
 
 
 def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styles(tmp_path):
@@ -402,7 +408,7 @@ def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styl
     assert "score.setAttribute('aria-label', scorePresentation.accessibleLabel)" in html
     assert "status.setAttribute('aria-label', `Status: ${statusValue}. ${statusDescription}`)" in html
     assert "${scorePresentation.accessibleLabel}" in html
-    for status in ("matched", "approved", "needs review", "imported", "pending"):
+    for status in ("Matched", "Queued", "Imported", "Needs attention"):
         assert f"{status}:" in html or f"'{status}':" in html
 
     palette = {
