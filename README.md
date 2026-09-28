@@ -89,7 +89,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `GET /api/items` — list beets library metadata
 - `GET /api/library-import/reviews` — list persisted track groups and album review records, paginated by artist (`limit`/`offset`, 25 artists by default)
 - `POST /api/library-import/candidates` — generate and persist bounded MusicBrainz release candidates
-- `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, and track exceptions
+- `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, and track exceptions; send `candidate_id: null` with an approved decision to explicitly keep the incoming metadata “As Is” with no MusicBrainz association
 - `POST /api/library-import/albums/<id>/rematch` — validate a MusicBrainz release UUID and rematch through the configured provider
 - `POST /api/imports/preview` — snapshot an inbox selection for review
 - `POST /api/imports/<id>/execute` — execute a reviewed import
@@ -98,7 +98,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 
 ### Library import inventory statuses
 
-The Library import inventory mirrors the source filesystem as expandable, nested folders and preserves each complete relative folder and track path. Albums appear within their actual folders, with artist and album tags used only as supporting metadata; this also supports loose files, artist/album layouts, and deeper mixed layouts in the same library. Album review uses a full-width track comparison with local and proposed durations, highlights changed rows, and lets each row expand for status, source-path, and recording details. Candidate alternatives remain selectable without obscuring the persisted MusicBrainz identity or any already-persisted artwork. Inventory, matching, rematching, and review operations show visible progress while requests are active. The inventory reports existing workflow state; it does not trigger imports or add state transitions:
+The Library import inventory mirrors the source filesystem as expandable, nested folders and preserves each complete relative folder and track path. Albums appear within their actual folders, with artist and album tags used only as supporting metadata; this also supports loose files, artist/album layouts, and deeper mixed layouts in the same library. Album review presents every MusicBrainz result as a compact, expandable candidate row with album-level metadata, media, track-coverage, and duration/track-delta highlights rather than a per-track rundown. Persisted artwork is shown when available. An explicit **As Is** row queues the album with its incoming metadata unchanged and no selected MusicBrainz release. The review response exposes `current_metadata` for that row and `selection_mode` (`suggested`, `candidate`, or `as-is`); MusicBrainz scoring and ranking remain unchanged. Inventory, matching, rematching, and review operations show visible progress while requests are active. The inventory reports existing workflow state; it does not trigger imports or add state transitions:
 
 | Status | Meaning |
 |---|---|

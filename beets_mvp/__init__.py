@@ -1177,6 +1177,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "selected_by_mbid": match["selected_by_mbid"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
+                    "release_status": provider_data.get("status"), "country": provider_data.get("country"),
                     "artwork_url": _persisted_artwork_source(provider_data),
                     "media": provider_data.get("media", []), "recordings": provider_data.get("tracks", []),
                     "retrieval": provider_data.get("retrieval", {}),
@@ -1188,9 +1189,18 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
             if proposed_match is None and serialized_candidates:
                 proposed_match = serialized_candidates[0]
             highest_confidence = max((candidate["confidence"] for candidate in serialized_candidates), default=None)
+            current_metadata = {
+                "artist": query["artist"], "album": query["album"],
+                "year": query.get("year"), "date": query.get("date"),
+                "track_count": len(query["tracks"]),
+                "disc_count": len({track.get("disc") or 1 for track in query["tracks"]}),
+            }
             payloads.append({
                 "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
                 "selected_candidate_id": selected_id, "proposed_match": proposed_match,
+                "selection_mode": ("as-is" if row["state"] == "approved" and selected_id is None
+                                   else "candidate" if selected_id is not None else "suggested"),
+                "current_metadata": current_metadata,
                 "highest_confidence": highest_confidence,
                 "candidate_status": row["candidate_status"],
                 "candidate_error": row["candidate_error"],

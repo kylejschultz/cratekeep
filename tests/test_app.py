@@ -347,12 +347,14 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'aria-labelledby="library-import-modal-title"' in modal
     assert b'aria-describedby="library-import-modal-description"' in modal
     assert b'This decision does not change music files.' in modal
-    assert b'class="match-summary"' in modal
     assert b'class="album-modal-section alternatives-section"' in modal
-    assert b'class="track-columns"' in modal
-    assert b'id="library-import-modal-tracks" class="track-comparison"' in modal
-    assert 'Local track · duration'.encode() in modal
-    assert 'Proposed track · duration'.encode() in modal
+    assert b'>Choose album metadata<' in modal
+    assert b'role="radiogroup" aria-label="Album metadata candidates"' in modal
+    assert b"detail.className = 'candidate-option'" in modal
+    assert b"const asIs = {...current, id:'as-is', is_as_is:true" in modal
+    assert b"['Track coverage'" in modal
+    assert b"['Duration delta'" in modal
+    assert b'id="library-import-modal-tracks"' not in modal
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'class="secondary danger-button" data-review-decision="rejected"' in modal
@@ -360,7 +362,7 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
-    assert b'.track-detail.is-changed .track-row-summary' in html
+    assert b'.candidate-option[open]' in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
@@ -754,6 +756,36 @@ def test_album_decision_candidate_and_track_exception_persist_across_group_sync(
     }).status_code == 400
 
 
+def test_album_as_is_selection_uses_null_candidate_without_changing_musicbrainz_results(tmp_path):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": query["artist"], "album": "Canonical Album",
+        "tracks": query["tracks"],
+    }]
+    path = tmp_path / "library" / "Artist" / "Incoming Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate_ids = [candidate["id"] for candidate in album["candidates"]]
+
+    response = client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": None,
+    })
+
+    assert response.status_code == 200
+    assert response.json["selected_candidate_id"] is None
+    assert response.json["selection_mode"] == "as-is"
+    assert response.json["current_metadata"] == {
+        "artist": "Artist", "album": "Incoming Album", "year": None, "date": None,
+        "track_count": 1, "disc_count": 1,
+    }
+    assert [candidate["id"] for candidate in response.json["candidates"]] == candidate_ids
+    assert response.json["proposed_match"]["provider_id"] == "release-1"
+
+
 def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tmp_path):
     app = make_app(tmp_path)
     app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
@@ -1089,15 +1121,14 @@ def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_co
 def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b'id="library-import-modal-proposed"' in html
     assert b'id="library-import-modal-candidates"' in html
-    assert b'id="library-import-modal-tracks"' in html
-    assert b'role="radiogroup" aria-label="Candidate alternatives"' in html
-    assert b'>Track comparison<' in html
-    assert b'>Album changes<' not in html
-    assert b"detail.className = `track-detail${changed ? ' is-changed' : ''}`" in html
-    assert b"formatDuration(localDuration)" in html
-    assert b"track.recording_id" in html
+    assert b'id="library-import-modal-proposed"' not in html
+    assert b'id="library-import-modal-tracks"' not in html
+    assert b'role="radiogroup" aria-label="Album metadata candidates"' in html
+    assert b"summary.setAttribute('role', 'radio')" in html
+    assert b"['Disc / media'" in html
+    assert b"['Track delta'" in html
+    assert b"Queues the album with incoming metadata unchanged" in html
     assert b"Math.round(candidate.confidence" not in html
     assert b"candidates.querySelector('[aria-checked=\"true\"]')?.focus()" in html
     assert b'id="library-import-rematch-form"' in html
@@ -1164,8 +1195,8 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     assert album["candidates"][1]["artwork_url"] is None
 
     html = client.get("/settings").data
-    assert b"if (candidate.artwork_url)" in html
-    assert b"artwork.src = candidate.artwork_url" in html
+    assert b"if (value.artwork_url)" in html
+    assert b"artwork.src = value.artwork_url" in html
     assert b"innerHTML" not in html
 
 
@@ -1173,7 +1204,7 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"const payload = {decision};" in html
-    assert b"decision === 'approved' && activeCandidateId !== null" in html
+    assert b"decision === 'approved') payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId" in html
     assert b"method: 'PATCH'" in html
     assert b"data-review-decision=\"skipped\"" in html
     assert b"data-review-decision=\"rejected\"" in html
