@@ -104,7 +104,9 @@ def _assign_tracks(local_tracks: list, canonical_tracks: list) -> tuple[list[dic
         if local_index in assigned_local or canonical_index in assigned_canonical:
             continue
         # Very weak pairs are clearer as unmatched than as a misleading match.
-        if metrics["distance"] > 0.78:
+        # A coincidental duration or position must not turn unrelated titles
+        # into positive track evidence.
+        if metrics["distance"] > 0.78 or metrics["title_distance"] > 0.65:
             continue
         assigned_local.add(local_index)
         assigned_canonical.add(canonical_index)
@@ -176,19 +178,63 @@ def score_release(query: dict, candidate: dict, *, exact_mbid: bool = False) -> 
     distance = min(sum(item["penalty"] for item in penalties), 1.0)
     confidence = 1.0 - distance
     count_mismatch = len(local_tracks) != len(canonical_tracks)
-    if exact_mbid:
-        confidence, distance, recommendation = 1.0, 0.0, "strong"
-        penalties.insert(0, {"field": "release_mbid", "distance": 0.0, "weight": 1.0, "penalty": 0.0})
-    else:
-        recommendation = "strong" if distance <= 0.15 else "medium" if distance <= 0.30 else "low" if distance <= 0.45 else "none"
+    paired_statuses = {"matched", "title-mismatch", "duration-mismatch", "order-mismatch"}
+    matched_track_count = sum(detail["status"] in paired_statuses for detail in track_details)
+    unmatched_local_count = sum(
+        detail.get("local") is not None and detail["status"] in {"missing", "unmatched"}
+        for detail in track_details
+    )
+    unmatched_canonical_count = sum(
+        detail.get("proposed") is not None and detail["status"] in {"extra", "unmatched"}
+        for detail in track_details
+    )
+    artist_unrelated = bool(_text(query.get("artist")) and _text(candidate.get("artist"))
+                            and artist_distance > 0.65)
+    album_unrelated = bool(_text(query.get("album")) and _text(candidate.get("album"))
+                           and album_distance > 0.65)
+    zero_matched_tracks = bool((local_tracks or canonical_tracks) and matched_track_count == 0)
+    hard_mismatches = []
+    if artist_unrelated:
+        hard_mismatches.append("artist")
+    if album_unrelated:
+        hard_mismatches.append("album")
+    if zero_matched_tracks:
+        hard_mismatches.append("zero_matched_tracks")
     if count_mismatch:
-        confidence = min(confidence, 0.94 if not exact_mbid else 0.99)
-        distance = max(distance, 1.0 - confidence)
+        hard_mismatches.append("track_count")
+    if unmatched_local_count or unmatched_canonical_count:
+        hard_mismatches.append("unmatched_tracks")
+
+    # Hard evidence failures cap the weighted score. Supplying a release ID
+    # chooses which canonical release to inspect; it is never match evidence.
+    if zero_matched_tracks:
+        confidence = min(confidence, 0.49)
+    if artist_unrelated and album_unrelated:
+        confidence = min(confidence, 0.10)
+    if zero_matched_tracks and (artist_unrelated or album_unrelated):
+        confidence = min(confidence, 0.05)
+    if zero_matched_tracks and artist_unrelated and album_unrelated:
+        confidence = min(confidence, 0.02)
+    if count_mismatch:
+        confidence = min(confidence, 0.94)
+    distance = max(distance, 1.0 - confidence)
+    recommendation = "strong" if confidence >= 0.85 else "medium" if confidence >= 0.70 else "low" if confidence >= 0.55 else "none"
     reasons = [f"{item['field'].replace('_', ' ').title()} penalty: {round(item['penalty'] * 100)}%" for item in penalties]
     reasons.append("Track count matches" if not count_mismatch else
                    f"Track count differs ({len(local_tracks)} local, {len(canonical_tracks)} MusicBrainz)")
+    if artist_unrelated:
+        reasons.append("Artist evidence is unrelated")
+    if album_unrelated:
+        reasons.append("Album evidence is unrelated")
+    if zero_matched_tracks:
+        reasons.append("No tracks matched the MusicBrainz release")
+    if unmatched_local_count or unmatched_canonical_count:
+        reasons.append(f"Unmatched tracks: {unmatched_local_count} local, {unmatched_canonical_count} MusicBrainz")
     if exact_mbid:
-        reasons.insert(0, "Exact MusicBrainz release ID override")
+        reasons.insert(0, "Selected by exact MusicBrainz release ID; confidence remains evidence-based")
     return {"confidence": round(max(0.0, min(confidence, 1.0)), 4), "distance": round(distance, 4),
             "recommendation": recommendation, "penalties": penalties, "reasons": reasons,
-            "track_details": track_details, "track_count_mismatch": count_mismatch}
+            "track_details": track_details, "track_count_mismatch": count_mismatch,
+            "matched_track_count": matched_track_count,
+            "unmatched_track_count": unmatched_local_count + unmatched_canonical_count,
+            "hard_mismatches": hard_mismatches, "selected_by_mbid": exact_mbid}

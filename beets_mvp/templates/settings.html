@@ -797,7 +797,7 @@
           activeAlbum = data; activeCandidateId = data.selected_candidate_id; input.value = '';
           const index = albumReviews.findIndex(album => album.id === data.id);
           if (index >= 0) albumReviews[index] = data;
-          renderAlbumMatch(); message.textContent = 'MusicBrainz override matched. No files were changed.';
+          renderAlbumMatch(); message.textContent = 'MusicBrainz release selected by ID. Confidence remains based on metadata evidence. No files were changed.';
         } catch (error) {
           message.textContent = error.message || 'Unable to rematch this album.';
         }

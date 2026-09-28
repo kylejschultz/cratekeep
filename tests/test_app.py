@@ -678,7 +678,7 @@ def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tm
     assert album["proposed_match"]["proposed_diff"]["album"] == {"from": "Album", "to": "Renamed Album"}
     assert all("search score" not in reason.lower() for reason in album["proposed_match"]["confidence_reasons"])
     assert album["proposed_match"]["recommendation"] in {"strong", "medium", "low", "none"}
-    assert [track["status"] for track in album["proposed_match"]["track_details"]] == ["matched", "title-mismatch"]
+    assert [track["status"] for track in album["proposed_match"]["track_details"]] == ["matched", "unmatched"]
     assert [track["title"] for track in album["tracks"]] == ["First", "Second"]
 
 
@@ -708,6 +708,9 @@ def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
 
     assert response.status_code == 200
     assert response.json["selected_candidate_id"] == response.json["proposed_match"]["id"]
+    assert response.json["proposed_match"]["confidence"] == 1.0
+    assert response.json["proposed_match"]["recommendation"] == "strong"
+    assert response.json["proposed_match"]["selected_by_mbid"] is True
     assert calls[0][0]["musicbrainz_id"] == "123e4567-e89b-42d3-a456-426614174000"
     assert calls[0][1] == 1
 
@@ -890,15 +893,77 @@ def test_matching_assigns_tracks_reports_explicit_mismatches_and_bounds_count_co
     assert {penalty["field"] for penalty in match["penalties"]} == {"artist", "album", "date", "tracks"}
 
 
-def test_exact_release_id_override_is_strongest_even_with_count_mismatch():
+def test_exact_release_id_selects_but_does_not_override_unrelated_evidence():
     result = score_release({"artist": "Wrong", "album": "Wrong", "tracks": [{"title": "One"}]}, {
         "provider_id": "release", "artist": "Canonical", "album": "Canonical", "tracks": [],
     }, exact_mbid=True)
 
-    assert result["confidence"] == .99
-    assert result["distance"] == .01
+    assert result["confidence"] == .02
+    assert result["distance"] == .98
+    assert result["recommendation"] == "none"
+    assert result["selected_by_mbid"] is True
+    assert {"artist", "album", "zero_matched_tracks", "track_count", "unmatched_tracks"} <= set(result["hard_mismatches"])
+    assert result["reasons"][0] == "Selected by exact MusicBrainz release ID; confidence remains evidence-based"
+
+
+def test_exact_release_id_with_exact_metadata_and_tracks_is_strong():
+    query = {"artist": "Artist", "album": "Album", "year": 2024, "tracks": [
+        {"title": "One", "duration": 120, "disc": 1, "track": 1},
+        {"title": "Two", "duration": 180, "disc": 1, "track": 2},
+    ]}
+    candidate = {"provider_id": "release", "artist": "Artist", "album": "Album", "year": 2024, "tracks": [
+        {"title": "One", "length_ms": 120000, "medium_position": 1, "position": 1},
+        {"title": "Two", "length_ms": 180000, "medium_position": 1, "position": 2},
+    ], "retrieval": {"source": "release-id", "search_score": None}}
+
+    result = score_release(query, candidate, exact_mbid=True)
+
+    assert result["confidence"] == 1.0
     assert result["recommendation"] == "strong"
-    assert result["reasons"][0] == "Exact MusicBrainz release ID override"
+    assert result["matched_track_count"] == 2
+    assert result["hard_mismatches"] == []
+
+
+def test_exact_release_id_partial_track_count_mismatch_is_penalized_and_visible():
+    result = score_release({"artist": "Artist", "album": "Album", "tracks": [
+        {"title": "One"}, {"title": "Two"},
+    ]}, {"provider_id": "release", "artist": "Artist", "album": "Album", "tracks": [
+        {"title": "One"},
+    ]}, exact_mbid=True)
+
+    assert result["confidence"] < 1.0
+    assert result["track_count_mismatch"] is True
+    assert result["matched_track_count"] == 1
+    assert result["unmatched_track_count"] == 1
+    assert {"track_count", "unmatched_tracks"} <= set(result["hard_mismatches"])
+    assert any(reason.startswith("Track count differs") for reason in result["reasons"])
+    assert any(reason.startswith("Unmatched tracks:") for reason in result["reasons"])
+
+
+def test_rematch_wrong_release_id_stays_selected_with_low_evidence_confidence(tmp_path):
+    app = make_app(tmp_path)
+    release_id = "123e4567-e89b-42d3-a456-426614174000"
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": release_id, "artist": "Other Performer", "album": "Foreign Recording",
+        "tracks": [], "retrieval": {"source": "release-id", "search_score": 100},
+    }]
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album_id = client.get("/api/library-import/reviews").json["albums"][0]["id"]
+
+    response = client.post(f"/api/library-import/albums/{album_id}/rematch", json={"musicbrainz_id": release_id})
+
+    assert response.status_code == 200
+    candidate = response.json["proposed_match"]
+    assert response.json["selected_candidate_id"] == candidate["id"]
+    assert candidate["provider_id"] == release_id
+    assert candidate["artist"] == "Other Performer"
+    assert candidate["retrieval"] == {"search_score": None, "source": "release-id"}
+    assert candidate["confidence"] == .02
+    assert candidate["recommendation"] == "none"
 
 
 def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tmp_path):
