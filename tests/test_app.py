@@ -349,9 +349,10 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'This decision does not change music files.' in modal
     assert b'class="match-summary"' in modal
     assert b'class="album-modal-section alternatives-section"' in modal
-    assert b'class="comparison-grid"' in modal
-    assert modal.count(b'<caption class="visually-hidden">') == 2
-    assert b'<th scope="col">Current</th>' in modal
+    assert b'class="track-columns"' in modal
+    assert b'id="library-import-modal-tracks" class="track-comparison"' in modal
+    assert 'Local track · duration'.encode() in modal
+    assert 'Proposed track · duration'.encode() in modal
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'class="secondary danger-button" data-review-decision="rejected"' in modal
@@ -359,7 +360,7 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
-    assert b'.comparison-grid { grid-template-columns:1fr;' in html
+    assert b'.track-detail.is-changed .track-row-summary' in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
@@ -574,7 +575,7 @@ def test_library_import_reviews_are_bounded_deterministic_and_decisions_only_upd
     assert all(path.read_bytes() == contents for path, contents in original.items())
 
 
-def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path):
+def test_library_import_review_groups_preserve_source_folder_hierarchy(tmp_path):
     app = make_app(tmp_path)
     root = tmp_path / "library"
     paths = [
@@ -582,6 +583,8 @@ def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path)
         root / "Artist One" / "Album A" / "02 Second.mp3",
         root / "Artist One" / "Album B" / "01 Other.mp3",
         root / "Artist Two" / "Album C" / "01 Last.mp3",
+        root / "Compilations" / "Deep" / "Various" / "01 Mixed.mp3",
+        root / "Loose.mp3",
     ]
     paths.extend(
         root / "Bulk Artist" / f"Album {number // 10}" / f"{number:02d} Song.mp3"
@@ -595,13 +598,19 @@ def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path)
     assert client.post("/api/library/inventory/preview").status_code == 201
     payload = client.get("/api/library-import/reviews?limit=50").json
 
-    assert [(group["artist"], len(group["albums"])) for group in payload["groups"]] == [
-        ("Artist One", 2), ("Artist Two", 1), ("Bulk Artist", 5),
+    assert [group["path"] for group in payload["groups"]] == [
+        "", "Artist One", "Artist Two", "Bulk Artist", "Compilations",
     ]
-    assert [song["title"] for song in payload["groups"][0]["albums"][0]["songs"]] == [
+    artist_one = payload["groups"][1]
+    assert [folder["path"] for folder in artist_one["folders"]] == ["Artist One/Album A", "Artist One/Album B"]
+    assert [song["title"] for song in artist_one["folders"][0]["albums"][0]["songs"]] == [
         "01 First", "02 Second",
     ]
-    assert sum(len(album["songs"]) for album in payload["groups"][2]["albums"]) == 50
+    bulk = payload["groups"][3]
+    assert sum(len(album["songs"]) for folder in bulk["folders"] for album in folder["albums"]) == 50
+    compilations = payload["groups"][4]
+    assert compilations["folders"][0]["folders"][0]["path"] == "Compilations/Deep/Various"
+    assert payload["groups"][0]["albums"][0]["songs"][0]["path"] == "Loose.mp3"
     assert _group_library_import_review_items(payload["items"]) == payload["groups"]
 
 
@@ -632,7 +641,7 @@ def test_library_import_review_paginates_25_artists_and_keeps_complete_albums(tm
     complete = first.json["albums"][0]
     assert complete["album"] == "Complete Album"
     assert len(complete["tracks"]) == 125
-    assert len(first.json["groups"][0]["albums"][0]["songs"]) == 125
+    assert len(first.json["groups"][0]["folders"][0]["albums"][0]["songs"]) == 125
 
     last = client.get("/api/library-import/reviews?limit=25&offset=25")
     assert last.status_code == 200
@@ -1059,9 +1068,9 @@ def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tm
 
     assert b"document.createElement('details')" in html
     assert b"document.createElement('summary')" in html
-    assert b"review-source" in html and b"review-album" in html
-    assert b"source.open = sourceRows.length === 1" in html
-    assert b"sourceFolderRows(albumGroup.songs)" in html
+    assert b"review-folder" in html and b"review-album" in html
+    assert b"source.open = topLevel && reviewGroups.length === 1" in html
+    assert b"folder.folders.map(child => renderFolder(child))" in html
     assert b"reviewList.replaceChildren(...reviewItems.map" not in html
     assert b"reviews?limit=50" not in html
 
@@ -1070,8 +1079,8 @@ def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_co
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b".review-list { overflow:hidden;" in html
-    assert b".review-source-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto;" in html
-    assert b".review-source-body { display:grid; grid-template-columns:minmax(0,1fr) auto;" in html
+    assert b".review-folder-summary { display:flex;" in html
+    assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     assert b"const source = document.createElement('details');" in html
     assert b"const album = document.createElement('button');" in html
@@ -1082,26 +1091,32 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
 
     assert b'id="library-import-modal-proposed"' in html
     assert b'id="library-import-modal-candidates"' in html
-    assert b'id="library-import-modal-diff"' in html
     assert b'id="library-import-modal-tracks"' in html
+    assert b'role="radiogroup" aria-label="Candidate alternatives"' in html
+    assert b'>Track comparison<' in html
+    assert b'>Album changes<' not in html
+    assert b"detail.className = `track-detail${changed ? ' is-changed' : ''}`" in html
+    assert b"formatDuration(localDuration)" in html
+    assert b"track.recording_id" in html
+    assert b"Math.round(candidate.confidence" not in html
+    assert b"candidates.querySelector('[aria-checked=\"true\"]')?.focus()" in html
     assert b'id="library-import-rematch-form"' in html
     assert b'aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1"' in html
     assert b"if (event.key === 'Escape')" in html
     assert b"input:not(:disabled)" in html
     assert b"album.addEventListener('click', () => openReview(albumReview, album));" in html
-    assert b"albumGroup.songs.forEach(item" not in html
 
 
 def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b"source.className = 'review-source'" in html
-    assert b"path.className = 'review-source-path'" in html
+    assert b"source.className = 'review-folder'" in html
+    assert b"path.className = 'review-folder-path'" in html
+    assert b"path.textContent = folder.path || 'Library root'" in html
     assert b"metadata.className = 'review-source-metadata'" in html
-    assert b"metadata.textContent = `${group.artist} \xe2\x80\x94 ${albumGroup.album}" in html
+    assert b"metadata.textContent = `${albumGroup.artist} \xe2\x80\x94 ${albumGroup.album}" in html
     assert b"track.textContent = `${item.title || 'Untitled track'} \xe2\x80\x94 ${item.path}`" in html
-    assert b"sourceFolderRows(albumGroup.songs)" in html
-    assert b"path.textContent = sourceFolder(songs)" in html
+    assert b"folder.folders.map(child => renderFolder(child))" in html
     assert b"status.className = 'status-pill'" in html
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html

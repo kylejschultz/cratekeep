@@ -133,14 +133,17 @@
     .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
     .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
     .review-pagination button { margin:0; }
-    .review-source { border-bottom:1px solid var(--border); background:transparent; }
-    .review-source:last-child { border-bottom:0; }
-    .review-source-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.65rem; align-items:center; cursor:pointer; padding:.7rem .8rem; }
-    .review-source-summary:hover { background:var(--active); }
-    .review-source-copy { min-width:0; }
-    .review-source-path { display:block; overflow:hidden; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
-    .review-source-metadata { display:block; margin-top:.12rem; overflow:hidden; color:var(--muted); font-size:.78rem; text-overflow:ellipsis; white-space:nowrap; }
-    .review-source-body { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.8rem; align-items:center; padding:.65rem .8rem .7rem 1.8rem; border-top:1px solid var(--border); background:var(--page); }
+    .review-folder { border-bottom:1px solid var(--border); background:transparent; }
+    .review-folder:last-child { border-bottom:0; }
+    .review-folder .review-folder { margin-left:1rem; border-left:1px solid var(--border); }
+    .review-folder-summary { display:flex; gap:.65rem; align-items:center; cursor:pointer; padding:.7rem .8rem; }
+    .review-folder-summary:hover { background:var(--active); }
+    .review-folder-path { min-width:0; overflow-wrap:anywhere; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .review-folder-count { margin-left:auto; color:var(--muted); font-size:.76rem; white-space:nowrap; }
+    .review-folder-contents { border-top:1px solid var(--border); background:var(--page); }
+    .review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.8rem; align-items:center; padding:.7rem .8rem .75rem 1.8rem; border-bottom:1px solid var(--border); }
+    .review-album-row:last-child { border-bottom:0; }
+    .review-source-metadata { display:block; margin-bottom:.25rem; color:var(--text); font-size:.82rem; font-weight:650; }
     .review-track-list { min-width:0; margin:0; padding-left:1rem; color:var(--muted); font-size:.78rem; }
     .review-track-list li { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .review-album { width:auto; min-width:7.5rem; margin:0; padding:.48rem .7rem; }
@@ -167,25 +170,34 @@
     .match-copy { min-width:0; }
     .match-summary-name { font-size:1rem; font-weight:750; line-height:1.3; }
     .match-summary-meta { color:var(--muted); font-size:.78rem; overflow-wrap:anywhere; }
-    .confidence-badge { grid-column:2; grid-row:1 / span 2; padding:.25rem .5rem; border-radius:999px; color:var(--modal-accent-hover); background:var(--modal-subtle); font-size:.78rem; font-weight:750; white-space:nowrap; }
-    .has-artwork .confidence-badge { grid-column:3; }
     .identity-pill { margin-top:.3rem; color:var(--modal-accent-hover); background:var(--modal-subtle); }
-    .match-reasons { display:flex; flex-wrap:wrap; gap:.3rem; margin:.55rem 0 0; padding:0; list-style:none; }
-    .match-reasons li { padding:.18rem .4rem; border-radius:999px; color:var(--muted); background:var(--modal-subtle); font-size:.72rem; }
+    .match-quality { grid-column:2; grid-row:1 / span 2; color:var(--muted); font-size:.78rem; font-weight:650; }
+    .has-artwork .match-quality { grid-column:3; }
     .alternatives-section { background:var(--modal-subtle); }
-    .candidate-list { display:grid; gap:.45rem; }
-    .browser-body button.candidate-option { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.5rem; width:100%; margin:0; padding:.45rem .55rem; border:1px solid transparent; background:transparent; color:var(--text); text-align:left; }
+    .candidate-list { display:grid; gap:.2rem; }
+    .browser-body button.candidate-option { display:grid; grid-template-columns:1rem minmax(0,1fr) auto; gap:.5rem; align-items:center; width:100%; margin:0; padding:.38rem .5rem; border:1px solid transparent; background:transparent; color:var(--text); text-align:left; }
     .browser-body button.candidate-option:hover { border-color:var(--modal-border); background:var(--modal-panel); }
-    .candidate-option[aria-pressed="true"] { border-color:var(--modal-accent); background:var(--modal-panel); box-shadow:inset 3px 0 var(--modal-accent); }
-    .candidate-confidence { color:var(--muted); font-size:.8rem; font-weight:650; }
-    .comparison-grid { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,3fr); gap:.7rem; }
-    .comparison-grid .album-modal-section { min-width:0; margin-bottom:.7rem; }
-    .compact-table { overflow-x:auto; }
-    .metadata-diff,.track-match-table { width:100%; border-collapse:collapse; font-size:.85rem; }
-    .metadata-diff th,.metadata-diff td,.track-match-table th,.track-match-table td { padding:.4rem; border-bottom:1px solid var(--modal-border); text-align:left; }
-    .metadata-diff tbody tr:last-child td,.track-match-table tbody tr:last-child td { border-bottom:0; }
-    .diff-changed { background:color-mix(in srgb, #d6a24a 13%, transparent); }
-    .match-status { font-weight:650; text-transform:capitalize; }
+    .browser-body button.candidate-option[aria-checked="true"] { border-color:var(--modal-accent); background:var(--modal-panel); box-shadow:inset 3px 0 var(--modal-accent); }
+    .candidate-marker { width:.8rem; height:.8rem; border:1px solid var(--modal-border); border-radius:50%; }
+    .candidate-option[aria-checked="true"] .candidate-marker { border:3px solid var(--modal-accent); }
+    .candidate-confidence { color:var(--muted); font-size:.76rem; font-weight:650; overflow-wrap:anywhere; text-align:right; text-transform:capitalize; }
+    .track-comparison { display:grid; gap:.25rem; }
+    .track-columns,.track-row-summary { display:grid; grid-template-columns:2rem minmax(0,1fr) 4.5rem minmax(0,1fr) 4.5rem 5.5rem; gap:.5rem; align-items:center; }
+    .track-columns { padding:0 .55rem .3rem; color:var(--muted); font-size:.7rem; font-weight:700; text-transform:uppercase; }
+    .track-columns span:nth-child(2) { grid-column:2 / 4; }
+    .track-columns span:nth-child(3) { grid-column:4 / 6; }
+    .track-columns span:nth-child(4) { grid-column:6; }
+    .track-detail { border:1px solid var(--modal-border); border-radius:.3rem; background:var(--modal-panel); }
+    .track-detail[open] { border-color:var(--modal-accent); }
+    .track-row-summary { cursor:pointer; padding:.48rem .55rem; list-style:none; font-size:.82rem; }
+    .track-row-summary::-webkit-details-marker { display:none; }
+    .track-detail.is-changed .track-row-summary { background:color-mix(in srgb, #d6a24a 14%, transparent); }
+    .track-duration { color:var(--muted); font-variant-numeric:tabular-nums; text-align:right; }
+    .track-delta { padding:.12rem .3rem; border-radius:999px; color:var(--muted); background:var(--modal-subtle); font-size:.72rem; font-weight:700; text-align:center; }
+    .track-detail.is-changed .track-delta { color:#714b08; background:#fae6bd; }
+    body.dark-mode .track-detail.is-changed .track-delta { color:#ffe9bd; background:#684b1c; }
+    .track-more { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.35rem 1rem; margin:0; padding:.55rem .8rem .65rem 2.55rem; border-top:1px solid var(--modal-border); color:var(--muted); font-size:.76rem; }
+    .track-more dt { font-weight:700; }.track-more dd { margin:0; overflow-wrap:anywhere; }
     .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .override-form label { margin:0; font-size:.86rem; }
     .override-form input { margin-top:.25rem; }
@@ -205,7 +217,9 @@
       body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:static; width:auto; height:auto; overflow:visible; clip-path:none; }
       body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:flex-start; padding-inline:.75rem; }
       .scrim { position:fixed; z-index:9; inset:0; margin:0; border:0; border-radius:0; background:rgb(8 19 26 / 62%); } body.sidebar-open .scrim { display:block; }
-      .comparison-grid { grid-template-columns:1fr; gap:0; }
+      .track-columns,.track-row-summary { grid-template-columns:1.5rem minmax(0,1fr) 4rem; }
+      .track-columns span:nth-child(2),.track-columns span:nth-child(3) { grid-column:auto; }
+      .track-columns span:nth-child(4),.track-row-summary .track-duration,.track-row-summary .track-delta { display:none; }
     }
     @media (max-width: 520px) {
       body { margin: 0; padding: .75rem; }
@@ -215,15 +229,14 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
-      .review-source-summary { grid-template-columns:minmax(0,1fr) auto; }
-      .review-source-summary .score-pill { display:none; }
-      .review-source-body { grid-template-columns:1fr; padding-left:.8rem; }
+      .review-album-row { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
+      .review-album-row .score-pill { display:none; }
       .review-album { width:100%; }
       .match-summary,.match-summary.has-artwork { grid-template-columns:minmax(0,1fr); }
       .match-summary.has-artwork { grid-template-columns:3.5rem minmax(0,1fr); }
       .match-artwork { width:3.5rem; height:3.5rem; }
-      .confidence-badge { grid-column:1; grid-row:auto; justify-self:start; }
-      .has-artwork .confidence-badge { grid-column:2; }
+      .match-quality { grid-column:1; grid-row:auto; justify-self:start; }
+      .has-artwork .match-quality { grid-column:2; }
       .review-footer { align-items:stretch; flex-direction:column-reverse; }
       .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
       .review-footer button { width:100%; }
@@ -355,22 +368,16 @@
         <section class="album-modal-section" aria-labelledby="proposed-match-title">
           <h3 id="proposed-match-title">Selected candidate</h3>
           <div id="library-import-modal-proposed" class="match-summary"></div>
-          <ul id="library-import-modal-reasons" class="match-reasons" aria-label="Match confidence reasons"></ul>
         </section>
         <section class="album-modal-section alternatives-section" aria-labelledby="candidate-alternatives-title">
           <h3 id="candidate-alternatives-title">Candidate alternatives</h3>
-          <div id="library-import-modal-candidates" class="candidate-list"></div>
+          <div id="library-import-modal-candidates" class="candidate-list" role="radiogroup" aria-label="Candidate alternatives"></div>
         </section>
-        <div class="comparison-grid">
-          <section class="album-modal-section" aria-labelledby="metadata-diff-title">
-            <h3 id="metadata-diff-title">Album changes</h3>
-            <div class="compact-table"><table class="metadata-diff"><caption class="visually-hidden">Current and proposed album metadata</caption><thead><tr><th scope="col">Field</th><th scope="col">Current</th><th scope="col">Proposed</th></tr></thead><tbody id="library-import-modal-diff"></tbody></table></div>
-          </section>
-          <section class="album-modal-section" aria-labelledby="track-details-title">
-            <h3 id="track-details-title">Track matching</h3>
-            <div class="compact-table"><table class="track-match-table"><caption class="visually-hidden">Library and proposed track matches</caption><thead><tr><th scope="col">#</th><th scope="col">Library</th><th scope="col">Proposed</th><th scope="col">Status</th></tr></thead><tbody id="library-import-modal-tracks"></tbody></table></div>
-          </section>
-        </div>
+        <section class="album-modal-section" aria-labelledby="track-details-title">
+          <h3 id="track-details-title">Track comparison</h3>
+          <div class="track-columns" aria-hidden="true"><span>#</span><span>Local track · duration</span><span>Proposed track · duration</span><span>Delta</span></div>
+          <div id="library-import-modal-tracks" class="track-comparison"></div>
+        </section>
         <form id="library-import-rematch-form" class="override-form">
           <label for="library-import-mbid">Rematch with MusicBrainz release ID
             <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
@@ -653,21 +660,13 @@
       }
     }
 
-    function sourceFolder(songs) {
-      const paths = songs.map(song => String(song.path || '')).filter(Boolean);
-      if (!paths.length) return 'Unknown source folder';
-      const parent = path => path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : path;
-      return parent(paths[0]);
+    function folderTrackCount(folder) {
+      return folder.albums.reduce((count, album) => count + album.songs.length, 0)
+        + folder.folders.reduce((count, child) => count + folderTrackCount(child), 0);
     }
 
-    function sourceFolderRows(songs) {
-      const rows = new Map();
-      songs.forEach(song => {
-        const folder = sourceFolder([song]);
-        if (!rows.has(folder)) rows.set(folder, []);
-        rows.get(folder).push(song);
-      });
-      return [...rows.values()];
+    function folderCount(folder) {
+      return 1 + folder.folders.reduce((count, child) => count + folderCount(child), 0);
     }
 
     function albumInventoryStatus(albumReview, songs) {
@@ -696,12 +695,8 @@
 
     function renderReviewItems() {
       if (!reviewList) return;
-      const sourceRows = reviewGroups.flatMap(group => group.albums.flatMap(albumGroup =>
-        sourceFolderRows(albumGroup.songs).map(songs => ({group, albumGroup, songs}))));
-      reviewList.replaceChildren(...sourceRows.map(({group, albumGroup, songs}) => {
-          const source = document.createElement('details'); source.className = 'review-source';
-          source.open = sourceRows.length === 1;
-          const albumReview = albumReviews.find(review => review.artist === group.artist && review.album === albumGroup.album);
+      function renderAlbum(albumGroup, folderPath) {
+          const albumReview = albumReviews.find(review => review.artist === albumGroup.artist && review.album === albumGroup.album);
           const statusValue = albumInventoryStatus(albumReview, albumGroup.songs);
           const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
           const statusDescription = inventoryStatusDescriptions[statusValue] || statusValue;
@@ -713,30 +708,46 @@
             score.dataset.band = scorePresentation.band;
             score.setAttribute('aria-label', scorePresentation.accessibleLabel);
           } else { score.textContent = 'No match score'; score.hidden = true; }
-          const summary = document.createElement('summary'); summary.className = 'review-source-summary';
-          const copy = document.createElement('span'); copy.className = 'review-source-copy';
-          const path = document.createElement('span'); path.className = 'review-source-path'; path.textContent = sourceFolder(songs);
+          const row = document.createElement('article'); row.className = 'review-album-row';
+          const copy = document.createElement('div');
           const metadata = document.createElement('span'); metadata.className = 'review-source-metadata';
-          metadata.textContent = `${group.artist} — ${albumGroup.album} · ${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`;
-          copy.append(path, metadata); summary.append(copy, status, score); source.append(summary);
-          const body = document.createElement('div'); body.className = 'review-source-body';
+          metadata.textContent = `${albumGroup.artist} — ${albumGroup.album} · ${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'track' : 'tracks'}`;
           const trackList = document.createElement('ol'); trackList.className = 'review-track-list';
-          songs.forEach(item => {
+          albumGroup.songs.forEach(item => {
             const track = document.createElement('li');
             track.textContent = `${item.title || 'Untitled track'} — ${item.path}`;
             track.title = item.path;
             trackList.append(track);
           });
+          copy.append(metadata, trackList);
           const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = 'Review match';
-          album.setAttribute('aria-label', `Review ${sourceFolder(songs)}: ${albumGroup.album} by ${group.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
+          album.setAttribute('aria-label', `Review ${folderPath || 'library root'}: ${albumGroup.album} by ${albumGroup.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
           if (albumReview) album.addEventListener('click', () => openReview(albumReview, album));
           else album.disabled = true;
-          body.append(trackList, album); source.append(body);
-          return source;
-      }));
+          row.append(copy, status, score, album);
+          return row;
+      }
+      function renderFolder(folder, topLevel = false) {
+        const source = document.createElement('details'); source.className = 'review-folder';
+        source.open = topLevel && reviewGroups.length === 1;
+        const summary = document.createElement('summary'); summary.className = 'review-folder-summary';
+        const path = document.createElement('span'); path.className = 'review-folder-path';
+        path.textContent = folder.path || 'Library root';
+        const count = document.createElement('span'); count.className = 'review-folder-count';
+        const tracks = folderTrackCount(folder);
+        count.textContent = `${tracks} ${tracks === 1 ? 'track' : 'tracks'}`;
+        summary.append(path, count);
+        const contents = document.createElement('div'); contents.className = 'review-folder-contents';
+        contents.append(...folder.albums.map(album => renderAlbum(album, folder.path)));
+        contents.append(...folder.folders.map(child => renderFolder(child)));
+        source.append(summary, contents);
+        return source;
+      }
+      reviewList.replaceChildren(...reviewGroups.map(folder => renderFolder(folder, true)));
+      const sourceFolderCount = reviewGroups.reduce((count, folder) => count + folderCount(folder), 0);
       reviewStatus.dataset.busy = 'false';
       reviewStatus.textContent = reviewItems.length
-        ? `${sourceRows.length} source ${sourceRows.length === 1 ? 'folder' : 'folders'}, ${reviewGroups.length} ${reviewGroups.length === 1 ? 'artist' : 'artists'}, ${reviewItems.length} tracks on this page.`
+        ? `${sourceFolderCount} source ${sourceFolderCount === 1 ? 'folder' : 'folders'}, ${reviewItems.length} tracks on this page.`
         : 'No current inventory review items.';
       const pageStart = reviewTotalArtists ? reviewOffset + 1 : 0;
       const pageEnd = Math.min(reviewOffset + reviewPageArtistCount, reviewTotalArtists);
@@ -787,41 +798,62 @@
         const name = document.createElement('div'); name.className = 'match-summary-name'; name.textContent = `${candidate.artist} — ${candidate.album}`;
         const metadata = document.createElement('div'); metadata.className = 'match-summary-meta'; metadata.textContent = `${candidate.date || candidate.year ? `${candidate.date || candidate.year} · ` : ''}MusicBrainz release ${candidate.provider_id}${candidate.release_group_id ? ` · group ${candidate.release_group_id}` : ''}`;
         const identity = document.createElement('span'); identity.className = 'identity-pill'; identity.textContent = candidate.id === activeCandidateId ? 'Selected candidate' : 'Proposed candidate';
-        const confidence = document.createElement('span'); confidence.className = 'confidence-badge'; confidence.textContent = `${Math.round(candidate.confidence * 100)}% · ${candidate.recommendation} recommendation`;
-        copy.append(name, metadata, identity); proposed.append(copy, confidence);
+        const quality = document.createElement('span'); quality.className = 'match-quality';
+        quality.textContent = `${candidate.recommendation} recommendation · ${candidate.matched_track_count} matched${candidate.unmatched_track_count ? ` · ${candidate.unmatched_track_count} unmatched` : ''}`;
+        copy.append(name, metadata, identity); proposed.append(copy, quality);
       } else {
         proposed.textContent = activeAlbum?.candidate_error || 'No MusicBrainz match proposed.';
       }
-      const reasons = document.getElementById('library-import-modal-reasons');
-      reasons.replaceChildren(...(candidate?.confidence_reasons || []).map(reason => {
-        const item = document.createElement('li'); item.textContent = reason; return item;
-      }));
       const candidates = document.getElementById('library-import-modal-candidates');
       candidates.replaceChildren(...(activeAlbum?.candidates || []).map((value, index) => {
         const button = document.createElement('button'); button.type = 'button'; button.className = 'candidate-option';
-        button.setAttribute('aria-pressed', String(value.id === candidate?.id));
-        const name = document.createElement('span'); name.textContent = `${value.id === candidate?.id ? 'Selected' : `Option ${index + 1}`} · ${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
-        const confidence = document.createElement('span'); confidence.className = 'candidate-confidence'; confidence.textContent = `${Math.round(value.confidence * 100)}% · ${value.recommendation}`;
-        button.append(name, confidence);
+        button.setAttribute('role', 'radio'); button.setAttribute('aria-checked', String(value.id === candidate?.id));
+        const marker = document.createElement('span'); marker.className = 'candidate-marker'; marker.setAttribute('aria-hidden', 'true');
+        const name = document.createElement('span'); name.textContent = `${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
+        const recommendation = document.createElement('span'); recommendation.className = 'candidate-confidence'; recommendation.textContent = `MusicBrainz ${value.provider_id} · ${value.recommendation} match`;
+        button.setAttribute('aria-label', `Option ${index + 1}: ${name.textContent}. ${recommendation.textContent}${value.id === candidate?.id ? '. Selected' : ''}`);
+        button.append(marker, name, recommendation);
         button.addEventListener('click', () => { activeCandidateId = value.id; renderAlbumMatch(); });
+        button.addEventListener('keydown', event => {
+          if (!['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft'].includes(event.key)) return;
+          event.preventDefault();
+          const options = activeAlbum.candidates;
+          const step = ['ArrowDown', 'ArrowRight'].includes(event.key) ? 1 : -1;
+          activeCandidateId = options[(index + step + options.length) % options.length].id;
+          renderAlbumMatch();
+          candidates.querySelector('[aria-checked="true"]')?.focus();
+        });
         return button;
       }));
       if (!candidates.children.length) candidates.textContent = 'No alternatives available.';
-      const diff = document.getElementById('library-import-modal-diff');
-      const changes = Object.entries(candidate?.proposed_diff || {}).filter(([field]) => field !== 'tracks');
-      diff.replaceChildren(...changes.map(([field, values]) => {
-        const row = document.createElement('tr');
-        if (String(values.from ?? '') !== String(values.to ?? '')) row.className = 'diff-changed';
-        [field.replace('_', ' '), values.from, values.to].forEach(value => { const cell = document.createElement('td'); cell.textContent = String(value); row.append(cell); });
-        return row;
-      }));
-      if (!changes.length) { const row = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 3; cell.textContent = 'No album-level metadata changes proposed.'; row.append(cell); diff.append(row); }
       const trackBody = document.getElementById('library-import-modal-tracks');
       const trackDetails = candidate?.track_details?.length ? candidate.track_details : (activeAlbum?.tracks || []).map((track, index) => ({position:index + 1, local:track.title, proposed:null, status:'unmatched'}));
+      function formatDuration(seconds) {
+        if (!Number.isFinite(seconds)) return '—';
+        const rounded = Math.round(seconds);
+        return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, '0')}`;
+      }
       trackBody.replaceChildren(...trackDetails.map(track => {
-        const row = document.createElement('tr');
-        [track.position, track.local || '—', track.proposed || '—', String(track.status).replaceAll('-', ' ')].forEach((value, index) => { const cell = document.createElement('td'); cell.textContent = String(value); if (index === 3) cell.className = 'match-status'; row.append(cell); });
-        return row;
+        const localTrack = track.local === null ? null : activeAlbum?.tracks?.[Math.max(0, Number(track.position || 1) - 1)];
+        const localDuration = Number.isFinite(track.local_duration) ? track.local_duration : localTrack?.duration;
+        const proposedDuration = track.proposed_duration;
+        const delta = Number.isFinite(localDuration) && Number.isFinite(proposedDuration) ? proposedDuration - localDuration : null;
+        const changed = track.status !== 'matched' || track.local !== track.proposed || (delta !== null && Math.abs(delta) > 0.5);
+        const detail = document.createElement('details'); detail.className = `track-detail${changed ? ' is-changed' : ''}`;
+        const summary = document.createElement('summary'); summary.className = 'track-row-summary';
+        const values = [track.position, track.local || '—', formatDuration(localDuration), track.proposed || '—', formatDuration(proposedDuration), delta === null ? 'n/a' : `${delta >= 0 ? '+' : '−'}${formatDuration(Math.abs(delta))}`];
+        values.forEach((value, index) => { const span = document.createElement('span'); span.textContent = String(value); if (index === 2) span.className = 'track-duration local-duration'; if (index === 4) span.className = 'track-duration proposed-duration'; if (index === 5) span.className = 'track-delta'; summary.append(span); });
+        summary.setAttribute('aria-label', `Track ${track.position}: local ${track.local || 'missing'}, ${formatDuration(localDuration)}; proposed ${track.proposed || 'missing'}, ${formatDuration(proposedDuration)}; ${String(track.status).replaceAll('-', ' ')}. Expand for details.`);
+        const more = document.createElement('dl'); more.className = 'track-more';
+        const facts = [
+          ['Status', String(track.status).replaceAll('-', ' ')],
+          ['Differences', track.issues?.length ? track.issues.map(issue => issue.replaceAll('-', ' ')).join(', ') : 'None'],
+          ['Local path', localTrack?.path || 'Not available'],
+          ['MusicBrainz recording', track.recording_id || 'Not available'],
+        ];
+        facts.forEach(([term, description]) => { const dt = document.createElement('dt'); dt.textContent = term; const dd = document.createElement('dd'); dd.textContent = description; more.append(dt, dd); });
+        detail.append(summary, more);
+        return detail;
       }));
     }
 

@@ -98,7 +98,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 
 ### Library import inventory statuses
 
-The Library import inventory presents expandable source-folder rows, with artist and album metadata as supporting context. Expanding a row shows every discovered track path and opens the existing album-match review. Inventory, matching, rematching, and review operations show visible progress while requests are active. The inventory reports existing workflow state; it does not trigger imports or add state transitions:
+The Library import inventory mirrors the source filesystem as expandable, nested folders and preserves each complete relative folder and track path. Albums appear within their actual folders, with artist and album tags used only as supporting metadata; this also supports loose files, artist/album layouts, and deeper mixed layouts in the same library. Album review uses a full-width track comparison with local and proposed durations, highlights changed rows, and lets each row expand for status, source-path, and recording details. Candidate alternatives remain selectable without obscuring the persisted MusicBrainz identity or any already-persisted artwork. Inventory, matching, rematching, and review operations show visible progress while requests are active. The inventory reports existing workflow state; it does not trigger imports or add state transitions:
 
 | Status | Meaning |
 |---|---|

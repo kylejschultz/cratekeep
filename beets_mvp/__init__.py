@@ -1277,20 +1277,46 @@ def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:
 
 
 def _group_library_import_review_items(items: list[dict]) -> list[dict]:
-    groups: dict[str, dict[str, list[dict]]] = {}
+    root = {"name": "Library root", "path": "", "folders": {}, "albums": {}}
     for item in items:
-        albums = groups.setdefault(item["artist"], {})
-        albums.setdefault(item["album"], []).append(item)
-    return [
-        {
-            "artist": artist,
+        parts = Path(item["path"]).parts[:-1]
+        folder = root
+        path_parts = []
+        for part in parts:
+            path_parts.append(part)
+            folder = folder["folders"].setdefault(
+                part,
+                {"name": part, "path": "/".join(path_parts), "folders": {}, "albums": {}},
+            )
+        album_key = (item["artist"], item["album"])
+        album = folder["albums"].setdefault(
+            album_key,
+            {"artist": item["artist"], "album": item["album"], "songs": []},
+        )
+        album["songs"].append(item)
+
+    def serialize(folder: dict) -> dict:
+        return {
+            "name": folder["name"],
+            "path": folder["path"],
+            "folders": [
+                serialize(child)
+                for _, child in sorted(folder["folders"].items(), key=lambda entry: entry[0].casefold())
+            ],
             "albums": [
-                {"album": album, "songs": songs}
-                for album, songs in albums.items()
+                album for _, album in sorted(
+                    folder["albums"].items(), key=lambda entry: (entry[0][0].casefold(), entry[0][1].casefold())
+                )
             ],
         }
-        for artist, albums in groups.items()
+
+    grouped = [
+        serialize(folder)
+        for _, folder in sorted(root["folders"].items(), key=lambda entry: entry[0].casefold())
     ]
+    if root["albums"]:
+        grouped.insert(0, serialize(root))
+    return grouped
 
 
 def _serialize_item(item) -> dict:
