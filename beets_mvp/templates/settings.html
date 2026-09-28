@@ -29,7 +29,7 @@
       --modal-accent-hover: #3f6073;
       --soft: #dde1e5; --side-text:#343a40; --side-muted:#7b838b;
     }
-    body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --accent-hover:#b6ccda; --focus:#b9d6e7; --success:#294337; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; --modal-surface:#2b3138; --modal-panel:#343b43; --modal-border:#4b5661; --modal-subtle:#343b43; }
+    body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --accent-hover:#b6ccda; --focus:#b9d6e7; --success:#294337; --error:#5a3034; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; --modal-surface:#2b3138; --modal-panel:#343b43; --modal-border:#4b5661; --modal-subtle:#343b43; }
     * { box-sizing: border-box; }
     body { margin: 0; color: var(--text); background: var(--page); font: 16px/1.5 var(--font-sans); }
     body.setup-mode { max-width: 720px; margin: 2rem auto; padding: 1.5rem; }
@@ -139,7 +139,9 @@
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
     .status-pill[data-status="matched"],.status-pill[data-status="approved"],.status-pill[data-status="imported"] { border-color:#78a68a; background:var(--success); }
     .status-pill[data-status="needs review"],.status-pill[data-status="rejected"] { border-color:#c47b82; background:var(--error); }
-    .score-pill { color:var(--modal-accent-hover); background:var(--modal-subtle); }
+    .score-pill[data-band="low"] { border-color:#8f1d14; color:#fff; background:#b42318; }
+    .score-pill[data-band="medium"] { border-color:#b54708; color:#342100; background:#fdb022; }
+    .score-pill[data-band="high"] { border-color:#085d3a; color:#fff; background:#067647; }
     .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
     .album-modal-dialog { width:min(920px,100%); }
     .album-modal-dialog .browser-header { padding:.8rem 1rem; }
@@ -642,6 +644,26 @@
       return 'pending';
     }
 
+    const inventoryStatusDescriptions = {
+      matched: 'A metadata candidate is available for review',
+      approved: 'The selected metadata candidate was approved',
+      'needs review': 'Candidate matching needs attention',
+      imported: 'Every track is already present in the library',
+      pending: 'Candidate matching has not completed',
+      rejected: 'The proposed metadata candidate was rejected',
+      skipped: 'This album was skipped during review',
+    };
+    const initialAutoImportThreshold = 0.90;
+
+    function matchScorePresentation(confidence) {
+      if (!Number.isFinite(confidence)) return null;
+      const percentage = Math.floor(confidence * 1000) / 10;
+      const band = confidence >= initialAutoImportThreshold ? 'high' : (confidence >= 0.75 ? 'medium' : 'low');
+      const thresholdNote = band === 'high' ? '; meets the initial auto-import indicator threshold' : '';
+      const label = `${Number.isInteger(percentage) ? percentage : percentage.toFixed(1)}%`;
+      return {percentage, band, label, accessibleLabel: `${label} match confidence${thresholdNote}`};
+    }
+
     function renderReviewItems() {
       if (!reviewList) return;
       const groups = reviewGroups;
@@ -662,11 +684,17 @@
           tracks.textContent = `${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'track' : 'tracks'}`;
           const statusValue = albumInventoryStatus(albumReview, albumGroup.songs);
           const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
+          const statusDescription = inventoryStatusDescriptions[statusValue] || statusValue;
+          status.setAttribute('aria-label', `Status: ${statusValue}. ${statusDescription}`);
           const score = document.createElement('span'); score.className = 'score-pill';
-          if (Number.isFinite(albumReview?.highest_confidence)) score.textContent = `${Math.round(albumReview.highest_confidence * 100)}% best match`;
-          else { score.textContent = 'No match score'; score.hidden = true; }
+          const scorePresentation = matchScorePresentation(albumReview?.highest_confidence);
+          if (scorePresentation) {
+            score.textContent = scorePresentation.label;
+            score.dataset.band = scorePresentation.band;
+            score.setAttribute('aria-label', scorePresentation.accessibleLabel);
+          } else { score.textContent = 'No match score'; score.hidden = true; }
           album.append(label, tracks, status, score);
-          album.setAttribute('aria-label', `Review album ${albumGroup.album} by ${group.artist}`);
+          album.setAttribute('aria-label', `Review album ${albumGroup.album} by ${group.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
           if (albumReview) album.addEventListener('click', () => openReview(albumReview, album));
           else album.disabled = true;
           albums.append(album);

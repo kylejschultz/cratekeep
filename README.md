@@ -96,6 +96,22 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
 - `POST /api/navidrome/rescan` — request a scan from the configured endpoint
 
+### Library import inventory statuses
+
+The dense Library import inventory reports existing workflow state; it does not trigger imports or add state transitions:
+
+| Status | Meaning |
+|---|---|
+| `matched` | A metadata candidate is available for review. |
+| `approved` | The selected metadata candidate was approved. |
+| `needs review` | Candidate matching failed or needs attention. |
+| `imported` | Every track in the album is already tracked in the library. |
+| `pending` | Candidate matching has not completed. |
+| `rejected` | The proposed metadata candidate was rejected. |
+| `skipped` | The album was skipped during review. |
+
+Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only the initial indicator cutoff for a future auto-import workflow; Cratekeep does not automatically import albums.
+
 ## Tests
 
 ```sh

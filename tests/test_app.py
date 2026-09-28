@@ -1,7 +1,11 @@
+import json
+import shutil
 import sqlite3
+import subprocess
 import urllib.error
 from pathlib import Path
 
+import pytest
 from beets.library import Item, Library
 
 from beets_mvp import _format_bytes, _group_library_import_review_items, create_app
@@ -356,6 +360,74 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
     assert b'.comparison-grid { grid-template-columns:1fr;' in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_library_inventory_score_bands_and_status_semantics(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    start = html.index("function albumInventoryStatus")
+    end = html.index("function renderReviewItems", start)
+    helpers = html[start:end]
+    probe = """
+const result = {
+  scores: [0.7499, 0.75, 0.8999, 0.90].map(matchScorePresentation),
+  statuses: [
+    albumInventoryStatus({decision: 'approved'}, []),
+    albumInventoryStatus(null, [{status: 'tracked'}]),
+    albumInventoryStatus({decision: 'pending', candidate_status: 'complete', candidates: [{}]}, []),
+    albumInventoryStatus({decision: 'pending', candidate_status: 'error', candidates: []}, []),
+    albumInventoryStatus({decision: 'pending', candidate_status: 'not-run', candidates: []}, []),
+  ],
+};
+console.log(JSON.stringify(result));
+"""
+    completed = subprocess.run(
+        [shutil.which("node"), "--input-type=module", "--eval", helpers + probe],
+        check=True, capture_output=True, text=True,
+    )
+    result = json.loads(completed.stdout)
+
+    assert [(score["label"], score["band"]) for score in result["scores"]] == [
+        ("74.9%", "low"), ("75%", "medium"), ("89.9%", "medium"), ("90%", "high"),
+    ]
+    assert result["scores"][3]["accessibleLabel"].endswith("initial auto-import indicator threshold")
+    assert result["statuses"] == ["approved", "imported", "matched", "needs review", "pending"]
+
+
+def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styles(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+
+    assert "% best match" not in html
+    assert "score.dataset.band = scorePresentation.band" in html
+    assert "score.setAttribute('aria-label', scorePresentation.accessibleLabel)" in html
+    assert "status.setAttribute('aria-label', `Status: ${statusValue}. ${statusDescription}`)" in html
+    assert "${scorePresentation.accessibleLabel}" in html
+    for status in ("matched", "approved", "needs review", "imported", "pending"):
+        assert f"{status}:" in html or f"'{status}':" in html
+
+    palette = {
+        "low": ("#fff", "#b42318"),
+        "medium": ("#342100", "#fdb022"),
+        "high": ("#fff", "#067647"),
+    }
+    for band, (foreground, background) in palette.items():
+        assert f'.score-pill[data-band="{band}"]' in html
+        assert f"color:{foreground}; background:{background};" in html
+        assert _contrast_ratio(foreground, background) >= 4.5
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    def luminance(value: str) -> float:
+        digits = value.removeprefix("#")
+        if len(digits) == 3:
+            digits = "".join(character * 2 for character in digits)
+        channels = [int(digits[offset:offset + 2], 16) / 255 for offset in (0, 2, 4)]
+        linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+                  for channel in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    lighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
 
 
 def test_library_inventory_preview_is_bounded_non_mutating_and_persisted(tmp_path):
@@ -1010,7 +1082,8 @@ def test_inventory_rows_render_status_score_and_artist_album_expansion(tmp_path)
     assert b"const albums = document.createElement('div'); albums.className = 'review-albums';" in html
     assert b"artist.append(albums);" in html
     assert b"status.className = 'status-pill'" in html
-    assert b"albumReview.highest_confidence * 100" in html
+    assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
+    assert b"score.dataset.band = scorePresentation.band" in html
     assert b"of ${reviewTotalArtists} artists" in html
     assert b"Previous artists" in html and b"Next artists" in html
 
