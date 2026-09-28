@@ -123,25 +123,23 @@
     .check-label { display:flex; align-items:flex-start; gap:.55rem; font-weight:500; }
     .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
     .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
-    .review-list { display:grid; gap:.65rem; margin-top:.75rem; }
+    .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; }
     .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
     .review-pagination button { margin:0; }
-    .review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }
-    .review-album { display:flex; width:calc(100% - 1.5rem); margin:.5rem .75rem .75rem; padding:.7rem .85rem; align-items:center; justify-content:space-between; gap:.75rem; color:var(--text); text-align:left; }
-    .review-group-summary { cursor:pointer; padding:.7rem .85rem; font-weight:700; }
-    .review-album > .review-group-summary { font-size:.9rem; font-weight:650; }
+    .review-artist { border-bottom:1px solid var(--border); background:transparent; }
+    .review-artist:last-child { border-bottom:0; }
+    .review-group-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; cursor:pointer; padding:.52rem .7rem; font-weight:700; }
     .review-group-count { margin-left:.4rem; color:var(--muted); font-size:.8rem; font-weight:500; }
-    .review-songs { display:grid; gap:.35rem; padding:0 .65rem .65rem; }
-    .album-review-controls { display:flex; align-items:center; flex-wrap:wrap; gap:.45rem; padding:0 .65rem .65rem; color:var(--muted); font-size:.82rem; }
-    .album-review-controls button { margin:0; padding:.35rem .55rem; }
-    .review-item { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; width:100%; margin:0; padding:.55rem .65rem; color:var(--text); border:1px solid var(--border); border-radius:.3rem; background:transparent; text-align:left; }
-    .review-item:hover { color:var(--text); border-color:var(--accent); background:transparent; }
-    .review-item-path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .review-item-status,.review-item-decision { color:var(--muted); font-size:.82rem; }
-    .review-detail { display:grid; gap:.75rem; margin:0; }
-    .review-detail div { padding:.65rem; border:1px solid var(--modal-border); border-radius:.3rem; background:var(--modal-panel); }
-    .review-detail dt { color:var(--muted); font-size:.8rem; font-weight:650; }
-    .review-detail dd { margin:.15rem 0 0; overflow-wrap:anywhere; }
+    .review-albums { border-top:1px solid var(--border); background:var(--page); }
+    .review-album { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.55rem; align-items:center; width:100%; margin:0; padding:.42rem .7rem .42rem 1.7rem; color:var(--text); border:0; border-bottom:1px solid var(--border); border-radius:0; background:transparent; text-align:left; }
+    .review-album:last-child { border-bottom:0; }
+    .review-album:hover { color:var(--text); background:var(--active); }
+    .review-album-name { overflow:hidden; font-size:.88rem; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
+    .review-track-count { color:var(--muted); font-size:.76rem; }
+    .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
+    .status-pill[data-status="matched"],.status-pill[data-status="approved"],.status-pill[data-status="imported"] { border-color:#78a68a; background:var(--success); }
+    .status-pill[data-status="needs review"],.status-pill[data-status="rejected"] { border-color:#c47b82; background:var(--error); }
+    .score-pill { color:var(--modal-accent-hover); background:var(--modal-subtle); }
     .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
     .album-modal-dialog { width:min(920px,100%); }
     .album-modal-dialog .browser-header { padding:.8rem 1rem; }
@@ -149,9 +147,14 @@
     .album-modal-section { margin-bottom:.7rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .album-modal-section h3 { margin:0 0 .45rem; font-size:.88rem; }
     .match-summary { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.25rem .75rem; align-items:start; }
+    .match-summary.has-artwork { grid-template-columns:4.25rem minmax(0,1fr) auto; }
+    .match-artwork { grid-row:1 / span 3; width:4.25rem; height:4.25rem; object-fit:cover; border:1px solid var(--modal-border); border-radius:.3rem; }
+    .match-copy { min-width:0; }
     .match-summary-name { font-size:1rem; font-weight:750; line-height:1.3; }
     .match-summary-meta { color:var(--muted); font-size:.78rem; overflow-wrap:anywhere; }
     .confidence-badge { grid-column:2; grid-row:1 / span 2; padding:.25rem .5rem; border-radius:999px; color:var(--modal-accent-hover); background:var(--modal-subtle); font-size:.78rem; font-weight:750; white-space:nowrap; }
+    .has-artwork .confidence-badge { grid-column:3; }
+    .identity-pill { margin-top:.3rem; color:var(--modal-accent-hover); background:var(--modal-subtle); }
     .match-reasons { display:flex; flex-wrap:wrap; gap:.3rem; margin:.55rem 0 0; padding:0; list-style:none; }
     .match-reasons li { padding:.18rem .4rem; border-radius:999px; color:var(--muted); background:var(--modal-subtle); font-size:.72rem; }
     .alternatives-section { background:var(--modal-subtle); }
@@ -166,6 +169,7 @@
     .metadata-diff,.track-match-table { width:100%; border-collapse:collapse; font-size:.85rem; }
     .metadata-diff th,.metadata-diff td,.track-match-table th,.track-match-table td { padding:.4rem; border-bottom:1px solid var(--modal-border); text-align:left; }
     .metadata-diff tbody tr:last-child td,.track-match-table tbody tr:last-child td { border-bottom:0; }
+    .diff-changed { background:color-mix(in srgb, #d6a24a 13%, transparent); }
     .match-status { font-weight:650; text-transform:capitalize; }
     .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .override-form label { margin:0; font-size:.86rem; }
@@ -196,8 +200,13 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
-      .match-summary { grid-template-columns:minmax(0,1fr); }
+      .review-album { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
+      .review-track-count { display:none; }
+      .match-summary,.match-summary.has-artwork { grid-template-columns:minmax(0,1fr); }
+      .match-summary.has-artwork { grid-template-columns:3.5rem minmax(0,1fr); }
+      .match-artwork { width:3.5rem; height:3.5rem; }
       .confidence-badge { grid-column:1; grid-row:auto; justify-self:start; }
+      .has-artwork .confidence-badge { grid-column:2; }
       .review-footer { align-items:stretch; flex-direction:column-reverse; }
       .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
       .review-footer button { width:100%; }
@@ -280,9 +289,9 @@
       <p id="library-import-review-status" role="status">Run an inventory preview to create review items.</p>
       <div id="library-import-review-list" class="review-list"></div>
       <nav class="review-pagination" aria-label="Library import review pages">
-        <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous albums</button>
+        <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous artists</button>
         <span id="library-import-review-page" aria-live="polite"></span>
-        <button id="library-import-review-next" class="secondary" type="button" disabled>Next albums</button>
+        <button id="library-import-review-next" class="secondary" type="button" disabled>Next artists</button>
       </nav>
     </section>
     </div>
@@ -325,7 +334,7 @@
       <div class="browser-body">
         <p id="library-import-modal-description" class="visually-hidden">Review and choose one metadata match for this album. This decision does not change music files.</p>
         <section class="album-modal-section" aria-labelledby="proposed-match-title">
-          <h3 id="proposed-match-title">Proposed MusicBrainz match</h3>
+          <h3 id="proposed-match-title">Selected candidate</h3>
           <div id="library-import-modal-proposed" class="match-summary"></div>
           <ul id="library-import-modal-reasons" class="match-reasons" aria-label="Match confidence reasons"></ul>
         </section>
@@ -562,8 +571,8 @@
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
     let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null;
-    const reviewAlbumLimit = 25;
-    let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalAlbums = 0;
+    const reviewArtistLimit = 25;
+    let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalArtists = 0, reviewPageArtistCount = 0;
 
     function renderInventoryPreview(data) {
       inventorySummary.replaceChildren(...[
@@ -583,8 +592,8 @@
       try {
         sessionStorage.setItem(inventoryStorageKey, JSON.stringify({
           preview: latestInventoryPreview,
-          reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore,
-                    offset: reviewOffset, total_albums: reviewTotalAlbums},
+          reviews: {items: reviewItems, groups: reviewGroups, albums: albumReviews, has_more: reviewHasMore,
+                    offset: reviewOffset, total_artists: reviewTotalArtists, artist_count: reviewPageArtistCount},
         }));
       } catch (error) {
         // Storage can be unavailable in privacy-restricted browser contexts.
@@ -600,9 +609,11 @@
         if (Array.isArray(stored.reviews?.items) && Array.isArray(stored.reviews?.groups)) {
           reviewItems = stored.reviews.items;
           reviewGroups = stored.reviews.groups;
+          albumReviews = Array.isArray(stored.reviews.albums) ? stored.reviews.albums : [];
           reviewHasMore = Boolean(stored.reviews.has_more);
           reviewOffset = Number.isInteger(stored.reviews.offset) ? stored.reviews.offset : 0;
-          reviewTotalAlbums = Number.isInteger(stored.reviews.total_albums) ? stored.reviews.total_albums : 0;
+          reviewTotalArtists = Number.isInteger(stored.reviews.total_artists) ? stored.reviews.total_artists : 0;
+          reviewPageArtistCount = Number.isInteger(stored.reviews.artist_count) ? stored.reviews.artist_count : reviewGroups.length;
           renderReviewItems();
         }
         return true;
@@ -611,15 +622,24 @@
       }
     }
 
-    function reviewSummary(label, count) {
+    function reviewSummary(label, albumCount, trackCount) {
       const summary = document.createElement('summary');
       summary.className = 'review-group-summary';
-      summary.append(document.createTextNode(label));
-      const total = document.createElement('span');
-      total.className = 'review-group-count';
-      total.textContent = `${count} ${count === 1 ? 'song' : 'songs'}`;
-      summary.append(total);
+      const name = document.createElement('span'); name.textContent = label;
+      const albums = document.createElement('span'); albums.className = 'review-group-count';
+      albums.textContent = `${albumCount} ${albumCount === 1 ? 'album' : 'albums'}`;
+      const tracks = document.createElement('span'); tracks.className = 'review-group-count';
+      tracks.textContent = `${trackCount} ${trackCount === 1 ? 'track' : 'tracks'}`;
+      summary.append(name, albums, tracks);
       return summary;
+    }
+
+    function albumInventoryStatus(albumReview, songs) {
+      if (albumReview?.decision && albumReview.decision !== 'pending') return albumReview.decision;
+      if (songs.length && songs.every(song => song.status === 'tracked')) return 'imported';
+      if (albumReview?.candidate_status === 'complete' && albumReview.candidates.length) return 'matched';
+      if (albumReview?.candidate_status === 'error') return 'needs review';
+      return 'pending';
     }
 
     function renderReviewItems() {
@@ -629,30 +649,37 @@
         const artist = document.createElement('details');
         artist.className = 'review-artist';
         const artistCount = group.albums.reduce((total, album) => total + album.songs.length, 0);
-        artist.open = groups.length === 1 && artistCount <= 12;
-        artist.append(reviewSummary(group.artist, artistCount));
+        artist.open = groups.length === 1;
+        artist.append(reviewSummary(group.artist, group.albums.length, artistCount));
+        const albums = document.createElement('div'); albums.className = 'review-albums';
         group.albums.forEach(albumGroup => {
           const album = document.createElement('button');
           album.type = 'button';
           album.className = 'review-album';
           const albumReview = albumReviews.find(review => review.artist === group.artist && review.album === albumGroup.album);
-          const label = document.createElement('span'); label.textContent = albumGroup.album;
-          const status = document.createElement('span'); status.className = 'review-item-decision';
-          status.textContent = `${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'song' : 'songs'} · ${albumReview?.decision || 'pending'}`;
-          album.append(label, status);
+          const label = document.createElement('span'); label.className = 'review-album-name'; label.textContent = albumGroup.album;
+          const tracks = document.createElement('span'); tracks.className = 'review-track-count';
+          tracks.textContent = `${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'track' : 'tracks'}`;
+          const statusValue = albumInventoryStatus(albumReview, albumGroup.songs);
+          const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
+          const score = document.createElement('span'); score.className = 'score-pill';
+          if (Number.isFinite(albumReview?.highest_confidence)) score.textContent = `${Math.round(albumReview.highest_confidence * 100)}% best match`;
+          else { score.textContent = 'No match score'; score.hidden = true; }
+          album.append(label, tracks, status, score);
           album.setAttribute('aria-label', `Review album ${albumGroup.album} by ${group.artist}`);
           if (albumReview) album.addEventListener('click', () => openReview(albumReview, album));
           else album.disabled = true;
-          artist.append(album);
+          albums.append(album);
         });
+        artist.append(albums);
         return artist;
       }));
       reviewStatus.textContent = reviewItems.length
-        ? `${reviewItems.length} review items in ${albumReviews.length} complete ${albumReviews.length === 1 ? 'album' : 'albums'}.`
+        ? `${reviewGroups.length} ${reviewGroups.length === 1 ? 'artist' : 'artists'}, ${albumReviews.length} albums, ${reviewItems.length} tracks on this page.`
         : 'No current inventory review items.';
-      const pageStart = reviewTotalAlbums ? reviewOffset + 1 : 0;
-      const pageEnd = Math.min(reviewOffset + albumReviews.length, reviewTotalAlbums);
-      reviewPage.textContent = `${pageStart}–${pageEnd} of ${reviewTotalAlbums} albums`;
+      const pageStart = reviewTotalArtists ? reviewOffset + 1 : 0;
+      const pageEnd = Math.min(reviewOffset + reviewPageArtistCount, reviewTotalArtists);
+      reviewPage.textContent = `${pageStart}–${pageEnd} of ${reviewTotalArtists} artists`;
       reviewPrevious.disabled = reviewOffset === 0;
       reviewNext.disabled = !reviewHasMore;
     }
@@ -661,7 +688,7 @@
       if (!reviewList) return;
       try {
         reviewPrevious.disabled = true; reviewNext.disabled = true;
-        const response = await fetch(`/api/library-import/reviews?limit=${reviewAlbumLimit}&offset=${offset}`);
+        const response = await fetch(`/api/library-import/reviews?limit=${reviewArtistLimit}&offset=${offset}`);
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
         reviewItems = data.items;
@@ -669,7 +696,8 @@
         albumReviews = data.albums || [];
         reviewHasMore = Boolean(data.has_more);
         reviewOffset = data.offset;
-        reviewTotalAlbums = data.total_albums;
+        reviewTotalArtists = data.total_artists;
+        reviewPageArtistCount = data.artist_count;
         renderReviewItems();
         persistInventoryPreview();
       } catch (error) {
@@ -677,18 +705,26 @@
       }
     }
 
-    reviewPrevious.addEventListener('click', () => loadReviewItems(Math.max(0, reviewOffset - reviewAlbumLimit)));
-    reviewNext.addEventListener('click', () => { if (reviewHasMore) loadReviewItems(reviewOffset + albumReviews.length); });
+    reviewPrevious.addEventListener('click', () => loadReviewItems(Math.max(0, reviewOffset - reviewArtistLimit)));
+    reviewNext.addEventListener('click', () => { if (reviewHasMore) loadReviewItems(reviewOffset + reviewPageArtistCount); });
 
     function renderAlbumMatch() {
       const candidate = activeAlbum?.candidates.find(value => value.id === activeCandidateId) || activeAlbum?.proposed_match || null;
       const proposed = document.getElementById('library-import-modal-proposed');
       proposed.replaceChildren();
+      proposed.classList.toggle('has-artwork', Boolean(candidate?.artwork_url));
       if (candidate) {
+        if (candidate.artwork_url) {
+          const artwork = document.createElement('img'); artwork.className = 'match-artwork';
+          artwork.src = candidate.artwork_url; artwork.alt = `Cover art for ${candidate.album}`;
+          proposed.append(artwork);
+        }
+        const copy = document.createElement('div'); copy.className = 'match-copy';
         const name = document.createElement('div'); name.className = 'match-summary-name'; name.textContent = `${candidate.artist} — ${candidate.album}`;
         const metadata = document.createElement('div'); metadata.className = 'match-summary-meta'; metadata.textContent = `${candidate.date || candidate.year ? `${candidate.date || candidate.year} · ` : ''}MusicBrainz release ${candidate.provider_id}${candidate.release_group_id ? ` · group ${candidate.release_group_id}` : ''}`;
+        const identity = document.createElement('span'); identity.className = 'identity-pill'; identity.textContent = candidate.id === activeCandidateId ? 'Selected candidate' : 'Proposed candidate';
         const confidence = document.createElement('span'); confidence.className = 'confidence-badge'; confidence.textContent = `${Math.round(candidate.confidence * 100)}% · ${candidate.recommendation} recommendation`;
-        proposed.append(name, metadata, confidence);
+        copy.append(name, metadata, identity); proposed.append(copy, confidence);
       } else {
         proposed.textContent = activeAlbum?.candidate_error || 'No MusicBrainz match proposed.';
       }
@@ -697,10 +733,10 @@
         const item = document.createElement('li'); item.textContent = reason; return item;
       }));
       const candidates = document.getElementById('library-import-modal-candidates');
-      candidates.replaceChildren(...(activeAlbum?.candidates || []).map(value => {
+      candidates.replaceChildren(...(activeAlbum?.candidates || []).map((value, index) => {
         const button = document.createElement('button'); button.type = 'button'; button.className = 'candidate-option';
         button.setAttribute('aria-pressed', String(value.id === candidate?.id));
-        const name = document.createElement('span'); name.textContent = `${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
+        const name = document.createElement('span'); name.textContent = `${value.id === candidate?.id ? 'Selected' : `Option ${index + 1}`} · ${value.artist} — ${value.album}${value.year ? ` (${value.year})` : ''}`;
         const confidence = document.createElement('span'); confidence.className = 'candidate-confidence'; confidence.textContent = `${Math.round(value.confidence * 100)}% · ${value.recommendation}`;
         button.append(name, confidence);
         button.addEventListener('click', () => { activeCandidateId = value.id; renderAlbumMatch(); });
@@ -711,6 +747,7 @@
       const changes = Object.entries(candidate?.proposed_diff || {}).filter(([field]) => field !== 'tracks');
       diff.replaceChildren(...changes.map(([field, values]) => {
         const row = document.createElement('tr');
+        if (String(values.from ?? '') !== String(values.to ?? '')) row.className = 'diff-changed';
         [field.replace('_', ' '), values.from, values.to].forEach(value => { const cell = document.createElement('td'); cell.textContent = String(value); row.append(cell); });
         return row;
       }));
@@ -756,9 +793,12 @@
       reviewModal.querySelectorAll('[data-review-decision]').forEach(button => button.addEventListener('click', async () => {
         const message = document.getElementById('library-import-modal-message');
         try {
+          const decision = button.dataset.reviewDecision;
+          const payload = {decision};
+          if (decision === 'approved' && activeCandidateId !== null) payload.candidate_id = activeCandidateId;
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}`, {
             method: 'PATCH', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({decision: button.dataset.reviewDecision, candidate_id: activeCandidateId}),
+            body: JSON.stringify(payload),
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || data.description || 'Unable to save review decision.');

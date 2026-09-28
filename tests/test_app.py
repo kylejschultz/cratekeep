@@ -519,7 +519,7 @@ def test_library_import_review_groups_synthetic_artist_album_hierarchy(tmp_path)
     assert _group_library_import_review_items(payload["items"]) == payload["groups"]
 
 
-def test_library_import_review_paginates_complete_albums_beyond_one_hundred_items(tmp_path):
+def test_library_import_review_paginates_25_artists_and_keeps_complete_albums(tmp_path):
     app = make_app(tmp_path)
     root = tmp_path / "library"
     large_album = root / "000 Large Artist" / "Complete Album"
@@ -527,8 +527,8 @@ def test_library_import_review_paginates_complete_albums_beyond_one_hundred_item
         path = large_album / f"{number + 1:03d} Track.mp3"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"synthetic")
-    for number in range(101):
-        path = root / "Paged Artist" / f"Album {number:03d}" / "01 Track.mp3"
+    for number in range(26):
+        path = root / f"Artist {number:03d}" / "Only Album" / "01 Track.mp3"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"synthetic")
 
@@ -537,7 +537,8 @@ def test_library_import_review_paginates_complete_albums_beyond_one_hundred_item
 
     first = client.get("/api/library-import/reviews?limit=25&offset=0")
     assert first.status_code == 200
-    assert first.json["total_albums"] == 102
+    assert first.json["total_artists"] == 27
+    assert first.json["artist_count"] == 25
     assert first.json["album_count"] == 25
     assert first.json["has_more"] is True
     assert first.json["next_offset"] == 25
@@ -547,8 +548,9 @@ def test_library_import_review_paginates_complete_albums_beyond_one_hundred_item
     assert len(complete["tracks"]) == 125
     assert len(first.json["groups"][0]["albums"][0]["songs"]) == 125
 
-    last = client.get("/api/library-import/reviews?limit=25&offset=100")
+    last = client.get("/api/library-import/reviews?limit=25&offset=25")
     assert last.status_code == 200
+    assert last.json["artist_count"] == 2
     assert last.json["album_count"] == 2
     assert len(last.json["items"]) == 2
     assert last.json["has_more"] is False
@@ -972,7 +974,7 @@ def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tm
     assert b"document.createElement('details')" in html
     assert b"document.createElement('summary')" in html
     assert b"review-artist" in html and b"review-album" in html
-    assert b"groups.length === 1 && artistCount <= 12" in html
+    assert b"artist.open = groups.length === 1" in html
     assert b"reviewList.replaceChildren(...reviewItems.map" not in html
     assert b"reviews?limit=50" not in html
 
@@ -980,8 +982,8 @@ def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tm
 def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_contract(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b".review-artist,.review-album { border:1px solid var(--border); border-radius:.4rem; background:transparent; }" in html
-    assert b".review-album { display:flex; width:calc(100% - 1.5rem);" in html
+    assert b".review-list { overflow:hidden;" in html
+    assert b".review-album { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     assert b"const artist = document.createElement('details');" in html
     assert b"const album = document.createElement('button');" in html
@@ -1002,6 +1004,62 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     assert b"albumGroup.songs.forEach(item" not in html
 
 
+def test_inventory_rows_render_status_score_and_artist_album_expansion(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b"const albums = document.createElement('div'); albums.className = 'review-albums';" in html
+    assert b"artist.append(albums);" in html
+    assert b"status.className = 'status-pill'" in html
+    assert b"albumReview.highest_confidence * 100" in html
+    assert b"of ${reviewTotalArtists} artists" in html
+    assert b"Previous artists" in html and b"Next artists" in html
+
+
+def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_score(tmp_path):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [
+        {
+            "provider_id": "safe", "artist": "Artist", "album": "Album", "track_count": 1,
+            "tracks": [{"title": "Song", "position": 1}],
+            "artwork_url": "https://images.example.test/cover.jpg",
+        },
+        {
+            "provider_id": "unsafe", "artist": "Artist", "album": "Album", "track_count": 1,
+            "tracks": [{"title": "Different", "position": 1}], "image_url": "javascript:alert(1)",
+        },
+    ]
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert album["candidate_status"] == "complete"
+    assert album["highest_confidence"] == max(candidate["confidence"] for candidate in album["candidates"])
+    assert album["candidates"][0]["artwork_url"] == "https://images.example.test/cover.jpg"
+    assert album["candidates"][1]["artwork_url"] is None
+
+    html = client.get("/settings").data
+    assert b"if (candidate.artwork_url)" in html
+    assert b"artwork.src = candidate.artwork_url" in html
+    assert b"innerHTML" not in html
+
+
+def test_album_modal_actions_remain_workflow_only(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b"const payload = {decision};" in html
+    assert b"decision === 'approved' && activeCandidateId !== null" in html
+    assert b"method: 'PATCH'" in html
+    assert b"data-review-decision=\"skipped\"" in html
+    assert b"data-review-decision=\"rejected\"" in html
+    assert b"data-review-decision=\"approved\"" in html
+    assert b"beet import" not in html
+    assert b"/api/imports/" not in html
+
+
 def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
     app = make_app(tmp_path)
     app.config["BUILD_SHA"] = "build-one"
@@ -1013,8 +1071,8 @@ def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
     assert b"const inventoryStorageKey = 'cratekeep-inventory-preview:' + \"build-two\";" in second
     assert b"sessionStorage.setItem(inventoryStorageKey, JSON.stringify({" in first
     assert b"preview: latestInventoryPreview" in first
-    assert b"reviews: {items: reviewItems, groups: reviewGroups, has_more: reviewHasMore," in first
-    assert b"/api/library-import/reviews?limit=${reviewAlbumLimit}&offset=${offset}" in first
+    assert b"reviews: {items: reviewItems, groups: reviewGroups, albums: albumReviews, has_more: reviewHasMore," in first
+    assert b"/api/library-import/reviews?limit=${reviewArtistLimit}&offset=${offset}" in first
     assert b'id="library-import-review-previous"' in first
     assert b'id="library-import-review-next"' in first
     assert b"sessionStorage.getItem(inventoryStorageKey)" in first

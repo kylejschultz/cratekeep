@@ -87,7 +87,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `GET /api/browse?path=/userMedia` — list directories beneath the container's browse root
 - `GET /api/inbox` — list immediate import candidates
 - `GET /api/items` — list beets library metadata
-- `GET /api/library-import/reviews` — list persisted track groups and album review records
+- `GET /api/library-import/reviews` — list persisted track groups and album review records, paginated by artist (`limit`/`offset`, 25 artists by default)
 - `POST /api/library-import/candidates` — generate and persist bounded MusicBrainz release candidates
 - `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, and track exceptions
 - `POST /api/library-import/albums/<id>/rematch` — validate a MusicBrainz release UUID and rematch through the configured provider

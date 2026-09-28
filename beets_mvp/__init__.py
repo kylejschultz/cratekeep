@@ -26,7 +26,7 @@ EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "
 SETTING_KEYS = ("inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art")
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
-MAX_LIBRARY_IMPORT_ALBUMS = 50
+MAX_LIBRARY_IMPORT_ARTISTS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
@@ -142,16 +142,17 @@ def create_app(test_config: dict | None = None) -> Flask:
             offset = int(request.args.get("offset", "0"))
         except ValueError:
             return jsonify(error="limit and offset must be integers"), 400
-        if not 1 <= limit <= MAX_LIBRARY_IMPORT_ALBUMS:
-            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_ALBUMS}"), 400
+        if not 1 <= limit <= MAX_LIBRARY_IMPORT_ARTISTS:
+            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_ARTISTS}"), 400
         if offset < 0:
             return jsonify(error="offset must be zero or greater"), 400
-        album_ids, has_more, total_albums = _library_import_review_album_page(app, limit, offset)
+        album_ids, artist_count, has_more, total_artists = _library_import_review_artist_page(app, limit, offset)
         items = _library_import_review_items(app, album_ids)
         return jsonify(items=items, groups=_group_library_import_review_items(items),
                        albums=_album_review_payloads(app, album_ids), limit=limit, offset=offset,
-                       album_count=len(album_ids), total_albums=total_albums, has_more=has_more,
-                       next_offset=(offset + len(album_ids)) if has_more else None)
+                       artist_count=artist_count, total_artists=total_artists,
+                       album_count=len(album_ids), has_more=has_more,
+                       next_offset=(offset + artist_count) if has_more else None)
 
     @app.post("/api/library-import/candidates")
     def generate_library_import_candidates():
@@ -750,24 +751,36 @@ def _latest_inventory_summary(app: Flask) -> dict | None:
     return json.loads(row["summary_json"]) if row else None
 
 
-def _library_import_review_album_page(app: Flask, limit: int, offset: int) -> tuple[list[int], bool, int]:
+def _library_import_review_artist_page(app: Flask, limit: int, offset: int) -> tuple[list[int], int, bool, int]:
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
     with _connect(app.config["APP_DB"]) as db:
-        rows = db.execute(
-            """SELECT albums.id FROM album_reviews AS albums
+        artists = db.execute(
+            """SELECT albums.artist_key FROM album_reviews AS albums
                 WHERE albums.root_path = ?
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
-                ORDER BY albums.artist_key, albums.album_key, albums.id
+                GROUP BY albums.artist_key
+                ORDER BY albums.artist_key
                 LIMIT ? OFFSET ?""",
             (root, limit + 1, offset),
         ).fetchall()
         total = db.execute(
-            """SELECT COUNT(*) FROM album_reviews AS albums
+            """SELECT COUNT(DISTINCT albums.artist_key) FROM album_reviews AS albums
                 WHERE albums.root_path = ?
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)""",
             (root,),
         ).fetchone()[0]
-    return [row["id"] for row in rows[:limit]], len(rows) > limit, total
+        page_artist_keys = [row["artist_key"] for row in artists[:limit]]
+        if not page_artist_keys:
+            return [], 0, False, total
+        placeholders = ", ".join("?" for _ in page_artist_keys)
+        albums = db.execute(
+            f"""SELECT albums.id FROM album_reviews AS albums
+                 WHERE albums.root_path = ? AND albums.artist_key IN ({placeholders})
+                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                 ORDER BY albums.artist_key, albums.album_key, albums.id""",
+            (root, *page_artist_keys),
+        ).fetchall()
+    return [row["id"] for row in albums], len(page_artist_keys), len(artists) > limit, total
 
 
 def _library_import_review_items(app: Flask, album_ids: list[int]) -> list[dict]:
@@ -1101,6 +1114,24 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
     return result
 
 
+def _persisted_artwork_source(provider_data: dict) -> str | None:
+    """Expose only an already-persisted, browser-renderable artwork source."""
+    values = [provider_data.get(key) for key in ("artwork_url", "image_url", "cover_url")]
+    cover_art = provider_data.get("cover_art")
+    if isinstance(cover_art, dict):
+        values.extend(cover_art.get(key) for key in ("url", "image", "data"))
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        source = value.strip()
+        lowered = source.lower()
+        if lowered.startswith(("https://", "http://")) or lowered.startswith(
+            ("data:image/png;", "data:image/jpeg;", "data:image/gif;", "data:image/webp;", "data:image/avif;")
+        ):
+            return source
+    return None
+
+
 def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> list[dict]:
     if album_ids == []:
         return []
@@ -1146,6 +1177,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "selected_by_mbid": match["selected_by_mbid"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
+                    "artwork_url": _persisted_artwork_source(provider_data),
                     "media": provider_data.get("media", []), "recordings": provider_data.get("tracks", []),
                     "retrieval": provider_data.get("retrieval", {}),
                     "proposed_diff": json.loads(candidate["proposed_diff_json"]),
@@ -1155,9 +1187,11 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
             proposed_match = next((candidate for candidate in serialized_candidates if candidate["id"] == selected_id), None)
             if proposed_match is None and serialized_candidates:
                 proposed_match = serialized_candidates[0]
+            highest_confidence = max((candidate["confidence"] for candidate in serialized_candidates), default=None)
             payloads.append({
                 "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
                 "selected_candidate_id": selected_id, "proposed_match": proposed_match,
+                "highest_confidence": highest_confidence,
                 "candidate_status": row["candidate_status"],
                 "candidate_error": row["candidate_error"],
                 "tracks": [{"id": track["id"], "path": track["relative_path"],
