@@ -811,6 +811,28 @@ def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tm
     assert [track["title"] for track in album["tracks"]] == ["First", "Second"]
 
 
+def test_album_track_comparison_carries_current_track_duration(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    library.add(Item(title="Song", artist="Artist", album="Album", path=str(path), length=187.25))
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": "Artist", "album": "Album",
+        "tracks": [{"title": "Song", "position": 1, "duration": 190}],
+    }]
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+
+    assert album["tracks"][0]["duration"] == pytest.approx(187.25)
+    assert album["candidates"][0]["track_details"][0]["local_duration"] == pytest.approx(187.25)
+    assert album["candidates"][0]["track_details"][0]["proposed_duration"] == 190
+
+
 def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
     calls = []
     app = make_app(tmp_path)
@@ -1177,10 +1199,20 @@ def test_album_modal_shows_readable_musicbrainz_ids_and_on_demand_track_delta(tm
     assert b"['Release ID', shortMusicBrainzId(value.provider_id), value.provider_id]" in html
     assert b"['Release group ID', shortMusicBrainzId(value.release_group_id), value.release_group_id]" in html
     assert b"id.title = fullValue" in html and b"id.setAttribute('aria-label', fullValue)" in html
-    assert b"button.className = 'track-delta-button'" in html
-    assert b"if (opening && !panel.hasChildNodes())" in html
+    assert b"disclosure.className = 'track-delta-disclosure'" in html
+    assert b"summary.className = 'track-delta-summary'" in html
+    assert b"Changed details" in html
+    assert b"if (disclosure.open && !panel.hasChildNodes())" in html
     assert b"['Track', 'Current title', 'Proposed title', 'Current position', 'Proposed position', 'Current duration', 'Proposed duration']" in html
     assert b"row.dataset.changed = String(changed)" in html
+
+
+def test_album_modal_candidate_rows_show_numeric_score_and_use_current_duration_fallback(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b"const scorePresentation = matchScorePresentation(value.confidence)" in html
+    assert b"${selected ? 'Selected \xc2\xb7 ' : ''}${scorePresentation?.label" in html
+    assert b"local_duration:Number.isFinite(track.local_duration) ? track.local_duration : current?.duration" in html
 
 
 def test_library_import_operations_expose_visible_live_progress(tmp_path):

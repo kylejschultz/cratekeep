@@ -185,8 +185,12 @@
     .candidate-facts dt { color:var(--muted); font-size:.68rem; font-weight:700; letter-spacing:.03em; text-transform:uppercase; }
     .candidate-facts dd { margin:.08rem 0 0; font-size:.78rem; overflow-wrap:anywhere; }
     .candidate-id { font:inherit; }
-    .track-delta-button { width:auto; margin:0; padding:0; border:0; color:var(--modal-accent); background:transparent; font:inherit; font-weight:700; text-decoration:underline; text-underline-offset:.15em; }
-    .track-delta-panel { grid-column:1 / -1; overflow-x:auto; }
+    .track-delta-disclosure { grid-column:1 / -1; border-top:1px solid var(--modal-border); }
+    .track-delta-summary { width:max-content; max-width:100%; margin:.1rem 0 0; padding:.25rem .45rem; border:1px solid var(--modal-border); border-radius:999px; color:var(--modal-accent); background:var(--modal-subtle); cursor:pointer; font-size:.74rem; font-weight:700; list-style:none; }
+    .track-delta-summary::-webkit-details-marker { display:none; }
+    .track-delta-summary::before { content:'\25b8'; display:inline-block; margin-right:.35rem; }
+    .track-delta-disclosure[open] .track-delta-summary::before { transform:rotate(90deg); }
+    .track-delta-panel { overflow-x:auto; margin-top:.45rem; }
     .track-delta-table { width:100%; border-collapse:collapse; font-size:.74rem; }
     .track-delta-table th,.track-delta-table td { padding:.35rem .45rem; border-top:1px solid var(--modal-border); text-align:left; vertical-align:top; }
     .track-delta-table th { color:var(--muted); font-size:.67rem; letter-spacing:.03em; text-transform:uppercase; }
@@ -809,7 +813,7 @@
         const details = Array.isArray(value.track_details) ? value.track_details : [];
         const durationPairs = details.filter(track => Number.isFinite(track.local_duration) && Number.isFinite(track.proposed_duration));
         const durationDelta = durationPairs.reduce((total, track) => total + Math.abs(track.proposed_duration - track.local_duration), 0);
-        const changedTracks = details.filter(track => track.status !== 'matched' || track.local !== track.proposed).length;
+        const changedTracks = comparisonTrackDetails(value).filter(trackHasChanges).length;
         const media = Array.isArray(value.media) ? value.media : [];
         const formats = [...new Set(media.map(medium => medium?.format).filter(Boolean))];
         const discCount = media.length || new Set((value.recordings || []).map(track => track?.medium_position || track?.disc || 1)).size || 1;
@@ -834,15 +838,29 @@
           proposed_position:[track.disc || 1, track.position || index + 1], status:'matched', issues:[],
         }));
       }
-      function appendTrackDeltaControl(dd, value, description) {
-        const button = document.createElement('button'); button.type = 'button'; button.className = 'track-delta-button';
-        button.textContent = description; button.setAttribute('aria-expanded', 'false');
+      function comparisonTrackDetails(value) {
+        const currentTracks = activeAlbum?.tracks || [];
+        return candidateTrackDetails(value).map((track, index) => {
+          const current = currentTracks[Number.isInteger(track.position) ? track.position - 1 : index] || currentTracks[index];
+          return {...track, local_duration:Number.isFinite(track.local_duration) ? track.local_duration : current?.duration};
+        });
+      }
+      function trackHasChanges(track) {
+        return track.status !== 'matched' || track.local !== track.proposed
+          || (Number.isFinite(track.local_duration) && Number.isFinite(track.proposed_duration) && track.local_duration !== track.proposed_duration)
+          || JSON.stringify(track.current_position || null) !== JSON.stringify(track.proposed_position || null);
+      }
+      function appendTrackDeltaDisclosure(body, value, changedTracks) {
+        const disclosure = document.createElement('details'); disclosure.className = 'track-delta-disclosure';
+        const summary = document.createElement('summary'); summary.className = 'track-delta-summary';
+        summary.textContent = changedTracks ? `Changed details · ${changedTracks} ${changedTracks === 1 ? 'track' : 'tracks'}` : 'Track details · No changes';
+        summary.setAttribute('aria-label', `${summary.textContent}. Expand track comparison.`);
         const panel = document.createElement('div'); panel.className = 'track-delta-panel'; panel.hidden = true;
         const panelId = `track-delta-${activeAlbum?.id || 'album'}-${value.id}`; panel.id = panelId;
-        button.setAttribute('aria-controls', panelId);
-        button.addEventListener('click', () => {
-          const opening = panel.hidden;
-          if (opening && !panel.hasChildNodes()) {
+        summary.setAttribute('aria-controls', panelId);
+        disclosure.addEventListener('toggle', () => {
+          panel.hidden = !disclosure.open;
+          if (disclosure.open && !panel.hasChildNodes()) {
             const table = document.createElement('table'); table.className = 'track-delta-table';
             const caption = document.createElement('caption'); caption.className = 'visually-hidden'; caption.textContent = 'Current and proposed track metadata';
             const head = document.createElement('thead'); const headRow = document.createElement('tr');
@@ -850,10 +868,8 @@
               const th = document.createElement('th'); th.scope = 'col'; th.textContent = label; headRow.append(th);
             });
             head.append(headRow); const rows = document.createElement('tbody');
-            candidateTrackDetails(value).forEach((track, index) => {
-              const changed = track.status !== 'matched' || track.local !== track.proposed
-                || (Number.isFinite(track.local_duration) && Number.isFinite(track.proposed_duration) && track.local_duration !== track.proposed_duration)
-                || JSON.stringify(track.current_position || null) !== JSON.stringify(track.proposed_position || null);
+            comparisonTrackDetails(value).forEach((track, index) => {
+              const changed = trackHasChanges(track);
               const row = document.createElement('tr'); row.dataset.changed = String(changed);
               const position = document.createElement('td'); position.textContent = String(track.position || index + 1);
               const currentValue = document.createElement('td'); currentValue.textContent = track.local || '—';
@@ -872,9 +888,8 @@
             });
             table.append(caption, head, rows); panel.append(table);
           }
-          panel.hidden = !opening; button.setAttribute('aria-expanded', String(opening));
         });
-        dd.append(button); return panel;
+        disclosure.append(summary, panel); body.append(disclosure);
       }
       candidates.replaceChildren(...options.map((value, index) => {
         const selected = value.id === activeCandidateId;
@@ -886,7 +901,8 @@
         const name = document.createElement('span'); name.className = 'candidate-name';
         name.textContent = value.is_as_is ? 'As Is — keep current metadata' : `${value.artist} — ${value.album}${value.date || value.year ? ` (${value.date || value.year})` : ''}`;
         const recommendation = document.createElement('span'); recommendation.className = 'candidate-confidence';
-        recommendation.textContent = value.is_as_is ? `${selected ? 'Selected · ' : ''}No MusicBrainz association` : `${selected ? 'Selected' : 'Alternative'} · ${value.recommendation} match`;
+        const scorePresentation = matchScorePresentation(value.confidence);
+        recommendation.textContent = value.is_as_is ? `${selected ? 'Selected · ' : ''}No MusicBrainz association` : `${selected ? 'Selected · ' : ''}${scorePresentation?.label || 'Score unavailable'} · ${value.recommendation} match`;
         summary.setAttribute('aria-label', `Option ${index + 1}: ${name.textContent}. ${recommendation.textContent}. ${selected ? 'Selected and expanded' : 'Expand and select'}.`);
         summary.append(marker, name, recommendation);
         summary.addEventListener('click', () => {
@@ -907,11 +923,11 @@
           artwork.src = value.artwork_url; artwork.alt = `Persisted cover art for ${value.album}`; body.append(artwork);
         }
         const facts = document.createElement('dl'); facts.className = 'candidate-facts';
-        let trackDeltaPanel = null;
+        let changedTracks = 0;
         candidateFacts(value).forEach(([term, description, fullValue]) => {
           const wrapper = document.createElement('div'); const dt = document.createElement('dt'); const dd = document.createElement('dd');
           dt.textContent = term;
-          if (term === 'Track delta') trackDeltaPanel = appendTrackDeltaControl(dd, value, description);
+          if (term === 'Track delta') { dd.textContent = description; changedTracks = Number.parseInt(description, 10) || 0; }
           else if (fullValue) {
             const id = document.createElement('code'); id.className = 'candidate-id'; id.textContent = description;
             id.title = fullValue; id.setAttribute('aria-label', fullValue); dd.append(id);
@@ -922,7 +938,7 @@
         note.textContent = value.is_as_is
           ? 'Queues the album with incoming metadata unchanged and without selecting a MusicBrainz release.'
           : `${value.recommendation} recommendation based on existing metadata and track evidence; selecting it only records this review choice.`;
-        body.append(facts); if (trackDeltaPanel) body.append(trackDeltaPanel); body.append(note); detail.append(summary, body);
+        body.append(facts); appendTrackDeltaDisclosure(body, value, changedTracks); body.append(note); detail.append(summary, body);
         return detail;
       }));
     }
