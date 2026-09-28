@@ -98,7 +98,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 
 ### Library import inventory statuses
 
-The dense Library import inventory reports existing workflow state; it does not trigger imports or add state transitions:
+The Library import inventory presents expandable source-folder rows, with artist and album metadata as supporting context. Expanding a row shows every discovered track path and opens the existing album-match review. Inventory, matching, rematching, and review operations show visible progress while requests are active. The inventory reports existing workflow state; it does not trigger imports or add state transitions:
 
 | Status | Meaning |
 |---|---|

@@ -421,6 +421,14 @@ def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styl
         assert f"color:{foreground}; background:{background};" in html
         assert _contrast_ratio(foreground, background) >= 4.5
 
+    status_palettes = [
+        ("#163d29", "#d9eee1"), ("#6d1620", "#f9dadd"),
+        ("#e9fff0", "#294337"), ("#fff0f1", "#5a3034"),
+    ]
+    for foreground, background in status_palettes:
+        assert f"color:{foreground}; background:{background};" in html
+        assert _contrast_ratio(foreground, background) >= 4.5
+
 
 def _contrast_ratio(first: str, second: str) -> float:
     def luminance(value: str) -> float:
@@ -1051,8 +1059,9 @@ def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tm
 
     assert b"document.createElement('details')" in html
     assert b"document.createElement('summary')" in html
-    assert b"review-artist" in html and b"review-album" in html
-    assert b"artist.open = groups.length === 1" in html
+    assert b"review-source" in html and b"review-album" in html
+    assert b"source.open = sourceRows.length === 1" in html
+    assert b"sourceFolderRows(albumGroup.songs)" in html
     assert b"reviewList.replaceChildren(...reviewItems.map" not in html
     assert b"reviews?limit=50" not in html
 
@@ -1061,9 +1070,10 @@ def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_co
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b".review-list { overflow:hidden;" in html
-    assert b".review-album { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
+    assert b".review-source-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto;" in html
+    assert b".review-source-body { display:grid; grid-template-columns:minmax(0,1fr) auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
-    assert b"const artist = document.createElement('details');" in html
+    assert b"const source = document.createElement('details');" in html
     assert b"const album = document.createElement('button');" in html
 
 
@@ -1082,16 +1092,34 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     assert b"albumGroup.songs.forEach(item" not in html
 
 
-def test_inventory_rows_render_status_score_and_artist_album_expansion(tmp_path):
+def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b"const albums = document.createElement('div'); albums.className = 'review-albums';" in html
-    assert b"artist.append(albums);" in html
+    assert b"source.className = 'review-source'" in html
+    assert b"path.className = 'review-source-path'" in html
+    assert b"metadata.className = 'review-source-metadata'" in html
+    assert b"metadata.textContent = `${group.artist} \xe2\x80\x94 ${albumGroup.album}" in html
+    assert b"track.textContent = `${item.title || 'Untitled track'} \xe2\x80\x94 ${item.path}`" in html
+    assert b"sourceFolderRows(albumGroup.songs)" in html
+    assert b"path.textContent = sourceFolder(songs)" in html
     assert b"status.className = 'status-pill'" in html
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html
     assert b"of ${reviewTotalArtists} artists" in html
     assert b"Previous artists" in html and b"Next artists" in html
+
+
+def test_library_import_operations_expose_visible_live_progress(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert html.count(b'class="operation-status"') >= 2
+    assert b'aria-live="polite"' in html
+    assert b'.operation-status[data-busy="true"]::before' in html
+    assert b"Scanning source folders, file names, and stats" in html
+    assert b"Requesting bounded MusicBrainz matches" in html
+    assert b"Rematching through the configured MusicBrainz provider" in html
+    assert b"Queueing this album for import" in html
+    assert b"setAttribute('aria-busy', String(busy))" in html
 
 
 def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_score(tmp_path):

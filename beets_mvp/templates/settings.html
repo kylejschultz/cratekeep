@@ -123,22 +123,35 @@
     .check-label { display:flex; align-items:flex-start; gap:.55rem; font-weight:500; }
     .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
     .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
-    .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; }
+    .import-actions { display:flex; flex-wrap:wrap; gap:.6rem; margin-top:1rem; }
+    .import-actions button { margin:0; }
+    .operation-status { min-height:1.5rem; margin:.65rem 0 0; color:var(--muted); }
+    .operation-status[data-busy="true"] { display:flex; align-items:center; gap:.5rem; color:var(--text); font-weight:650; }
+    .operation-status[data-busy="true"]::before { width:.75rem; height:.75rem; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; content:""; animation:operation-spin .7s linear infinite; }
+    @keyframes operation-spin { to { transform:rotate(360deg); } }
+    @media (prefers-reduced-motion:reduce) { .operation-status[data-busy="true"]::before { animation-duration:1.8s; } }
+    .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
     .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
     .review-pagination button { margin:0; }
-    .review-artist { border-bottom:1px solid var(--border); background:transparent; }
-    .review-artist:last-child { border-bottom:0; }
-    .review-group-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.75rem; align-items:center; cursor:pointer; padding:.52rem .7rem; font-weight:700; }
-    .review-group-count { margin-left:.4rem; color:var(--muted); font-size:.8rem; font-weight:500; }
-    .review-albums { border-top:1px solid var(--border); background:var(--page); }
-    .review-album { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.55rem; align-items:center; width:100%; margin:0; padding:.42rem .7rem .42rem 1.7rem; color:var(--text); border:0; border-bottom:1px solid var(--border); border-radius:0; background:transparent; text-align:left; }
-    .review-album:last-child { border-bottom:0; }
-    .review-album:hover { color:var(--text); background:var(--active); }
-    .review-album-name { overflow:hidden; font-size:.88rem; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
+    .review-source { border-bottom:1px solid var(--border); background:transparent; }
+    .review-source:last-child { border-bottom:0; }
+    .review-source-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.65rem; align-items:center; cursor:pointer; padding:.7rem .8rem; }
+    .review-source-summary:hover { background:var(--active); }
+    .review-source-copy { min-width:0; }
+    .review-source-path { display:block; overflow:hidden; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+    .review-source-metadata { display:block; margin-top:.12rem; overflow:hidden; color:var(--muted); font-size:.78rem; text-overflow:ellipsis; white-space:nowrap; }
+    .review-source-body { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.8rem; align-items:center; padding:.65rem .8rem .7rem 1.8rem; border-top:1px solid var(--border); background:var(--page); }
+    .review-track-list { min-width:0; margin:0; padding-left:1rem; color:var(--muted); font-size:.78rem; }
+    .review-track-list li { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .review-album { width:auto; min-width:7.5rem; margin:0; padding:.48rem .7rem; }
     .review-track-count { color:var(--muted); font-size:.76rem; }
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
-    .status-pill[data-status="Matched"],.status-pill[data-status="Queued"],.status-pill[data-status="Imported"] { border-color:#78a68a; background:var(--success); }
-    .status-pill[data-status="Needs attention"] { border-color:#c47b82; background:var(--error); }
+    .status-pill { color:#20252b; background:#f4f5f6; }
+    .status-pill[data-status="Matched"],.status-pill[data-status="Queued"],.status-pill[data-status="Imported"] { border-color:#397052; color:#163d29; background:#d9eee1; }
+    .status-pill[data-status="Needs attention"] { border-color:#9f3b45; color:#6d1620; background:#f9dadd; }
+    body.dark-mode .status-pill { color:#edf1f4; background:#3e4852; }
+    body.dark-mode .status-pill[data-status="Matched"],body.dark-mode .status-pill[data-status="Queued"],body.dark-mode .status-pill[data-status="Imported"] { border-color:#78a68a; color:#e9fff0; background:#294337; }
+    body.dark-mode .status-pill[data-status="Needs attention"] { border-color:#d78089; color:#fff0f1; background:#5a3034; }
     .score-pill[data-band="low"] { border-color:#8f1d14; color:#fff; background:#b42318; }
     .score-pill[data-band="medium"] { border-color:#b54708; color:#342100; background:#fdb022; }
     .score-pill[data-band="high"] { border-color:#085d3a; color:#fff; background:#067647; }
@@ -202,8 +215,10 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
-      .review-album { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
-      .review-track-count { display:none; }
+      .review-source-summary { grid-template-columns:minmax(0,1fr) auto; }
+      .review-source-summary .score-pill { display:none; }
+      .review-source-body { grid-template-columns:1fr; padding-left:.8rem; }
+      .review-album { width:100%; }
       .match-summary,.match-summary.has-artwork { grid-template-columns:minmax(0,1fr); }
       .match-summary.has-artwork { grid-template-columns:3.5rem minmax(0,1fr); }
       .match-artwork { width:3.5rem; height:3.5rem; }
@@ -283,12 +298,14 @@
     <section class="settings-section" aria-labelledby="library-import-title">
       <h2 id="library-import-title">Library import preview</h2>
       <p>Inventory audio file paths and file stats, then compare them with the canonical beets library. This preview never changes music files or runs beets import.</p>
-      <button id="inventory-preview" type="button">Run inventory preview</button>
-      <button id="candidate-generate" type="button">Find MusicBrainz candidates</button>
-      <p id="inventory-status" role="status">No preview run in this browser session.</p>
+      <div class="import-actions">
+        <button id="inventory-preview" type="button">Run inventory preview</button>
+        <button id="candidate-generate" type="button">Find MusicBrainz candidates</button>
+      </div>
+      <p id="inventory-status" class="operation-status" role="status" aria-live="polite">No preview run in this browser session.</p>
       <div id="inventory-summary" class="inventory-summary" hidden></div>
       <h3>Review inventory items</h3>
-      <p id="library-import-review-status" role="status">Run an inventory preview to create review items.</p>
+      <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite">Run an inventory preview to create review items.</p>
       <div id="library-import-review-list" class="review-list"></div>
       <nav class="review-pagination" aria-label="Library import review pages">
         <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous artists</button>
@@ -358,10 +375,10 @@
           <label for="library-import-mbid">Rematch with MusicBrainz release ID
             <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
           </label>
-          <button type="submit">Rematch</button>
+          <button id="library-import-rematch" type="submit">Rematch</button>
           <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
         </form>
-        <p id="library-import-modal-message" class="browser-status" role="status"></p>
+        <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
       </div>
       <footer class="browser-actions review-footer">
         <div class="review-footer-group">
@@ -576,6 +593,17 @@
     const reviewArtistLimit = 25;
     let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalArtists = 0, reviewPageArtistCount = 0;
 
+    function setOperationBusy(button, statusElement, busy, message = '') {
+      if (button) {
+        button.disabled = busy;
+        button.setAttribute('aria-busy', String(busy));
+      }
+      if (statusElement) {
+        statusElement.dataset.busy = String(busy);
+        if (message) statusElement.textContent = message;
+      }
+    }
+
     function renderInventoryPreview(data) {
       inventorySummary.replaceChildren(...[
         ['Files', data.files], ['Tracked by beets', data.tracked],
@@ -586,6 +614,7 @@
         return cell;
       }));
       inventorySummary.hidden = false;
+      inventoryStatus.dataset.busy = 'false';
       inventoryStatus.textContent = `Preview #${data.id} complete. No music files were changed.`;
     }
 
@@ -624,16 +653,21 @@
       }
     }
 
-    function reviewSummary(label, albumCount, trackCount) {
-      const summary = document.createElement('summary');
-      summary.className = 'review-group-summary';
-      const name = document.createElement('span'); name.textContent = label;
-      const albums = document.createElement('span'); albums.className = 'review-group-count';
-      albums.textContent = `${albumCount} ${albumCount === 1 ? 'album' : 'albums'}`;
-      const tracks = document.createElement('span'); tracks.className = 'review-group-count';
-      tracks.textContent = `${trackCount} ${trackCount === 1 ? 'track' : 'tracks'}`;
-      summary.append(name, albums, tracks);
-      return summary;
+    function sourceFolder(songs) {
+      const paths = songs.map(song => String(song.path || '')).filter(Boolean);
+      if (!paths.length) return 'Unknown source folder';
+      const parent = path => path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : path;
+      return parent(paths[0]);
+    }
+
+    function sourceFolderRows(songs) {
+      const rows = new Map();
+      songs.forEach(song => {
+        const folder = sourceFolder([song]);
+        if (!rows.has(folder)) rows.set(folder, []);
+        rows.get(folder).push(song);
+      });
+      return [...rows.values()];
     }
 
     function albumInventoryStatus(albumReview, songs) {
@@ -662,22 +696,12 @@
 
     function renderReviewItems() {
       if (!reviewList) return;
-      const groups = reviewGroups;
-      reviewList.replaceChildren(...groups.map(group => {
-        const artist = document.createElement('details');
-        artist.className = 'review-artist';
-        const artistCount = group.albums.reduce((total, album) => total + album.songs.length, 0);
-        artist.open = groups.length === 1;
-        artist.append(reviewSummary(group.artist, group.albums.length, artistCount));
-        const albums = document.createElement('div'); albums.className = 'review-albums';
-        group.albums.forEach(albumGroup => {
-          const album = document.createElement('button');
-          album.type = 'button';
-          album.className = 'review-album';
+      const sourceRows = reviewGroups.flatMap(group => group.albums.flatMap(albumGroup =>
+        sourceFolderRows(albumGroup.songs).map(songs => ({group, albumGroup, songs}))));
+      reviewList.replaceChildren(...sourceRows.map(({group, albumGroup, songs}) => {
+          const source = document.createElement('details'); source.className = 'review-source';
+          source.open = sourceRows.length === 1;
           const albumReview = albumReviews.find(review => review.artist === group.artist && review.album === albumGroup.album);
-          const label = document.createElement('span'); label.className = 'review-album-name'; label.textContent = albumGroup.album;
-          const tracks = document.createElement('span'); tracks.className = 'review-track-count';
-          tracks.textContent = `${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'track' : 'tracks'}`;
           const statusValue = albumInventoryStatus(albumReview, albumGroup.songs);
           const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
           const statusDescription = inventoryStatusDescriptions[statusValue] || statusValue;
@@ -689,17 +713,30 @@
             score.dataset.band = scorePresentation.band;
             score.setAttribute('aria-label', scorePresentation.accessibleLabel);
           } else { score.textContent = 'No match score'; score.hidden = true; }
-          album.append(label, tracks, status, score);
-          album.setAttribute('aria-label', `Review album ${albumGroup.album} by ${group.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
+          const summary = document.createElement('summary'); summary.className = 'review-source-summary';
+          const copy = document.createElement('span'); copy.className = 'review-source-copy';
+          const path = document.createElement('span'); path.className = 'review-source-path'; path.textContent = sourceFolder(songs);
+          const metadata = document.createElement('span'); metadata.className = 'review-source-metadata';
+          metadata.textContent = `${group.artist} — ${albumGroup.album} · ${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`;
+          copy.append(path, metadata); summary.append(copy, status, score); source.append(summary);
+          const body = document.createElement('div'); body.className = 'review-source-body';
+          const trackList = document.createElement('ol'); trackList.className = 'review-track-list';
+          songs.forEach(item => {
+            const track = document.createElement('li');
+            track.textContent = `${item.title || 'Untitled track'} — ${item.path}`;
+            track.title = item.path;
+            trackList.append(track);
+          });
+          const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = 'Review match';
+          album.setAttribute('aria-label', `Review ${sourceFolder(songs)}: ${albumGroup.album} by ${group.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
           if (albumReview) album.addEventListener('click', () => openReview(albumReview, album));
           else album.disabled = true;
-          albums.append(album);
-        });
-        artist.append(albums);
-        return artist;
+          body.append(trackList, album); source.append(body);
+          return source;
       }));
+      reviewStatus.dataset.busy = 'false';
       reviewStatus.textContent = reviewItems.length
-        ? `${reviewGroups.length} ${reviewGroups.length === 1 ? 'artist' : 'artists'}, ${albumReviews.length} albums, ${reviewItems.length} tracks on this page.`
+        ? `${sourceRows.length} source ${sourceRows.length === 1 ? 'folder' : 'folders'}, ${reviewGroups.length} ${reviewGroups.length === 1 ? 'artist' : 'artists'}, ${reviewItems.length} tracks on this page.`
         : 'No current inventory review items.';
       const pageStart = reviewTotalArtists ? reviewOffset + 1 : 0;
       const pageEnd = Math.min(reviewOffset + reviewPageArtistCount, reviewTotalArtists);
@@ -712,6 +749,8 @@
       if (!reviewList) return;
       try {
         reviewPrevious.disabled = true; reviewNext.disabled = true;
+        reviewStatus.dataset.busy = 'true';
+        reviewStatus.textContent = 'Loading inventory review rows…';
         const response = await fetch(`/api/library-import/reviews?limit=${reviewArtistLimit}&offset=${offset}`);
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
@@ -725,6 +764,7 @@
         renderReviewItems();
         persistInventoryPreview();
       } catch (error) {
+        reviewStatus.dataset.busy = 'false';
         reviewStatus.textContent = error.message || 'Unable to load review items.';
       }
     }
@@ -788,7 +828,8 @@
     function openReview(album, button) {
       activeAlbum = album; activeCandidateId = album.selected_candidate_id || album.proposed_match?.id || null; reviewReturnFocus = button;
       document.getElementById('library-import-modal-title').textContent = `${album.artist} — ${album.album}`;
-      document.getElementById('library-import-modal-message').textContent = '';
+      const message = document.getElementById('library-import-modal-message');
+      message.dataset.busy = 'false'; message.textContent = '';
       document.getElementById('library-import-mbid').value = '';
       renderAlbumMatch();
       reviewModal.hidden = false;
@@ -816,8 +857,12 @@
       });
       reviewModal.querySelectorAll('[data-review-decision]').forEach(button => button.addEventListener('click', async () => {
         const message = document.getElementById('library-import-modal-message');
+        const decisionButtons = [...reviewModal.querySelectorAll('[data-review-decision]')];
+        const decision = button.dataset.reviewDecision;
+        const progressLabel = {approved: 'Queueing this album for import…', rejected: 'Saving rejected status…', skipped: 'Saving skipped status…'}[decision] || 'Saving review decision…';
+        decisionButtons.forEach(action => { action.disabled = true; action.setAttribute('aria-busy', 'true'); });
+        message.dataset.busy = 'true'; message.textContent = progressLabel;
         try {
-          const decision = button.dataset.reviewDecision;
           const payload = {decision};
           if (decision === 'approved' && activeCandidateId !== null) payload.candidate_id = activeCandidateId;
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}`, {
@@ -829,15 +874,20 @@
           await loadReviewItems();
           closeReview();
         } catch (error) {
+          message.dataset.busy = 'false';
           message.textContent = error.message || 'Unable to save review decision.';
+        } finally {
+          decisionButtons.forEach(action => { action.disabled = false; action.setAttribute('aria-busy', 'false'); });
         }
       }));
       document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
         event.preventDefault();
         const input = document.getElementById('library-import-mbid');
         const message = document.getElementById('library-import-modal-message');
+        const rematchButton = document.getElementById('library-import-rematch');
         if (!input.reportValidity()) return;
-        message.textContent = 'Rematching through the configured MusicBrainz provider…';
+        setOperationBusy(rematchButton, message, true, 'Rematching through the configured MusicBrainz provider…');
+        input.disabled = true;
         try {
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/rematch`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -864,14 +914,16 @@
           renderAlbumMatch(); message.textContent = 'MusicBrainz release selected by ID. Confidence remains based on metadata evidence. No files were changed.';
         } catch (error) {
           message.textContent = error.message || 'Unable to rematch this album.';
+        } finally {
+          input.disabled = false;
+          setOperationBusy(rematchButton, message, false);
         }
       });
       if (restoreInventoryPreview()) loadReviewItems();
     }
 
     if (inventoryButton) inventoryButton.addEventListener('click', async () => {
-      inventoryButton.disabled = true;
-      inventoryStatus.textContent = 'Scanning file names and stats…';
+      setOperationBusy(inventoryButton, inventoryStatus, true, 'Scanning source folders, file names, and stats…');
       try {
         const response = await fetch('/api/library/inventory/preview', { method: 'POST' });
         const data = await response.json();
@@ -883,12 +935,12 @@
       } catch (error) {
         inventoryStatus.textContent = error.message || 'Inventory preview failed.';
       } finally {
-        inventoryButton.disabled = false;
+        setOperationBusy(inventoryButton, inventoryStatus, false);
       }
     });
 
     if (candidateButton) candidateButton.addEventListener('click', async () => {
-      candidateButton.disabled = true; reviewStatus.textContent = 'Requesting bounded MusicBrainz matches…';
+      setOperationBusy(candidateButton, reviewStatus, true, 'Requesting bounded MusicBrainz matches…');
       try {
         const response = await fetch('/api/library-import/candidates', {
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({limit: 25}),
@@ -899,7 +951,7 @@
         if (data.errors?.length) reviewStatus.textContent += ` ${data.errors.length} album lookup(s) can be retried.`;
       } catch (error) {
         reviewStatus.textContent = error.message || 'Candidate generation failed.';
-      } finally { candidateButton.disabled = false; }
+      } finally { setOperationBusy(candidateButton, reviewStatus, false); }
     });
 
     {% if not first_run %}
