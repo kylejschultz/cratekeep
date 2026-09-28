@@ -927,6 +927,7 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
     years = []
     dates = []
     release_ids = []
+    artwork_url = None
     for row in rows:
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
         title = item.get("title") if item and item.get("title") else Path(row["relative_path"]).stem
@@ -944,6 +945,10 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
                              + (f"-{day:02d}" if month and day else ""))
             if item.get("mb_albumid"):
                 release_ids.append(str(item.get("mb_albumid")).lower())
+            if artwork_url is None:
+                artwork_url = _persisted_artwork_source({
+                    key: item.get(key) for key in ("artwork_url", "image_url", "cover_url", "cover_art")
+                })
         tracks.append(track)
     query = {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
     if years:
@@ -951,6 +956,8 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
         query["date"] = dates[0]
     if release_ids and len(set(release_ids)) == 1:
         query["release_mbid"] = release_ids[0]
+    if artwork_url:
+        query["artwork_url"] = artwork_url
     return query
 
 
@@ -1194,6 +1201,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                 "year": query.get("year"), "date": query.get("date"),
                 "track_count": len(query["tracks"]),
                 "disc_count": len({track.get("disc") or 1 for track in query["tracks"]}),
+                "artwork_url": query.get("artwork_url"),
             }
             payloads.append({
                 "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],

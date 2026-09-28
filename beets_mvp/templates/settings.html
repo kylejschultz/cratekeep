@@ -136,10 +136,12 @@
     .review-folder { border-bottom:1px solid var(--border); background:transparent; }
     .review-folder:last-child { border-bottom:0; }
     .review-folder .review-folder { margin-left:1rem; border-left:1px solid var(--border); }
-    .review-folder-summary { display:flex; gap:.65rem; align-items:center; cursor:pointer; padding:.7rem .8rem; }
+    .review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.65rem; align-items:center; cursor:pointer; padding:.7rem .8rem; }
     .review-folder-summary:hover { background:var(--active); }
-    .review-folder-path { min-width:0; overflow-wrap:anywhere; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
-    .review-folder-count { margin-left:auto; color:var(--muted); font-size:.76rem; white-space:nowrap; }
+    .review-folder-identity { min-width:0; }
+    .review-folder-path { display:block; min-width:0; overflow-wrap:anywhere; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .review-folder-path::before { content:"\1F4C1"; margin-right:.45rem; font-family:system-ui,sans-serif; }
+    .review-folder-count { color:var(--muted); font-size:.76rem; white-space:nowrap; }
     .review-folder-contents { border-top:1px solid var(--border); background:var(--page); }
     .review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.8rem; align-items:center; padding:.7rem .8rem .75rem 1.8rem; border-bottom:1px solid var(--border); }
     .review-album-row:last-child { border-bottom:0; }
@@ -182,6 +184,14 @@
     .candidate-facts div { min-width:0; }
     .candidate-facts dt { color:var(--muted); font-size:.68rem; font-weight:700; letter-spacing:.03em; text-transform:uppercase; }
     .candidate-facts dd { margin:.08rem 0 0; font-size:.78rem; overflow-wrap:anywhere; }
+    .candidate-id { font:inherit; }
+    .track-delta-button { width:auto; margin:0; padding:0; border:0; color:var(--modal-accent); background:transparent; font:inherit; font-weight:700; text-decoration:underline; text-underline-offset:.15em; }
+    .track-delta-panel { grid-column:1 / -1; overflow-x:auto; }
+    .track-delta-table { width:100%; border-collapse:collapse; font-size:.74rem; }
+    .track-delta-table th,.track-delta-table td { padding:.35rem .45rem; border-top:1px solid var(--modal-border); text-align:left; vertical-align:top; }
+    .track-delta-table th { color:var(--muted); font-size:.67rem; letter-spacing:.03em; text-transform:uppercase; }
+    .track-delta-table tr[data-changed="true"] { background:var(--modal-subtle); }
+    .track-delta-table .changed-value { border-left:3px solid var(--modal-accent); font-weight:700; }
     .candidate-note { grid-column:1 / -1; margin:0; color:var(--muted); font-size:.74rem; }
     .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .override-form label { margin:0; font-size:.86rem; }
@@ -212,8 +222,8 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
-      .review-album-row { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
-      .review-album-row .score-pill { display:none; }
+      .review-folder-summary,.review-album-row { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
+      .review-folder-summary .score-pill,.review-album-row .score-pill { display:none; }
       .review-album { width:100%; }
       .candidate-option-summary { grid-template-columns:1rem minmax(0,1fr); }
       .candidate-confidence { grid-column:2; text-align:left; }
@@ -669,7 +679,7 @@
 
     function renderReviewItems() {
       if (!reviewList) return;
-      function renderAlbum(albumGroup, folderPath) {
+      function albumRowParts(albumGroup, folderPath) {
           const albumReview = albumReviews.find(review => review.artist === albumGroup.artist && review.album === albumGroup.album);
           const statusValue = albumInventoryStatus(albumReview, albumGroup.songs);
           const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
@@ -682,10 +692,15 @@
             score.dataset.band = scorePresentation.band;
             score.setAttribute('aria-label', scorePresentation.accessibleLabel);
           } else { score.textContent = 'No match score'; score.hidden = true; }
-          const row = document.createElement('article'); row.className = 'review-album-row';
-          const copy = document.createElement('div');
           const metadata = document.createElement('span'); metadata.className = 'review-source-metadata';
           metadata.textContent = `${albumGroup.artist} — ${albumGroup.album} · ${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'track' : 'tracks'}`;
+          const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = 'Review match';
+          album.setAttribute('aria-label', `Review ${folderPath || 'library root'}: ${albumGroup.album} by ${albumGroup.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
+          if (albumReview) album.addEventListener('click', event => { event.stopPropagation(); openReview(albumReview, album); });
+          else album.disabled = true;
+          return {metadata, status, score, album};
+      }
+      function renderTrackList(albumGroup) {
           const trackList = document.createElement('ol'); trackList.className = 'review-track-list';
           albumGroup.songs.forEach(item => {
             const track = document.createElement('li');
@@ -693,26 +708,37 @@
             track.title = item.path;
             trackList.append(track);
           });
-          copy.append(metadata, trackList);
-          const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = 'Review match';
-          album.setAttribute('aria-label', `Review ${folderPath || 'library root'}: ${albumGroup.album} by ${albumGroup.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
-          if (albumReview) album.addEventListener('click', () => openReview(albumReview, album));
-          else album.disabled = true;
-          row.append(copy, status, score, album);
+          return trackList;
+      }
+      function renderAlbum(albumGroup, folderPath) {
+          const row = document.createElement('article'); row.className = 'review-album-row';
+          const copy = document.createElement('div');
+          const parts = albumRowParts(albumGroup, folderPath);
+          copy.append(parts.metadata, renderTrackList(albumGroup));
+          row.append(copy, parts.status, parts.score, parts.album);
           return row;
       }
       function renderFolder(folder, topLevel = false) {
         const source = document.createElement('details'); source.className = 'review-folder';
         source.open = topLevel && reviewGroups.length === 1;
         const summary = document.createElement('summary'); summary.className = 'review-folder-summary';
+        const identity = document.createElement('span'); identity.className = 'review-folder-identity';
         const path = document.createElement('span'); path.className = 'review-folder-path';
-        path.textContent = folder.path || 'Library root';
+        path.textContent = folder.name || 'Library root'; path.title = folder.path || 'Library root';
         const count = document.createElement('span'); count.className = 'review-folder-count';
         const tracks = folderTrackCount(folder);
         count.textContent = `${tracks} ${tracks === 1 ? 'track' : 'tracks'}`;
-        summary.append(path, count);
+        identity.append(path);
         const contents = document.createElement('div'); contents.className = 'review-folder-contents';
-        contents.append(...folder.albums.map(album => renderAlbum(album, folder.path)));
+        if (folder.albums.length === 1) {
+          const parts = albumRowParts(folder.albums[0], folder.path);
+          identity.append(parts.metadata);
+          summary.append(identity, parts.status, parts.score, parts.album);
+          contents.append(renderTrackList(folder.albums[0]));
+        } else {
+          identity.append(count); summary.append(identity);
+          contents.append(...folder.albums.map(album => renderAlbum(album, folder.path)));
+        }
         contents.append(...folder.folders.map(child => renderFolder(child)));
         source.append(summary, contents);
         return source;
@@ -760,12 +786,17 @@
     function renderAlbumMatch() {
       const candidates = document.getElementById('library-import-modal-candidates');
       const current = activeAlbum?.current_metadata || {artist:activeAlbum?.artist, album:activeAlbum?.album, track_count:activeAlbum?.tracks?.length || 0};
-      const asIs = {...current, id:'as-is', is_as_is:true, artwork_url:null};
+      const asIs = {...current, id:'as-is', is_as_is:true};
       const options = [...(activeAlbum?.candidates || []), asIs];
       function formatDuration(seconds) {
         if (!Number.isFinite(seconds)) return '—';
         const rounded = Math.round(Math.abs(seconds));
         return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, '0')}`;
+      }
+      function shortMusicBrainzId(value) {
+        if (!value) return 'Not provided';
+        const id = String(value);
+        return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
       }
       function candidateFacts(value) {
         if (value.is_as_is) return [
@@ -785,12 +816,65 @@
         return [
           ['Artist', value.artist || 'Unknown artist'], ['Album', value.album || 'Unknown album'],
           ['Year / date', value.date || value.year || 'Not provided'],
-          ['Release', `${[value.release_status, value.country].filter(Boolean).join(' · ') || 'MusicBrainz release'} · ${value.provider_id}${value.release_group_id ? ` · group ${value.release_group_id}` : ''}`],
+          ['Release', [value.release_status, value.country].filter(Boolean).join(' · ') || 'MusicBrainz release'],
+          ['Release ID', shortMusicBrainzId(value.provider_id), value.provider_id],
+          ['Release group ID', shortMusicBrainzId(value.release_group_id), value.release_group_id],
           ['Disc / media', `${discCount} ${discCount === 1 ? 'disc' : 'discs'}${formats.length ? ` · ${formats.join(', ')}` : ''}`],
           ['Track coverage', `${value.matched_track_count || 0} matched · ${value.unmatched_track_count || 0} unmatched`],
           ['Duration delta', durationPairs.length ? `${formatDuration(durationDelta)} total across ${durationPairs.length}` : 'Not available'],
           ['Track delta', changedTracks ? `${changedTracks} changed` : 'No changes'],
         ];
+      }
+      function candidateTrackDetails(value) {
+        if (!value.is_as_is) return Array.isArray(value.track_details) ? value.track_details : [];
+        return (activeAlbum?.tracks || []).map((track, index) => ({
+          position:index + 1, local:track.title, proposed:track.title,
+          local_duration:track.duration, proposed_duration:track.duration,
+          current_position:[track.disc || 1, track.position || index + 1],
+          proposed_position:[track.disc || 1, track.position || index + 1], status:'matched', issues:[],
+        }));
+      }
+      function appendTrackDeltaControl(dd, value, description) {
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'track-delta-button';
+        button.textContent = description; button.setAttribute('aria-expanded', 'false');
+        const panel = document.createElement('div'); panel.className = 'track-delta-panel'; panel.hidden = true;
+        const panelId = `track-delta-${activeAlbum?.id || 'album'}-${value.id}`; panel.id = panelId;
+        button.setAttribute('aria-controls', panelId);
+        button.addEventListener('click', () => {
+          const opening = panel.hidden;
+          if (opening && !panel.hasChildNodes()) {
+            const table = document.createElement('table'); table.className = 'track-delta-table';
+            const caption = document.createElement('caption'); caption.className = 'visually-hidden'; caption.textContent = 'Current and proposed track metadata';
+            const head = document.createElement('thead'); const headRow = document.createElement('tr');
+            ['Track', 'Current title', 'Proposed title', 'Current position', 'Proposed position', 'Current duration', 'Proposed duration'].forEach(label => {
+              const th = document.createElement('th'); th.scope = 'col'; th.textContent = label; headRow.append(th);
+            });
+            head.append(headRow); const rows = document.createElement('tbody');
+            candidateTrackDetails(value).forEach((track, index) => {
+              const changed = track.status !== 'matched' || track.local !== track.proposed
+                || (Number.isFinite(track.local_duration) && Number.isFinite(track.proposed_duration) && track.local_duration !== track.proposed_duration)
+                || JSON.stringify(track.current_position || null) !== JSON.stringify(track.proposed_position || null);
+              const row = document.createElement('tr'); row.dataset.changed = String(changed);
+              const position = document.createElement('td'); position.textContent = String(track.position || index + 1);
+              const currentValue = document.createElement('td'); currentValue.textContent = track.local || '—';
+              const proposedValue = document.createElement('td'); proposedValue.textContent = track.proposed || '—';
+              const currentPosition = document.createElement('td');
+              currentPosition.textContent = track.current_position ? `${track.current_position[0]}.${track.current_position[1]}` : '—';
+              const proposedPosition = document.createElement('td');
+              proposedPosition.textContent = track.proposed_position ? `${track.proposed_position[0]}.${track.proposed_position[1]}` : '—';
+              const currentDuration = document.createElement('td'); currentDuration.textContent = formatDuration(track.local_duration);
+              const proposedDuration = document.createElement('td'); proposedDuration.textContent = formatDuration(track.proposed_duration);
+              if (changed) {
+                proposedValue.classList.add('changed-value'); proposedPosition.classList.add('changed-value');
+                proposedDuration.classList.add('changed-value');
+              }
+              row.append(position, currentValue, proposedValue, currentPosition, proposedPosition, currentDuration, proposedDuration); rows.append(row);
+            });
+            table.append(caption, head, rows); panel.append(table);
+          }
+          panel.hidden = !opening; button.setAttribute('aria-expanded', String(opening));
+        });
+        dd.append(button); return panel;
       }
       candidates.replaceChildren(...options.map((value, index) => {
         const selected = value.id === activeCandidateId;
@@ -823,15 +907,22 @@
           artwork.src = value.artwork_url; artwork.alt = `Persisted cover art for ${value.album}`; body.append(artwork);
         }
         const facts = document.createElement('dl'); facts.className = 'candidate-facts';
-        candidateFacts(value).forEach(([term, description]) => {
+        let trackDeltaPanel = null;
+        candidateFacts(value).forEach(([term, description, fullValue]) => {
           const wrapper = document.createElement('div'); const dt = document.createElement('dt'); const dd = document.createElement('dd');
-          dt.textContent = term; dd.textContent = description; wrapper.append(dt, dd); facts.append(wrapper);
+          dt.textContent = term;
+          if (term === 'Track delta') trackDeltaPanel = appendTrackDeltaControl(dd, value, description);
+          else if (fullValue) {
+            const id = document.createElement('code'); id.className = 'candidate-id'; id.textContent = description;
+            id.title = fullValue; id.setAttribute('aria-label', fullValue); dd.append(id);
+          } else dd.textContent = description;
+          wrapper.append(dt, dd); facts.append(wrapper);
         });
         const note = document.createElement('p'); note.className = 'candidate-note';
         note.textContent = value.is_as_is
           ? 'Queues the album with incoming metadata unchanged and without selecting a MusicBrainz release.'
           : `${value.recommendation} recommendation based on existing metadata and track evidence; selecting it only records this review choice.`;
-        body.append(facts, note); detail.append(summary, body);
+        body.append(facts); if (trackDeltaPanel) body.append(trackDeltaPanel); body.append(note); detail.append(summary, body);
         return detail;
       }));
     }
@@ -863,7 +954,8 @@
       reviewModal.addEventListener('keydown', event => {
         if (event.key === 'Escape') { event.preventDefault(); closeReview(); return; }
         if (event.key !== 'Tab') return;
-        const focusable = [...reviewModal.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])')];
+        const focusable = [...reviewModal.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])')]
+          .filter(element => !element.closest('details:not([open])') && !element.closest('[hidden]'));
         const first = focusable[0], last = focusable[focusable.length - 1];
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }

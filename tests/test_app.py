@@ -780,7 +780,7 @@ def test_album_as_is_selection_uses_null_candidate_without_changing_musicbrainz_
     assert response.json["selection_mode"] == "as-is"
     assert response.json["current_metadata"] == {
         "artist": "Artist", "album": "Incoming Album", "year": None, "date": None,
-        "track_count": 1, "disc_count": 1,
+        "track_count": 1, "disc_count": 1, "artwork_url": None,
     }
     assert [candidate["id"] for candidate in response.json["candidates"]] == candidate_ids
     assert response.json["proposed_match"]["provider_id"] == "release-1"
@@ -1014,6 +1014,11 @@ def test_matching_assigns_tracks_reports_explicit_mismatches_and_bounds_count_co
 
     statuses = {detail["status"] for detail in match["track_details"]}
     issues = {issue for detail in match["track_details"] for issue in detail["issues"]}
+    paired = next(detail for detail in match["track_details"] if detail["local"] == "First")
+    assert paired["local_duration"] == 120
+    assert paired["proposed_duration"] == 150
+    assert paired["current_position"] == [1, 1]
+    assert paired["proposed_position"] == [1, 2]
     assert "order-mismatch" in statuses
     assert {"title-mismatch", "duration-mismatch", "order-mismatch", "extra"} <= issues
     assert match["track_count_mismatch"] is True
@@ -1111,7 +1116,7 @@ def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_co
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b".review-list { overflow:hidden;" in html
-    assert b".review-folder-summary { display:flex;" in html
+    assert b".review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     assert b"const source = document.createElement('details');" in html
@@ -1135,7 +1140,7 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     assert b'aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1"' in html
     assert b"if (event.key === 'Escape')" in html
     assert b"input:not(:disabled)" in html
-    assert b"album.addEventListener('click', () => openReview(albumReview, album));" in html
+    assert b"openReview(albumReview, album);" in html
 
 
 def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
@@ -1143,7 +1148,8 @@ def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
 
     assert b"source.className = 'review-folder'" in html
     assert b"path.className = 'review-folder-path'" in html
-    assert b"path.textContent = folder.path || 'Library root'" in html
+    assert b"path.textContent = folder.name || 'Library root'" in html
+    assert b"path.title = folder.path || 'Library root'" in html
     assert b"metadata.className = 'review-source-metadata'" in html
     assert b"metadata.textContent = `${albumGroup.artist} \xe2\x80\x94 ${albumGroup.album}" in html
     assert b"track.textContent = `${item.title || 'Untitled track'} \xe2\x80\x94 ${item.path}`" in html
@@ -1153,6 +1159,28 @@ def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     assert b"score.dataset.band = scorePresentation.band" in html
     assert b"of ${reviewTotalArtists} artists" in html
     assert b"Previous artists" in html and b"Next artists" in html
+
+
+def test_source_folder_line_carries_review_status_score_and_track_only_expansion(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b"if (folder.albums.length === 1)" in html
+    assert b"summary.append(identity, parts.status, parts.score, parts.album)" in html
+    assert b"contents.append(renderTrackList(folder.albums[0]))" in html
+    assert b"event.stopPropagation(); openReview(albumReview, album)" in html
+    assert b"identity.append(parts.metadata)" in html
+
+
+def test_album_modal_shows_readable_musicbrainz_ids_and_on_demand_track_delta(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b"['Release ID', shortMusicBrainzId(value.provider_id), value.provider_id]" in html
+    assert b"['Release group ID', shortMusicBrainzId(value.release_group_id), value.release_group_id]" in html
+    assert b"id.title = fullValue" in html and b"id.setAttribute('aria-label', fullValue)" in html
+    assert b"button.className = 'track-delta-button'" in html
+    assert b"if (opening && !panel.hasChildNodes())" in html
+    assert b"['Track', 'Current title', 'Proposed title', 'Current position', 'Proposed position', 'Current duration', 'Proposed duration']" in html
+    assert b"row.dataset.changed = String(changed)" in html
 
 
 def test_library_import_operations_expose_visible_live_progress(tmp_path):
@@ -1184,6 +1212,9 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"synthetic")
+    incoming_artwork = "data:image/png;base64,aW5jb21pbmc="
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    library.add(Item(title="Song", artist="Artist", album="Album", path=str(path), artwork_url=incoming_artwork))
     client = app.test_client()
     assert client.post("/api/library/inventory/preview").status_code == 201
     assert client.post("/api/library-import/candidates", json={}).status_code == 201
@@ -1193,10 +1224,13 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     assert album["highest_confidence"] == max(candidate["confidence"] for candidate in album["candidates"])
     assert album["candidates"][0]["artwork_url"] == "https://images.example.test/cover.jpg"
     assert album["candidates"][1]["artwork_url"] is None
+    assert album["current_metadata"]["artwork_url"] == incoming_artwork
 
     html = client.get("/settings").data
     assert b"if (value.artwork_url)" in html
     assert b"artwork.src = value.artwork_url" in html
+    assert b"const asIs = {...current, id:'as-is', is_as_is:true};" in html
+    assert b"artwork_url:null" not in html
     assert b"innerHTML" not in html
 
 

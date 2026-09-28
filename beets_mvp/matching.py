@@ -132,16 +132,22 @@ def _assign_tracks(local_tracks: list, canonical_tracks: list) -> tuple[list[dic
         details.append({
             "position": local_index + 1, "local": _track_title(local), "proposed": _track_title(canonical),
             "local_duration": _duration(local), "proposed_duration": _duration(canonical),
+            "current_position": list(metrics["local_position"]),
+            "proposed_position": list(metrics["canonical_position"]),
             "recording_id": canonical.get("recording_id") if isinstance(canonical, dict) else None,
             "status": metrics["status"], "issues": metrics["issues"], "distance": round(metrics["distance"], 4),
         })
     for index, track in enumerate(local_tracks):
         if index not in assigned_local:
             details.append({"position": index + 1, "local": _track_title(track), "proposed": None,
+                            "local_duration": _duration(track), "proposed_duration": None,
+                            "current_position": list(_position(track, index + 1)), "proposed_position": None,
                             "status": "missing", "issues": ["missing"], "distance": 1.0})
     for index, track in enumerate(canonical_tracks):
         if index not in assigned_canonical:
             details.append({"position": index + 1, "local": None, "proposed": _track_title(track),
+                            "local_duration": None, "proposed_duration": _duration(track),
+                            "current_position": None, "proposed_position": list(_position(track, index + 1)),
                             "recording_id": track.get("recording_id") if isinstance(track, dict) else None,
                             "status": "extra", "issues": ["extra"], "distance": 1.0})
     details.sort(key=lambda item: (item["position"], item["local"] is None, item.get("proposed") or ""))
