@@ -353,6 +353,11 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"detail.className = 'candidate-option'" in modal
     assert b"const asIs = {...current, id:'as-is', is_as_is:true" in modal
     assert b"label:'Tracks changed'" in modal
+    assert b"candidateReleaseYear(value)" in modal
+    assert b"changes.className = 'candidate-track-changes'" in modal
+    assert "Title: “${track.local}” → “${track.proposed}”".encode() in modal
+    assert "Position: ${track.localPosition || '—'} → ${track.proposedPosition || '—'}".encode() in modal
+    assert "Duration: ${track.localDuration || '—'} → ${track.proposedDuration || '—'}".encode() in modal
     assert b"label:'Release Type/media'" in modal
     assert b"label:'Release Region'" in modal
     assert b"label:'Local tracks found online'" in modal
@@ -366,6 +371,40 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
     assert b'.candidate-option[open]' in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_candidate_evidence_uses_release_year_and_identifies_changed_tracks(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    start = html.index("function metadataChanged")
+    end = html.index("function candidateFacts", start)
+    helpers = html[start:end]
+    probe = """
+const result = {
+  years: [
+    candidateReleaseYear({date: '2024-03-17'}),
+    candidateReleaseYear({year: '1999', date: '1999-12-31'}),
+    candidateReleaseYear({year: 'unknown', date: '2003-08-04'}),
+    candidateReleaseYear({date: 'not provided'}),
+  ],
+  changes: changedTrackEvidence([
+    {local:'Old title', proposed:'New title', current_position:[1,1], proposed_position:[1,2], local_duration:120, proposed_duration:130, status:'title-mismatch'},
+    {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
+    {local:null, proposed:'Bonus', current_position:null, proposed_position:[2,1], local_duration:null, proposed_duration:90, status:'extra'},
+  ]).map(track => ({local:track.local, proposed:track.proposed, localPosition:track.localPosition,
+    proposedPosition:track.proposedPosition, durationDelta:track.durationDelta})),
+};
+console.log(JSON.stringify(result));
+"""
+    completed = subprocess.run(["node", "-e", f"{helpers}\n{probe}"], check=True, capture_output=True, text=True)
+
+    assert json.loads(completed.stdout) == {
+        "years": ["2024", "1999", "2003", ""],
+        "changes": [
+            {"local": "Old title", "proposed": "New title", "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10},
+            {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None},
+        ],
+    }
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")

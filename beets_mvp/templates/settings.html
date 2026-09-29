@@ -194,6 +194,12 @@
     .candidate-fact[data-changed="true"] > .candidate-icon { color:#b54708; }
     .candidate-fact dt { color:var(--muted); font-size:.67rem; font-weight:700; letter-spacing:.03em; line-height:1.2; text-transform:uppercase; }
     .candidate-fact dd { margin:.06rem 0 0; font-size:.79rem; line-height:1.3; overflow-wrap:anywhere; }
+    .candidate-track-changes { margin:0; }
+    .candidate-track-changes > summary { width:max-content; max-width:100%; cursor:pointer; font-weight:650; }
+    .candidate-track-list { display:grid; gap:.45rem; margin:.45rem 0 0; padding:0; list-style:none; }
+    .candidate-track-change { padding:.4rem .5rem; border-left:2px solid var(--modal-border); background:var(--modal-subtle); }
+    .candidate-track-change strong { display:block; }
+    .candidate-track-deltas { display:flex; flex-wrap:wrap; gap:.15rem .65rem; margin-top:.15rem; color:var(--muted); font-size:.73rem; }
     .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .override-form label { margin:0; font-size:.86rem; }
     .override-form input { margin-top:.25rem; }
@@ -802,10 +808,41 @@
       function metadataChanged(left, right) {
         return String(left || '').trim().toLocaleLowerCase() !== String(right || '').trim().toLocaleLowerCase();
       }
+      function candidateReleaseYear(value) {
+        const match = [value.year, value.date]
+          .map(candidate => String(candidate || '').match(/(?:^|\D)(\d{4})(?:\D|$)/)).find(Boolean);
+        return match ? match[1] : '';
+      }
+      function trackPosition(value) {
+        if (!Array.isArray(value) || value.length < 2) return '';
+        return `${value[0]}.${String(value[1]).padStart(2, '0')}`;
+      }
+      function trackDuration(value) {
+        if (value == null || value === '' || !Number.isFinite(Number(value))) return '';
+        const seconds = Math.round(Number(value));
+        return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+      }
+      function changedTrackEvidence(details) {
+        return details.map(track => {
+          const localPosition = trackPosition(track.current_position);
+          const proposedPosition = trackPosition(track.proposed_position);
+          const localDuration = trackDuration(track.local_duration);
+          const proposedDuration = trackDuration(track.proposed_duration);
+          const titleChanged = metadataChanged(track.local, track.proposed);
+          const positionChanged = localPosition !== proposedPosition;
+          const rawDurationDelta = track.local_duration != null && track.proposed_duration != null
+            && Number.isFinite(Number(track.local_duration)) && Number.isFinite(Number(track.proposed_duration))
+            ? Number(track.proposed_duration) - Number(track.local_duration) : null;
+          const durationDelta = rawDurationDelta === null ? null : Math.round(rawDurationDelta);
+          const durationChanged = rawDurationDelta !== null && Math.abs(rawDurationDelta) > 3;
+          const unpaired = ['missing', 'extra', 'unmatched'].includes(track.status);
+          return {...track, localPosition, proposedPosition, localDuration, proposedDuration,
+            durationDelta, titleChanged, positionChanged, durationChanged, unpaired};
+        }).filter(track => track.titleChanged || track.positionChanged || track.durationChanged || track.unpaired);
+      }
       function candidateFacts(value) {
         const details = value.is_as_is || !Array.isArray(value.track_details) ? [] : value.track_details;
-        const paired = details.filter(track => track.local != null && track.proposed != null);
-        const changedTracks = paired.filter(track => metadataChanged(track.local, track.proposed)).length;
+        const trackChanges = changedTrackEvidence(details);
         const unmatchedLocal = details.filter(track => track.local != null && ['missing', 'unmatched'].includes(track.status)).length;
         const unmatchedOnline = details.filter(track => track.proposed != null && ['extra', 'unmatched'].includes(track.status)).length;
         const formats = [...new Set(Array.isArray(value.media)
@@ -821,8 +858,8 @@
         return [
           {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
-          {kind:'year', label:'Release Year', value:value.date || value.year || (value.is_as_is ? 'Unchanged' : 'Not provided'), changed:!value.is_as_is && metadataChanged(current.year, value.year)},
-          {kind:'tracks', label:'Tracks changed', value:changedTracks ? `${changedTracks} of ${paired.length} tracks changed` : 'No track titles changed', changed:changedTracks > 0},
+          {kind:'year', label:'Release Year', value:candidateReleaseYear(value) || (value.is_as_is ? 'Unchanged' : 'Not provided'), changed:!value.is_as_is && metadataChanged(candidateReleaseYear(current), candidateReleaseYear(value))},
+          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'No tracks changed', changed:trackChanges.length > 0, trackChanges, expandable:!value.is_as_is},
           {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
           {kind:'region', label:'Release Region', value:value.country || (value.is_as_is ? 'Not present in current metadata' : 'Region not provided'), changed:!value.is_as_is && Boolean(current.country) && metadataChanged(current.country, value.country)},
           {kind:'local', label:'Local tracks found online', value:value.is_as_is ? 'Not applicable — As Is' : (unmatchedLocal === 0 ? `All ${localTrackCount} local tracks found online` : `${unmatchedLocal} local ${unmatchedLocal === 1 ? 'track was' : 'tracks were'} not found online`), changed:unmatchedLocal > 0},
@@ -837,7 +874,8 @@
         summary.setAttribute('role', 'radio'); summary.setAttribute('aria-checked', String(selected)); summary.tabIndex = selected ? 0 : -1;
         const marker = document.createElement('span'); marker.className = 'candidate-marker'; marker.setAttribute('aria-hidden', 'true');
         const name = document.createElement('span'); name.className = 'candidate-name';
-        name.textContent = value.is_as_is ? 'As Is — keep current metadata' : `${value.artist} — ${value.album}${value.date || value.year ? ` (${value.date || value.year})` : ''}`;
+        const releaseYear = candidateReleaseYear(value);
+        name.textContent = value.is_as_is ? 'As Is — keep current metadata' : `${value.artist} — ${value.album}${releaseYear ? ` (${releaseYear})` : ''}`;
         const recommendation = document.createElement('span'); recommendation.className = 'candidate-confidence';
         const scorePresentation = matchScorePresentation(value.confidence);
         recommendation.textContent = value.is_as_is ? `${selected ? 'Selected · ' : ''}As Is` : `${selected ? 'Selected · ' : ''}${scorePresentation?.label || 'Score unavailable'}`;
@@ -873,7 +911,39 @@
           const wrapper = document.createElement('div'); wrapper.className = 'candidate-fact';
           wrapper.dataset.changed = String(fact.changed);
           const dt = document.createElement('dt'); const dd = document.createElement('dd');
-          dt.textContent = fact.label; dd.textContent = fact.value;
+          dt.textContent = fact.label;
+          if (fact.expandable) {
+            const changes = document.createElement('details'); changes.className = 'candidate-track-changes';
+            const changeSummary = document.createElement('summary'); changeSummary.textContent = fact.value;
+            const list = document.createElement('ul'); list.className = 'candidate-track-list';
+            if (!fact.trackChanges.length) {
+              const item = document.createElement('li'); item.className = 'candidate-track-change';
+              item.textContent = 'No title, position, or material duration changes.'; list.append(item);
+            }
+            fact.trackChanges.forEach(track => {
+              const item = document.createElement('li'); item.className = 'candidate-track-change';
+              const heading = document.createElement('strong');
+              heading.textContent = track.local && track.proposed && !track.titleChanged ? track.local
+                : `${track.local || 'Not present locally'} → ${track.proposed || 'Not present online'}`;
+              const deltas = document.createElement('div'); deltas.className = 'candidate-track-deltas';
+              if (track.titleChanged && track.local && track.proposed) {
+                const delta = document.createElement('span'); delta.textContent = `Title: “${track.local}” → “${track.proposed}”`; deltas.append(delta);
+              }
+              if (track.positionChanged) {
+                const delta = document.createElement('span'); delta.textContent = `Position: ${track.localPosition || '—'} → ${track.proposedPosition || '—'}`; deltas.append(delta);
+              }
+              if (track.durationChanged || track.unpaired) {
+                const delta = document.createElement('span');
+                const signedDelta = track.durationDelta === null ? '' : ` (${track.durationDelta > 0 ? '+' : '−'}${trackDuration(Math.abs(track.durationDelta))})`;
+                delta.textContent = `Duration: ${track.localDuration || '—'} → ${track.proposedDuration || '—'}${signedDelta}`; deltas.append(delta);
+              }
+              if (track.unpaired) {
+                const delta = document.createElement('span'); delta.textContent = track.status === 'unmatched' ? 'Not paired confidently' : track.status === 'missing' ? 'Missing online' : 'Extra online'; deltas.append(delta);
+              }
+              item.append(heading, deltas); list.append(item);
+            });
+            changes.append(changeSummary, list); dd.append(changes);
+          } else dd.textContent = fact.value;
           wrapper.append(candidateIcon(fact.kind), dt, dd); facts.append(wrapper);
         });
         body.append(facts); detail.append(summary, body);
