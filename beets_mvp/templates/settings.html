@@ -146,8 +146,6 @@
     .review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.8rem; align-items:center; padding:.7rem .8rem .75rem 1.8rem; border-bottom:1px solid var(--border); }
     .review-album-row:last-child { border-bottom:0; }
     .review-source-metadata { display:block; margin-bottom:.25rem; color:var(--text); font-size:.82rem; font-weight:650; }
-    .review-track-list { min-width:0; margin:0; padding-left:1rem; color:var(--muted); font-size:.78rem; }
-    .review-track-list li { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .review-album { width:auto; min-width:7.5rem; margin:0; padding:.48rem .7rem; }
     .review-track-count { color:var(--muted); font-size:.76rem; }
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
@@ -704,28 +702,17 @@
           else album.disabled = true;
           return {metadata, status, score, album};
       }
-      function renderTrackList(albumGroup) {
-          const trackList = document.createElement('ol'); trackList.className = 'review-track-list';
-          albumGroup.songs.forEach(item => {
-            const track = document.createElement('li');
-            track.textContent = `${item.title || 'Untitled track'} — ${item.path}`;
-            track.title = item.path;
-            trackList.append(track);
-          });
-          return trackList;
-      }
       function renderAlbum(albumGroup, folderPath) {
           const row = document.createElement('article'); row.className = 'review-album-row';
-          const copy = document.createElement('div');
           const parts = albumRowParts(albumGroup, folderPath);
-          copy.append(parts.metadata, renderTrackList(albumGroup));
-          row.append(copy, parts.status, parts.score, parts.album);
+          row.append(parts.metadata, parts.status, parts.score, parts.album);
           return row;
       }
       function renderFolder(folder, topLevel = false) {
-        const source = document.createElement('details'); source.className = 'review-folder';
-        source.open = topLevel && reviewGroups.length === 1;
-        const summary = document.createElement('summary'); summary.className = 'review-folder-summary';
+        const isAlbumLeaf = folder.albums.length === 1 && folder.folders.length === 0;
+        const source = document.createElement(isAlbumLeaf ? 'article' : 'details'); source.className = 'review-folder';
+        if (!isAlbumLeaf) source.open = topLevel && reviewGroups.length === 1;
+        const summary = document.createElement(isAlbumLeaf ? 'div' : 'summary'); summary.className = 'review-folder-summary';
         const identity = document.createElement('span'); identity.className = 'review-folder-identity';
         const path = document.createElement('span'); path.className = 'review-folder-path';
         path.textContent = folder.name || 'Library root'; path.title = folder.path || 'Library root';
@@ -738,13 +725,13 @@
           const parts = albumRowParts(folder.albums[0], folder.path);
           identity.append(parts.metadata);
           summary.append(identity, parts.status, parts.score, parts.album);
-          contents.append(renderTrackList(folder.albums[0]));
         } else {
           identity.append(count); summary.append(identity);
           contents.append(...folder.albums.map(album => renderAlbum(album, folder.path)));
         }
         contents.append(...folder.folders.map(child => renderFolder(child)));
-        source.append(summary, contents);
+        source.append(summary);
+        if (!isAlbumLeaf) source.append(contents);
         return source;
       }
       reviewList.replaceChildren(...reviewGroups.map(folder => renderFolder(folder, true)));
@@ -841,8 +828,11 @@
       function comparisonTrackDetails(value) {
         const currentTracks = activeAlbum?.tracks || [];
         return candidateTrackDetails(value).map((track, index) => {
-          const current = currentTracks[Number.isInteger(track.position) ? track.position - 1 : index] || currentTracks[index];
-          return {...track, local_duration:Number.isFinite(track.local_duration) ? track.local_duration : current?.duration};
+          const currentPosition = Array.isArray(track.current_position) ? track.current_position : [];
+          const current = track.local == null ? null : currentTracks.find(item =>
+            (item.disc || 1) === currentPosition[0] && (item.position || 0) === currentPosition[1]
+          ) || currentTracks[Number.isInteger(track.position) ? track.position - 1 : index] || currentTracks[index];
+          return {...track, local_duration:Number.isFinite(current?.duration) ? current.duration : track.local_duration};
         });
       }
       function trackHasChanges(track) {

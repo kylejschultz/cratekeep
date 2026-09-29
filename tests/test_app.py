@@ -1128,7 +1128,7 @@ def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tm
     assert b"document.createElement('details')" in html
     assert b"document.createElement('summary')" in html
     assert b"review-folder" in html and b"review-album" in html
-    assert b"source.open = topLevel && reviewGroups.length === 1" in html
+    assert b"if (!isAlbumLeaf) source.open = topLevel && reviewGroups.length === 1" in html
     assert b"folder.folders.map(child => renderFolder(child))" in html
     assert b"reviewList.replaceChildren(...reviewItems.map" not in html
     assert b"reviews?limit=50" not in html
@@ -1141,7 +1141,7 @@ def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_co
     assert b".review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
-    assert b"const source = document.createElement('details');" in html
+    assert b"document.createElement(isAlbumLeaf ? 'article' : 'details')" in html
     assert b"const album = document.createElement('button');" in html
 
 
@@ -1174,7 +1174,7 @@ def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     assert b"path.title = folder.path || 'Library root'" in html
     assert b"metadata.className = 'review-source-metadata'" in html
     assert b"metadata.textContent = `${albumGroup.artist} \xe2\x80\x94 ${albumGroup.album}" in html
-    assert b"track.textContent = `${item.title || 'Untitled track'} \xe2\x80\x94 ${item.path}`" in html
+    assert b"renderTrackList" not in html
     assert b"folder.folders.map(child => renderFolder(child))" in html
     assert b"status.className = 'status-pill'" in html
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
@@ -1183,12 +1183,15 @@ def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     assert b"Previous artists" in html and b"Next artists" in html
 
 
-def test_source_folder_line_carries_review_status_score_and_track_only_expansion(tmp_path):
+def test_source_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"if (folder.albums.length === 1)" in html
     assert b"summary.append(identity, parts.status, parts.score, parts.album)" in html
-    assert b"contents.append(renderTrackList(folder.albums[0]))" in html
+    assert b"const isAlbumLeaf = folder.albums.length === 1 && folder.folders.length === 0" in html
+    assert b"document.createElement(isAlbumLeaf ? 'article' : 'details')" in html
+    assert b"renderTrackList" not in html
+    assert b"review-track-list" not in html
     assert b"event.stopPropagation(); openReview(albumReview, album)" in html
     assert b"identity.append(parts.metadata)" in html
 
@@ -1212,7 +1215,8 @@ def test_album_modal_candidate_rows_show_numeric_score_and_use_current_duration_
 
     assert b"const scorePresentation = matchScorePresentation(value.confidence)" in html
     assert b"${selected ? 'Selected \xc2\xb7 ' : ''}${scorePresentation?.label" in html
-    assert b"local_duration:Number.isFinite(track.local_duration) ? track.local_duration : current?.duration" in html
+    assert b"local_duration:Number.isFinite(current?.duration) ? current.duration : track.local_duration" in html
+    assert b"(item.disc || 1) === currentPosition[0]" in html
 
 
 def test_library_import_operations_expose_visible_live_progress(tmp_path):
