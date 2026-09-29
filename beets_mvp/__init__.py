@@ -927,6 +927,9 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
     years = []
     dates = []
     release_ids = []
+    release_types = []
+    media_types = []
+    countries = []
     artwork_url = None
     for row in rows:
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
@@ -945,6 +948,9 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
                              + (f"-{day:02d}" if month and day else ""))
             if item.get("mb_albumid"):
                 release_ids.append(str(item.get("mb_albumid")).lower())
+            for field, values in (("albumtype", release_types), ("media", media_types), ("country", countries)):
+                if item.get(field):
+                    values.append(str(item.get(field)))
             if artwork_url is None:
                 artwork_url = _persisted_artwork_source({
                     key: item.get(key) for key in ("artwork_url", "image_url", "cover_url", "cover_art")
@@ -956,6 +962,9 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
         query["date"] = dates[0]
     if release_ids and len(set(release_ids)) == 1:
         query["release_mbid"] = release_ids[0]
+    for field, values in (("release_type", release_types), ("media", media_types), ("country", countries)):
+        if values and len(set(values)) == 1:
+            query[field] = values[0]
     if artwork_url:
         query["artwork_url"] = artwork_url
     return query
@@ -1184,6 +1193,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "selected_by_mbid": match["selected_by_mbid"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
+                    "release_type": provider_data.get("release_type"),
                     "release_status": provider_data.get("status"), "country": provider_data.get("country"),
                     "artwork_url": _persisted_artwork_source(provider_data),
                     "media": provider_data.get("media", []), "recordings": provider_data.get("tracks", []),
@@ -1203,6 +1213,8 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                 "disc_count": len({track.get("disc") or 1 for track in query["tracks"]}),
                 "artwork_url": query.get("artwork_url"),
             }
+            current_metadata.update({field: query[field] for field in ("release_type", "media", "country")
+                                     if query.get(field)})
             payloads.append({
                 "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
                 "selected_candidate_id": selected_id, "proposed_match": proposed_match,

@@ -165,36 +165,35 @@
     .album-modal-section { margin-bottom:.7rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .album-modal-section h3 { margin:0 0 .45rem; font-size:.88rem; }
     .alternatives-section { background:var(--modal-subtle); }
-    .candidate-list { display:grid; gap:.35rem; }
+    .candidate-list { display:grid; gap:.3rem; }
     .candidate-option { overflow:hidden; border:1px solid var(--modal-border); border-radius:.35rem; background:var(--modal-panel); }
     .candidate-option[open] { border-color:var(--modal-accent); }
     .candidate-option[aria-current="true"] { box-shadow:inset 3px 0 var(--modal-accent); }
-    .candidate-option-summary { display:grid; grid-template-columns:1rem minmax(0,1fr) auto; gap:.55rem; align-items:center; padding:.48rem .6rem; cursor:pointer; list-style:none; }
+    .candidate-option-summary { display:grid; grid-template-columns:1rem minmax(10rem,1fr) auto auto 1rem; gap:.5rem; align-items:center; min-height:2.45rem; padding:.4rem .55rem; cursor:pointer; list-style:none; }
     .candidate-option-summary::-webkit-details-marker { display:none; }
     .candidate-option-summary:hover { background:var(--modal-subtle); }
-    .candidate-marker { width:.8rem; height:.8rem; border:1px solid var(--modal-border); border-radius:50%; }
+    .candidate-marker { width:.78rem; height:.78rem; border:1px solid var(--modal-border); border-radius:50%; }
     .candidate-option[aria-current="true"] .candidate-marker { border:3px solid var(--modal-accent); }
-    .candidate-name { min-width:0; font-size:.86rem; font-weight:700; overflow-wrap:anywhere; }
-    .candidate-confidence { color:var(--muted); font-size:.76rem; font-weight:650; overflow-wrap:anywhere; text-align:right; text-transform:capitalize; }
-    .candidate-detail { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.55rem .8rem; padding:.6rem .75rem .7rem 2.15rem; border-top:1px solid var(--modal-border); }
-    .candidate-artwork { grid-row:1 / span 2; width:4rem; height:4rem; object-fit:cover; border:1px solid var(--modal-border); border-radius:.3rem; }
-    .candidate-facts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.4rem .75rem; margin:0; }
-    .candidate-facts div { min-width:0; }
-    .candidate-facts dt { color:var(--muted); font-size:.68rem; font-weight:700; letter-spacing:.03em; text-transform:uppercase; }
-    .candidate-facts dd { margin:.08rem 0 0; font-size:.78rem; overflow-wrap:anywhere; }
-    .candidate-id { font:inherit; }
-    .track-delta-disclosure { grid-column:1 / -1; border-top:1px solid var(--modal-border); }
-    .track-delta-summary { width:max-content; max-width:100%; margin:.1rem 0 0; padding:.25rem .45rem; border:1px solid var(--modal-border); border-radius:999px; color:var(--modal-accent); background:var(--modal-subtle); cursor:pointer; font-size:.74rem; font-weight:700; list-style:none; }
-    .track-delta-summary::-webkit-details-marker { display:none; }
-    .track-delta-summary::before { content:'\25b8'; display:inline-block; margin-right:.35rem; }
-    .track-delta-disclosure[open] .track-delta-summary::before { transform:rotate(90deg); }
-    .track-delta-panel { overflow-x:auto; margin-top:.45rem; }
-    .track-delta-table { width:100%; border-collapse:collapse; font-size:.74rem; }
-    .track-delta-table th,.track-delta-table td { padding:.35rem .45rem; border-top:1px solid var(--modal-border); text-align:left; vertical-align:top; }
-    .track-delta-table th { color:var(--muted); font-size:.67rem; letter-spacing:.03em; text-transform:uppercase; }
-    .track-delta-table tr[data-changed="true"] { background:var(--modal-subtle); }
-    .track-delta-table .changed-value { border-left:3px solid var(--modal-accent); font-weight:700; }
-    .candidate-note { grid-column:1 / -1; margin:0; color:var(--muted); font-size:.74rem; }
+    .candidate-name { min-width:0; overflow:hidden; font-size:.84rem; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
+    .candidate-confidence { color:var(--muted); font-size:.76rem; font-weight:700; white-space:nowrap; }
+    .candidate-signals { display:flex; align-items:center; gap:.22rem; color:var(--muted); }
+    .candidate-signal { display:inline-flex; }
+    .candidate-signal[data-changed="true"] { color:#b54708; }
+    body.dark-mode .candidate-signal[data-changed="true"],body.dark-mode .candidate-fact[data-changed="true"] > .candidate-icon { color:#fdb022; }
+    .candidate-signal[data-changed="false"] { opacity:.5; }
+    .candidate-icon { width:1rem; height:1rem; fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; stroke-width:1.8; }
+    .candidate-toggle { color:var(--muted); font-size:.75rem; transition:transform .15s ease; }
+    .candidate-toggle::before { content:'\25be'; }
+    .candidate-option:not([open]) .candidate-toggle { transform:rotate(-90deg); }
+    .candidate-detail { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.75rem; padding:.7rem .8rem .8rem 2.05rem; border-top:1px solid var(--modal-border); }
+    .candidate-artwork { width:5rem; height:5rem; object-fit:cover; border:1px solid var(--modal-border); border-radius:.3rem; }
+    .candidate-facts { grid-column:2; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.45rem 1rem; margin:0; }
+    .candidate-detail > .candidate-facts:first-child { grid-column:1 / -1; }
+    .candidate-fact { display:grid; grid-template-columns:1.15rem minmax(0,1fr); grid-template-rows:auto auto; column-gap:.35rem; min-width:0; }
+    .candidate-fact > .candidate-icon { grid-row:1 / span 2; margin-top:.12rem; color:var(--modal-accent); }
+    .candidate-fact[data-changed="true"] > .candidate-icon { color:#b54708; }
+    .candidate-fact dt { color:var(--muted); font-size:.67rem; font-weight:700; letter-spacing:.03em; line-height:1.2; text-transform:uppercase; }
+    .candidate-fact dd { margin:.06rem 0 0; font-size:.79rem; line-height:1.3; overflow-wrap:anywhere; }
     .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .override-form label { margin:0; font-size:.86rem; }
     .override-form input { margin-top:.25rem; }
@@ -227,11 +226,12 @@
       .review-folder-summary,.review-album-row { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
       .review-folder-summary .score-pill,.review-album-row .score-pill { display:none; }
       .review-album { width:100%; }
-      .candidate-option-summary { grid-template-columns:1rem minmax(0,1fr); }
-      .candidate-confidence { grid-column:2; text-align:left; }
+      .candidate-option-summary { grid-template-columns:1rem minmax(0,1fr) auto 1rem; }
+      .candidate-confidence { grid-column:3; }
+      .candidate-signals { grid-column:2 / 4; grid-row:2; }
+      .candidate-toggle { grid-column:4; grid-row:1 / span 2; }
       .candidate-detail { grid-template-columns:minmax(0,1fr); padding-left:.75rem; }
-      .candidate-artwork { grid-row:auto; }
-      .candidate-facts { grid-template-columns:minmax(0,1fr); }
+      .candidate-facts,.candidate-detail > .candidate-facts:first-child { grid-column:1; grid-template-columns:minmax(0,1fr); }
       .review-footer { align-items:stretch; flex-direction:column-reverse; }
       .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
       .review-footer button { width:100%; }
@@ -779,107 +779,55 @@
       const current = activeAlbum?.current_metadata || {artist:activeAlbum?.artist, album:activeAlbum?.album, track_count:activeAlbum?.tracks?.length || 0};
       const asIs = {...current, id:'as-is', is_as_is:true};
       const options = [...(activeAlbum?.candidates || []), asIs];
-      function formatDuration(seconds) {
-        if (!Number.isFinite(seconds)) return '—';
-        const rounded = Math.round(Math.abs(seconds));
-        return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, '0')}`;
+      const candidateIconPaths = {
+        artist:['M20 21a8 8 0 0 0-16 0','M12 13a4 4 0 1 0 0-8 4 4 0 0 0 0 8'],
+        album:['M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20','M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6','M12 12h.01'],
+        year:['M3 5h18v16H3z','M16 3v4','M8 3v4','M3 10h18'],
+        tracks:['M4 6h16','M4 12h16','M4 18h10'],
+        media:['M4 5h16v14H4z','M8 9h8','M8 15h8','M9 15l-1 4','M15 15l1 4'],
+        region:['M5 21V4','M5 5h11l-1 4 1 4H5'],
+        local:['M6 2h8l4 4v16H6z','M14 2v5h5','m9 14 2 2 4-4'],
+        online:['M7 18h10a4 4 0 0 0 .4-8 6 6 0 0 0-11.3 1.2A3.5 3.5 0 0 0 7 18','m9 14 2 2 4-4'],
+      };
+      function candidateIcon(kind) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.classList.add('candidate-icon'); svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('focusable', 'false');
+        candidateIconPaths[kind].forEach(pathValue => {
+          const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+          path.setAttribute('d', pathValue); svg.append(path);
+        });
+        return svg;
       }
-      function shortMusicBrainzId(value) {
-        if (!value) return 'Not provided';
-        const id = String(value);
-        return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+      function metadataChanged(left, right) {
+        return String(left || '').trim().toLocaleLowerCase() !== String(right || '').trim().toLocaleLowerCase();
       }
       function candidateFacts(value) {
-        if (value.is_as_is) return [
-          ['Artist', value.artist || 'Unknown artist'], ['Album', value.album || 'Unknown album'],
-          ['Year / date', value.date || value.year || 'Unchanged'], ['Release', 'No MusicBrainz association'],
-          ['Disc / media', `${value.disc_count || 1} ${value.disc_count === 1 ? 'disc' : 'discs'} · current files`],
-          ['Track coverage', `${value.track_count || 0} local tracks preserved`],
-          ['Duration delta', 'No change'], ['Track delta', 'No change'],
-        ];
-        const details = Array.isArray(value.track_details) ? value.track_details : [];
-        const durationPairs = details.filter(track => Number.isFinite(track.local_duration) && Number.isFinite(track.proposed_duration));
-        const durationDelta = durationPairs.reduce((total, track) => total + Math.abs(track.proposed_duration - track.local_duration), 0);
-        const changedTracks = comparisonTrackDetails(value).filter(trackHasChanges).length;
-        const media = Array.isArray(value.media) ? value.media : [];
-        const formats = [...new Set(media.map(medium => medium?.format).filter(Boolean))];
-        const discCount = media.length || new Set((value.recordings || []).map(track => track?.medium_position || track?.disc || 1)).size || 1;
+        const details = value.is_as_is || !Array.isArray(value.track_details) ? [] : value.track_details;
+        const paired = details.filter(track => track.local != null && track.proposed != null);
+        const changedTracks = paired.filter(track => metadataChanged(track.local, track.proposed)).length;
+        const unmatchedLocal = details.filter(track => track.local != null && ['missing', 'unmatched'].includes(track.status)).length;
+        const unmatchedOnline = details.filter(track => track.proposed != null && ['extra', 'unmatched'].includes(track.status)).length;
+        const formats = [...new Set(Array.isArray(value.media)
+          ? value.media.map(medium => medium?.format).filter(Boolean)
+          : value.media ? [value.media] : [])];
+        const releaseMedia = [value.release_type, ...formats].filter(Boolean).join(' · ')
+          || (value.is_as_is ? `${value.disc_count || 1} ${value.disc_count === 1 ? 'disc' : 'discs'} · current files` : 'Release/media not provided');
+        const releaseMediaChanged = !value.is_as_is && (
+          (current.release_type && metadataChanged(current.release_type, value.release_type))
+          || (current.media && !formats.some(format => !metadataChanged(current.media, format)))
+        );
+        const localTrackCount = value.track_count || activeAlbum?.tracks?.length || 0;
         return [
-          ['Artist', value.artist || 'Unknown artist'], ['Album', value.album || 'Unknown album'],
-          ['Year / date', value.date || value.year || 'Not provided'],
-          ['Release', [value.release_status, value.country].filter(Boolean).join(' · ') || 'MusicBrainz release'],
-          ['Release ID', shortMusicBrainzId(value.provider_id), value.provider_id],
-          ['Release group ID', shortMusicBrainzId(value.release_group_id), value.release_group_id],
-          ['Disc / media', `${discCount} ${discCount === 1 ? 'disc' : 'discs'}${formats.length ? ` · ${formats.join(', ')}` : ''}`],
-          ['Track coverage', `${value.matched_track_count || 0} matched · ${value.unmatched_track_count || 0} unmatched`],
-          ['Duration delta', durationPairs.length ? `${formatDuration(durationDelta)} total across ${durationPairs.length}` : 'Not available'],
-          ['Track delta', changedTracks ? `${changedTracks} changed` : 'No changes'],
+          {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
+          {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
+          {kind:'year', label:'Release Year', value:value.date || value.year || (value.is_as_is ? 'Unchanged' : 'Not provided'), changed:!value.is_as_is && metadataChanged(current.year, value.year)},
+          {kind:'tracks', label:'Tracks changed', value:changedTracks ? `${changedTracks} of ${paired.length} tracks changed` : 'No track titles changed', changed:changedTracks > 0},
+          {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
+          {kind:'region', label:'Release Region', value:value.country || (value.is_as_is ? 'Not present in current metadata' : 'Region not provided'), changed:!value.is_as_is && Boolean(current.country) && metadataChanged(current.country, value.country)},
+          {kind:'local', label:'Local tracks found online', value:value.is_as_is ? 'Not applicable — As Is' : (unmatchedLocal === 0 ? `All ${localTrackCount} local tracks found online` : `${unmatchedLocal} local ${unmatchedLocal === 1 ? 'track was' : 'tracks were'} not found online`), changed:unmatchedLocal > 0},
+          {kind:'online', label:'Online tracks present locally', value:value.is_as_is ? 'Not applicable — As Is' : (unmatchedOnline === 0 ? 'All online tracks present locally' : `${unmatchedOnline} online ${unmatchedOnline === 1 ? 'track is' : 'tracks are'} not present locally`), changed:unmatchedOnline > 0},
         ];
-      }
-      function candidateTrackDetails(value) {
-        if (!value.is_as_is) return Array.isArray(value.track_details) ? value.track_details : [];
-        return (activeAlbum?.tracks || []).map((track, index) => ({
-          position:index + 1, local:track.title, proposed:track.title,
-          local_duration:track.duration, proposed_duration:track.duration,
-          current_position:[track.disc || 1, track.position || index + 1],
-          proposed_position:[track.disc || 1, track.position || index + 1], status:'matched', issues:[],
-        }));
-      }
-      function comparisonTrackDetails(value) {
-        const currentTracks = activeAlbum?.tracks || [];
-        return candidateTrackDetails(value).map((track, index) => {
-          const currentPosition = Array.isArray(track.current_position) ? track.current_position : [];
-          const current = track.local == null ? null : currentTracks.find(item =>
-            (item.disc || 1) === currentPosition[0] && (item.position || 0) === currentPosition[1]
-          ) || currentTracks[Number.isInteger(track.position) ? track.position - 1 : index] || currentTracks[index];
-          return {...track, local_duration:Number.isFinite(current?.duration) ? current.duration : track.local_duration};
-        });
-      }
-      function trackHasChanges(track) {
-        return track.status !== 'matched' || track.local !== track.proposed
-          || (Number.isFinite(track.local_duration) && Number.isFinite(track.proposed_duration) && track.local_duration !== track.proposed_duration)
-          || JSON.stringify(track.current_position || null) !== JSON.stringify(track.proposed_position || null);
-      }
-      function appendTrackDeltaDisclosure(body, value, changedTracks) {
-        const disclosure = document.createElement('details'); disclosure.className = 'track-delta-disclosure';
-        const summary = document.createElement('summary'); summary.className = 'track-delta-summary';
-        summary.textContent = changedTracks ? `Changed details · ${changedTracks} ${changedTracks === 1 ? 'track' : 'tracks'}` : 'Track details · No changes';
-        summary.setAttribute('aria-label', `${summary.textContent}. Expand track comparison.`);
-        const panel = document.createElement('div'); panel.className = 'track-delta-panel'; panel.hidden = true;
-        const panelId = `track-delta-${activeAlbum?.id || 'album'}-${value.id}`; panel.id = panelId;
-        summary.setAttribute('aria-controls', panelId);
-        disclosure.addEventListener('toggle', () => {
-          panel.hidden = !disclosure.open;
-          if (disclosure.open && !panel.hasChildNodes()) {
-            const table = document.createElement('table'); table.className = 'track-delta-table';
-            const caption = document.createElement('caption'); caption.className = 'visually-hidden'; caption.textContent = 'Current and proposed track metadata';
-            const head = document.createElement('thead'); const headRow = document.createElement('tr');
-            ['Track', 'Current title', 'Proposed title', 'Current position', 'Proposed position', 'Current duration', 'Proposed duration'].forEach(label => {
-              const th = document.createElement('th'); th.scope = 'col'; th.textContent = label; headRow.append(th);
-            });
-            head.append(headRow); const rows = document.createElement('tbody');
-            comparisonTrackDetails(value).forEach((track, index) => {
-              const changed = trackHasChanges(track);
-              const row = document.createElement('tr'); row.dataset.changed = String(changed);
-              const position = document.createElement('td'); position.textContent = String(track.position || index + 1);
-              const currentValue = document.createElement('td'); currentValue.textContent = track.local || '—';
-              const proposedValue = document.createElement('td'); proposedValue.textContent = track.proposed || '—';
-              const currentPosition = document.createElement('td');
-              currentPosition.textContent = track.current_position ? `${track.current_position[0]}.${track.current_position[1]}` : '—';
-              const proposedPosition = document.createElement('td');
-              proposedPosition.textContent = track.proposed_position ? `${track.proposed_position[0]}.${track.proposed_position[1]}` : '—';
-              const currentDuration = document.createElement('td'); currentDuration.textContent = formatDuration(track.local_duration);
-              const proposedDuration = document.createElement('td'); proposedDuration.textContent = formatDuration(track.proposed_duration);
-              if (changed) {
-                proposedValue.classList.add('changed-value'); proposedPosition.classList.add('changed-value');
-                proposedDuration.classList.add('changed-value');
-              }
-              row.append(position, currentValue, proposedValue, currentPosition, proposedPosition, currentDuration, proposedDuration); rows.append(row);
-            });
-            table.append(caption, head, rows); panel.append(table);
-          }
-        });
-        disclosure.append(summary, panel); body.append(disclosure);
       }
       candidates.replaceChildren(...options.map((value, index) => {
         const selected = value.id === activeCandidateId;
@@ -892,9 +840,17 @@
         name.textContent = value.is_as_is ? 'As Is — keep current metadata' : `${value.artist} — ${value.album}${value.date || value.year ? ` (${value.date || value.year})` : ''}`;
         const recommendation = document.createElement('span'); recommendation.className = 'candidate-confidence';
         const scorePresentation = matchScorePresentation(value.confidence);
-        recommendation.textContent = value.is_as_is ? `${selected ? 'Selected · ' : ''}No MusicBrainz association` : `${selected ? 'Selected · ' : ''}${scorePresentation?.label || 'Score unavailable'} · ${value.recommendation} match`;
-        summary.setAttribute('aria-label', `Option ${index + 1}: ${name.textContent}. ${recommendation.textContent}. ${selected ? 'Selected and expanded' : 'Expand and select'}.`);
-        summary.append(marker, name, recommendation);
+        recommendation.textContent = value.is_as_is ? `${selected ? 'Selected · ' : ''}As Is` : `${selected ? 'Selected · ' : ''}${scorePresentation?.label || 'Score unavailable'}`;
+        const optionFacts = candidateFacts(value);
+        const signals = document.createElement('span'); signals.className = 'candidate-signals';
+        optionFacts.forEach(fact => {
+          const signal = document.createElement('span'); signal.className = 'candidate-signal';
+          signal.dataset.changed = String(fact.changed); signal.setAttribute('aria-label', `${fact.label}: ${fact.value}`);
+          signal.title = `${fact.label}: ${fact.value}`; signal.append(candidateIcon(fact.kind)); signals.append(signal);
+        });
+        const toggle = document.createElement('span'); toggle.className = 'candidate-toggle'; toggle.setAttribute('aria-hidden', 'true');
+        summary.setAttribute('aria-label', `Option ${index + 1}: ${name.textContent}. ${recommendation.textContent}. ${selected ? 'Selected' : 'Select'}. ${optionFacts.map(fact => `${fact.label}: ${fact.value}`).join('. ')}. Toggle details.`);
+        summary.append(marker, name, recommendation, signals, toggle);
         summary.addEventListener('click', () => {
           if (!selected) { activeCandidateId = value.id; renderAlbumMatch(); candidates.querySelector('[aria-checked="true"]')?.focus(); }
         });
@@ -913,22 +869,14 @@
           artwork.src = value.artwork_url; artwork.alt = `Persisted cover art for ${value.album}`; body.append(artwork);
         }
         const facts = document.createElement('dl'); facts.className = 'candidate-facts';
-        let changedTracks = 0;
-        candidateFacts(value).forEach(([term, description, fullValue]) => {
-          const wrapper = document.createElement('div'); const dt = document.createElement('dt'); const dd = document.createElement('dd');
-          dt.textContent = term;
-          if (term === 'Track delta') { dd.textContent = description; changedTracks = Number.parseInt(description, 10) || 0; }
-          else if (fullValue) {
-            const id = document.createElement('code'); id.className = 'candidate-id'; id.textContent = description;
-            id.title = fullValue; id.setAttribute('aria-label', fullValue); dd.append(id);
-          } else dd.textContent = description;
-          wrapper.append(dt, dd); facts.append(wrapper);
+        optionFacts.forEach(fact => {
+          const wrapper = document.createElement('div'); wrapper.className = 'candidate-fact';
+          wrapper.dataset.changed = String(fact.changed);
+          const dt = document.createElement('dt'); const dd = document.createElement('dd');
+          dt.textContent = fact.label; dd.textContent = fact.value;
+          wrapper.append(candidateIcon(fact.kind), dt, dd); facts.append(wrapper);
         });
-        const note = document.createElement('p'); note.className = 'candidate-note';
-        note.textContent = value.is_as_is
-          ? 'Queues the album with incoming metadata unchanged and without selecting a MusicBrainz release.'
-          : `${value.recommendation} recommendation based on existing metadata and track evidence; selecting it only records this review choice.`;
-        body.append(facts); appendTrackDeltaDisclosure(body, value, changedTracks); body.append(note); detail.append(summary, body);
+        body.append(facts); detail.append(summary, body);
         return detail;
       }));
     }

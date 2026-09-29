@@ -352,8 +352,11 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'role="radiogroup" aria-label="Album metadata candidates"' in modal
     assert b"detail.className = 'candidate-option'" in modal
     assert b"const asIs = {...current, id:'as-is', is_as_is:true" in modal
-    assert b"['Track coverage'" in modal
-    assert b"['Duration delta'" in modal
+    assert b"label:'Tracks changed'" in modal
+    assert b"label:'Release Type/media'" in modal
+    assert b"label:'Release Region'" in modal
+    assert b"label:'Local tracks found online'" in modal
+    assert b"label:'Online tracks present locally'" in modal
     assert b'id="library-import-modal-tracks"' not in modal
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
@@ -666,6 +669,7 @@ def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
              "tracks": [{"title": f"Other {number}", "position": number} for number in range(1, 8)],
              "retrieval": {"search_score": 100, "source": "musicbrainz-search"}},
             {"provider_id": "best", "artist": "Artist One", "album": "Album A", "track_count": 2, "year": 2020,
+             "release_type": "Album", "country": "GB", "media": [{"format": "CD"}],
              "tracks": [{"title": "First Song", "position": 1}, {"title": "Second Song", "position": 2}],
              "retrieval": {"search_score": 1, "source": "musicbrainz-search"}},
         ]
@@ -690,6 +694,9 @@ def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
     assert [candidate["provider_id"] for candidate in album["candidates"]] == ["best", "weaker"]
     assert album["candidates"][0]["confidence"] > .9
     assert album["candidates"][0]["retrieval"]["search_score"] == 1
+    assert album["candidates"][0]["release_type"] == "Album"
+    assert album["candidates"][0]["country"] == "GB"
+    assert album["candidates"][0]["media"] == [{"format": "CD"}]
     assert {key: album["candidates"][1]["proposed_diff"][key] for key in ("artist", "track_count")} == {
         "artist": {"from": "Artist One", "to": "Other Artist"},
         "track_count": {"from": 2, "to": 7},
@@ -980,13 +987,15 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
         seen["url"] = request.full_url
         seen["timeout"] = timeout
         if "/release/id-1" in request.full_url:
-            return Response(b'{"id":"id-1","title":"Album","date":"2024-03-02","release-group":{"id":"group-1"},"artist-credit":[{"name":"Artist"}],"media":[{"position":1,"format":"CD","track-count":1,"tracks":[{"position":1,"number":"1","length":123000,"recording":{"id":"recording-1","title":"Song"}}]}]}')
+            return Response(b'{"id":"id-1","title":"Album","date":"2024-03-02","country":"GB","release-group":{"id":"group-1","primary-type":"Album"},"artist-credit":[{"name":"Artist"}],"media":[{"position":1,"format":"CD","track-count":1,"tracks":[{"position":1,"number":"1","length":123000,"recording":{"id":"recording-1","title":"Song"}}]}]}')
         return Response(b'{"releases": [{"id": "id-1", "score": 99}]}')
 
     monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", urlopen)
     result = search_releases({"artist": "Artist", "album": "Album"}, limit=100)
     assert result[0]["provider_id"] == "id-1"
     assert result[0]["release_group_id"] == "group-1"
+    assert result[0]["release_type"] == "Album"
+    assert result[0]["country"] == "GB"
     assert result[0]["tracks"][0] == {"medium_position": 1, "position": 1, "number": "1", "title": "Song", "recording_id": "recording-1", "length_ms": 123000}
     assert result[0]["retrieval"] == {"search_score": 99, "source": "musicbrainz-search"}
     assert "/release/id-1" in seen["url"]
@@ -1153,9 +1162,9 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     assert b'id="library-import-modal-tracks"' not in html
     assert b'role="radiogroup" aria-label="Album metadata candidates"' in html
     assert b"summary.setAttribute('role', 'radio')" in html
-    assert b"['Disc / media'" in html
-    assert b"['Track delta'" in html
-    assert b"Queues the album with incoming metadata unchanged" in html
+    assert b"label:'Release Type/media'" in html
+    assert b"label:'Tracks changed'" in html
+    assert b"Not applicable \xe2\x80\x94 As Is" in html
     assert b"Math.round(candidate.confidence" not in html
     assert b"candidates.querySelector('[aria-checked=\"true\"]')?.focus()" in html
     assert b'id="library-import-rematch-form"' in html
@@ -1196,27 +1205,37 @@ def test_source_folder_line_carries_review_status_score_without_track_expansion(
     assert b"identity.append(parts.metadata)" in html
 
 
-def test_album_modal_shows_readable_musicbrainz_ids_and_on_demand_track_delta(tmp_path):
+def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
+    candidate_ui = html[html.index(b"const candidateIconPaths"):html.index(b"function openReview")]
 
-    assert b"['Release ID', shortMusicBrainzId(value.provider_id), value.provider_id]" in html
-    assert b"['Release group ID', shortMusicBrainzId(value.release_group_id), value.release_group_id]" in html
-    assert b"id.title = fullValue" in html and b"id.setAttribute('aria-label', fullValue)" in html
-    assert b"disclosure.className = 'track-delta-disclosure'" in html
-    assert b"summary.className = 'track-delta-summary'" in html
-    assert b"Changed details" in html
-    assert b"if (disclosure.open && !panel.hasChildNodes())" in html
-    assert b"['Track', 'Current title', 'Proposed title', 'Current position', 'Proposed position', 'Current duration', 'Proposed duration']" in html
-    assert b"row.dataset.changed = String(changed)" in html
+    for label in (
+        b"Artist", b"Album", b"Release Year", b"Tracks changed",
+        b"Release Type/media", b"Release Region",
+        b"Local tracks found online", b"Online tracks present locally",
+    ):
+        assert label in candidate_ui
+    for omitted in (
+        b"Duration delta", b"Release ID", b"Release group ID", b"Proposed position",
+        b"Current duration", b"Label", b"Barcode", b"matching service",
+    ):
+        assert omitted not in candidate_ui
+    assert b"candidateIconPaths" in candidate_ui
+    assert b"candidate-signals" in candidate_ui
+    assert b"candidate-fact" in candidate_ui
+    assert b"document.createElement('details')" in candidate_ui
+    assert b"document.createElement('summary')" in candidate_ui
 
 
-def test_album_modal_candidate_rows_show_numeric_score_and_use_current_duration_fallback(tmp_path):
+def test_album_modal_candidate_rows_keep_numeric_score_selected_state_and_artwork(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"const scorePresentation = matchScorePresentation(value.confidence)" in html
     assert b"${selected ? 'Selected \xc2\xb7 ' : ''}${scorePresentation?.label" in html
-    assert b"local_duration:Number.isFinite(current?.duration) ? current.duration : track.local_duration" in html
-    assert b"(item.disc || 1) === currentPosition[0]" in html
+    assert b"detail.open = selected" in html
+    assert b"detail.setAttribute('aria-current', String(selected))" in html
+    assert b"if (value.artwork_url)" in html
+    assert b"artwork.src = value.artwork_url" in html
 
 
 def test_library_import_operations_expose_visible_live_progress(tmp_path):
@@ -1250,7 +1269,10 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     path.write_bytes(b"synthetic")
     incoming_artwork = "data:image/png;base64,aW5jb21pbmc="
     library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
-    library.add(Item(title="Song", artist="Artist", album="Album", path=str(path), artwork_url=incoming_artwork))
+    library.add(Item(
+        title="Song", artist="Artist", album="Album", path=str(path), artwork_url=incoming_artwork,
+        albumtype="album", media="Digital Media", country="GB",
+    ))
     client = app.test_client()
     assert client.post("/api/library/inventory/preview").status_code == 201
     assert client.post("/api/library-import/candidates", json={}).status_code == 201
@@ -1261,6 +1283,9 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     assert album["candidates"][0]["artwork_url"] == "https://images.example.test/cover.jpg"
     assert album["candidates"][1]["artwork_url"] is None
     assert album["current_metadata"]["artwork_url"] == incoming_artwork
+    assert {key: album["current_metadata"][key] for key in ("release_type", "media", "country")} == {
+        "release_type": "album", "media": "Digital Media", "country": "GB",
+    }
 
     html = client.get("/settings").data
     assert b"if (value.artwork_url)" in html
