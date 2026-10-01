@@ -314,8 +314,9 @@
       <p>Inventory audio file paths and file stats, then compare them with the canonical beets library. This preview never changes music files or runs beets import.</p>
       <div class="import-actions">
         <button id="inventory-preview" type="button">Run inventory preview</button>
-        <button id="candidate-generate" type="button">Find MusicBrainz candidates</button>
+        <button id="candidate-generate" type="button" aria-describedby="candidate-generate-help" disabled>Find MusicBrainz candidates</button>
       </div>
+      <small id="candidate-generate-help">Run inventory preview in this browser session before finding candidates.</small>
       <p id="inventory-status" class="operation-status" role="status" aria-live="polite">No preview run in this browser session.</p>
       <div id="inventory-summary" class="inventory-summary" hidden></div>
       <h3>Review inventory items</h3>
@@ -579,6 +580,7 @@
 
     const inventoryButton = document.getElementById('inventory-preview');
     const candidateButton = document.getElementById('candidate-generate');
+    const candidateHelp = document.getElementById('candidate-generate-help');
     const reviewList = document.getElementById('library-import-review-list');
     const reviewStatus = document.getElementById('library-import-review-status');
     const reviewPrevious = document.getElementById('library-import-review-previous');
@@ -591,6 +593,18 @@
     let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null;
     const reviewArtistLimit = 25;
     let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalArtists = 0, reviewPageArtistCount = 0;
+    let inventoryPreviewReady = false;
+
+    function setCandidateAvailability(ready) {
+      inventoryPreviewReady = ready;
+      candidateButton.disabled = !ready;
+      candidateButton.setAttribute('aria-disabled', String(!ready));
+      candidateHelp.textContent = ready
+        ? 'Inventory preview complete. Candidate lookup uses the current inventory.'
+        : 'Run inventory preview in this browser session before finding candidates.';
+    }
+
+    if (candidateButton) setCandidateAvailability(false);
 
     function setOperationBusy(button, statusElement, busy, message = '') {
       if (button) {
@@ -1060,6 +1074,7 @@
         latestInventoryPreview = data;
         renderInventoryPreview(data);
         persistInventoryPreview();
+        setCandidateAvailability(true);
         await loadReviewItems(0);
       } catch (error) {
         inventoryStatus.textContent = error.message || 'Inventory preview failed.';
@@ -1069,6 +1084,7 @@
     });
 
     if (candidateButton) candidateButton.addEventListener('click', async () => {
+      if (!inventoryPreviewReady) return;
       setOperationBusy(candidateButton, reviewStatus, true, 'Requesting bounded MusicBrainz matches…');
       try {
         const response = await fetch('/api/library-import/candidates', {
@@ -1080,7 +1096,10 @@
         if (data.errors?.length) reviewStatus.textContent += ` ${data.errors.length} album lookup(s) can be retried.`;
       } catch (error) {
         reviewStatus.textContent = error.message || 'Candidate generation failed.';
-      } finally { setOperationBusy(candidateButton, reviewStatus, false); }
+      } finally {
+        setOperationBusy(candidateButton, reviewStatus, false);
+        setCandidateAvailability(inventoryPreviewReady);
+      }
     });
 
     {% if not first_run %}

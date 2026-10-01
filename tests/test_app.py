@@ -1368,6 +1368,49 @@ def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
     assert b"latestInventoryPreview = data;" in first
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_musicbrainz_candidates_require_successful_preview_in_current_page_session(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+
+    assert 'id="candidate-generate" type="button" aria-describedby="candidate-generate-help" disabled' in html
+    assert "Run inventory preview in this browser session before finding candidates." in html
+    assert html.count("setCandidateAvailability(true);") == 1
+    preview_success = html.index("setCandidateAvailability(true);")
+    assert html.index("if (!response.ok) throw new Error", html.index("/api/library/inventory/preview")) < preview_success
+    assert preview_success < html.index("await loadReviewItems(0);")
+
+    start = html.index("let inventoryPreviewReady = false;")
+    end = html.index("function setOperationBusy", start)
+    helper = html[start:end]
+    probe = f"""
+const attributes = {{}};
+const candidateButton = {{disabled: null, setAttribute(name, value) {{ attributes[name] = value; }}}};
+const candidateHelp = {{textContent: ''}};
+{helper}
+const before = {{disabled: candidateButton.disabled, ariaDisabled: attributes['aria-disabled'], help: candidateHelp.textContent}};
+setCandidateAvailability(true);
+const after = {{disabled: candidateButton.disabled, ariaDisabled: attributes['aria-disabled'], help: candidateHelp.textContent}};
+console.log(JSON.stringify({{before, after}}));
+"""
+    completed = subprocess.run(
+        [shutil.which("node"), "--input-type=module", "--eval", probe],
+        check=True, capture_output=True, text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "before": {
+            "disabled": True,
+            "ariaDisabled": "true",
+            "help": "Run inventory preview in this browser session before finding candidates.",
+        },
+        "after": {
+            "disabled": False,
+            "ariaDisabled": "false",
+            "help": "Inventory preview complete. Candidate lookup uses the current inventory.",
+        },
+    }
+
+
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()
