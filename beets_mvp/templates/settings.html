@@ -913,6 +913,13 @@
       function metadataChanged(left, right) {
         return String(left || '').trim().toLocaleLowerCase() !== String(right || '').trim().toLocaleLowerCase();
       }
+      function trackTitleExplanation(local, proposed) {
+        const localTitle = String(local ?? 'Not present locally');
+        const proposedTitle = String(proposed ?? 'Not present on MusicBrainz');
+        const comparable = title => title.normalize('NFKC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+        const difference = comparable(localTitle) === comparable(proposedTitle) ? ' punctuation or formatting' : '';
+        return `Title${difference} differs: local “${localTitle}” → MusicBrainz “${proposedTitle}”.`;
+      }
       function candidateReleaseYear(value) {
         const match = [value.year, value.date]
           .map(candidate => String(candidate || '').match(/(?:^|\D)(\d{4})(?:\D|$)/)).find(Boolean);
@@ -957,13 +964,14 @@
           if (track.status === 'missing') explanations.push('Local track was not found on the MusicBrainz release.');
           else if (track.status === 'extra') explanations.push('MusicBrainz track is not present locally.');
           else if (track.status === 'unmatched') explanations.push('Local and MusicBrainz tracks could not be confidently matched.');
-          if (titleChanged && !unpaired) explanations.push('Title differs.');
-          if (positionChanged && !unpaired) explanations.push('Track position differs.');
+          if (titleChanged && !unpaired) explanations.push(trackTitleExplanation(track.local, track.proposed));
+          if (positionChanged && !unpaired) explanations.push(`Position differs: local ${localPosition || 'not provided'} → MusicBrainz ${proposedPosition || 'not provided'}.`);
           if (changed && localDuration === '' && proposedDuration !== '') explanations.push('Local duration unavailable.');
           if (changed && proposedDuration === '' && localDuration !== '') explanations.push('MusicBrainz duration unavailable.');
           if (durationChanged) {
             const seconds = Math.abs(durationDelta);
-            explanations.push(`Duration differs by ${seconds} second${seconds === 1 ? '' : 's'}.`);
+            const direction = durationDelta > 0 ? 'longer' : 'shorter';
+            explanations.push(`Duration differs: local ${localDuration} → MusicBrainz ${proposedDuration} (${seconds} second${seconds === 1 ? '' : 's'} ${direction}).`);
           }
           return {...track, localPosition, proposedPosition, localDuration, proposedDuration,
             durationDelta, titleChanged, positionChanged, durationChanged, unpaired, explanations};
@@ -993,7 +1001,7 @@
           {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
           {kind:'year', label:'Release Year', value:year.value, changed:year.changed, localYear:year.localYear, proposedYear:year.proposedYear, comparison:year.changed},
-          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'No tracks changed', changed:trackChanges.length > 0, tracks, expandable:!value.is_as_is},
+          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'No tracks changed', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks, expandable:!value.is_as_is},
           {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
           {kind:'region', label:'Release Region', value:value.country || (value.is_as_is ? 'Not present in current metadata' : 'Region not provided'), changed:!value.is_as_is && Boolean(current.country) && metadataChanged(current.country, value.country)},
           {kind:'local', label:'Local tracks found online', value:value.is_as_is ? 'Not applicable — As Is' : (unmatchedLocal === 0 ? `All ${localTrackCount} local tracks found online` : `${unmatchedLocal} local ${unmatchedLocal === 1 ? 'track was' : 'tracks were'} not found online`), changed:unmatchedLocal > 0},
@@ -1048,9 +1056,9 @@
           dt.textContent = fact.label;
           if (fact.expandable) {
             const changeButton = document.createElement('button'); changeButton.type = 'button';
-            changeButton.className = 'track-change-button'; changeButton.textContent = fact.value;
+            changeButton.className = 'track-change-button'; changeButton.textContent = `View track changes (${fact.changeCount})`;
             changeButton.setAttribute('aria-haspopup', 'dialog');
-            changeButton.setAttribute('aria-label', `${fact.value}. Compare local and MusicBrainz tracks for ${value.artist} — ${value.album}`);
+            changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist} — ${value.album}`);
             changeButton.addEventListener('click', () => openTrackComparison(fact.tracks, `${value.artist} — ${value.album}`, changeButton));
             dd.append(changeButton);
           } else if (fact.comparison) {

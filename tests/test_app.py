@@ -358,6 +358,8 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"oldYear.className = 'metadata-old'" in modal
     assert b"newYear.className = 'metadata-new'" in modal
     assert b"changeButton.className = 'track-change-button'" in modal
+    assert b"changeButton.textContent = `View track changes (${fact.changeCount})`" in modal
+    assert b"changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist}" in modal
     assert b"changeButton.setAttribute('aria-haspopup', 'dialog')" in modal
     assert b"openTrackComparison(fact.tracks" in modal
     assert b'class="browser track-modal"' in modal
@@ -412,6 +414,7 @@ const result = {
   ],
   changes: changedTrackEvidence([
     {local:'Old title', proposed:'New title', current_position:[1,1], proposed_position:[1,2], local_duration:120, proposed_duration:130, status:'title-mismatch'},
+    {local:'Part 1: Intro', proposed:'Part 1 — Intro', current_position:[1,2], proposed_position:[1,2], local_duration:90, proposed_duration:90, status:'title-mismatch'},
     {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
     {local:null, proposed:'Bonus', current_position:null, proposed_position:[2,1], local_duration:null, proposed_duration:90, status:'extra'},
   ]).map(track => ({local:track.local, proposed:track.proposed, localPosition:track.localPosition,
@@ -433,7 +436,11 @@ console.log(JSON.stringify(result));
         ],
         "changes": [
             {"local": "Old title", "proposed": "New title", "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10,
-             "explanations": ["Title differs.", "Track position differs.", "Duration differs by 10 seconds."]},
+             "explanations": ["Title differs: local “Old title” → MusicBrainz “New title”.",
+                              "Position differs: local 1.01 → MusicBrainz 1.02.",
+                              "Duration differs: local 2:00 → MusicBrainz 2:10 (10 seconds longer)."]},
+            {"local": "Part 1: Intro", "proposed": "Part 1 — Intro", "localPosition": "1.02", "proposedPosition": "1.02", "durationDelta": 0,
+             "explanations": ["Title punctuation or formatting differs: local “Part 1: Intro” → MusicBrainz “Part 1 — Intro”."]},
             {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None,
              "explanations": ["MusicBrainz track is not present locally.", "Local duration unavailable."]},
         ],
