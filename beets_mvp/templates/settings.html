@@ -208,6 +208,8 @@
     .track-comparison-table td:first-child,.track-comparison-table td:nth-last-child(-n+2) { white-space:nowrap; }
     .track-cell-changed { background:color-mix(in srgb,#fdb022 16%,var(--modal-panel)); font-weight:650; }
     .track-row-unmatched { box-shadow:inset 3px 0 #b54708; }
+    .track-explanation-row td { padding:.25rem .5rem .45rem; color:var(--muted); background:var(--modal-subtle); font-size:.69rem; }
+    .track-change-explanation { margin:0; }
     .track-missing { color:var(--muted); font-style:italic; }
     .track-unmatched-label { display:block; margin-top:.15rem; color:#b54708; font-size:.65rem; font-weight:750; text-transform:uppercase; }
     body.dark-mode .track-unmatched-label { color:#fdb022; }
@@ -852,7 +854,7 @@
       trackComparisonReturnFocus = button;
       document.getElementById('track-comparison-title').textContent = `Track changes — ${candidateName}`;
       const rows = document.getElementById('track-comparison-rows');
-      rows.replaceChildren(...tracks.map(track => {
+      rows.replaceChildren(...tracks.flatMap(track => {
         const row = document.createElement('tr');
         if (track.unpaired) row.className = 'track-row-unmatched';
         const position = track.localPosition === track.proposedPosition
@@ -865,7 +867,13 @@
           missing:track.proposed == null, label:track.proposed == null ? 'Not present online' : (track.status === 'extra' ? 'Extra online' : track.status === 'unmatched' ? 'Unmatched' : '')});
         appendTrackCell(row, track.localDuration, {changed:track.durationChanged && track.localDuration !== '', missing:track.localDuration === ''});
         appendTrackCell(row, track.proposedDuration, {changed:track.durationChanged && track.proposedDuration !== '', missing:track.proposedDuration === ''});
-        return row;
+        const explanations = track.explanations || [];
+        if (!explanations.length) return [row];
+        const explanationRow = document.createElement('tr'); explanationRow.className = 'track-explanation-row';
+        const explanationCell = document.createElement('td'); explanationCell.colSpan = 5;
+        const explanation = document.createElement('p'); explanation.className = 'track-change-explanation';
+        explanation.textContent = explanations.join(' '); explanationCell.append(explanation); explanationRow.append(explanationCell);
+        return [row, explanationRow];
       }));
       if (!tracks.length) {
         const row = document.createElement('tr'); const cell = document.createElement('td');
@@ -944,8 +952,21 @@
           const durationDelta = rawDurationDelta === null ? null : Math.round(rawDurationDelta);
           const durationChanged = rawDurationDelta !== null && Math.abs(rawDurationDelta) > 3;
           const unpaired = ['missing', 'extra', 'unmatched'].includes(track.status);
+          const changed = titleChanged || positionChanged || durationChanged || unpaired;
+          const explanations = [];
+          if (track.status === 'missing') explanations.push('Local track was not found on the MusicBrainz release.');
+          else if (track.status === 'extra') explanations.push('MusicBrainz track is not present locally.');
+          else if (track.status === 'unmatched') explanations.push('Local and MusicBrainz tracks could not be confidently matched.');
+          if (titleChanged && !unpaired) explanations.push('Title differs.');
+          if (positionChanged && !unpaired) explanations.push('Track position differs.');
+          if (changed && localDuration === '' && proposedDuration !== '') explanations.push('Local duration unavailable.');
+          if (changed && proposedDuration === '' && localDuration !== '') explanations.push('MusicBrainz duration unavailable.');
+          if (durationChanged) {
+            const seconds = Math.abs(durationDelta);
+            explanations.push(`Duration differs by ${seconds} second${seconds === 1 ? '' : 's'}.`);
+          }
           return {...track, localPosition, proposedPosition, localDuration, proposedDuration,
-            durationDelta, titleChanged, positionChanged, durationChanged, unpaired};
+            durationDelta, titleChanged, positionChanged, durationChanged, unpaired, explanations};
         });
       }
       function changedTrackEvidence(details) {

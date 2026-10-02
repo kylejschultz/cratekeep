@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -17,6 +18,7 @@ import yaml
 from beets import config as beets_config
 from beets.library import Library
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
+from mediafile import MediaFile, UnreadableFileError
 
 from .musicbrainz import ProviderError, search_releases
 from .matching import score_release
@@ -935,8 +937,12 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
         title = item.get("title") if item and item.get("title") else Path(row["relative_path"]).stem
         track = {"title": _normalize_track_title(title), "path": row["relative_path"]}
+        stored_duration = item.get("length") if item and item.get("length") not in (None, "", 0) else None
+        duration = _audio_duration(Path(app.config["LIBRARY_PATH"]) / row["relative_path"], stored_duration)
+        if duration is not None:
+            track["duration"] = duration
         if item:
-            for source, target in (("length", "duration"), ("disc", "disc"), ("track", "track"),
+            for source, target in (("disc", "disc"), ("track", "track"),
                                    ("mb_trackid", "recording_id")):
                 if item.get(source) not in (None, "", 0):
                     track[target] = item.get(source)
@@ -968,6 +974,18 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
     if artwork_url:
         query["artwork_url"] = artwork_url
     return query
+
+
+def _audio_duration(path: Path, fallback: object = None) -> float | object | None:
+    """Read an audio stream's duration without changing the file or library."""
+    try:
+        measured = MediaFile(str(path)).length
+        duration = float(measured)
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except (OSError, TypeError, ValueError, UnreadableFileError):
+        pass
+    return fallback
 
 
 def _candidate_match(query: dict, candidate: dict, *, exact_mbid: bool = False) -> dict:

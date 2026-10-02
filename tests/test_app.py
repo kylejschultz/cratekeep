@@ -3,6 +3,7 @@ import shutil
 import sqlite3
 import subprocess
 import urllib.error
+import wave
 from pathlib import Path
 
 import pytest
@@ -369,6 +370,8 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'<th scope="col">Proposed duration</th>' in modal
     assert b"row.className = 'track-row-unmatched'" in modal
     assert b"cell.classList.add('track-cell-changed')" in modal
+    assert b"explanationRow.className = 'track-explanation-row'" in modal
+    assert b"const explanations = track.explanations || []" in modal
     assert b"reviewDialog.inert = true" in modal
     assert b"reviewDialog.inert = false" in modal
     assert b"trackComparisonReturnFocus.focus()" in modal
@@ -412,7 +415,10 @@ const result = {
     {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
     {local:null, proposed:'Bonus', current_position:null, proposed_position:[2,1], local_duration:null, proposed_duration:90, status:'extra'},
   ]).map(track => ({local:track.local, proposed:track.proposed, localPosition:track.localPosition,
-    proposedPosition:track.proposedPosition, durationDelta:track.durationDelta})),
+    proposedPosition:track.proposedPosition, durationDelta:track.durationDelta, explanations:track.explanations})),
+  compact: trackEvidence([
+    {local:'Same', proposed:'Same', current_position:[1,1], proposed_position:[1,1], local_duration:180, proposed_duration:null, status:'matched'},
+  ])[0].explanations,
 };
 console.log(JSON.stringify(result));
 """
@@ -426,9 +432,12 @@ console.log(JSON.stringify(result));
             {"localYear": "", "proposedYear": "2024", "changed": True, "value": "Not provided → 2024"},
         ],
         "changes": [
-            {"local": "Old title", "proposed": "New title", "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10},
-            {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None},
+            {"local": "Old title", "proposed": "New title", "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10,
+             "explanations": ["Title differs.", "Track position differs.", "Duration differs by 10 seconds."]},
+            {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None,
+             "explanations": ["MusicBrainz track is not present locally.", "Local duration unavailable."]},
         ],
+        "compact": [],
     }
 
 
@@ -902,6 +911,34 @@ def test_album_track_comparison_carries_current_track_duration(tmp_path):
     assert album["tracks"][0]["duration"] == pytest.approx(187.25)
     assert album["candidates"][0]["track_details"][0]["local_duration"] == pytest.approx(187.25)
     assert album["candidates"][0]["track_details"][0]["proposed_duration"] == 190
+
+
+def test_album_track_comparison_measures_duration_from_audio_file(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    path.parent.mkdir(parents=True)
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(8000)
+        audio.writeframes(b"\0\0" * 16000)
+    original_bytes = path.read_bytes()
+    original_mtime = path.stat().st_mtime_ns
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": "Artist", "album": "Album",
+        "tracks": [{"title": "Song", "position": 1, "duration": 7}],
+    }]
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+
+    assert album["tracks"][0]["duration"] == pytest.approx(2.0)
+    assert album["candidates"][0]["track_details"][0]["local_duration"] == pytest.approx(2.0)
+    assert album["candidates"][0]["track_details"][0]["proposed_duration"] == 7
+    assert path.read_bytes() == original_bytes
+    assert path.stat().st_mtime_ns == original_mtime
 
 
 def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
