@@ -354,10 +354,25 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"const asIs = {...current, id:'as-is', is_as_is:true" in modal
     assert b"label:'Tracks changed'" in modal
     assert b"candidateReleaseYear(value)" in modal
-    assert b"changes.className = 'candidate-track-changes'" in modal
-    assert "Title: “${track.local}” → “${track.proposed}”".encode() in modal
-    assert "Position: ${track.localPosition || '—'} → ${track.proposedPosition || '—'}".encode() in modal
-    assert "Duration: ${track.localDuration || '—'} → ${track.proposedDuration || '—'}".encode() in modal
+    assert b"oldYear.className = 'metadata-old'" in modal
+    assert b"newYear.className = 'metadata-new'" in modal
+    assert b"changeButton.className = 'track-change-button'" in modal
+    assert b"changeButton.setAttribute('aria-haspopup', 'dialog')" in modal
+    assert b"openTrackComparison(fact.tracks" in modal
+    assert b'class="browser track-modal"' in modal
+    assert b'aria-labelledby="track-comparison-title"' in modal
+    assert b'aria-describedby="track-comparison-description"' in modal
+    assert b'<th scope="col">Position</th>' in modal
+    assert b'<th scope="col">Local title</th>' in modal
+    assert b'<th scope="col">MusicBrainz title</th>' in modal
+    assert b'<th scope="col">Local duration</th>' in modal
+    assert b'<th scope="col">Proposed duration</th>' in modal
+    assert b"row.className = 'track-row-unmatched'" in modal
+    assert b"cell.classList.add('track-cell-changed')" in modal
+    assert b"reviewDialog.inert = true" in modal
+    assert b"reviewDialog.inert = false" in modal
+    assert b"trackComparisonReturnFocus.focus()" in modal
+    assert b"event.stopPropagation(); closeTrackComparison()" in modal
     assert b"label:'Release Type/media'" in modal
     assert b"label:'Release Region'" in modal
     assert b"label:'Local tracks found online'" in modal
@@ -387,6 +402,11 @@ const result = {
     candidateReleaseYear({year: 'unknown', date: '2003-08-04'}),
     candidateReleaseYear({date: 'not provided'}),
   ],
+  yearEvidence: [
+    releaseYearEvidence({year:'2021'}, {date:'2022-03-04'}),
+    releaseYearEvidence({date:'2022-01-01'}, {year:'2022'}),
+    releaseYearEvidence({year:null}, {year:'2024'}),
+  ],
   changes: changedTrackEvidence([
     {local:'Old title', proposed:'New title', current_position:[1,1], proposed_position:[1,2], local_duration:120, proposed_duration:130, status:'title-mismatch'},
     {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
@@ -400,6 +420,11 @@ console.log(JSON.stringify(result));
 
     assert json.loads(completed.stdout) == {
         "years": ["2024", "1999", "2003", ""],
+        "yearEvidence": [
+            {"localYear": "2021", "proposedYear": "2022", "changed": True, "value": "2021 → 2022"},
+            {"localYear": "2022", "proposedYear": "2022", "changed": False, "value": "2022"},
+            {"localYear": "", "proposedYear": "2024", "changed": True, "value": "Not provided → 2024"},
+        ],
         "changes": [
             {"local": "Old title", "proposed": "New title", "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10},
             {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None},
