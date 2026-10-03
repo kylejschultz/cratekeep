@@ -131,6 +131,9 @@
     @keyframes operation-spin { to { transform:rotate(360deg); } }
     @media (prefers-reduced-motion:reduce) { .operation-status[data-busy="true"]::before { animation-duration:1.8s; } }
     .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
+    .review-bulk-actions { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; padding:.5rem .65rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
+    .review-bulk-actions label { display:flex; align-items:center; gap:.45rem; margin:0; font-size:.8rem; }
+    .review-bulk-actions button { margin:0; }
     .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
     .review-pagination button { margin:0; }
     .review-folder { border-bottom:1px solid var(--border); background:transparent; }
@@ -143,13 +146,19 @@
     .review-folder-path::before { content:"\1F4C1"; margin-right:.45rem; font-family:system-ui,sans-serif; }
     .review-folder-count { color:var(--muted); font-size:.76rem; white-space:nowrap; }
     .review-folder-contents { border-top:1px solid var(--border); background:var(--page); }
-    .review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.8rem; align-items:center; padding:.7rem .8rem .75rem 1.8rem; border-bottom:1px solid var(--border); }
+    .review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto auto; gap:.55rem; align-items:center; padding:.42rem .6rem; border-bottom:1px solid var(--border); }
     .review-album-row:last-child { border-bottom:0; }
-    .review-source-metadata { display:block; margin-bottom:.25rem; color:var(--text); font-size:.82rem; font-weight:650; }
+    .review-select { width:1rem; height:1rem; margin:0; }
     .review-album { display:grid; place-items:center; width:2rem; min-width:2rem; height:2rem; margin:0; padding:0; border:0; border-radius:.25rem; background:transparent; color:var(--accent); font-size:1.05rem; }
     .review-album:hover { background:var(--active); color:var(--text); }
     .review-album:focus-visible { outline:3px solid var(--focus); outline-offset:2px; }
-    .review-track-count { color:var(--muted); font-size:.76rem; }
+    .review-track-count { display:inline-flex; align-items:center; padding:.12rem .4rem; border:1px solid var(--border); border-radius:999px; color:var(--muted); background:var(--subtle); font-size:.7rem; font-weight:700; white-space:nowrap; }
+    .duplicate-row-warning { color:#8f1d14; font-size:.72rem; font-weight:800; white-space:nowrap; }
+    .duplicate-warning { border-color:#b54708; color:#5f3300; background:#fff4d5; }
+    .duplicate-warning[hidden] { display:none; }
+    .duplicate-warning h3 { color:#8f3d00; }
+    .duplicate-warning ul { margin:.4rem 0 0; padding-left:1.2rem; font: .76rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    body.dark-mode .duplicate-warning { color:#ffe7b2; background:#563b18; }
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
     .status-pill { color:#20252b; background:#f4f5f6; }
     .status-pill[data-status="Matched"],.status-pill[data-status="Queued"],.status-pill[data-status="Imported"] { border-color:#397052; color:#163d29; background:#d9eee1; }
@@ -223,8 +232,6 @@
     .review-footer { position:sticky; bottom:0; justify-content:space-between; flex-wrap:nowrap; padding:.7rem 1rem; }
     .review-footer-group { display:flex; flex-wrap:wrap; gap:.5rem; }
     .review-footer button { margin:0; padding:.55rem .8rem; }
-    .browser-actions .danger-button { border-color:#b64b55; background:transparent; color:#a52b35; }
-    .browser-actions .danger-button:hover { background:var(--error); color:#8d2029; }
     .browser-actions .approve-button { min-width:6.5rem; font-weight:750; }
     @media (max-width: 760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
@@ -245,8 +252,9 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
-      .review-folder-summary,.review-album-row { grid-template-columns:minmax(0,1fr) auto auto; padding-left:.8rem; }
+      .review-folder-summary,.review-album-row { grid-template-columns:auto minmax(0,1fr) auto auto; padding-left:.6rem; }
       .review-folder-summary .score-pill,.review-album-row .score-pill { display:none; }
+      .review-album-row .status-pill,.duplicate-row-warning { display:none; }
       .review-album { width:100%; }
       .candidate-option-summary { grid-template-columns:1rem minmax(0,1fr) auto 1rem; }
       .candidate-confidence { grid-column:3; }
@@ -338,6 +346,10 @@
       <div id="inventory-summary" class="inventory-summary" hidden></div>
       <h3>Review inventory items</h3>
       <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite">Run an inventory preview to create review items.</p>
+      <div class="review-bulk-actions" aria-label="Album selection actions">
+        <label for="library-import-select-all"><input id="library-import-select-all" type="checkbox"> Select all albums on this page</label>
+        <button id="library-import-review-selected" class="secondary" type="button" disabled>Review selected (0)</button>
+      </div>
       <div id="library-import-review-list" class="review-list"></div>
       <nav class="review-pagination" aria-label="Library import review pages">
         <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous artists</button>
@@ -384,6 +396,11 @@
       </header>
       <div class="browser-body">
         <p id="library-import-modal-description" class="visually-hidden">Review and choose one metadata match for this album. This decision does not change music files.</p>
+        <section id="library-import-duplicate-warning" class="album-modal-section duplicate-warning" role="alert" aria-labelledby="duplicate-warning-title" hidden>
+          <h3 id="duplicate-warning-title">This album may already be managed</h3>
+          <p id="library-import-duplicate-message"></p>
+          <ul id="library-import-duplicate-files"></ul>
+        </section>
         <section class="album-modal-section alternatives-section" aria-labelledby="candidate-alternatives-title">
           <h3 id="candidate-alternatives-title">Choose album metadata</h3>
           <div id="library-import-modal-candidates" class="candidate-list" role="radiogroup" aria-label="Album metadata candidates"></div>
@@ -395,7 +412,7 @@
           <button id="library-import-rematch" type="submit">Rematch</button>
           <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
         </form>
-        <section class="album-modal-section" aria-labelledby="duplicate-action-title">
+        <section id="library-import-duplicate-policy" class="album-modal-section" aria-labelledby="duplicate-action-title" hidden>
           <h3 id="duplicate-action-title">If a managed track has the same MusicBrainz recording ID</h3>
           <label for="library-import-duplicate-action">Duplicate decision
             <select id="library-import-duplicate-action">
@@ -425,8 +442,7 @@
           <button type="button" class="secondary" data-review-decision="skipped">Skip for now</button>
         </div>
         <div class="review-footer-group">
-          <button type="button" class="secondary danger-button" data-review-decision="rejected">Reject</button>
-          <button type="button" class="approve-button" data-review-decision="approved">Queue import</button>
+          <button type="button" id="library-import-queue" class="approve-button" data-review-decision="approved">Queue import</button>
         </div>
       </footer>
     </section>
@@ -645,12 +661,16 @@
     const reviewPrevious = document.getElementById('library-import-review-previous');
     const reviewNext = document.getElementById('library-import-review-next');
     const reviewPage = document.getElementById('library-import-review-page');
+    const reviewSelectAll = document.getElementById('library-import-select-all');
+    const reviewSelectedButton = document.getElementById('library-import-review-selected');
     const reviewModal = document.getElementById('library-import-modal');
     const trackComparisonModal = document.getElementById('track-comparison-modal');
     const inventoryStatus = document.getElementById('inventory-status');
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
     let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null, trackComparisonReturnFocus = null;
+    const selectedAlbumIds = new Set();
+    let reviewSequence = [];
     const reviewArtistLimit = 25;
     let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalArtists = 0, reviewPageArtistCount = 0;
     let inventoryPreviewReady = false;
@@ -761,6 +781,14 @@
 
     function renderReviewItems() {
       if (!reviewList) return;
+      const updateBulkActions = () => {
+        const pageIds = [...new Set(albumReviews.map(album => album.id))];
+        const selectedOnPage = pageIds.filter(id => selectedAlbumIds.has(id)).length;
+        reviewSelectAll.checked = pageIds.length > 0 && selectedOnPage === pageIds.length;
+        reviewSelectAll.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
+        reviewSelectedButton.disabled = selectedAlbumIds.size === 0;
+        reviewSelectedButton.textContent = `Review selected (${selectedAlbumIds.size})`;
+      };
       function albumRowParts(albumReview, folderPath, songs) {
           const statusValue = albumInventoryStatus(albumReview, songs);
           const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
@@ -773,17 +801,26 @@
             score.dataset.band = scorePresentation.band;
             score.setAttribute('aria-label', scorePresentation.accessibleLabel);
           } else { score.textContent = 'No match score'; score.hidden = true; }
-          const metadata = document.createElement('span'); metadata.className = 'review-source-metadata';
-          metadata.textContent = `${albumReview.artist} — ${albumReview.album} · ${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`;
           const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = '↗';
+          album.dataset.albumId = albumReview.id;
           album.title = `Review match for ${folderPath || 'library root'}`;
           album.setAttribute('aria-label', `Review ${folderPath || 'library root'}: ${albumReview.album} by ${albumReview.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
           if (albumReview) album.addEventListener('click', event => { event.stopPropagation(); openReview(albumReview, album); });
           else album.disabled = true;
-          return {metadata, status, score, album};
+          return {status, score, album};
       }
       function renderAlbum(albumReview, folderPath) {
           const row = document.createElement('article'); row.className = 'review-album-row';
+        const select = document.createElement('input'); select.type = 'checkbox'; select.className = 'review-select';
+        select.checked = selectedAlbumIds.has(albumReview.id);
+        select.setAttribute('aria-label', `Select ${folderPath === '.' ? 'library root' : folderPath} for sequential review`);
+        select.addEventListener('change', () => {
+          if (select.checked) selectedAlbumIds.add(albumReview.id); else selectedAlbumIds.delete(albumReview.id);
+          reviewList.querySelectorAll(`.review-album[data-album-id="${albumReview.id}"]`).forEach(button => {
+            const checkbox = button.closest('.review-album-row').querySelector('.review-select'); checkbox.checked = select.checked;
+          });
+          updateBulkActions();
+        });
         const identity = document.createElement('span'); identity.className = 'review-folder-identity';
         const path = document.createElement('span'); path.className = 'review-folder-path';
         path.textContent = folderPath === '.' ? 'Library root' : folderPath;
@@ -791,8 +828,14 @@
         const songs = reviewItems.filter(item => albumReview.tracks.some(track => track.id === item.id)
           && (folderPath === '.' ? !item.path.includes('/') : item.path.slice(0, item.path.lastIndexOf('/')) === folderPath));
         const parts = albumRowParts(albumReview, folderPath, songs);
-        identity.append(path, parts.metadata);
-        row.append(identity, parts.status, parts.score, parts.album);
+        const count = document.createElement('span'); count.className = 'review-track-count';
+        count.textContent = `${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`;
+        const duplicate = document.createElement('span'); duplicate.className = 'duplicate-row-warning';
+        duplicate.textContent = '⚠ Possible duplicate';
+        duplicate.hidden = !['possible', 'ambiguous'].includes(albumReview.duplicate_preflight?.status);
+        if (!duplicate.hidden) duplicate.setAttribute('aria-label', albumReview.duplicate_preflight.message);
+        identity.append(path);
+        row.append(select, identity, count, duplicate, parts.status, parts.score, parts.album);
         return row;
       }
       const albumCards = albumReviews.flatMap(album => album.source_paths.map(path => renderAlbum(album, path)));
@@ -806,7 +849,20 @@
       reviewPage.textContent = `${pageStart}–${pageEnd} of ${reviewTotalArtists} artists`;
       reviewPrevious.disabled = reviewOffset === 0;
       reviewNext.disabled = !reviewHasMore;
+      updateBulkActions();
     }
+
+    reviewSelectAll.addEventListener('change', () => {
+      albumReviews.forEach(album => reviewSelectAll.checked ? selectedAlbumIds.add(album.id) : selectedAlbumIds.delete(album.id));
+      renderReviewItems();
+    });
+    reviewSelectedButton.addEventListener('click', () => {
+      reviewSequence = albumReviews.filter(album => selectedAlbumIds.has(album.id)).map(album => album.id);
+      const first = reviewSequence.shift();
+      const album = albumReviews.find(value => value.id === first);
+      const button = reviewList.querySelector(`.review-album[data-album-id="${first}"]`);
+      if (album && button) openReview(album, button);
+    });
 
     async function loadReviewItems(offset = reviewOffset) {
       if (!reviewList) return;
@@ -820,6 +876,8 @@
         reviewItems = data.items;
         reviewGroups = data.groups;
         albumReviews = data.albums || [];
+        const pageAlbumIds = new Set(albumReviews.map(album => album.id));
+        selectedAlbumIds.forEach(id => { if (!pageAlbumIds.has(id)) selectedAlbumIds.delete(id); });
         reviewHasMore = Boolean(data.has_more);
         reviewOffset = data.offset;
         reviewTotalArtists = data.total_artists;
@@ -894,8 +952,22 @@
     function renderAlbumMatch() {
       const candidates = document.getElementById('library-import-modal-candidates');
       const current = activeAlbum?.current_metadata || {artist:activeAlbum?.artist, album:activeAlbum?.album, track_count:activeAlbum?.tracks?.length || 0};
-      const asIs = {...current, id:'as-is', is_as_is:true};
+      const asIs = {...current, id:'as-is', is_as_is:true, duplicate_preflight:activeAlbum?.duplicate_preflight};
       const options = [...(activeAlbum?.candidates || []), asIs];
+      const selectedOption = options.find(option => option.id === activeCandidateId) || asIs;
+      const preflight = selectedOption.duplicate_preflight || activeAlbum?.duplicate_preflight || {status:'clear', warnings:[]};
+      const warning = document.getElementById('library-import-duplicate-warning');
+      const policy = document.getElementById('library-import-duplicate-policy');
+      const queueButton = document.getElementById('library-import-queue');
+      warning.hidden = preflight.status === 'clear';
+      policy.hidden = preflight.status !== 'possible';
+      queueButton.disabled = preflight.status === 'ambiguous';
+      document.getElementById('library-import-duplicate-message').textContent = preflight.message || '';
+      document.getElementById('library-import-duplicate-files').replaceChildren(...(preflight.warnings || []).map(item => {
+        const entry = document.createElement('li');
+        entry.textContent = `${item.incoming_path} → ${item.managed_paths.join(', ')}${item.ambiguous ? ' (ambiguous managed identity)' : ''}`;
+        return entry;
+      }));
       const candidateIconPaths = {
         artist:['M20 21a8 8 0 0 0-16 0','M12 13a4 4 0 1 0 0-8 4 4 0 0 0 0 8'],
         album:['M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20','M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6','M12 12h.01'],
@@ -1116,10 +1188,11 @@
       reviewModal.querySelector('.browser-dialog').focus();
     }
 
-    function closeReview() {
+    function closeReview(clearSequence = true) {
       closeTrackComparison();
       reviewModal.hidden = true;
       document.body.classList.remove('modal-open');
+      if (clearSequence) reviewSequence = [];
       if (reviewReturnFocus) reviewReturnFocus.focus();
     }
 
@@ -1154,14 +1227,18 @@
         const message = document.getElementById('library-import-modal-message');
         const decisionButtons = [...reviewModal.querySelectorAll('[data-review-decision]')];
         const decision = button.dataset.reviewDecision;
-        const progressLabel = {approved: 'Queueing this album for import…', rejected: 'Saving rejected status…', skipped: 'Saving skipped status…'}[decision] || 'Saving review decision…';
+        const progressLabel = {approved: 'Queueing this album for import…', skipped: 'Saving skipped status…'}[decision] || 'Saving review decision…';
         decisionButtons.forEach(action => { action.disabled = true; action.setAttribute('aria-busy', 'true'); });
         message.dataset.busy = 'true'; message.textContent = progressLabel;
         try {
           const payload = {decision};
           if (decision === 'approved') {
             payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId;
+            const selected = activeAlbum.candidates.find(candidate => candidate.id === activeCandidateId);
+            const preflight = selected?.duplicate_preflight || activeAlbum.duplicate_preflight || {status:'clear'};
+            if (preflight.status === 'ambiguous') throw new Error('Queueing is blocked because managed recording identity is ambiguous.');
             const duplicateAction = document.getElementById('library-import-duplicate-action').value;
+            if (preflight.status === 'possible' && !duplicateAction) throw new Error('Choose a duplicate decision before queueing this album.');
             if (duplicateAction) payload.duplicate_action = duplicateAction;
           }
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}`, {
@@ -1170,8 +1247,15 @@
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || data.description || 'Unable to save review decision.');
+          selectedAlbumIds.delete(activeAlbum.id);
+          const nextId = reviewSequence.shift();
           await loadReviewItems();
-          closeReview();
+          closeReview(false);
+          if (nextId) {
+            const nextAlbum = albumReviews.find(album => album.id === nextId);
+            const nextButton = reviewList.querySelector(`.review-album[data-album-id="${nextId}"]`);
+            if (nextAlbum && nextButton) openReview(nextAlbum, nextButton);
+          }
         } catch (error) {
           message.dataset.busy = 'false';
           message.textContent = error.message || 'Unable to save review decision.';

@@ -1317,6 +1317,56 @@ def _persisted_artwork_source(provider_data: dict) -> str | None:
     return None
 
 
+def _duplicate_preflight(
+    app: Flask, tracks: list[sqlite3.Row], query: dict, details: list[dict] | None = None,
+    managed_items: list[Item] | None = None,
+) -> dict:
+    """Report recording-ID collisions without choosing identity or changing state."""
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    managed_by_recording: dict[str, list[Item]] = {}
+    for item in managed_items if managed_items is not None else _library(app).items():
+        recording_id = str(item.get("mb_trackid") or "").strip()
+        if recording_id:
+            managed_by_recording.setdefault(recording_id, []).append(item)
+    proposed_by_position = {
+        detail["position"]: str(detail.get("recording_id") or "").strip()
+        for detail in (details or []) if detail.get("local") is not None and detail.get("recording_id")
+    }
+    warnings = []
+    for position, (track, source) in enumerate(zip(tracks, query["tracks"]), 1):
+        if track["beets_item_id"] is not None:
+            continue
+        recording_id = proposed_by_position.get(position) or str(source.get("recording_id") or "").strip()
+        matches = managed_by_recording.get(recording_id, []) if recording_id else []
+        if not matches:
+            continue
+        managed_paths = []
+        for item in matches:
+            try:
+                path = Path(os.fsdecode(item.path)).resolve()
+                managed_paths.append(path.relative_to(root).as_posix() if root in path.parents else str(path))
+            except (OSError, ValueError, TypeError):
+                managed_paths.append("Managed path unavailable")
+        warnings.append({
+            "incoming_path": track["relative_path"],
+            "recording_id": recording_id,
+            "managed_paths": sorted(managed_paths, key=str.casefold),
+            "ambiguous": len(matches) != 1,
+        })
+    ambiguous = any(warning["ambiguous"] for warning in warnings)
+    return {
+        "status": "ambiguous" if ambiguous else "possible" if warnings else "clear",
+        "count": len(warnings),
+        "warnings": warnings,
+        "message": (
+            "Managed recording identity is ambiguous; queueing is blocked until the library identity is corrected."
+            if ambiguous else
+            f"{len(warnings)} incoming file{' may' if len(warnings) == 1 else 's may'} already be managed. Review the duplicate decision before queueing."
+            if warnings else "No managed recording-ID duplicate was found during preflight."
+        ),
+    }
+
+
 def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> list[dict]:
     if album_ids == []:
         return []
@@ -1336,10 +1386,11 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                 ORDER BY albums.artist_key, albums.album_key, albums.id""", parameters
         ).fetchall()
         payloads = []
+        managed_items = list(_library(app).items())
         for row in rows:
             query = _album_query(app, row)
             tracks = db.execute(
-                """SELECT inventory.id, inventory.relative_path, tracks.exception_state
+                """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id, tracks.exception_state
                      FROM album_review_tracks AS tracks
                      JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
                     WHERE tracks.album_review_id = ? ORDER BY inventory.relative_path COLLATE NOCASE""", (row["id"],)
@@ -1371,11 +1422,18 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "retrieval": provider_data.get("retrieval", {}),
                     "proposed_diff": json.loads(candidate["proposed_diff_json"]),
                     "track_details": match["track_details"],
+                    "duplicate_preflight": _duplicate_preflight(
+                        app, tracks, query, match["track_details"], managed_items
+                    ),
                 })
             selected_id = row["selected_candidate_id"]
             proposed_match = next((candidate for candidate in serialized_candidates if candidate["id"] == selected_id), None)
             if proposed_match is None and serialized_candidates:
                 proposed_match = serialized_candidates[0]
+            duplicate_preflight = (
+                proposed_match["duplicate_preflight"] if proposed_match is not None
+                else _duplicate_preflight(app, tracks, query, managed_items=managed_items)
+            )
             highest_confidence = max((candidate["confidence"] for candidate in serialized_candidates), default=None)
             current_metadata = {
                 "artist": query["artist"], "album": query["album"],
@@ -1397,6 +1455,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                                    else "candidate" if selected_id is not None else "suggested"),
                 "current_metadata": current_metadata,
                 "highest_confidence": highest_confidence,
+                "duplicate_preflight": duplicate_preflight,
                 "candidate_status": row["candidate_status"],
                 "candidate_error": row["candidate_error"],
                 "execution_status": row["execution_status"],

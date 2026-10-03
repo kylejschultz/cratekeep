@@ -398,8 +398,8 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'id="library-import-modal-tracks"' not in modal
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
-    assert b'class="secondary danger-button" data-review-decision="rejected"' in modal
-    assert b'class="approve-button" data-review-decision="approved">Queue import' in modal
+    assert b'data-review-decision="rejected"' not in modal
+    assert b'id="library-import-queue" class="approve-button" data-review-decision="approved">Queue import' in modal
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
@@ -1121,6 +1121,15 @@ def test_duplicate_decision_is_persisted_previewed_and_enforced(tmp_path, duplic
         album for album in client.get("/api/library-import/reviews").json["albums"]
         if album["album"] == "Incoming Album"
     )
+    assert album["duplicate_preflight"]["status"] == "possible"
+    assert album["duplicate_preflight"]["count"] == 1
+    assert album["duplicate_preflight"]["warnings"] == [{
+        "incoming_path": "Incoming Artist/Incoming Album/01 Song.wav",
+        "recording_id": "recording-1",
+        "managed_paths": ["Managed/Old Album/01 Song.wav"],
+        "ambiguous": False,
+    }]
+    assert album["candidates"][0]["duplicate_preflight"] == album["duplicate_preflight"]
     patch = {"decision": "approved", "candidate_id": album["candidates"][0]["id"]}
     if duplicate_action:
         patch["duplicate_action"] = duplicate_action
@@ -1186,6 +1195,9 @@ def test_duplicate_merge_rejects_ambiguous_managed_recording_identity(tmp_path):
     client.post("/api/library/inventory/preview")
     client.post("/api/library-import/candidates", json={})
     album = next(album for album in client.get("/api/library-import/reviews").json["albums"] if album["artist"] == "Incoming")
+    assert album["duplicate_preflight"]["status"] == "ambiguous"
+    assert album["duplicate_preflight"]["warnings"][0]["ambiguous"] is True
+    assert len(album["duplicate_preflight"]["warnings"][0]["managed_paths"]) == 2
     client.patch(f'/api/library-import/albums/{album["id"]}', json={
         "decision": "approved", "candidate_id": album["candidates"][0]["id"], "duplicate_action": "merge",
     })
@@ -1712,7 +1724,7 @@ def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_pat
 
     assert b".review-list { overflow:hidden;" in html
     assert b".review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
-    assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
+    assert b".review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     assert b"document.createElement('article')" in html
     assert b"const album = document.createElement('button');" in html
@@ -1740,15 +1752,15 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     assert b"openReview(albumReview, album);" in html
 
 
-def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
+def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"path.className = 'review-folder-path'" in html
     assert b"path.textContent = folderPath === '.' ? 'Library root' : folderPath" in html
     assert b"path.title = folderPath === '.' ? 'Library root' : folderPath" in html
-    assert b"metadata.className = 'review-source-metadata'" in html
-    assert b"metadata.textContent = `${albumReview.artist}" in html
-    assert b"${albumReview.album}" in html
+    assert b"review-source-metadata" not in html
+    assert b"count.className = 'review-track-count'" in html
+    assert b"count.textContent = `${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`" in html
     assert b"renderTrackList" not in html
     assert b"album.source_paths.map(path => renderAlbum(album, path))" in html
     assert b"status.className = 'status-pill'" in html
@@ -1761,12 +1773,36 @@ def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
 def test_album_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b"row.append(identity, parts.status, parts.score, parts.album)" in html
+    assert b"row.append(select, identity, count, duplicate, parts.status, parts.score, parts.album)" in html
     assert b"const albumCards = albumReviews.flatMap" in html
     assert b"renderTrackList" not in html
     assert b"review-track-list" not in html
     assert b"event.stopPropagation(); openReview(albumReview, album)" in html
-    assert b"identity.append(path, parts.metadata)" in html
+    assert b"identity.append(path)" in html
+
+
+def test_album_review_multi_select_keeps_sequential_single_album_flow(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b'id="library-import-select-all" type="checkbox"' in html
+    assert b'id="library-import-review-selected" class="secondary" type="button" disabled>Review selected (0)' in html
+    assert b"select.setAttribute('aria-label', `Select ${folderPath === '.' ? 'library root' : folderPath} for sequential review`)" in html
+    assert b"const selectedAlbumIds = new Set();" in html
+    assert b"reviewSelectedButton.textContent = `Review selected (${selectedAlbumIds.size})`" in html
+    assert b"reviewSequence = albumReviews.filter(album => selectedAlbumIds.has(album.id)).map(album => album.id)" in html
+    assert b"if (nextAlbum && nextButton) openReview(nextAlbum, nextButton)" in html
+
+
+def test_duplicate_warning_is_preflighted_and_gates_only_the_review_queue(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").data
+
+    assert b'id="library-import-duplicate-warning"' in html
+    assert b'id="library-import-duplicate-policy"' in html
+    assert b"warning.hidden = preflight.status === 'clear'" in html
+    assert b"policy.hidden = preflight.status !== 'possible'" in html
+    assert b"queueButton.disabled = preflight.status === 'ambiguous'" in html
+    assert b"if (preflight.status === 'possible' && !duplicateAction)" in html
+    assert b"/execute" in html
 
 
 def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
@@ -1854,7 +1890,7 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     html = client.get("/settings").data
     assert b"if (value.artwork_url)" in html
     assert b"artwork.src = value.artwork_url" in html
-    assert b"const asIs = {...current, id:'as-is', is_as_is:true};" in html
+    assert b"const asIs = {...current, id:'as-is', is_as_is:true, duplicate_preflight:activeAlbum?.duplicate_preflight};" in html
     assert b"artwork_url:null" not in html
     assert b"innerHTML" not in html
 
@@ -1871,7 +1907,7 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
     assert b"same MusicBrainz recording ID" in html
     assert b"method: 'PATCH'" in html
     assert b"data-review-decision=\"skipped\"" in html
-    assert b"data-review-decision=\"rejected\"" in html
+    assert b"data-review-decision=\"rejected\"" not in html
     assert b"data-review-decision=\"approved\"" in html
     assert b"beet import" not in html
     assert b"/api/imports/" not in html
