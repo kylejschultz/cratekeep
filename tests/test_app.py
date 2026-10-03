@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from beets.library import Item, Library
 
-from beets_mvp import _format_bytes, _group_library_import_review_items, create_app
+from beets_mvp import _candidate_diff, _format_bytes, _group_library_import_review_items, create_app
 from beets_mvp.musicbrainz import ProviderError, search_releases
 from beets_mvp.matching import score_release
 
@@ -361,6 +361,8 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"changeButton.textContent = `View track changes (${fact.changeCount})`" in modal
     assert b"changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist}" in modal
     assert b"changeButton.setAttribute('aria-haspopup', 'dialog')" in modal
+    assert b'.track-change-button { display:inline; width:auto; margin:0; padding:0; border:0; border-radius:0; appearance:none; background:transparent; color:var(--text); font:inherit; font-weight:700;' in html
+    assert b'.track-change-button:focus-visible { outline:2px solid var(--modal-accent); outline-offset:3px; }' in html
     assert b"openTrackComparison(fact.tracks" in modal
     assert b'class="browser track-modal"' in modal
     assert b'aria-labelledby="track-comparison-title"' in modal
@@ -415,6 +417,9 @@ const result = {
   changes: changedTrackEvidence([
     {local:'Old title', proposed:'New title', current_position:[1,1], proposed_position:[1,2], local_duration:120, proposed_duration:130, status:'title-mismatch'},
     {local:'Part 1: Intro', proposed:'Part 1 — Intro', current_position:[1,2], proposed_position:[1,2], local_duration:90, proposed_duration:90, status:'title-mismatch'},
+    {local:"Don't Stop", proposed:'Don’t Stop', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:180, status:'matched'},
+    {local:'He Said "Go"', proposed:'He Said “Go”', current_position:[1,4], proposed_position:[1,4], local_duration:180, proposed_duration:180, status:'matched'},
+    {local:"Don't Stop", proposed:'Doesn’t Stop', current_position:[1,5], proposed_position:[1,5], local_duration:180, proposed_duration:180, status:'title-mismatch'},
     {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
     {local:null, proposed:'Bonus', current_position:null, proposed_position:[2,1], local_duration:null, proposed_duration:90, status:'extra'},
   ]).map(track => ({local:track.local, proposed:track.proposed, localPosition:track.localPosition,
@@ -441,6 +446,8 @@ console.log(JSON.stringify(result));
                               "Duration differs: local 2:00 → MusicBrainz 2:10 (10 seconds longer)."]},
             {"local": "Part 1: Intro", "proposed": "Part 1 — Intro", "localPosition": "1.02", "proposedPosition": "1.02", "durationDelta": 0,
              "explanations": ["Title punctuation or formatting differs: local “Part 1: Intro” → MusicBrainz “Part 1 — Intro”."]},
+            {"local": "Don't Stop", "proposed": "Doesn’t Stop", "localPosition": "1.05", "proposedPosition": "1.05", "durationDelta": 0,
+             "explanations": ["Title differs: local “Don't Stop” → MusicBrainz “Doesn’t Stop”."]},
             {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None,
              "explanations": ["MusicBrainz track is not present locally.", "Local duration unavailable."]},
         ],
@@ -896,6 +903,21 @@ def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tm
     assert album["proposed_match"]["recommendation"] in {"strong", "medium", "low", "none"}
     assert [track["status"] for track in album["proposed_match"]["track_details"]] == ["matched", "unmatched"]
     assert [track["title"] for track in album["tracks"]] == ["First", "Second"]
+
+
+def test_track_title_quote_variants_do_not_create_candidate_changes():
+    query = {"artist": "Artist", "album": "Album", "tracks": [
+        {"title": "Don't Stop"}, {"title": 'He Said "Go"'},
+    ]}
+    typographic = {"artist": "Artist", "album": "Album", "tracks": [
+        {"title": "Don’t Stop"}, {"title": "He Said “Go”"},
+    ]}
+
+    assert "tracks" not in _candidate_diff(query, typographic)
+    assert [detail["status"] for detail in score_release(query, typographic)["track_details"]] == ["matched", "matched"]
+
+    meaningful = {**typographic, "tracks": [{"title": "Doesn’t Stop"}, {"title": "He Said “Go”"}]}
+    assert _candidate_diff(query, meaningful)["tracks"]["to"][0] == "Doesn’t Stop"
 
 
 def test_album_track_comparison_carries_current_track_duration(tmp_path):

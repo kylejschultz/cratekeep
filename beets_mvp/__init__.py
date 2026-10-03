@@ -841,6 +841,14 @@ def _normalize_track_title(value: object) -> str:
     return re.sub(r"^\s*(?:\d+[.-]?\s*[-–—.]?\s*)", "", title) or title
 
 
+def _track_title_key(value: object) -> str:
+    title = _normalize_track_title(value).casefold()
+    return title.translate(str.maketrans({
+        "‘": "'", "’": "'", "‚": "'", "‛": "'", "ʼ": "'", "＇": "'",
+        "“": '"', "”": '"', "„": '"', "‟": '"', "＂": '"',
+    }))
+
+
 def _all_library_import_review_items(app: Flask) -> list[dict]:
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
     with _connect(app.config["APP_DB"]) as db:
@@ -1015,7 +1023,7 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
                              for track in candidate_tracks]
         local_tracks = [_normalize_track_title(track.get("title") if isinstance(track, dict) else track)
                         for track in query["tracks"]]
-        if [_metadata_key(track) for track in normalized_tracks] != [_metadata_key(track) for track in local_tracks]:
+        if [_track_title_key(track) for track in normalized_tracks] != [_track_title_key(track) for track in local_tracks]:
             proposed["tracks"] = {"from": local_tracks, "to": normalized_tracks}
     return proposed
 

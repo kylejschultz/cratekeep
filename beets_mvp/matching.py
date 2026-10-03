@@ -34,6 +34,13 @@ def _track_title(track: object) -> str:
     return re.sub(r"^\s*(?:\d+[.-]?\s*[-–—.]?\s*)", "", title) or title
 
 
+def _track_title_key(track: object) -> str:
+    return _track_title(track).casefold().translate(str.maketrans({
+        "‘": "'", "’": "'", "‚": "'", "‛": "'", "ʼ": "'", "＇": "'",
+        "“": '"', "”": '"', "„": '"', "‟": '"', "＂": '"',
+    }))
+
+
 def _duration(track: object) -> float | None:
     if not isinstance(track, dict):
         return None
@@ -71,7 +78,7 @@ def _candidate_tracks(candidate: dict) -> list[dict]:
 
 
 def _pair_metrics(local: object, canonical: object, local_index: int, canonical_index: int) -> dict:
-    title_distance = 1 - _similarity(_track_title(local), _track_title(canonical))
+    title_distance = 1 - _similarity(_track_title_key(local), _track_title_key(canonical))
     local_duration, canonical_duration = _duration(local), _duration(canonical)
     duration_delta = None if local_duration is None or canonical_duration is None else abs(local_duration - canonical_duration)
     duration_distance = 0.0 if duration_delta is None else min(duration_delta / 30.0, 1.0)

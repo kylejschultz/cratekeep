@@ -197,8 +197,9 @@
     .metadata-old { color:var(--muted); text-decoration:line-through; }
     .metadata-arrow { margin:0 .3rem; color:var(--muted); }
     .metadata-new { color:var(--text); font-weight:700; }
-    .track-change-button { margin:0; padding:0; border:0; background:transparent; color:var(--modal-accent); font:inherit; font-weight:650; text-align:left; text-decoration:underline; text-underline-offset:.16em; }
-    .track-change-button:hover { background:transparent; color:var(--modal-accent-hover); }
+    .track-change-button { display:inline; width:auto; margin:0; padding:0; border:0; border-radius:0; appearance:none; background:transparent; color:var(--text); font:inherit; font-weight:700; line-height:inherit; text-align:left; text-decoration:underline; text-underline-offset:.16em; }
+    .track-change-button:hover { background:transparent; color:var(--text); text-decoration-thickness:2px; }
+    .track-change-button:focus-visible { outline:2px solid var(--modal-accent); outline-offset:3px; }
     .track-modal { z-index:12; padding:clamp(.4rem,2vw,1rem); background:rgb(8 19 26 / 50%); }
     .track-modal-dialog { width:min(800px,100%); max-height:min(620px,calc(100vh - 2rem)); }
     .track-table-wrap { overflow:auto; }
@@ -913,6 +914,10 @@
       function metadataChanged(left, right) {
         return String(left || '').trim().toLocaleLowerCase() !== String(right || '').trim().toLocaleLowerCase();
       }
+      function trackTitleKey(value) {
+        return String(value || '').normalize('NFKC').trim().toLocaleLowerCase()
+          .replace(/[‘’‚‛ʼ＇]/gu, "'").replace(/[“”„‟＂]/gu, '"');
+      }
       function trackTitleExplanation(local, proposed) {
         const localTitle = String(local ?? 'Not present locally');
         const proposedTitle = String(proposed ?? 'Not present on MusicBrainz');
@@ -951,7 +956,7 @@
           const proposedPosition = trackPosition(track.proposed_position);
           const localDuration = trackDuration(track.local_duration);
           const proposedDuration = trackDuration(track.proposed_duration);
-          const titleChanged = metadataChanged(track.local, track.proposed);
+          const titleChanged = trackTitleKey(track.local) !== trackTitleKey(track.proposed);
           const positionChanged = localPosition !== proposedPosition;
           const rawDurationDelta = track.local_duration != null && track.proposed_duration != null
             && Number.isFinite(Number(track.local_duration)) && Number.isFinite(Number(track.proposed_duration))
