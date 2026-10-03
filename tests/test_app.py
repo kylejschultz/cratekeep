@@ -361,6 +361,8 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"changeButton.textContent = `View track changes (${fact.changeCount})`" in modal
     assert b"changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist}" in modal
     assert b"changeButton.setAttribute('aria-haspopup', 'dialog')" in modal
+    assert b"if (fact.changeCount === 0)" in modal
+    assert b"dd.textContent = 'All tracks matched'" in modal
     assert b'.track-change-button { display:inline; width:auto; margin:0; padding:0; border:0; border-radius:0; appearance:none; background:transparent; color:var(--text); font:inherit; font-weight:700;' in html
     assert b'.track-change-button:focus-visible { outline:2px solid var(--modal-accent); outline-offset:3px; }' in html
     assert b"openTrackComparison(fact.tracks" in modal
@@ -393,6 +395,65 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
     assert b'.candidate-option[open]' in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_candidate_track_evidence_is_text_only_when_all_tracks_match(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    start = html.index("function renderTrackChangeFact")
+    end = html.index("function candidateFacts", start)
+    helper = html[start:end]
+    probe = """
+const created = [];
+const modalCalls = [];
+globalThis.document = {
+  createElement(tagName) {
+    const element = {
+      tagName,
+      attributes: {},
+      listeners: {},
+      setAttribute(name, value) { this.attributes[name] = value; },
+      addEventListener(name, listener) { this.listeners[name] = listener; },
+    };
+    created.push(element);
+    return element;
+  },
+};
+globalThis.openTrackComparison = (...args) => modalCalls.push(args);
+function destination() {
+  return {textContent: '', children: [], append(child) { this.children.push(child); }};
+}
+const matched = destination();
+renderTrackChangeFact(matched, {changeCount: 0, tracks: []}, {artist: 'Artist', album: 'Album'});
+const changed = destination();
+const tracks = [{local: 'Old', proposed: 'New'}];
+renderTrackChangeFact(changed, {changeCount: 1, tracks}, {artist: 'Artist', album: 'Album'});
+changed.children[0].listeners.click();
+console.log(JSON.stringify({
+  matched: {textContent: matched.textContent, childCount: matched.children.length},
+  changed: {
+    textContent: changed.children[0].textContent,
+    className: changed.children[0].className,
+    hasPopup: changed.children[0].attributes['aria-haspopup'],
+    childCount: changed.children.length,
+  },
+  createdCount: created.length,
+  modalCall: {tracks: modalCalls[0][0], title: modalCalls[0][1], returnControlMatches: modalCalls[0][2] === changed.children[0]},
+}));
+"""
+    completed = subprocess.run(["node", "-e", f"{helper}\n{probe}"], check=True, capture_output=True, text=True)
+
+    assert json.loads(completed.stdout) == {
+        "matched": {"textContent": "All tracks matched", "childCount": 0},
+        "changed": {
+            "textContent": "View track changes (1)",
+            "className": "track-change-button",
+            "hasPopup": "dialog",
+            "childCount": 1,
+        },
+        "createdCount": 1,
+        "modalCall": {"tracks": [{"local": "Old", "proposed": "New"}], "title": "Artist — Album", "returnControlMatches": True},
+    }
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")

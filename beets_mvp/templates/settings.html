@@ -985,6 +985,18 @@
       function changedTrackEvidence(details) {
         return trackEvidence(details).filter(track => track.titleChanged || track.positionChanged || track.durationChanged || track.unpaired);
       }
+      function renderTrackChangeFact(dd, fact, value) {
+        if (fact.changeCount === 0) {
+          dd.textContent = 'All tracks matched';
+          return;
+        }
+        const changeButton = document.createElement('button'); changeButton.type = 'button';
+        changeButton.className = 'track-change-button'; changeButton.textContent = `View track changes (${fact.changeCount})`;
+        changeButton.setAttribute('aria-haspopup', 'dialog');
+        changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist} — ${value.album}`);
+        changeButton.addEventListener('click', () => openTrackComparison(fact.tracks, `${value.artist} — ${value.album}`, changeButton));
+        dd.append(changeButton);
+      }
       function candidateFacts(value) {
         const details = value.is_as_is || !Array.isArray(value.track_details) ? [] : value.track_details;
         const tracks = trackEvidence(details);
@@ -1006,7 +1018,7 @@
           {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
           {kind:'year', label:'Release Year', value:year.value, changed:year.changed, localYear:year.localYear, proposedYear:year.proposedYear, comparison:year.changed},
-          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'No tracks changed', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks, expandable:!value.is_as_is},
+          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'All tracks matched', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks, expandable:!value.is_as_is},
           {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
           {kind:'region', label:'Release Region', value:value.country || (value.is_as_is ? 'Not present in current metadata' : 'Region not provided'), changed:!value.is_as_is && Boolean(current.country) && metadataChanged(current.country, value.country)},
           {kind:'local', label:'Local tracks found online', value:value.is_as_is ? 'Not applicable — As Is' : (unmatchedLocal === 0 ? `All ${localTrackCount} local tracks found online` : `${unmatchedLocal} local ${unmatchedLocal === 1 ? 'track was' : 'tracks were'} not found online`), changed:unmatchedLocal > 0},
@@ -1060,12 +1072,7 @@
           const dt = document.createElement('dt'); const dd = document.createElement('dd');
           dt.textContent = fact.label;
           if (fact.expandable) {
-            const changeButton = document.createElement('button'); changeButton.type = 'button';
-            changeButton.className = 'track-change-button'; changeButton.textContent = `View track changes (${fact.changeCount})`;
-            changeButton.setAttribute('aria-haspopup', 'dialog');
-            changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist} — ${value.album}`);
-            changeButton.addEventListener('click', () => openTrackComparison(fact.tracks, `${value.artist} — ${value.album}`, changeButton));
-            dd.append(changeButton);
+            renderTrackChangeFact(dd, fact, value);
           } else if (fact.comparison) {
             const oldYear = document.createElement('span'); oldYear.className = 'metadata-old'; oldYear.textContent = fact.localYear || 'Not provided';
             const arrow = document.createElement('span'); arrow.className = 'metadata-arrow'; arrow.setAttribute('aria-hidden', 'true'); arrow.textContent = '→';
