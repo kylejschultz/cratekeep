@@ -32,6 +32,7 @@ MAX_LIBRARY_IMPORT_ARTISTS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
+DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip"}
 MUSICBRAINZ_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -108,7 +109,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             "library.html",
             build_sha=app.config["BUILD_SHA"],
             **_library_page_data(items, request.args.get("q", ""), request.args.get("sort", "artist"),
-                                 request.args.get("order", "asc")),
+                                 request.args.get("order", "asc"), request.args.get("artist", ""),
+                                 request.args.get("album", "")),
         )
 
     @app.get("/healthz")
@@ -519,6 +521,7 @@ def _init_db(path: str) -> None:
         _ensure_column(db, "album_reviews", "execution_error", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(db, "album_reviews", "last_execution_job_id", "INTEGER")
         _ensure_column(db, "album_reviews", "executed_at", "TEXT")
+        _ensure_column(db, "album_reviews", "duplicate_action", "TEXT")
         _ensure_column(db, "adoption_reviews", "imported_at", "TEXT")
         db.execute(
             """UPDATE adoption_reviews
@@ -706,15 +709,21 @@ def _items(app: Flask) -> list[dict]:
     return [_serialize_item(item) for item in _library(app).items()]
 
 
-def _library_page_data(items: list[dict], query: str, sort: str, order: str) -> dict:
+def _library_page_data(
+    items: list[dict], query: str, sort: str, order: str, artist_filter: str = "", album_filter: str = ""
+) -> dict:
     """Build the small, read-only browse model used by the Library landing page."""
     query = _normalize_metadata(query)
+    artist_filter = _normalize_metadata(artist_filter)
+    album_filter = _normalize_metadata(album_filter)
     sort = sort if sort in {"artist", "album", "title"} else "artist"
     order = order if order in {"asc", "desc"} else "asc"
     searchable = ("artist", "album", "title")
     filtered = [
         item for item in items
-        if not query or query.casefold() in " ".join(str(item.get(field) or "") for field in searchable).casefold()
+        if (not query or query.casefold() in " ".join(str(item.get(field) or "") for field in searchable).casefold())
+        and (not artist_filter or _metadata_key(item.get("albumartist") or item.get("artist")) == _metadata_key(artist_filter))
+        and (not album_filter or _metadata_key(item.get("album")) == _metadata_key(album_filter))
     ]
     tie_breakers = tuple(field for field in searchable if field != sort) + ("id",)
 
@@ -743,6 +752,8 @@ def _library_page_data(items: list[dict], query: str, sort: str, order: str) -> 
         "query": query,
         "sort": sort,
         "order": order,
+        "artist_filter": artist_filter,
+        "album_filter": album_filter,
     }
 
 
@@ -1057,9 +1068,17 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
     release_types = []
     media_types = []
     countries = []
+    genres = []
     artwork_url = None
     for row in rows:
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+        if item is None:
+            try:
+                item = Item.from_path(Path(app.config["LIBRARY_PATH"]) / row["relative_path"])
+            except Exception:
+                # Inventory may contain unreadable or synthetic fixtures. Path
+                # fallback still provides a reviewable, non-mutating query.
+                item = None
         title = item.get("title") if item and item.get("title") else Path(row["relative_path"]).stem
         track = {"title": _normalize_track_title(title), "path": row["relative_path"]}
         stored_duration = item.get("length") if item and item.get("length") not in (None, "", 0) else None
@@ -1082,6 +1101,8 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
             for field, values in (("albumtype", release_types), ("media", media_types), ("country", countries)):
                 if item.get(field):
                     values.append(str(item.get(field)))
+            if item.get("genre"):
+                genres.append(str(item.get("genre")))
             if artwork_url is None:
                 artwork_url = _persisted_artwork_source({
                     key: item.get(key) for key in ("artwork_url", "image_url", "cover_url", "cover_art")
@@ -1096,6 +1117,8 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
     for field, values in (("release_type", release_types), ("media", media_types), ("country", countries)):
         if values and len(set(values)) == 1:
             query[field] = values[0]
+    if genres and len(set(genres)) == 1:
+        query["genre"] = genres[0]
     if artwork_url:
         query["artwork_url"] = artwork_url
     return query
@@ -1131,6 +1154,9 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
         value = _normalize_metadata(candidate.get(key))
         if value and _metadata_key(value) != _metadata_key(query[key]):
             proposed[key] = {"from": query[key], "to": value}
+    genre = _normalize_metadata(candidate.get("genre"))
+    if genre and _metadata_key(genre) != _metadata_key(query.get("genre")):
+        proposed["genre"] = {"from": query.get("genre"), "to": genre}
     count = candidate.get("track_count")
     if isinstance(count, int) and count != len(query["tracks"]):
         proposed["track_count"] = {"from": len(query["tracks"]), "to": count}
@@ -1336,6 +1362,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "hard_mismatches": match["hard_mismatches"],
                     "selected_by_mbid": match["selected_by_mbid"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
+                    "genre": provider_data.get("genre"),
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
                     "release_type": provider_data.get("release_type"),
                     "release_status": provider_data.get("status"), "country": provider_data.get("country"),
@@ -1353,6 +1380,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
             current_metadata = {
                 "artist": query["artist"], "album": query["album"],
                 "year": query.get("year"), "date": query.get("date"),
+                "genre": query.get("genre"),
                 "track_count": len(query["tracks"]),
                 "disc_count": len({track.get("disc") or 1 for track in query["tracks"]}),
                 "artwork_url": query.get("artwork_url"),
@@ -1361,6 +1389,9 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                                      if query.get(field)})
             payloads.append({
                 "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
+                "duplicate_action": row["duplicate_action"],
+                "duplicate_actions": ["merge", "replace", "keep-both", "skip"],
+                "source_paths": sorted({str(Path(track["relative_path"]).parent.as_posix()) for track in tracks}, key=str.casefold),
                 "selected_candidate_id": selected_id, "proposed_match": proposed_match,
                 "selection_mode": ("as-is" if row["state"] == "approved" and selected_id is None
                                    else "candidate" if selected_id is not None else "suggested"),
@@ -1388,13 +1419,16 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
 
 
 def _update_album_review(app: Flask, album_review_id: int, values: dict) -> dict | None:
-    allowed = {"decision", "candidate_id", "track_exceptions"}
+    allowed = {"decision", "candidate_id", "track_exceptions", "duplicate_action"}
     unknown = set(values) - allowed
     if unknown:
         raise ValueError(f"unsupported fields: {', '.join(sorted(unknown))}")
     decision = values.get("decision")
     if decision is not None and decision not in LIBRARY_IMPORT_DECISIONS:
         raise ValueError("decision must be approved, rejected, or skipped")
+    duplicate_action = values.get("duplicate_action")
+    if "duplicate_action" in values and duplicate_action not in DUPLICATE_ACTIONS:
+        raise ValueError("duplicate_action must be merge, replace, keep-both, or skip")
     exceptions = values.get("track_exceptions", {})
     if not isinstance(exceptions, dict):
         raise ValueError("track_exceptions must be an object keyed by track id")
@@ -1428,6 +1462,8 @@ def _update_album_review(app: Flask, album_review_id: int, values: dict) -> dict
             assignments.append("state = ?"); parameters.append(decision)
         if "candidate_id" in values:
             assignments.append("selected_candidate_id = ?"); parameters.append(candidate_id)
+        if "duplicate_action" in values:
+            assignments.append("duplicate_action = ?"); parameters.append(duplicate_action)
         if assignments or exceptions:
             assignments.extend(["execution_status = 'not-run'", "execution_error = ''",
                                 "last_execution_job_id = NULL", "executed_at = NULL"])
@@ -1505,15 +1541,17 @@ def _execute_library_import_album(app: Flask, album_review_id: int, *, dry_run: 
             "dry_run": dry_run,
             "selection_mode": "candidate" if candidate else "as-is",
             "files": len(plans),
-            "registered": sum(plan["beets_item_id"] is None for plan in plans),
+            "registered": sum(plan["action"] in {"register", "keep-both"} for plan in plans),
             "metadata_updates": sum(bool(plan["changes"]) for plan in plans),
+            "duplicate_action": album["duplicate_action"],
+            "duplicates": sum(plan["duplicate_of"] is not None for plan in plans),
             "skipped_tracks": len(rows) - len(approved),
-            "items": [{key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes")} for plan in plans],
+            "items": [{key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes", "action", "duplicate_of", "target_path")} for plan in plans],
         }
         if not dry_run:
             _apply_library_import_plans(app, plans)
             result["items"] = [
-                {key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes")} for plan in plans
+                {key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes", "action", "duplicate_of", "target_path")} for plan in plans
             ]
         finished = _now()
         result["finished_at"] = finished
@@ -1523,6 +1561,13 @@ def _execute_library_import_album(app: Flask, album_review_id: int, *, dry_run: 
                 (json.dumps(result, sort_keys=True), finished, job_id),
             )
             if not dry_run:
+                db.executemany(
+                    "UPDATE library_inventory SET beets_item_id = NULL WHERE root_path = ? AND beets_item_id = ? AND id != ?",
+                    [
+                        (str(root), plan["duplicate_of"], plan["inventory_id"])
+                        for plan in plans if plan["action"] == "replace"
+                    ],
+                )
                 db.executemany(
                     "UPDATE library_inventory SET beets_item_id = ? WHERE id = ?",
                     [(plan["beets_item_id"], plan["inventory_id"]) for plan in plans],
@@ -1599,6 +1644,7 @@ def _library_import_plans(
     app: Flask, album: sqlite3.Row, rows: list[tuple[int, sqlite3.Row]], paths: list[Path], provider_data: dict | None
 ) -> list[dict]:
     library = _library(app)
+    managed_items = list(library.items())
     details = {}
     if provider_data:
         query = _album_query(app, album)
@@ -1616,15 +1662,72 @@ def _library_import_plans(
         if item is None:
             item = Item.from_path(path)
         values = _candidate_item_values(provider_data, details.get(position)) if provider_data else {}
+        duplicate = None
+        recording_id = values.get("mb_trackid")
+        if row["beets_item_id"] is None and recording_id:
+            matches = [candidate for candidate in managed_items if str(candidate.get("mb_trackid") or "") == recording_id]
+            if len(matches) > 1:
+                raise LibraryImportExecutionError(
+                    f"Duplicate identity is ambiguous for {row['relative_path']}; {len(matches)} managed tracks share recording ID {recording_id}.",
+                    code="duplicate_ambiguous",
+                )
+            duplicate = matches[0] if matches else None
+        duplicate_action = album["duplicate_action"] if duplicate is not None else None
+        if duplicate is not None and duplicate_action is None:
+            raise LibraryImportExecutionError(
+                f"Choose merge, replace, keep both, or skip for duplicate {row['relative_path']} before execution.",
+                code="duplicate_decision_required",
+            )
+        target_path = row["relative_path"]
+        action = "update" if row["beets_item_id"] is not None else "register"
+        comparison_item = item
+        if duplicate is not None:
+            if duplicate_action in {"merge", "replace"}:
+                duplicate_path = _validate_duplicate_item(app, root=Path(app.config["LIBRARY_PATH"]).resolve(), item=duplicate)
+                target_path = duplicate_path.relative_to(Path(app.config["LIBRARY_PATH"]).resolve()).as_posix()
+            if duplicate_action == "skip":
+                action = "skip"
+                values = {}
+            elif duplicate_action == "keep-both":
+                action = "keep-both"
+            elif duplicate_action == "replace":
+                action = "replace"
+                target_path = row["relative_path"]
+            elif duplicate_action == "merge":
+                action = "merge"
+                comparison_item = duplicate
         changes = {
-            field: {"from": item.get(field), "to": value}
-            for field, value in values.items() if item.get(field) != value
+            field: {"from": comparison_item.get(field), "to": value}
+            for field, value in values.items() if comparison_item.get(field) != value
         }
         plans.append({
             "inventory_id": row["id"], "path": row["relative_path"], "absolute_path": path,
             "beets_item_id": row["beets_item_id"], "item": item, "values": values, "changes": changes,
+            "action": action, "duplicate_item": duplicate,
+            "duplicate_of": duplicate.id if duplicate is not None else None, "target_path": target_path,
         })
     return plans
+
+
+def _validate_duplicate_item(app: Flask, *, root: Path, item: Item) -> Path:
+    """Require a unique, current inventory snapshot before touching a managed duplicate."""
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            "SELECT * FROM library_inventory WHERE root_path = ? AND beets_item_id = ? AND present = 1",
+            (str(root), item.id),
+        ).fetchall()
+    if len(rows) != 1:
+        raise LibraryImportExecutionError(
+            f"Managed duplicate identity {item.id} is not uniquely represented in the current inventory.",
+            code="duplicate_ambiguous",
+        )
+    path = _validate_inventory_file(root, rows[0])
+    if Path(os.fsdecode(item.path)).resolve() != path:
+        raise LibraryImportExecutionError(
+            f"Managed duplicate path changed after inventory preview: {rows[0]['relative_path']}",
+            code="inventory_stale",
+        )
+    return path
 
 
 def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
@@ -1635,6 +1738,9 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
         values.update(artist=artist, albumartist=artist)
     if album:
         values["album"] = album
+    genre = _normalize_metadata(candidate.get("genre"))
+    if genre:
+        values["genre"] = genre
     date = str(candidate.get("date") or candidate.get("year") or "")
     date_match = re.fullmatch(r"(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?", date)
     if date_match:
@@ -1672,9 +1778,32 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
 def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
     library = _library(app)
     for plan in plans:
+        if plan["action"] == "skip":
+            continue
+        if plan["action"] == "merge":
+            item = plan["duplicate_item"]
+            for field, value in plan["values"].items():
+                item[field] = value
+            if plan["changes"]:
+                item.write()
+                item.store()
+            continue
         item = plan["item"]
         for field, value in plan["values"].items():
             item[field] = value
+        if plan["action"] == "replace":
+            replacement = plan["duplicate_item"]
+            for field in ("title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc"):
+                replacement[field] = item.get(field)
+            for field, value in plan["values"].items():
+                replacement[field] = value
+            replacement.path = os.fsencode(plan["absolute_path"])
+            replacement.write()
+            replacement.store()
+            if Path(os.fsdecode(replacement.path)).resolve() != plan["absolute_path"]:
+                raise OSError(f"beets changed the replacement path for {plan['path']}")
+            plan["beets_item_id"] = replacement.id
+            continue
         if plan["changes"]:
             item.write()
         if plan["beets_item_id"] is None:

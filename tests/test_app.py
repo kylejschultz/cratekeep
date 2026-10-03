@@ -773,6 +773,9 @@ def test_library_import_review_groups_preserve_source_folder_hierarchy(tmp_path)
     compilations = payload["groups"][4]
     assert compilations["folders"][0]["folders"][0]["path"] == "Compilations/Deep/Various"
     assert payload["groups"][0]["albums"][0]["songs"][0]["path"] == "Loose.mp3"
+    assert "Artist One/Album A" in {
+        path for album in payload["albums"] for path in album["source_paths"]
+    }
     assert _group_library_import_review_items(payload["items"]) == payload["groups"]
 
 
@@ -814,6 +817,21 @@ def test_library_import_review_paginates_25_artists_and_keeps_complete_albums(tm
     assert last.json["next_offset"] is None
     assert client.get("/api/library-import/reviews?offset=-1").status_code == 400
     assert client.get("/api/library-import/reviews?limit=51").status_code == 400
+
+
+def test_album_review_source_path_preserves_literal_filesystem_spelling(tmp_path):
+    app = make_app(tmp_path)
+    folder = "+44 - When Your Heart Stops Beating"
+    path = tmp_path / "library" / folder / "01 - Lycanthrope.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    payload = client.get("/api/library-import/reviews").json
+
+    assert payload["albums"][0]["source_paths"] == [folder]
+    assert payload["items"][0]["path"] == f"{folder}/01 - Lycanthrope.mp3"
 
 
 def test_musicbrainz_candidates_normalize_rank_and_persist_by_album(tmp_path):
@@ -888,6 +906,36 @@ def test_candidate_refresh_replaces_results_and_provider_errors_are_persisted(tm
     assert album["candidates"][0]["provider_id"] == "old"
 
 
+@pytest.mark.parametrize("provider_genre, expected_genre", [(None, None), ("Jazz", {"from": "Rock", "to": "Jazz"})])
+def test_candidate_genre_is_explicit_and_only_proposed_when_real(tmp_path, provider_genre, expected_genre):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    library.add(Item(title="Song", artist="Artist", albumartist="Artist", album="Album", genre="Rock", path=str(path)))
+    candidate = {
+        "provider_id": "release-1", "artist": "Artist", "album": "Album", "track_count": 1,
+        "tracks": [{"title": "Song", "position": 1}],
+    }
+    if provider_genre:
+        candidate["genre"] = provider_genre
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [candidate]
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+
+    assert album["current_metadata"]["genre"] == "Rock"
+    assert album["candidates"][0]["genre"] == provider_genre
+    assert album["candidates"][0]["proposed_diff"].get("genre") == expected_genre
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"],
+    })
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    genre_changes = [item["changes"].get("genre") for item in preview.json["items"] if item["changes"].get("genre")]
+    assert genre_changes == ([expected_genre] if expected_genre else [])
+
+
 def test_album_decision_candidate_and_track_exception_persist_across_group_sync(tmp_path):
     app = make_app(tmp_path)
     app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [
@@ -918,6 +966,9 @@ def test_album_decision_candidate_and_track_exception_persist_across_group_sync(
     assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
         "track_exceptions": {"999999": "approved"},
     }).status_code == 400
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "duplicate_action": "overwrite",
+    }).status_code == 400
 
 
 def test_album_as_is_selection_uses_null_candidate_without_changing_musicbrainz_results(tmp_path):
@@ -944,7 +995,7 @@ def test_album_as_is_selection_uses_null_candidate_without_changing_musicbrainz_
     assert response.json["selection_mode"] == "as-is"
     assert response.json["current_metadata"] == {
         "artist": "Artist", "album": "Incoming Album", "year": None, "date": None,
-        "track_count": 1, "disc_count": 1, "artwork_url": None,
+        "genre": None, "track_count": 1, "disc_count": 1, "artwork_url": None,
     }
     assert [candidate["id"] for candidate in response.json["candidates"]] == candidate_ids
     assert response.json["proposed_match"]["provider_id"] == "release-1"
@@ -1044,6 +1095,106 @@ def test_approved_candidate_execution_preserves_query_position_and_file_paths(tm
     assert item.get("mb_albumid") == "123e4567-e89b-42d3-a456-426614174000"
     assert item.get("track") == 2
     assert item.get("mb_trackid") == "recording-2"
+
+
+@pytest.mark.parametrize("duplicate_action", [None, "skip", "keep-both", "merge", "replace"])
+def test_duplicate_decision_is_persisted_previewed_and_enforced(tmp_path, duplicate_action):
+    app = make_app(tmp_path)
+    managed_path = tmp_path / "library" / "Managed" / "Old Album" / "01 Song.wav"
+    incoming_path = tmp_path / "library" / "Incoming Artist" / "Incoming Album" / "01 Song.wav"
+    write_wav(managed_path)
+    write_wav(incoming_path)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    managed = Item(
+        title="Song", artist="Managed", albumartist="Managed", album="Old Album",
+        mb_trackid="recording-1", path=str(managed_path),
+    )
+    library.add(managed)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": query["artist"], "album": query["album"], "track_count": 1,
+        "tracks": [{"title": "Song", "position": 1, "medium_position": 1, "recording_id": "recording-1"}],
+    }]
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = next(
+        album for album in client.get("/api/library-import/reviews").json["albums"]
+        if album["album"] == "Incoming Album"
+    )
+    patch = {"decision": "approved", "candidate_id": album["candidates"][0]["id"]}
+    if duplicate_action:
+        patch["duplicate_action"] = duplicate_action
+    saved = client.patch(f'/api/library-import/albums/{album["id"]}', json=patch)
+    assert saved.status_code == 200
+    assert saved.json["duplicate_action"] == duplicate_action
+
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    if duplicate_action is None:
+        assert preview.status_code == 409
+        assert preview.json["code"] == "duplicate_decision_required"
+        return
+    assert preview.status_code == 200
+    assert preview.json["duplicate_action"] == duplicate_action
+    assert preview.json["duplicates"] == 1
+    assert preview.json["items"][0]["action"] == duplicate_action
+
+    incoming_before = incoming_path.read_bytes()
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    items = list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items())
+    if duplicate_action == "keep-both":
+        assert len(items) == 2
+    else:
+        assert len(items) == 1
+    if duplicate_action == "replace":
+        assert Path(items[0].path.decode()).resolve() == incoming_path.resolve()
+        assert managed_path.exists()
+    elif duplicate_action == "keep-both":
+        assert {Path(item.path.decode()).resolve() for item in items} == {managed_path.resolve(), incoming_path.resolve()}
+    else:
+        assert Path(items[0].path.decode()).resolve() == managed_path.resolve()
+    if duplicate_action in {"skip", "merge"}:
+        assert incoming_path.read_bytes() == incoming_before
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        identities = dict(db.execute("SELECT relative_path, beets_item_id FROM library_inventory"))
+    incoming_relative = "Incoming Artist/Incoming Album/01 Song.wav"
+    managed_relative = "Managed/Old Album/01 Song.wav"
+    if duplicate_action in {"skip", "merge"}:
+        assert identities[incoming_relative] is None
+    elif duplicate_action == "keep-both":
+        assert identities[incoming_relative] != identities[managed_relative]
+    else:
+        assert identities[incoming_relative] == managed.id
+        assert identities[managed_relative] is None
+
+
+def test_duplicate_merge_rejects_ambiguous_managed_recording_identity(tmp_path):
+    app = make_app(tmp_path)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    for number in (1, 2):
+        path = tmp_path / "library" / f"Managed {number}" / "Album" / "01 Song.wav"
+        write_wav(path)
+        library.add(Item(title="Song", artist=f"Managed {number}", album="Album",
+                         mb_trackid="recording-1", path=str(path)))
+    incoming = tmp_path / "library" / "Incoming" / "Album" / "01 Song.wav"
+    write_wav(incoming)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": query["artist"], "album": query["album"], "track_count": 1,
+        "tracks": [{"title": "Song", "position": 1, "recording_id": "recording-1"}],
+    }]
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = next(album for album in client.get("/api/library-import/reviews").json["albums"] if album["artist"] == "Incoming")
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"], "duplicate_action": "merge",
+    })
+
+    response = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+
+    assert response.status_code == 409
+    assert response.json["code"] == "duplicate_ambiguous"
+    assert len(list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items())) == 2
 
 
 @pytest.mark.parametrize("change", ["changed", "missing"])
@@ -1150,6 +1301,17 @@ def test_library_route_exposes_summary_search_sort_and_existing_edits(tmp_path):
     assert b"Alpha Song" not in browse
     assert b'option value="title" selected' in filtered.data
     assert b'option value="desc" selected' in filtered.data
+
+    artist_filtered = client.get("/library?q=song&sort=title&order=desc&artist=Artist+A")
+    artist_browse = artist_filtered.data.split(b'id="browse-title"', 1)[1]
+    assert b"Alpha Song" in artist_browse and b"Beta Song" not in artist_browse
+    assert b'name="artist" value="Artist A"' in artist_filtered.data
+    assert b'q=song&amp;sort=title&amp;order=desc&amp;artist=Artist+A' in artist_filtered.data
+
+    album_filtered = client.get("/library?sort=album&order=asc&album=Shared")
+    album_browse = album_filtered.data.split(b'id="browse-title"', 1)[1]
+    assert b"Beta Song" in album_browse and b"Alpha Song" not in album_browse
+    assert b'name="album" value="Shared"' in album_filtered.data
 
 
 def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tmp_path):
@@ -1533,27 +1695,29 @@ def test_rematch_wrong_release_id_stays_selected_with_low_evidence_confidence(tm
     assert candidate["recommendation"] == "none"
 
 
-def test_library_import_review_markup_is_collapsible_and_not_a_flat_file_wall(tmp_path):
+def test_library_import_review_markup_is_album_folder_first(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"document.createElement('details')" in html
     assert b"document.createElement('summary')" in html
     assert b"review-folder" in html and b"review-album" in html
-    assert b"if (!isAlbumLeaf) source.open = topLevel && reviewGroups.length === 1" in html
-    assert b"folder.folders.map(child => renderFolder(child))" in html
+    assert b"albumReviews.flatMap(album => album.source_paths.map(path => renderAlbum(album, path)))" in html
+    assert b"path.textContent = folderPath === '.' ? 'Library root' : folderPath" in html
     assert b"reviewList.replaceChildren(...reviewItems.map" not in html
     assert b"reviews?limit=50" not in html
 
 
-def test_library_import_review_rows_are_unfilled_but_keep_hierarchy_and_focus_contract(tmp_path):
+def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b".review-list { overflow:hidden;" in html
     assert b".review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
-    assert b"document.createElement(isAlbumLeaf ? 'article' : 'details')" in html
+    assert b"document.createElement('article')" in html
     assert b"const album = document.createElement('button');" in html
+    assert b"album.textContent =" in html
+    assert b"album.title = `Review match for ${folderPath || 'library root'}`" in html
 
 
 def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
@@ -1579,14 +1743,14 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
 def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b"source.className = 'review-folder'" in html
     assert b"path.className = 'review-folder-path'" in html
-    assert b"path.textContent = folder.name || 'Library root'" in html
-    assert b"path.title = folder.path || 'Library root'" in html
+    assert b"path.textContent = folderPath === '.' ? 'Library root' : folderPath" in html
+    assert b"path.title = folderPath === '.' ? 'Library root' : folderPath" in html
     assert b"metadata.className = 'review-source-metadata'" in html
-    assert b"metadata.textContent = `${albumGroup.artist} \xe2\x80\x94 ${albumGroup.album}" in html
+    assert b"metadata.textContent = `${albumReview.artist}" in html
+    assert b"${albumReview.album}" in html
     assert b"renderTrackList" not in html
-    assert b"folder.folders.map(child => renderFolder(child))" in html
+    assert b"album.source_paths.map(path => renderAlbum(album, path))" in html
     assert b"status.className = 'status-pill'" in html
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html
@@ -1594,17 +1758,15 @@ def test_inventory_rows_render_source_paths_with_secondary_metadata(tmp_path):
     assert b"Previous artists" in html and b"Next artists" in html
 
 
-def test_source_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
+def test_album_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b"if (folder.albums.length === 1)" in html
-    assert b"summary.append(identity, parts.status, parts.score, parts.album)" in html
-    assert b"const isAlbumLeaf = folder.albums.length === 1 && folder.folders.length === 0" in html
-    assert b"document.createElement(isAlbumLeaf ? 'article' : 'details')" in html
+    assert b"row.append(identity, parts.status, parts.score, parts.album)" in html
+    assert b"const albumCards = albumReviews.flatMap" in html
     assert b"renderTrackList" not in html
     assert b"review-track-list" not in html
     assert b"event.stopPropagation(); openReview(albumReview, album)" in html
-    assert b"identity.append(parts.metadata)" in html
+    assert b"identity.append(path, parts.metadata)" in html
 
 
 def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
@@ -1612,7 +1774,7 @@ def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
     candidate_ui = html[html.index(b"const candidateIconPaths"):html.index(b"function openReview")]
 
     for label in (
-        b"Artist", b"Album", b"Release Year", b"Tracks changed",
+        b"Artist", b"Album", b"Genre", b"Release Year", b"Tracks changed",
         b"Release Type/media", b"Release Region",
         b"Local tracks found online", b"Online tracks present locally",
     ):
@@ -1701,7 +1863,12 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"const payload = {decision};" in html
-    assert b"decision === 'approved') payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId" in html
+    assert b"payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId" in html
+    assert b"payload.duplicate_action = duplicateAction" in html
+    assert b'id="library-import-duplicate-action"' in html
+    for action in (b'merge', b'replace', b'keep-both', b'skip'):
+        assert b'value="' + action + b'"' in html
+    assert b"same MusicBrainz recording ID" in html
     assert b"method: 'PATCH'" in html
     assert b"data-review-decision=\"skipped\"" in html
     assert b"data-review-decision=\"rejected\"" in html

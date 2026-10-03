@@ -146,7 +146,9 @@
     .review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.8rem; align-items:center; padding:.7rem .8rem .75rem 1.8rem; border-bottom:1px solid var(--border); }
     .review-album-row:last-child { border-bottom:0; }
     .review-source-metadata { display:block; margin-bottom:.25rem; color:var(--text); font-size:.82rem; font-weight:650; }
-    .review-album { width:auto; min-width:7.5rem; margin:0; padding:.48rem .7rem; }
+    .review-album { display:grid; place-items:center; width:2rem; min-width:2rem; height:2rem; margin:0; padding:0; border:0; border-radius:.25rem; background:transparent; color:var(--accent); font-size:1.05rem; }
+    .review-album:hover { background:var(--active); color:var(--text); }
+    .review-album:focus-visible { outline:3px solid var(--focus); outline-offset:2px; }
     .review-track-count { color:var(--muted); font-size:.76rem; }
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
     .status-pill { color:#20252b; background:#f4f5f6; }
@@ -393,6 +395,19 @@
           <button id="library-import-rematch" type="submit">Rematch</button>
           <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
         </form>
+        <section class="album-modal-section" aria-labelledby="duplicate-action-title">
+          <h3 id="duplicate-action-title">If a managed track has the same MusicBrainz recording ID</h3>
+          <label for="library-import-duplicate-action">Duplicate decision
+            <select id="library-import-duplicate-action">
+              <option value="">Choose when a duplicate is found</option>
+              <option value="merge">Merge metadata into the managed track; keep both files in place</option>
+              <option value="replace">Replace the managed record with this file; do not move either file</option>
+              <option value="keep-both">Keep both as separate managed tracks</option>
+              <option value="skip">Skip the incoming duplicate</option>
+            </select>
+          </label>
+          <small>Merge and replace require one unambiguous recording-ID match and a current, path-safe inventory snapshot. Cratekeep stops on missing or ambiguous identity instead of guessing.</small>
+        </section>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
         <section class="album-modal-section" aria-labelledby="library-import-execution-title">
           <h3 id="library-import-execution-title">Apply approved album</h3>
@@ -746,9 +761,8 @@
 
     function renderReviewItems() {
       if (!reviewList) return;
-      function albumRowParts(albumGroup, folderPath) {
-          const albumReview = albumReviews.find(review => review.artist === albumGroup.artist && review.album === albumGroup.album);
-          const statusValue = albumInventoryStatus(albumReview, albumGroup.songs);
+      function albumRowParts(albumReview, folderPath, songs) {
+          const statusValue = albumInventoryStatus(albumReview, songs);
           const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue; status.textContent = statusValue;
           const statusDescription = inventoryStatusDescriptions[statusValue] || statusValue;
           status.setAttribute('aria-label', `Status: ${statusValue}. ${statusDescription}`);
@@ -760,50 +774,32 @@
             score.setAttribute('aria-label', scorePresentation.accessibleLabel);
           } else { score.textContent = 'No match score'; score.hidden = true; }
           const metadata = document.createElement('span'); metadata.className = 'review-source-metadata';
-          metadata.textContent = `${albumGroup.artist} — ${albumGroup.album} · ${albumGroup.songs.length} ${albumGroup.songs.length === 1 ? 'track' : 'tracks'}`;
-          const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = 'Review match';
-          album.setAttribute('aria-label', `Review ${folderPath || 'library root'}: ${albumGroup.album} by ${albumGroup.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
+          metadata.textContent = `${albumReview.artist} — ${albumReview.album} · ${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`;
+          const album = document.createElement('button'); album.type = 'button'; album.className = 'review-album'; album.textContent = '↗';
+          album.title = `Review match for ${folderPath || 'library root'}`;
+          album.setAttribute('aria-label', `Review ${folderPath || 'library root'}: ${albumReview.album} by ${albumReview.artist}. Status: ${statusValue}. ${statusDescription}${scorePresentation ? `. ${scorePresentation.accessibleLabel}` : ''}`);
           if (albumReview) album.addEventListener('click', event => { event.stopPropagation(); openReview(albumReview, album); });
           else album.disabled = true;
           return {metadata, status, score, album};
       }
-      function renderAlbum(albumGroup, folderPath) {
+      function renderAlbum(albumReview, folderPath) {
           const row = document.createElement('article'); row.className = 'review-album-row';
-          const parts = albumRowParts(albumGroup, folderPath);
-          row.append(parts.metadata, parts.status, parts.score, parts.album);
-          return row;
-      }
-      function renderFolder(folder, topLevel = false) {
-        const isAlbumLeaf = folder.albums.length === 1 && folder.folders.length === 0;
-        const source = document.createElement(isAlbumLeaf ? 'article' : 'details'); source.className = 'review-folder';
-        if (!isAlbumLeaf) source.open = topLevel && reviewGroups.length === 1;
-        const summary = document.createElement(isAlbumLeaf ? 'div' : 'summary'); summary.className = 'review-folder-summary';
         const identity = document.createElement('span'); identity.className = 'review-folder-identity';
         const path = document.createElement('span'); path.className = 'review-folder-path';
-        path.textContent = folder.name || 'Library root'; path.title = folder.path || 'Library root';
-        const count = document.createElement('span'); count.className = 'review-folder-count';
-        const tracks = folderTrackCount(folder);
-        count.textContent = `${tracks} ${tracks === 1 ? 'track' : 'tracks'}`;
-        identity.append(path);
-        const contents = document.createElement('div'); contents.className = 'review-folder-contents';
-        if (folder.albums.length === 1) {
-          const parts = albumRowParts(folder.albums[0], folder.path);
-          identity.append(parts.metadata);
-          summary.append(identity, parts.status, parts.score, parts.album);
-        } else {
-          identity.append(count); summary.append(identity);
-          contents.append(...folder.albums.map(album => renderAlbum(album, folder.path)));
-        }
-        contents.append(...folder.folders.map(child => renderFolder(child)));
-        source.append(summary);
-        if (!isAlbumLeaf) source.append(contents);
-        return source;
+        path.textContent = folderPath === '.' ? 'Library root' : folderPath;
+        path.title = folderPath === '.' ? 'Library root' : folderPath;
+        const songs = reviewItems.filter(item => albumReview.tracks.some(track => track.id === item.id)
+          && (folderPath === '.' ? !item.path.includes('/') : item.path.slice(0, item.path.lastIndexOf('/')) === folderPath));
+        const parts = albumRowParts(albumReview, folderPath, songs);
+        identity.append(path, parts.metadata);
+        row.append(identity, parts.status, parts.score, parts.album);
+        return row;
       }
-      reviewList.replaceChildren(...reviewGroups.map(folder => renderFolder(folder, true)));
-      const sourceFolderCount = reviewGroups.reduce((count, folder) => count + folderCount(folder), 0);
+      const albumCards = albumReviews.flatMap(album => album.source_paths.map(path => renderAlbum(album, path)));
+      reviewList.replaceChildren(...albumCards);
       reviewStatus.dataset.busy = 'false';
       reviewStatus.textContent = reviewItems.length
-        ? `${sourceFolderCount} source ${sourceFolderCount === 1 ? 'folder' : 'folders'}, ${reviewItems.length} tracks on this page.`
+        ? `${albumCards.length} album ${albumCards.length === 1 ? 'folder' : 'folders'}, ${reviewItems.length} tracks on this page.`
         : 'No current inventory review items.';
       const pageStart = reviewTotalArtists ? reviewOffset + 1 : 0;
       const pageEnd = Math.min(reviewOffset + reviewPageArtistCount, reviewTotalArtists);
@@ -903,6 +899,7 @@
       const candidateIconPaths = {
         artist:['M20 21a8 8 0 0 0-16 0','M12 13a4 4 0 1 0 0-8 4 4 0 0 0 0 8'],
         album:['M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20','M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6','M12 12h.01'],
+        genre:['M20 13c0 5-3.5 8-8 8s-8-3-8-8c0-4 3-7 8-11 5 4 8 7 8 11Z','M9 13h6'],
         year:['M3 5h18v16H3z','M16 3v4','M8 3v4','M3 10h18'],
         tracks:['M4 6h16','M4 12h16','M4 18h10'],
         media:['M4 5h16v14H4z','M8 9h8','M8 15h8','M9 15l-1 4','M15 15l1 4'],
@@ -1026,6 +1023,7 @@
         return [
           {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
+          {kind:'genre', label:'Genre', value:value.genre || (value.is_as_is ? (current.genre || 'Not present in current metadata') : `Not provided by MusicBrainz; preserving ${current.genre || 'no current genre'}`), changed:!value.is_as_is && Boolean(value.genre) && metadataChanged(current.genre, value.genre)},
           {kind:'year', label:'Release Year', value:year.value, changed:year.changed, localYear:year.localYear, proposedYear:year.proposedYear, comparison:year.changed},
           {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'All tracks matched', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks, expandable:!value.is_as_is},
           {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
@@ -1111,6 +1109,7 @@
         ? 'This approved album has already been applied.'
         : (executionReady ? 'Preview before applying. Files will remain at their current paths.' : 'Queue an approved review to enable execution.');
       document.getElementById('library-import-mbid').value = '';
+      document.getElementById('library-import-duplicate-action').value = album.duplicate_action || '';
       renderAlbumMatch();
       reviewModal.hidden = false;
       document.body.classList.add('modal-open');
@@ -1160,7 +1159,11 @@
         message.dataset.busy = 'true'; message.textContent = progressLabel;
         try {
           const payload = {decision};
-          if (decision === 'approved') payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId;
+          if (decision === 'approved') {
+            payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId;
+            const duplicateAction = document.getElementById('library-import-duplicate-action').value;
+            if (duplicateAction) payload.duplicate_action = duplicateAction;
+          }
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}`, {
             method: 'PATCH', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload),
@@ -1192,8 +1195,10 @@
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || data.description || 'Unable to execute approved album.');
           result.dataset.busy = 'false';
+          const genreChanges = data.items?.filter(item => item.changes?.genre)
+            .map(item => `${item.path}: ${item.changes.genre.from || 'Not provided'} → ${item.changes.genre.to}`) || [];
           result.textContent = dryRun
-            ? `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.`
+            ? `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.${genreChanges.length ? ` Genre: ${genreChanges.join('; ')}.` : ''}`
             : `${data.files} files applied in place; no files were moved or copied.`;
           if (!dryRun) await loadReviewItems();
         } catch (error) {
