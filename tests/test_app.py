@@ -27,6 +27,15 @@ def make_app(tmp_path: Path):
     assert response.status_code == 302
     return app
 
+
+def write_wav(path: Path, seconds: int = 1) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(8000)
+        audio.writeframes(b"\0\0" * 8000 * seconds)
+
 def test_health_and_empty_lists(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()
@@ -939,6 +948,151 @@ def test_album_as_is_selection_uses_null_candidate_without_changing_musicbrainz_
     }
     assert [candidate["id"] for candidate in response.json["candidates"]] == candidate_ids
     assert response.json["proposed_match"]["provider_id"] == "release-1"
+
+
+def test_approved_as_is_execution_registers_in_place_and_honors_track_exceptions(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library" / "Artist" / "Album"
+    approved_path = root / "01 Approved.wav"
+    rejected_path = root / "02 Rejected.wav"
+    write_wav(approved_path)
+    write_wav(rejected_path)
+    original = approved_path.read_bytes()
+    original_mtime = approved_path.stat().st_mtime_ns
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    rejected_id = album["tracks"][1]["id"]
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": None,
+        "track_exceptions": {str(rejected_id): "rejected"},
+    }).status_code == 200
+
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    assert preview.json["selection_mode"] == "as-is"
+    assert preview.json["files"] == 1
+    assert preview.json["registered"] == 1
+    assert preview.json["metadata_updates"] == 0
+    assert preview.json["skipped_tracks"] == 1
+    assert approved_path.read_bytes() == original
+    assert approved_path.stat().st_mtime_ns == original_mtime
+
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    items = list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items())
+    assert len(items) == 1
+    assert Path(items[0].path.decode()).resolve() == approved_path.resolve()
+    assert approved_path.read_bytes() == original
+    assert approved_path.stat().st_mtime_ns == original_mtime
+    assert rejected_path.exists()
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT execution_status FROM album_reviews WHERE id = ?", (album["id"],)).fetchone()[0] == "complete"
+        assert db.execute("SELECT status FROM adoption_jobs WHERE kind = 'library_import_execute'").fetchone()[0] == "complete"
+
+
+def test_approved_candidate_execution_preserves_query_position_and_file_paths(tmp_path):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174000",
+        "release_group_id": "group-1", "artist": "Canonical Artist", "album": "Canonical Album",
+        "date": "2024-03-02", "year": "2024", "release_type": "Album", "country": "GB",
+        "track_count": 2, "media": [{"position": 1, "format": "CD"}],
+        "tracks": [
+            {"title": "First Song", "position": 1, "medium_position": 1,
+             "recording_id": "recording-1"},
+            {"title": "Second Song", "position": 2, "medium_position": 1,
+             "recording_id": "recording-2"},
+        ],
+    }]
+    root = tmp_path / "library" / "Local Artist" / "Local Album"
+    rejected_path = root / "01 First Song.wav"
+    path = root / "02 Second Song.wav"
+    write_wav(rejected_path)
+    write_wav(path)
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate_id = album["candidates"][0]["id"]
+    rejected_id = album["tracks"][0]["id"]
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": candidate_id,
+        "track_exceptions": {str(rejected_id): "rejected"},
+    })
+    before_preview = path.read_bytes()
+    rejected_before = rejected_path.read_bytes()
+
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    assert preview.json["metadata_updates"] == 1
+    assert preview.json["files"] == 1
+    assert preview.json["items"][0]["path"] == "Local Artist/Local Album/02 Second Song.wav"
+    assert preview.json["items"][0]["changes"]["track"]["to"] == 2
+    assert preview.json["items"][0]["changes"]["mb_trackid"]["to"] == "recording-2"
+    assert path.read_bytes() == before_preview
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    assert path.exists()
+    assert rejected_path.read_bytes() == rejected_before
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    assert Path(item.path.decode()).resolve() == path.resolve()
+    assert {field: item.get(field) for field in ("title", "artist", "album", "albumartist", "year", "month", "day")} == {
+        "title": "Second Song", "artist": "Canonical Artist", "album": "Canonical Album",
+        "albumartist": "Canonical Artist", "year": 2024, "month": 3, "day": 2,
+    }
+    assert item.get("mb_albumid") == "123e4567-e89b-42d3-a456-426614174000"
+    assert item.get("track") == 2
+    assert item.get("mb_trackid") == "recording-2"
+
+
+@pytest.mark.parametrize("change", ["changed", "missing"])
+def test_library_execution_rejects_files_changed_since_inventory(tmp_path, change):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={"decision": "approved", "candidate_id": None})
+    if change == "changed":
+        path.write_bytes(path.read_bytes() + b"changed")
+    else:
+        path.unlink()
+
+    response = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert response.status_code == 409
+    assert response.json["code"] == "inventory_stale"
+    assert list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()) == []
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        review = db.execute(
+            "SELECT execution_status, execution_error, last_execution_job_id FROM album_reviews WHERE id = ?",
+            (album["id"],),
+        ).fetchone()
+        assert review[0] == "failed"
+        assert "Library file" in review[1]
+        assert db.execute("SELECT status FROM adoption_jobs WHERE id = ?", (review[2],)).fetchone()[0] == "failed"
+
+
+def test_library_execution_rerun_is_idempotent(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={"decision": "approved", "candidate_id": None})
+    first = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    item_id = first.json["items"][0]["beets_item_id"]
+    second = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json["already_complete"] is True
+    assert second.json["items"][0]["beets_item_id"] == item_id
+    assert [item.id for item in Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()] == [item_id]
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_execute'").fetchone()[0] == 1
 
 
 def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tmp_path):

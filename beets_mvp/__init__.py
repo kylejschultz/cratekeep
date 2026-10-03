@@ -16,7 +16,7 @@ from pathlib import Path
 
 import yaml
 from beets import config as beets_config
-from beets.library import Library
+from beets.library import Item, Library
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
 from mediafile import MediaFile, UnreadableFileError
 
@@ -36,6 +36,14 @@ MUSICBRAINZ_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+
+
+class LibraryImportExecutionError(RuntimeError):
+    def __init__(self, message: str, *, code: str, status: int = 409, job_id: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.job_id = job_id
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -203,6 +211,22 @@ def create_app(test_config: dict | None = None) -> Flask:
         if item is None:
             return jsonify(error="Album review not found", code="album_review_not_found"), 404
         return jsonify(item)
+
+    @app.post("/api/library-import/albums/<int:album_review_id>/execute")
+    def execute_library_import_album(album_review_id: int):
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if (not isinstance(values, dict) or set(values) - {"dry_run"}
+                or not isinstance(values.get("dry_run", False), bool)):
+            return jsonify(error="request may contain only a boolean dry_run", code="invalid_request"), 400
+        try:
+            result = _execute_library_import_album(app, album_review_id, dry_run=values.get("dry_run", False))
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code, job_id=exc.job_id), exc.status
+        if result is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        return jsonify(result), (201 if result["status"] == "complete" and not result.get("already_complete") else 200)
 
     @app.patch("/api/library-import/reviews/<int:inventory_id>")
     def update_library_import_review(inventory_id: int):
@@ -477,6 +501,15 @@ def _init_db(path: str) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(album_review_id, provider, provider_id)
         )""")
+        _ensure_column(db, "album_reviews", "execution_status", "TEXT NOT NULL DEFAULT 'not-run'")
+        _ensure_column(db, "album_reviews", "execution_error", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "album_reviews", "last_execution_job_id", "INTEGER")
+        _ensure_column(db, "album_reviews", "executed_at", "TEXT")
+
+
+def _ensure_column(db: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def _load_settings(path: str) -> dict[str, str]:
@@ -1250,6 +1283,10 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                 "highest_confidence": highest_confidence,
                 "candidate_status": row["candidate_status"],
                 "candidate_error": row["candidate_error"],
+                "execution_status": row["execution_status"],
+                "execution_error": row["execution_error"],
+                "last_execution_job_id": row["last_execution_job_id"],
+                "executed_at": row["executed_at"],
                 "tracks": [{"id": track["id"], "path": track["relative_path"],
                             "title": query["tracks"][index]["title"],
                             "duration": query["tracks"][index].get("duration"),
@@ -1307,9 +1344,257 @@ def _update_album_review(app: Flask, album_review_id: int, values: dict) -> dict
         if "candidate_id" in values:
             assignments.append("selected_candidate_id = ?"); parameters.append(candidate_id)
         if assignments or exceptions:
+            assignments.extend(["execution_status = 'not-run'", "execution_error = ''",
+                                "last_execution_job_id = NULL", "executed_at = NULL"])
             assignments.append("updated_at = ?"); parameters.append(_now())
             db.execute(f"UPDATE album_reviews SET {', '.join(assignments)} WHERE id = ?", (*parameters, album_review_id))
     return next(iter(_album_review_payloads(app, [album_review_id])), None)
+
+
+def _execute_library_import_album(app: Flask, album_review_id: int, *, dry_run: bool) -> dict | None:
+    """Register an approved in-library album and optionally write its chosen tags in place."""
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            "SELECT * FROM album_reviews WHERE id = ? AND root_path = ?", (album_review_id, str(root))
+        ).fetchone()
+        if album is None:
+            return None
+        if not dry_run and album["execution_status"] == "complete":
+            previous = db.execute(
+                "SELECT summary_json FROM adoption_jobs WHERE id = ?", (album["last_execution_job_id"],)
+            ).fetchone()
+            result = json.loads(previous["summary_json"]) if previous else {
+                "album_review_id": album_review_id, "status": "complete"
+            }
+            return {**result, "already_complete": True}
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES (?, ?, 'running', ?)",
+            ("library_import_preview" if dry_run else "library_import_execute", str(root), _now()),
+        ).lastrowid
+        if album["state"] != "approved":
+            _fail_library_execution(db, album_review_id, job_id, "album review is not approved", dry_run)
+            db.commit()
+            raise LibraryImportExecutionError(
+                "Album review must be approved before execution.", code="review_not_approved", job_id=job_id
+            )
+        rows = db.execute(
+            """SELECT inventory.*, tracks.exception_state
+                 FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE tracks.album_review_id = ?
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (album_review_id,),
+        ).fetchall()
+        candidate = None
+        if album["selected_candidate_id"] is not None:
+            candidate = db.execute(
+                "SELECT * FROM metadata_candidates WHERE id = ? AND album_review_id = ?",
+                (album["selected_candidate_id"], album_review_id),
+            ).fetchone()
+            if candidate is None:
+                _fail_library_execution(db, album_review_id, job_id, "selected candidate is unavailable", dry_run)
+                db.commit()
+                raise LibraryImportExecutionError(
+                    "The selected metadata candidate is no longer available.",
+                    code="candidate_unavailable", job_id=job_id,
+                )
+
+    # Keep each row's position in the complete album query. Candidate track
+    # details use that position even when an earlier track is excluded.
+    approved = [
+        (position, row) for position, row in enumerate(rows, 1)
+        if (row["exception_state"] or album["state"]) == "approved"
+    ]
+    if not approved:
+        _persist_library_execution_failure(app, album_review_id, job_id, "no tracks are approved", dry_run)
+        raise LibraryImportExecutionError("No tracks are approved for execution.", code="no_approved_tracks", job_id=job_id)
+    try:
+        paths = [_validate_inventory_file(root, row) for _, row in approved]
+        provider_data = json.loads(candidate["provider_data_json"]) if candidate else None
+        plans = _library_import_plans(app, album, approved, paths, provider_data)
+        result = {
+            "id": job_id,
+            "album_review_id": album_review_id,
+            "status": "preview" if dry_run else "complete",
+            "dry_run": dry_run,
+            "selection_mode": "candidate" if candidate else "as-is",
+            "files": len(plans),
+            "registered": sum(plan["beets_item_id"] is None for plan in plans),
+            "metadata_updates": sum(bool(plan["changes"]) for plan in plans),
+            "skipped_tracks": len(rows) - len(approved),
+            "items": [{key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes")} for plan in plans],
+        }
+        if not dry_run:
+            _apply_library_import_plans(app, plans)
+            result["items"] = [
+                {key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes")} for plan in plans
+            ]
+        finished = _now()
+        result["finished_at"] = finished
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status = 'complete', summary_json = ?, finished_at = ? WHERE id = ?",
+                (json.dumps(result, sort_keys=True), finished, job_id),
+            )
+            if not dry_run:
+                db.executemany(
+                    "UPDATE library_inventory SET beets_item_id = ? WHERE id = ?",
+                    [(plan["beets_item_id"], plan["inventory_id"]) for plan in plans],
+                )
+                db.execute(
+                    """UPDATE album_reviews SET execution_status = 'complete', execution_error = '',
+                              last_execution_job_id = ?, executed_at = ?, updated_at = ? WHERE id = ?""",
+                    (job_id, finished, finished, album_review_id),
+                )
+        return result
+    except LibraryImportExecutionError as exc:
+        _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
+        exc.job_id = job_id
+        raise
+    except Exception as exc:
+        message = f"library import execution failed: {exc}"
+        _persist_library_execution_failure(app, album_review_id, job_id, message, dry_run)
+        raise LibraryImportExecutionError(message, code="execution_failed", status=500, job_id=job_id) from exc
+
+
+def _fail_library_execution(
+    db: sqlite3.Connection, album_review_id: int, job_id: int, message: str, dry_run: bool
+) -> None:
+    finished = _now()
+    db.execute(
+        "UPDATE adoption_jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?",
+        (message[:1000], finished, job_id),
+    )
+    if not dry_run:
+        db.execute(
+            """UPDATE album_reviews SET execution_status = 'failed', execution_error = ?,
+                      last_execution_job_id = ?, updated_at = ? WHERE id = ?""",
+            (message[:500], job_id, finished, album_review_id),
+        )
+
+
+def _persist_library_execution_failure(
+    app: Flask, album_review_id: int, job_id: int, message: str, dry_run: bool
+) -> None:
+    with _connect(app.config["APP_DB"]) as db:
+        _fail_library_execution(db, album_review_id, job_id, message, dry_run)
+
+
+def _validate_inventory_file(root: Path, row: sqlite3.Row) -> Path:
+    path = root / row["relative_path"]
+    try:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Library file is missing: {row['relative_path']}", code="inventory_stale"
+        ) from exc
+    if resolved == root or root not in resolved.parents or path.is_symlink() or not resolved.is_file():
+        raise LibraryImportExecutionError(
+            f"Library file is no longer a safe regular file: {row['relative_path']}", code="inventory_stale"
+        )
+    expected = (row["size_bytes"], row["mtime_ns"], row["device"], row["inode"])
+    current = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+    if not row["present"] or current != expected:
+        raise LibraryImportExecutionError(
+            f"Library file changed after inventory preview: {row['relative_path']}", code="inventory_stale"
+        )
+    return resolved
+
+
+def _library_import_plans(
+    app: Flask, album: sqlite3.Row, rows: list[tuple[int, sqlite3.Row]], paths: list[Path], provider_data: dict | None
+) -> list[dict]:
+    library = _library(app)
+    details = {}
+    if provider_data:
+        query = _album_query(app, album)
+        details = {
+            detail["position"]: detail for detail in _candidate_match(query, provider_data)["track_details"]
+            if detail.get("local") is not None
+        }
+    plans = []
+    for (position, row), path in zip(rows, paths):
+        item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+        if item is not None and Path(os.fsdecode(item.path)).resolve() != path:
+            raise LibraryImportExecutionError(
+                f"Tracked item path changed after inventory preview: {row['relative_path']}", code="inventory_stale"
+            )
+        if item is None:
+            item = Item.from_path(path)
+        values = _candidate_item_values(provider_data, details.get(position)) if provider_data else {}
+        changes = {
+            field: {"from": item.get(field), "to": value}
+            for field, value in values.items() if item.get(field) != value
+        }
+        plans.append({
+            "inventory_id": row["id"], "path": row["relative_path"], "absolute_path": path,
+            "beets_item_id": row["beets_item_id"], "item": item, "values": values, "changes": changes,
+        })
+    return plans
+
+
+def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
+    values = {}
+    artist = _normalize_metadata(candidate.get("artist"))
+    album = _normalize_metadata(candidate.get("album"))
+    if artist:
+        values.update(artist=artist, albumartist=artist)
+    if album:
+        values["album"] = album
+    date = str(candidate.get("date") or candidate.get("year") or "")
+    date_match = re.fullmatch(r"(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?", date)
+    if date_match:
+        values["year"] = int(date_match.group(1))
+        values["month"] = int(date_match.group(2) or 0)
+        values["day"] = int(date_match.group(3) or 0)
+    if candidate.get("provider_id"):
+        values["mb_albumid"] = str(candidate["provider_id"])
+    if candidate.get("release_group_id"):
+        values["mb_releasegroupid"] = str(candidate["release_group_id"])
+    if candidate.get("release_type"):
+        values["albumtype"] = str(candidate["release_type"])
+    if candidate.get("country"):
+        values["country"] = str(candidate["country"])
+    media = candidate.get("media") if isinstance(candidate.get("media"), list) else []
+    if media and isinstance(media[0], dict) and media[0].get("format"):
+        values["media"] = str(media[0]["format"])
+    try:
+        if candidate.get("track_count") is not None:
+            values["tracktotal"] = int(candidate["track_count"])
+        if media:
+            values["disctotal"] = len(media)
+    except (TypeError, ValueError):
+        pass
+    if detail and detail.get("proposed") is not None:
+        values["title"] = detail["proposed"]
+        proposed_position = detail.get("proposed_position")
+        if proposed_position:
+            values["disc"], values["track"] = (int(proposed_position[0]), int(proposed_position[1]))
+        if detail.get("recording_id"):
+            values["mb_trackid"] = str(detail["recording_id"])
+    return values
+
+
+def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
+    library = _library(app)
+    for plan in plans:
+        item = plan["item"]
+        for field, value in plan["values"].items():
+            item[field] = value
+        if plan["changes"]:
+            item.write()
+        if plan["beets_item_id"] is None:
+            # Library.add only registers the existing path in beets. File
+            # copying and moving are importer operations, not Library.add
+            # options; the invariant below verifies registration stayed in place.
+            library.add(item)
+        else:
+            item.store()
+        if Path(os.fsdecode(item.path)).resolve() != plan["absolute_path"]:
+            raise OSError(f"beets changed the file path for {plan['path']}")
+        plan["beets_item_id"] = item.id
 
 
 def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:

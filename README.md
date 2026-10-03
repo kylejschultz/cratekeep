@@ -91,6 +91,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `POST /api/library-import/candidates` — generate and persist bounded MusicBrainz release candidates
 - `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, and track exceptions; send `candidate_id: null` with an approved decision to explicitly keep the incoming metadata “As Is” with no MusicBrainz association
 - `POST /api/library-import/albums/<id>/rematch` — validate a MusicBrainz release UUID and rematch through the configured provider
+- `POST /api/library-import/albums/<id>/execute` — preview or execute an approved album in place; send `{"dry_run":true}` to validate the inventory snapshot and return registrations/tag changes without mutation
 - `POST /api/imports/preview` — snapshot an inbox selection for review
 - `POST /api/imports/<id>/execute` — execute a reviewed import
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
@@ -107,7 +108,9 @@ The Library import inventory mirrors the source filesystem as nested folders and
 | `Imported` | Every track in the album is already tracked in the library. |
 | `Needs attention` | Matching is incomplete or failed, or the album was rejected or skipped during review. |
 
-Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only the initial indicator cutoff for a future auto-import workflow; Cratekeep does not automatically import albums. Queuing an album records the review decision; it does not execute an import.
+Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only an indicator; Cratekeep never automatically imports albums. **Queue import** records the review decision and remains non-mutating. Reopen an approved review to use the separate **Preview in-place changes** and **Apply in place** actions.
+
+Library execution is review-gated and synchronous. Before changing anything, Cratekeep verifies each approved track against the size, modification time, device, and inode captured by the latest inventory preview. Missing or changed files are rejected with `409 inventory_stale`; run a fresh inventory preview and review again. Track exceptions are honored, so rejected or skipped tracks are not registered or tagged. **As Is** registers approved files in the beets database without rewriting tags. A selected candidate registers untracked files and writes the approved album/track metadata to each file at its existing path. It never invokes `beet import`, moves, or copies a file. Execution and dry-run attempts are audited in `adoption_jobs`; album records retain execution status, errors, the last execution job, and completion time. A completed execution can be safely retried and returns its stored result without another write.
 
 ## Tests
 
@@ -120,7 +123,7 @@ python -m compileall -q beets_mvp tests
 
 - Cratekeep is designed for one trusted user and one process. It has no authentication, authorization, CSRF protection, job queue, or background workers.
 - Imports are synchronous and may occupy the sole Gunicorn worker for up to one hour.
-- MusicBrainz matching is an explicit, bounded metadata-only lookup. Each search hit is resolved to canonical release/release-group type and region, media, position, recording, title, and duration data before a deterministic beets-inspired distance is calculated. The MusicBrainz search score remains retrieval metadata and never contributes to confidence. A supplied release ID selects that canonical candidate but never overrides evidence-based confidence or recommendation. Recommendations and per-field penalties are bounded and explainable, and track-count mismatches can never report 100%. Candidate and review decisions are persisted, but they do not write tags, move files, fetch artwork, or execute a beets import.
+- MusicBrainz matching is an explicit, bounded metadata-only lookup. Each search hit is resolved to canonical release/release-group type and region, media, position, recording, title, and duration data before a deterministic beets-inspired distance is calculated. The MusicBrainz search score remains retrieval metadata and never contributes to confidence. A supplied release ID selects that canonical candidate but never overrides evidence-based confidence or recommendation. Recommendations and per-field penalties are bounded and explainable, and track-count mismatches can never report 100%. Candidate lookup and review decisions do not mutate media; only the separate execution action for an approved review writes tags. Library execution does not fetch artwork or run a beets import.
 - There is no automatic duplicate resolution, artwork workflow, progress stream, undo, or delete endpoint.
 - A metadata database update occurs before its file-tag write, so a failed tag write can leave them temporarily inconsistent. Keep backups and ensure library files are writable.
 - Navidrome integration is a generic POST with optional bearer authentication and is not automatically run after imports.

@@ -394,6 +394,15 @@
           <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
         </form>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
+        <section class="album-modal-section" aria-labelledby="library-import-execution-title">
+          <h3 id="library-import-execution-title">Apply approved album</h3>
+          <p>After queueing this review, preview the exact registrations and tag changes, then apply them to the files at their current paths.</p>
+          <div class="import-actions">
+            <button id="library-import-execution-preview" class="secondary" type="button">Preview in-place changes</button>
+            <button id="library-import-execution-apply" type="button">Apply in place</button>
+          </div>
+          <p id="library-import-execution-result" class="operation-status" role="status" aria-live="polite"></p>
+        </section>
       </div>
       <footer class="browser-actions review-footer">
         <div class="review-footer-group">
@@ -1094,6 +1103,13 @@
       document.getElementById('library-import-modal-title').textContent = `${album.artist} — ${album.album}`;
       const message = document.getElementById('library-import-modal-message');
       message.dataset.busy = 'false'; message.textContent = '';
+      const executionResult = document.getElementById('library-import-execution-result');
+      const executionReady = album.decision === 'approved';
+      document.getElementById('library-import-execution-preview').disabled = !executionReady;
+      document.getElementById('library-import-execution-apply').disabled = !executionReady || album.execution_status === 'complete';
+      executionResult.textContent = album.execution_status === 'complete'
+        ? 'This approved album has already been applied.'
+        : (executionReady ? 'Preview before applying. Files will remain at their current paths.' : 'Queue an approved review to enable execution.');
       document.getElementById('library-import-mbid').value = '';
       renderAlbumMatch();
       reviewModal.hidden = false;
@@ -1160,6 +1176,36 @@
           decisionButtons.forEach(action => { action.disabled = false; action.setAttribute('aria-busy', 'false'); });
         }
       }));
+      async function executeApprovedAlbum(dryRun, button) {
+        const result = document.getElementById('library-import-execution-result');
+        const actions = [
+          document.getElementById('library-import-execution-preview'),
+          document.getElementById('library-import-execution-apply'),
+        ];
+        actions.forEach(action => { action.disabled = true; });
+        button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
+        result.textContent = dryRun ? 'Checking files and preparing an in-place preview…' : 'Registering files and applying approved metadata in place…';
+        try {
+          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/execute`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({dry_run: dryRun}),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || data.description || 'Unable to execute approved album.');
+          result.dataset.busy = 'false';
+          result.textContent = dryRun
+            ? `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.`
+            : `${data.files} files applied in place; no files were moved or copied.`;
+          if (!dryRun) await loadReviewItems();
+        } catch (error) {
+          result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to execute approved album.';
+        } finally {
+          button.setAttribute('aria-busy', 'false');
+          document.getElementById('library-import-execution-preview').disabled = activeAlbum.decision !== 'approved';
+          document.getElementById('library-import-execution-apply').disabled = activeAlbum.decision !== 'approved' || !dryRun;
+        }
+      }
+      document.getElementById('library-import-execution-preview').addEventListener('click', event => executeApprovedAlbum(true, event.currentTarget));
+      document.getElementById('library-import-execution-apply').addEventListener('click', event => executeApprovedAlbum(false, event.currentTarget));
       document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
         event.preventDefault();
         const input = document.getElementById('library-import-mbid');
