@@ -71,6 +71,8 @@ gunicorn --bind 127.0.0.1:8788 --workers 1 --threads 4 'beets_mvp:create_app()'
 
 Inbox and library paths are chosen during first-run setup. The in-app Settings page also manages optional Navidrome details, an explicit artwork-fetching opt-in, and an advanced YAML editor for `$STATE_PATH/config.yaml`. On save, Cratekeep validates and normalizes the YAML; library/database paths, core import safety options, and `fetchart` plugin state remain controlled by the form.
 
+The overview remains at `/`. The dedicated `/inbox` page opens the pending library-import review workspace, while `/library` provides collection counts, recently added tracks, top artists, searchable/sortable browsing, and the existing metadata edit forms.
+
 ## API overview
 
 Imports require a preview followed by an explicit execute call:
@@ -110,7 +112,7 @@ The Library import inventory mirrors the source filesystem as nested folders and
 
 Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only an indicator; Cratekeep never automatically imports albums. **Queue import** records the review decision and remains non-mutating. Reopen an approved review to use the separate **Preview in-place changes** and **Apply in place** actions.
 
-Library execution is review-gated and synchronous. Before changing anything, Cratekeep verifies each approved track against the size, modification time, device, and inode captured by the latest inventory preview. Missing or changed files are rejected with `409 inventory_stale`; run a fresh inventory preview and review again. Track exceptions are honored, so rejected or skipped tracks are not registered or tagged. **As Is** registers approved files in the beets database without rewriting tags. A selected candidate registers untracked files and writes the approved album/track metadata to each file at its existing path. It never invokes `beet import`, moves, or copies a file. Execution and dry-run attempts are audited in `adoption_jobs`; album records retain execution status, errors, the last execution job, and completion time. A completed execution can be safely retried and returns its stored result without another write.
+Library execution is review-gated and synchronous. Before changing anything, Cratekeep verifies each approved track against the size, modification time, device, and inode captured by the latest inventory preview. Missing or changed files are rejected with `409 inventory_stale`; run a fresh inventory preview and review again. Track exceptions are honored, so rejected or skipped tracks are not registered or tagged. **As Is** registers approved files in the beets database without rewriting tags. A selected candidate registers untracked files and writes the approved album/track metadata to each file at its existing path. It never invokes `beet import`, moves, or copies a file. Execution and dry-run attempts are audited in `adoption_jobs`; album records retain execution status, errors, the last execution job, and completion time. After successful execution, every track in that album is marked imported and removed from pending review responses without deleting inventory, review, album, or job history. A completed execution can be safely retried and returns its stored result without another write.
 
 ## Tests
 

@@ -127,9 +127,9 @@
     </div>
     <nav aria-label="Primary navigation">
       <ul class="nav-list">
-        <li><a class="nav-link" href="#overview" aria-current="page"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
-        <li><a class="nav-link" href="#inbox"><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
-        <li><a class="nav-link" href="#library"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
+        <li><a class="nav-link" href="{{ url_for('index') }}" aria-current="page"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
+        <li><a class="nav-link" href="{{ url_for('inbox_page') }}"><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
+        <li><a class="nav-link" href="{{ url_for('library_page') }}"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
         <li><a class="nav-link" href="{{ url_for('settings') }}"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></a></li>
       </ul>
     </nav>

@@ -97,6 +97,20 @@ def create_app(test_config: dict | None = None) -> Flask:
             items=_items(app),
         )
 
+    @app.get("/inbox")
+    def inbox_page():
+        return _settings_response(app, first_run=False, active_tab="library-import", page="inbox")
+
+    @app.get("/library")
+    def library_page():
+        items = _items(app)
+        return render_template(
+            "library.html",
+            build_sha=app.config["BUILD_SHA"],
+            **_library_page_data(items, request.args.get("q", ""), request.args.get("sort", "artist"),
+                                 request.args.get("order", "asc")),
+        )
+
     @app.get("/healthz")
     def healthz():
         return jsonify(status="ok")
@@ -319,7 +333,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if request.is_json:
             return jsonify(_serialize_item(item))
         flash("Metadata and file tags updated.")
-        return redirect(url_for("index"))
+        return redirect(url_for("library_page"))
 
     @app.post("/api/navidrome/rescan")
     def navidrome_rescan():
@@ -505,6 +519,26 @@ def _init_db(path: str) -> None:
         _ensure_column(db, "album_reviews", "execution_error", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(db, "album_reviews", "last_execution_job_id", "INTEGER")
         _ensure_column(db, "album_reviews", "executed_at", "TEXT")
+        _ensure_column(db, "adoption_reviews", "imported_at", "TEXT")
+        db.execute(
+            """UPDATE adoption_reviews
+                  SET imported_at = COALESCE((
+                        SELECT albums.executed_at
+                          FROM album_review_tracks AS tracks
+                          JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                         WHERE tracks.inventory_id = adoption_reviews.inventory_id
+                           AND albums.execution_status = 'complete'
+                         LIMIT 1
+                      ), updated_at)
+                WHERE imported_at IS NULL
+                  AND EXISTS (
+                        SELECT 1
+                          FROM album_review_tracks AS tracks
+                          JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                         WHERE tracks.inventory_id = adoption_reviews.inventory_id
+                           AND albums.execution_status = 'complete'
+                      )"""
+        )
 
 
 def _ensure_column(db: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
@@ -544,7 +578,7 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         beets_config.read(user=False, defaults=True)
 
 
-def _settings_response(app: Flask, first_run: bool):
+def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "general", page: str = "settings"):
     current = _load_settings(app.config["APP_DB"])
     config_path = Path(app.config["BEETS_CONFIG"])
     config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
@@ -614,6 +648,8 @@ def _settings_response(app: Flask, first_run: bool):
         has_token=bool(current.get("navidrome_token")),
         beets_config=config_text,
         build_sha=app.config["BUILD_SHA"],
+        active_tab=active_tab,
+        page=page,
     )
 
 
@@ -668,6 +704,46 @@ def _library(app: Flask) -> Library:
 
 def _items(app: Flask) -> list[dict]:
     return [_serialize_item(item) for item in _library(app).items()]
+
+
+def _library_page_data(items: list[dict], query: str, sort: str, order: str) -> dict:
+    """Build the small, read-only browse model used by the Library landing page."""
+    query = _normalize_metadata(query)
+    sort = sort if sort in {"artist", "album", "title"} else "artist"
+    order = order if order in {"asc", "desc"} else "asc"
+    searchable = ("artist", "album", "title")
+    filtered = [
+        item for item in items
+        if not query or query.casefold() in " ".join(str(item.get(field) or "") for field in searchable).casefold()
+    ]
+    tie_breakers = tuple(field for field in searchable if field != sort) + ("id",)
+
+    def item_key(item: dict) -> tuple:
+        return tuple(str(item.get(field) or "").casefold() for field in (sort, *tie_breakers))
+
+    filtered.sort(key=item_key, reverse=order == "desc")
+    album_keys = {
+        (_metadata_key(item.get("albumartist") or item.get("artist")), _metadata_key(item.get("album")))
+        for item in items
+    }
+    artist_counts: dict[str, int] = {}
+    for item in items:
+        artist = _normalize_metadata(item.get("albumartist") or item.get("artist")) or "Unknown artist"
+        artist_counts[artist] = artist_counts.get(artist, 0) + 1
+    top_artists = sorted(artist_counts.items(), key=lambda pair: (-pair[1], pair[0].casefold()))[:5]
+    recent = sorted(items, key=lambda item: int(item.get("id") or 0), reverse=True)[:5]
+    return {
+        "items": filtered,
+        "recent_items": recent,
+        "top_artists": [{"name": name, "tracks": count} for name, count in top_artists],
+        "summary": {
+            "tracks": len(items), "albums": len(album_keys), "artists": len(artist_counts),
+            "bytes": sum(item.get("bytes") or 0 for item in items),
+        },
+        "query": query,
+        "sort": sort,
+        "order": order,
+    }
 
 
 def _preview_library_inventory(app: Flask) -> dict:
@@ -792,6 +868,7 @@ def _library_import_review_artist_page(app: Flask, limit: int, offset: int) -> t
         artists = db.execute(
             """SELECT albums.artist_key FROM album_reviews AS albums
                 WHERE albums.root_path = ?
+                  AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
                 GROUP BY albums.artist_key
                 ORDER BY albums.artist_key
@@ -801,6 +878,7 @@ def _library_import_review_artist_page(app: Flask, limit: int, offset: int) -> t
         total = db.execute(
             """SELECT COUNT(DISTINCT albums.artist_key) FROM album_reviews AS albums
                 WHERE albums.root_path = ?
+                  AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)""",
             (root,),
         ).fetchone()[0]
@@ -811,6 +889,7 @@ def _library_import_review_artist_page(app: Flask, limit: int, offset: int) -> t
         albums = db.execute(
             f"""SELECT albums.id FROM album_reviews AS albums
                  WHERE albums.root_path = ? AND albums.artist_key IN ({placeholders})
+                   AND albums.execution_status != 'complete'
                    AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
                  ORDER BY albums.artist_key, albums.album_key, albums.id""",
             (root, *page_artist_keys),
@@ -891,6 +970,7 @@ def _all_library_import_review_items(app: Flask) -> list[dict]:
                  FROM library_inventory AS inventory
                  JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
                 WHERE inventory.root_path = ? AND inventory.present = 1
+                  AND reviews.imported_at IS NULL
                 ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
             (root,),
         ).fetchall()
@@ -922,7 +1002,10 @@ def _sync_album_reviews(app: Flask) -> None:
             )
         }
         db.execute(
-            "DELETE FROM album_review_tracks WHERE album_review_id IN (SELECT id FROM album_reviews WHERE root_path = ?)",
+            """DELETE FROM album_review_tracks
+                 WHERE album_review_id IN (
+                   SELECT id FROM album_reviews WHERE root_path = ? AND execution_status != 'complete'
+                 )""",
             (root,),
         )
         for (artist_key, album_key), group in groups.items():
@@ -950,6 +1033,7 @@ def _candidate_album_rows(app: Flask, limit: int) -> list[sqlite3.Row]:
             """SELECT albums.id, albums.artist, albums.album
                  FROM album_reviews AS albums
                 WHERE albums.root_path = ?
+                  AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
                 ORDER BY albums.artist_key, albums.album_key, albums.id LIMIT ?""",
             (root, limit),
@@ -1220,6 +1304,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
         rows = db.execute(
             f"""SELECT albums.* FROM album_reviews AS albums
                 WHERE albums.root_path = ?
+                  AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
                   {album_filter}
                 ORDER BY albums.artist_key, albums.album_key, albums.id""", parameters
@@ -1446,6 +1531,13 @@ def _execute_library_import_album(app: Flask, album_review_id: int, *, dry_run: 
                     """UPDATE album_reviews SET execution_status = 'complete', execution_error = '',
                               last_execution_job_id = ?, executed_at = ?, updated_at = ? WHERE id = ?""",
                     (job_id, finished, finished, album_review_id),
+                )
+                db.execute(
+                    """UPDATE adoption_reviews SET imported_at = ?, updated_at = ?
+                         WHERE inventory_id IN (
+                           SELECT inventory_id FROM album_review_tracks WHERE album_review_id = ?
+                         )""",
+                    (finished, finished, album_review_id),
                 )
         return result
     except LibraryImportExecutionError as exc:

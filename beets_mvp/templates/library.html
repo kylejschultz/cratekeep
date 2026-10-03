@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Library · Cratekeep</title>
+  <style>
+    :root { color-scheme:light; --font:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; --page:#e7e9ec; --surface:#fdfdfd; --subtle:#f1f2f4; --text:#20252b; --muted:#687078; --border:#c9ced4; --soft:#dde1e5; --accent:#475569; --hover:#334155; --focus:#64748b; --sidebar:#f7f7f8; --side-text:#343a40; --side-muted:#7b838b; --active:#e8eaed; }
+    body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --subtle:#343b43; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --hover:#b6ccda; --focus:#b9d6e7; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--text); background:var(--page); font:16px/1.5 var(--font); } a { color:var(--accent); } button,input,select { font:inherit; } :is(a,button,input,select,summary):focus-visible { outline:3px solid var(--focus); outline-offset:2px; }
+    .skip-link { position:fixed; z-index:20; top:.5rem; left:.5rem; padding:.55rem .8rem; background:var(--surface); transform:translateY(-150%); }.skip-link:focus { transform:translateY(0); }
+    .sidebar { position:fixed; z-index:10; inset:0 auto 0 0; display:flex; flex-direction:column; width:13.5rem; padding:1rem .8rem; color:var(--side-text); background:var(--sidebar); border-right:1px solid var(--soft); transition:width .2s,transform .2s; }
+    .brand { display:flex; align-items:center; gap:.65rem; padding:.15rem .4rem 1rem; border-bottom:1px solid var(--soft); }.brand img,.mobile-header img { width:2rem; height:2rem; object-fit:contain; }.brand-copy { overflow:hidden; white-space:nowrap; }.brand-name { display:block; font-size:1.05rem; font-weight:750; }.brand-tagline { display:block; color:var(--side-muted); font-size:.75rem; }
+    .nav-list { display:grid; gap:.2rem; margin:1rem 0; padding:0; list-style:none; }.nav-link { display:flex; align-items:center; gap:.7rem; min-height:2.35rem; padding:.45rem .65rem; border-radius:.3rem; color:var(--side-text); text-decoration:none; white-space:nowrap; font-size:.9rem; }.nav-link:hover,.nav-link[aria-current="page"] { background:var(--active); }.nav-icon { flex:0 0 1.35rem; text-align:center; }.nav-label { overflow:hidden; }
+    .sidebar-footer { display:grid; gap:.7rem; margin-top:auto; padding:.8rem .15rem 0; border-top:1px solid var(--soft); }.utility-link,.theme-toggle { display:flex; align-items:center; gap:.55rem; color:var(--side-muted); font-size:.78rem; }.utility-link { text-decoration:none; }.theme-toggle { justify-content:space-between; }.theme-toggle button { width:2rem; height:1.5rem; padding:0; border:1px solid var(--soft); border-radius:999px; color:var(--side-text); background:var(--active); cursor:pointer; }.build-sha { overflow:hidden; color:var(--side-muted); font:.7rem ui-monospace,monospace; text-overflow:ellipsis; white-space:nowrap; }
+    .collapse-button { position:absolute; top:5.5rem; right:-.8rem; display:grid; place-items:center; width:1.6rem; height:1.6rem; padding:0; border:1px solid var(--soft); border-radius:50%; color:var(--side-muted); background:var(--sidebar); cursor:pointer; }.content { min-width:0; margin-left:13.5rem; transition:margin-left .2s; }.mobile-header { display:none; }.scrim { display:none; }
+    body.sidebar-collapsed .sidebar { width:5rem; } body.sidebar-collapsed .content { margin-left:5rem; } body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); } body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:center; padding-inline:0; }
+    main { width:min(1180px,100%); margin:0 auto; padding:clamp(1.25rem,3vw,2.25rem); }.page-header { margin-bottom:1.25rem; }.eyebrow { margin:0 0 .2rem; color:var(--accent); font-size:.76rem; font-weight:750; letter-spacing:.1em; text-transform:uppercase; }h1,h2,h3 { line-height:1.2; }h1 { margin:0; font-size:clamp(1.65rem,3vw,2rem); }.lede { max-width:45rem; margin:.4rem 0 0; color:var(--muted); }
+    .summary-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.8rem; }.card,.panel { border:1px solid var(--soft); border-radius:.45rem; background:var(--surface); box-shadow:0 1px 2px rgb(15 23 42 / 4%); }.card { padding:1rem; }.card span { display:block; color:var(--muted); font-size:.8rem; }.card strong { display:block; margin:.15rem 0; color:var(--accent); font-size:1.65rem; }
+    .dashboard-grid { display:grid; grid-template-columns:2fr 1fr; gap:1rem; margin-top:1rem; }.panel { overflow:hidden; }.panel h2 { margin:0; padding:.8rem 1rem; border-bottom:1px solid var(--soft); font-size:1rem; }.compact-list { margin:0; padding:0; list-style:none; }.compact-list li { display:flex; justify-content:space-between; gap:1rem; padding:.65rem 1rem; border-bottom:1px solid var(--soft); }.compact-list li:last-child { border:0; }.secondary { color:var(--muted); font-size:.82rem; }
+    .browse { margin-top:1.5rem; }.browse-head { display:flex; align-items:end; justify-content:space-between; gap:1rem; margin-bottom:.7rem; }.browse-head h2 { margin:0; }.browse-head p { margin:.2rem 0 0; color:var(--muted); }.controls { display:flex; flex-wrap:wrap; gap:.5rem; align-items:end; }.control { display:grid; gap:.2rem; color:var(--muted); font-size:.75rem; font-weight:650; }.control input,.control select { min-height:2.35rem; padding:.42rem .55rem; border:1px solid var(--border); border-radius:.35rem; color:var(--text); background:var(--surface); }.controls button,.save-button { min-height:2.35rem; padding:.45rem .8rem; border:1px solid var(--accent); border-radius:.35rem; color:#fff; background:var(--accent); cursor:pointer; }.controls button:hover,.save-button:hover { background:var(--hover); }
+    .table-wrap { overflow-x:auto; }table { width:100%; border-collapse:collapse; }th,td { padding:.65rem .75rem; border-bottom:1px solid var(--soft); text-align:left; vertical-align:top; }th { color:var(--muted); background:var(--subtle); font-size:.74rem; letter-spacing:.04em; text-transform:uppercase; }th a { color:inherit; }tbody tr:last-child td { border-bottom:0; }.track-title { font-weight:700; }.numeric { text-align:right; font-variant-numeric:tabular-nums; }.edit-details summary { cursor:pointer; color:var(--accent); white-space:nowrap; }.edit-row td { padding:.8rem; background:var(--subtle); }.metadata-form { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; }.field { display:grid; gap:.2rem; color:var(--muted); font-size:.72rem; font-weight:650; }.field input { min-width:0; width:100%; padding:.45rem .5rem; border:1px solid var(--border); border-radius:.3rem; color:var(--text); background:var(--surface); }.form-actions { display:flex; align-items:end; }.empty-state { padding:2rem; color:var(--muted); text-align:center; }
+    @media(max-width:900px) { .summary-grid { grid-template-columns:repeat(2,1fr); }.dashboard-grid { grid-template-columns:1fr; }.metadata-form { grid-template-columns:repeat(2,1fr); } }
+    @media(max-width:760px) { .sidebar { width:min(18rem,86vw); transform:translateX(-105%); }.content,body.sidebar-collapsed .content { margin-left:0; }.mobile-header { position:sticky; z-index:8; top:0; display:flex; align-items:center; gap:.7rem; padding:.55rem 1rem; border-bottom:1px solid var(--soft); background:var(--surface); }.menu-button { width:2.5rem; height:2.5rem; border:1px solid var(--border); border-radius:.35rem; color:var(--text); background:var(--surface); }.collapse-button { display:none; }body.sidebar-open .sidebar { transform:translateX(0); }body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:static; width:auto; height:auto; overflow:visible; clip-path:none; }body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:flex-start; padding-inline:.75rem; }.scrim { position:fixed; z-index:9; inset:0; border:0; background:rgb(8 19 26 / 62%); }body.sidebar-open .scrim { display:block; }.browse-head { align-items:flex-start; flex-direction:column; } }
+    @media(max-width:520px) { .summary-grid,.metadata-form { grid-template-columns:1fr; }main { padding:1rem; } }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <aside class="sidebar" id="sidebar" aria-label="Application sidebar">
+    <div class="brand"><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><div class="brand-copy"><span class="brand-name">Cratekeep</span><span class="brand-tagline">Music library manager</span></div></div>
+    <nav aria-label="Primary navigation"><ul class="nav-list">
+      <li><a class="nav-link" href="{{ url_for('index') }}"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
+      <li><a class="nav-link" href="{{ url_for('inbox_page') }}"><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
+      <li><a class="nav-link" href="{{ url_for('library_page') }}" aria-current="page"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
+      <li><a class="nav-link" href="{{ url_for('settings') }}"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></a></li>
+    </ul></nav>
+    <div class="sidebar-footer"><div class="theme-toggle"><span>Dark mode</span><button id="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">☾</button></div><a class="utility-link" href="https://github.com/kylejschultz/cratekeep" target="_blank" rel="noreferrer"><span aria-hidden="true">↗</span><span class="nav-label">GitHub</span></a><span class="build-sha" title="Build SHA">build {{ build_sha[:7] if build_sha else 'unknown' }}</span></div>
+    <button class="collapse-button" id="collapse-sidebar" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><span aria-hidden="true">‹</span></button>
+  </aside>
+  <button class="scrim" id="sidebar-scrim" type="button" aria-label="Close navigation" tabindex="-1"></button>
+  <div class="content"><header class="mobile-header"><button class="menu-button" id="open-sidebar" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">☰</button><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><strong>Cratekeep</strong></header>
+    <main id="main-content">
+      <header class="page-header"><p class="eyebrow">Collection</p><h1>Library</h1><p class="lede">Browse the managed collection and edit track metadata without leaving the library.</p></header>
+      {% for message in get_flashed_messages() %}<p role="status">{{ message }}</p>{% endfor %}
+      <section class="summary-grid" aria-label="Library summary">
+        <article class="card"><span>Tracks</span><strong>{{ summary.tracks }}</strong></article><article class="card"><span>Albums</span><strong>{{ summary.albums }}</strong></article><article class="card"><span>Artists</span><strong>{{ summary.artists }}</strong></article><article class="card"><span>Library size</span><strong>{{ summary.bytes|format_bytes }}</strong></article>
+      </section>
+      <div class="dashboard-grid">
+        <section class="panel" aria-labelledby="recent-title"><h2 id="recent-title">Recently added</h2>{% if recent_items %}<ul class="compact-list">{% for item in recent_items %}<li><span><strong>{{ item.title or 'Untitled track' }}</strong><br><span class="secondary">{{ item.artist or 'Unknown artist' }} · {{ item.album or 'Unknown album' }}</span></span><span class="secondary">#{{ item.id }}</span></li>{% endfor %}</ul>{% else %}<p class="empty-state">No tracks yet.</p>{% endif %}</section>
+        <section class="panel" aria-labelledby="artists-title"><h2 id="artists-title">Top artists</h2>{% if top_artists %}<ul class="compact-list">{% for artist in top_artists %}<li><span>{{ artist.name }}</span><span class="secondary">{{ artist.tracks }} track{{ '' if artist.tracks == 1 else 's' }}</span></li>{% endfor %}</ul>{% else %}<p class="empty-state">No artists yet.</p>{% endif %}</section>
+      </div>
+      <section class="browse" aria-labelledby="browse-title">
+        <div class="browse-head"><div><h2 id="browse-title">Browse tracks</h2><p>{{ items|length }} matching track{{ '' if items|length == 1 else 's' }}</p></div>
+          <form class="controls" method="get" action="{{ url_for('library_page') }}" role="search">
+            <label class="control" for="library-search">Search artist, album, or song<input id="library-search" name="q" type="search" value="{{ query }}"></label>
+            <label class="control" for="library-sort">Sort by<select id="library-sort" name="sort"><option value="artist"{% if sort == 'artist' %} selected{% endif %}>Artist</option><option value="album"{% if sort == 'album' %} selected{% endif %}>Album</option><option value="title"{% if sort == 'title' %} selected{% endif %}>Song title</option></select></label>
+            <label class="control" for="library-order">Order<select id="library-order" name="order"><option value="asc"{% if order == 'asc' %} selected{% endif %}>A–Z</option><option value="desc"{% if order == 'desc' %} selected{% endif %}>Z–A</option></select></label><button type="submit">Apply</button>
+          </form>
+        </div>
+        <div class="panel table-wrap">{% if items %}<table><thead><tr><th scope="col">Song</th><th scope="col">Artist</th><th scope="col">Album</th><th scope="col">Genre</th><th class="numeric" scope="col">Year</th><th scope="col">Edit</th></tr></thead><tbody>
+          {% for item in items %}<tr><td class="track-title">{{ item.title or 'Untitled track' }}</td><td>{{ item.artist or 'Unknown artist' }}</td><td>{{ item.album or 'Unknown album' }}</td><td>{{ item.genre or '—' }}</td><td class="numeric">{{ item.year or '—' }}</td><td><details class="edit-details"><summary>Edit metadata</summary></details></td></tr>
+          <tr class="edit-row"><td colspan="6"><form class="metadata-form" method="post" action="{{ url_for('edit_item', item_id=item.id) }}">{% for field in ('title','artist','album','albumartist','genre','year','track','disc') %}<label class="field" for="item-{{ item.id }}-{{ field }}">{{ 'Album artist' if field == 'albumartist' else field|title }}<input id="item-{{ item.id }}-{{ field }}" name="{{ field }}" value="{{ item[field] or '' }}"{% if field in ('year','track','disc') %} inputmode="numeric"{% endif %}></label>{% endfor %}<div class="form-actions"><button class="save-button" type="submit">Save changes</button></div></form></td></tr>{% endfor %}
+        </tbody></table>{% else %}<div class="empty-state">{% if query %}No tracks match “{{ query }}”.{% else %}Imported tracks will appear here.{% endif %}</div>{% endif %}</div>
+      </section>
+    </main>
+  </div>
+  <script>
+    (() => {
+      const body = document.body;
+      const sidebar = document.getElementById('sidebar');
+      const collapse = document.getElementById('collapse-sidebar');
+      const open = document.getElementById('open-sidebar');
+      const scrim = document.getElementById('sidebar-scrim');
+      const theme = document.getElementById('theme-toggle');
+      const mobile = window.matchMedia('(max-width: 760px)');
+      const editRows = [...document.querySelectorAll('.edit-row')];
+      editRows.forEach(row => { row.hidden = true; const details = row.previousElementSibling.querySelector('.edit-details'); details.addEventListener('toggle', () => { row.hidden = !details.open; }); });
+      if (localStorage.getItem('cratekeep-theme') === 'dark') { body.classList.add('dark-mode'); theme.setAttribute('aria-pressed', 'true'); theme.textContent = '☀'; }
+      if (localStorage.getItem('cratekeep-sidebar') === 'collapsed') { body.classList.add('sidebar-collapsed'); collapse.setAttribute('aria-expanded', 'false'); }
+      const close = () => { body.classList.remove('sidebar-open'); open.setAttribute('aria-expanded', 'false'); scrim.tabIndex = -1; };
+      collapse.addEventListener('click', () => { const collapsed = body.classList.toggle('sidebar-collapsed'); collapse.setAttribute('aria-expanded', String(!collapsed)); localStorage.setItem('cratekeep-sidebar', collapsed ? 'collapsed' : 'expanded'); });
+      theme.addEventListener('click', () => { const dark = body.classList.toggle('dark-mode'); theme.setAttribute('aria-pressed', String(dark)); theme.textContent = dark ? '☀' : '☾'; localStorage.setItem('cratekeep-theme', dark ? 'dark' : 'light'); });
+      open.addEventListener('click', () => { body.classList.add('sidebar-open'); open.setAttribute('aria-expanded', 'true'); scrim.tabIndex = 0; sidebar.querySelector('a').focus(); });
+      scrim.addEventListener('click', close); document.addEventListener('keydown', event => { if (event.key === 'Escape') close(); }); mobile.addEventListener('change', event => { if (!event.matches) close(); });
+    })();
+  </script>
+</body>
+</html>

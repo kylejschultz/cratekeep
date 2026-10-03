@@ -52,9 +52,9 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     assert page.status_code == 200
     assert b'id="sidebar"' in page.data
     assert b'aria-label="Primary navigation"' in page.data
-    assert b'href="#overview"' in page.data
-    assert b'href="#inbox"' in page.data
-    assert b'href="#library"' in page.data
+    assert b'href="/"' in page.data
+    assert b'href="/inbox"' in page.data
+    assert b'href="/library"' in page.data
     assert b'href="/settings"' in page.data
     assert b'id="overview-title"' in page.data
     assert b'id="inbox-title"' in page.data
@@ -1084,6 +1084,10 @@ def test_library_execution_rerun_is_idempotent(tmp_path):
     client.patch(f'/api/library-import/albums/{album["id"]}', json={"decision": "approved", "candidate_id": None})
     first = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
     item_id = first.json["items"][0]["beets_item_id"]
+    pending = client.get("/api/library-import/reviews").json
+    assert pending["items"] == []
+    assert pending["albums"] == []
+    assert pending["total_artists"] == 0
     second = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
 
     assert first.status_code == 201
@@ -1093,6 +1097,59 @@ def test_library_execution_rerun_is_idempotent(tmp_path):
     assert [item.id for item in Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()] == [item_id]
     with sqlite3.connect(app.config["APP_DB"]) as db:
         assert db.execute("SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_execute'").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM library_inventory").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM adoption_reviews WHERE imported_at IS NOT NULL").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM album_reviews WHERE execution_status = 'complete'").fetchone()[0] == 1
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.get("/api/library-import/reviews").json["albums"] == []
+
+
+def test_inbox_route_owns_library_import_review_workspace(tmp_path):
+    page = make_app(tmp_path).test_client().get("/inbox")
+
+    assert page.status_code == 200
+    assert b"<title>Inbox \xc2\xb7 Cratekeep</title>" in page.data
+    assert b"<h1>Inbox</h1>" in page.data
+    assert b'href="/inbox" aria-current="page"' in page.data
+    assert b'id="library-import-review-list"' in page.data
+    assert b'id="library-import-modal"' in page.data
+    assert b": \"library-import\");" in page.data
+
+
+def test_library_route_exposes_summary_search_sort_and_existing_edits(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    tracks = [
+        Item(title="Beta Song", artist="Artist B", albumartist="Artist B", album="Shared", genre="Rock", year=2024,
+             path=str(root / "b.mp3")),
+        Item(title="Alpha Song", artist="Artist A", albumartist="Artist A", album="First", genre="Jazz", year=2023,
+             path=str(root / "a.mp3")),
+        Item(title="Other Song", artist="Artist A", albumartist="Artist A", album="First", genre="Jazz", year=2023,
+             path=str(root / "other.mp3")),
+    ]
+    for item in tracks:
+        Path(item.path.decode()).write_bytes(b"audio")
+        library.add(item)
+
+    client = app.test_client()
+    page = client.get("/library")
+    assert page.status_code == 200
+    assert b'aria-current="page"' in page.data
+    assert b"<span>Tracks</span><strong>3</strong>" in page.data
+    assert b"<span>Albums</span><strong>2</strong>" in page.data
+    assert b"<span>Artists</span><strong>2</strong>" in page.data
+    assert b"Top artists" in page.data and b"Recently added" in page.data
+    assert b'name="q" type="search"' in page.data
+    assert b'name="sort"' in page.data and b'name="order"' in page.data
+    assert b'action="/api/items/' in page.data
+
+    filtered = client.get("/library?q=artist+b&sort=title&order=desc")
+    browse = filtered.data.split(b'id="browse-title"', 1)[1]
+    assert b"Beta Song" in browse
+    assert b"Alpha Song" not in browse
+    assert b'option value="title" selected' in filtered.data
+    assert b'option value="desc" selected' in filtered.data
 
 
 def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tmp_path):

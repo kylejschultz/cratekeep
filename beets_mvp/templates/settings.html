@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{ 'Set up' if first_run else 'Settings' }} · Cratekeep</title>
+  <title>{{ 'Set up' if first_run else ('Inbox' if page == 'inbox' else 'Settings') }} · Cratekeep</title>
   <style>
     :root {
       color-scheme: light;
@@ -265,10 +265,10 @@
 <aside class="sidebar" id="sidebar" aria-label="Application sidebar">
   <div class="brand"><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><div class="brand-copy"><span class="brand-name">Cratekeep</span><span class="brand-tagline">Music library manager</span></div></div>
   <nav aria-label="Primary navigation"><ul class="nav-list">
-    <li><a class="nav-link" href="{{ url_for('index') }}#overview"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
-    <li><a class="nav-link" href="{{ url_for('index') }}#inbox"><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
-    <li><a class="nav-link" href="{{ url_for('index') }}#library"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
-    <li><a class="nav-link" href="{{ url_for('settings') }}" aria-current="page"><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('index') }}"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('inbox_page') }}"{% if page == 'inbox' %} aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('library_page') }}"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('settings') }}"{% if page == 'settings' %} aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></a></li>
   </ul></nav>
   <div class="sidebar-footer"><div class="theme-toggle"><span>Dark mode</span><button id="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">☾</button></div><a class="utility-link" href="https://github.com/kylejschultz/cratekeep" target="_blank" rel="noreferrer"><span aria-hidden="true">↗</span><span class="nav-label">GitHub</span></a><span class="build-sha" title="Build SHA">build {{ build_sha[:7] if build_sha else 'unknown' }}</span></div>
   <button class="collapse-button" id="collapse-sidebar" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><span class="collapse-icon" aria-hidden="true">‹</span></button>
@@ -282,7 +282,7 @@
     <h1>Set up Cratekeep</h1>
     <p>Choose the inbox and library folders for this installation. You can fine-tune integrations later from the in-app Settings page.</p>
   {% else %}
-    <header class="page-head"><h1>Settings</h1><p>Manage storage, integrations, and the active beets configuration.</p></header>
+    <header class="page-head"><h1>{{ 'Inbox' if page == 'inbox' else 'Settings' }}</h1><p>{{ 'Review pending library selections and apply approved albums.' if page == 'inbox' else 'Manage storage, integrations, and the active beets configuration.' }}</p></header>
   {% endif %}
   {% for category, message in get_flashed_messages(with_categories=true) %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}
   <form method="post">
@@ -479,7 +479,7 @@
     });
     if (settingsTabs.length) {
       const hashTab = window.location.hash.slice(1);
-      selectSettingsTab(settingsTabs.some(tab => tab.dataset.settingsTab === hashTab) ? hashTab : 'general');
+      selectSettingsTab(settingsTabs.some(tab => tab.dataset.settingsTab === hashTab) ? hashTab : {{ active_tab|tojson }});
       window.addEventListener('hashchange', () => selectSettingsTab(window.location.hash.slice(1)));
     }
 
