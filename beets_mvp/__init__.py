@@ -244,6 +244,42 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify(error="Album review not found", code="album_review_not_found"), 404
         return jsonify(result), (201 if result["status"] == "complete" and not result.get("already_complete") else 200)
 
+    @app.post("/api/library-import/albums/<int:album_review_id>/preview")
+    def preview_library_import_album(album_review_id: int):
+        """Save a match-screen selection and preview the existing in-place execution."""
+        values = request.get_json(silent=True)
+        if (not isinstance(values, dict) or "candidate_id" not in values
+                or set(values) - {"candidate_id", "duplicate_action"}):
+            return jsonify(
+                error="request must contain candidate_id and may contain duplicate_action",
+                code="invalid_request",
+            ), 400
+        root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+        with _connect(app.config["APP_DB"]) as db:
+            existing = db.execute(
+                "SELECT execution_status FROM album_reviews WHERE id = ? AND root_path = ?",
+                (album_review_id, root),
+            ).fetchone()
+        if existing is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        if existing["execution_status"] == "complete":
+            result = _execute_library_import_album(app, album_review_id, dry_run=False)
+            return jsonify(result)
+        selection = {"decision": "approved", "candidate_id": values["candidate_id"]}
+        if "duplicate_action" in values:
+            selection["duplicate_action"] = values["duplicate_action"]
+        try:
+            item = _update_album_review(app, album_review_id, selection)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        if item is None:  # The row can only disappear if storage changed between the two transactions.
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        try:
+            result = _execute_library_import_album(app, album_review_id, dry_run=True)
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code, job_id=exc.job_id), exc.status
+        return jsonify(result)
+
     @app.patch("/api/library-import/reviews/<int:inventory_id>")
     def update_library_import_review(inventory_id: int):
         values = request.get_json(silent=True) or {}

@@ -427,11 +427,10 @@
         </section>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
         <section class="album-modal-section" aria-labelledby="library-import-execution-title">
-          <h3 id="library-import-execution-title">Apply approved album</h3>
-          <p>After queueing this review, preview the exact registrations and tag changes, then apply them to the files at their current paths.</p>
-          <div class="import-actions">
-            <button id="library-import-execution-preview" class="secondary" type="button">Preview in-place changes</button>
-            <button id="library-import-execution-apply" type="button">Apply in place</button>
+          <h3 id="library-import-execution-title">Import in place</h3>
+          <p>Cratekeep checks the exact registrations and tag changes first. Confirm the preview to apply them without moving or copying files.</p>
+          <div id="library-import-confirmation" hidden>
+            <button id="library-import-execution-apply" type="button">Confirm import</button>
           </div>
           <p id="library-import-execution-result" class="operation-status" role="status" aria-live="polite"></p>
         </section>
@@ -442,7 +441,7 @@
           <button type="button" class="secondary" data-review-decision="skipped">Skip for now</button>
         </div>
         <div class="review-footer-group">
-          <button type="button" id="library-import-queue" class="approve-button" data-review-decision="approved">Queue import</button>
+          <button type="button" id="library-import-in-place" class="approve-button">Import in place</button>
         </div>
       </footer>
     </section>
@@ -1063,6 +1062,12 @@
       function changedTrackEvidence(details) {
         return trackEvidence(details).filter(track => track.titleChanged || track.positionChanged || track.durationChanged || track.unpaired);
       }
+      function resetImportPreview() {
+        const confirmation = document.getElementById('library-import-confirmation');
+        const applyButton = document.getElementById('library-import-execution-apply');
+        if (confirmation) confirmation.hidden = true;
+        if (applyButton) applyButton.disabled = true;
+      }
       function renderTrackChangeFact(dd, fact, value) {
         if (fact.changeCount === 0) {
           dd.textContent = 'All tracks matched';
@@ -1128,7 +1133,7 @@
         summary.setAttribute('aria-label', `Option ${index + 1}: ${name.textContent}. ${recommendation.textContent}. ${selected ? 'Selected' : 'Select'}. ${optionFacts.map(fact => `${fact.label}: ${fact.value}`).join('. ')}. Toggle details.`);
         summary.append(marker, name, recommendation, signals, toggle);
         summary.addEventListener('click', () => {
-          if (!selected) { activeCandidateId = value.id; renderAlbumMatch(); candidates.querySelector('[aria-checked="true"]')?.focus(); }
+          if (!selected) { activeCandidateId = value.id; resetImportPreview(); renderAlbumMatch(); candidates.querySelector('[aria-checked="true"]')?.focus(); }
         });
         summary.addEventListener('keydown', event => {
           if (!['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
@@ -1136,6 +1141,7 @@
           const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
             : (index + (['ArrowDown', 'ArrowRight'].includes(event.key) ? 1 : -1) + options.length) % options.length;
           activeCandidateId = options[nextIndex].id;
+          resetImportPreview();
           renderAlbumMatch();
           candidates.querySelector('[aria-checked="true"]')?.focus();
         });
@@ -1174,12 +1180,12 @@
       const message = document.getElementById('library-import-modal-message');
       message.dataset.busy = 'false'; message.textContent = '';
       const executionResult = document.getElementById('library-import-execution-result');
-      const executionReady = album.decision === 'approved';
-      document.getElementById('library-import-execution-preview').disabled = !executionReady;
-      document.getElementById('library-import-execution-apply').disabled = !executionReady || album.execution_status === 'complete';
+      document.getElementById('library-import-confirmation').hidden = true;
+      document.getElementById('library-import-execution-apply').disabled = true;
+      document.getElementById('library-import-in-place').disabled = album.execution_status === 'complete';
       executionResult.textContent = album.execution_status === 'complete'
-        ? 'This approved album has already been applied.'
-        : (executionReady ? 'Preview before applying. Files will remain at their current paths.' : 'Queue an approved review to enable execution.');
+        ? 'This album has already been imported.'
+        : 'Choose metadata, then preview the in-place import. Files will remain at their current paths.';
       document.getElementById('library-import-mbid').value = '';
       document.getElementById('library-import-duplicate-action').value = album.duplicate_action || '';
       renderAlbumMatch();
@@ -1227,20 +1233,11 @@
         const message = document.getElementById('library-import-modal-message');
         const decisionButtons = [...reviewModal.querySelectorAll('[data-review-decision]')];
         const decision = button.dataset.reviewDecision;
-        const progressLabel = {approved: 'Queueing this album for import…', skipped: 'Saving skipped status…'}[decision] || 'Saving review decision…';
+        const progressLabel = {skipped: 'Saving skipped status…'}[decision] || 'Saving review decision…';
         decisionButtons.forEach(action => { action.disabled = true; action.setAttribute('aria-busy', 'true'); });
         message.dataset.busy = 'true'; message.textContent = progressLabel;
         try {
           const payload = {decision};
-          if (decision === 'approved') {
-            payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId;
-            const selected = activeAlbum.candidates.find(candidate => candidate.id === activeCandidateId);
-            const preflight = selected?.duplicate_preflight || activeAlbum.duplicate_preflight || {status:'clear'};
-            if (preflight.status === 'ambiguous') throw new Error('Queueing is blocked because managed recording identity is ambiguous.');
-            const duplicateAction = document.getElementById('library-import-duplicate-action').value;
-            if (preflight.status === 'possible' && !duplicateAction) throw new Error('Choose a duplicate decision before queueing this album.');
-            if (duplicateAction) payload.duplicate_action = duplicateAction;
-          }
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}`, {
             method: 'PATCH', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload),
@@ -1263,38 +1260,79 @@
           decisionButtons.forEach(action => { action.disabled = false; action.setAttribute('aria-busy', 'false'); });
         }
       }));
-      async function executeApprovedAlbum(dryRun, button) {
+      async function previewSelectedAlbum(button) {
         const result = document.getElementById('library-import-execution-result');
-        const actions = [
-          document.getElementById('library-import-execution-preview'),
-          document.getElementById('library-import-execution-apply'),
-        ];
-        actions.forEach(action => { action.disabled = true; });
+        const applyButton = document.getElementById('library-import-execution-apply');
+        const confirmation = document.getElementById('library-import-confirmation');
+        const selected = activeAlbum.candidates.find(candidate => candidate.id === activeCandidateId);
+        const preflight = selected?.duplicate_preflight || activeAlbum.duplicate_preflight || {status:'clear'};
+        if (preflight.status === 'ambiguous') {
+          result.textContent = 'Import is blocked because managed recording identity is ambiguous.';
+          return;
+        }
+        const duplicateAction = document.getElementById('library-import-duplicate-action').value;
+        if (preflight.status === 'possible' && !duplicateAction) {
+          result.textContent = 'Choose a duplicate decision before importing this album.';
+          return;
+        }
+        button.disabled = true;
+        applyButton.disabled = true;
+        confirmation.hidden = true;
         button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
-        result.textContent = dryRun ? 'Checking files and preparing an in-place preview…' : 'Registering files and applying approved metadata in place…';
+        result.textContent = 'Checking files and preparing an in-place preview…';
         try {
-          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/execute`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({dry_run: dryRun}),
+          const payload = {candidate_id: activeCandidateId === 'as-is' ? null : activeCandidateId};
+          if (duplicateAction) payload.duplicate_action = duplicateAction;
+          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/preview`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
           });
           const data = await response.json();
-          if (!response.ok) throw new Error(data.error || data.description || 'Unable to execute approved album.');
+          if (!response.ok) throw new Error(data.error || data.description || 'Unable to preview this import.');
           result.dataset.busy = 'false';
           const genreChanges = data.items?.filter(item => item.changes?.genre)
             .map(item => `${item.path}: ${item.changes.genre.from || 'Not provided'} → ${item.changes.genre.to}`) || [];
-          result.textContent = dryRun
-            ? `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.${genreChanges.length ? ` Genre: ${genreChanges.join('; ')}.` : ''}`
-            : `${data.files} files applied in place; no files were moved or copied.`;
-          if (!dryRun) await loadReviewItems();
+          result.textContent = `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.${genreChanges.length ? ` Genre: ${genreChanges.join('; ')}.` : ''}`;
+          confirmation.hidden = false;
+          applyButton.disabled = false;
+          applyButton.focus();
         } catch (error) {
-          result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to execute approved album.';
+          result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to preview this import.';
         } finally {
           button.setAttribute('aria-busy', 'false');
-          document.getElementById('library-import-execution-preview').disabled = activeAlbum.decision !== 'approved';
-          document.getElementById('library-import-execution-apply').disabled = activeAlbum.decision !== 'approved' || !dryRun;
+          button.disabled = false;
         }
       }
-      document.getElementById('library-import-execution-preview').addEventListener('click', event => executeApprovedAlbum(true, event.currentTarget));
-      document.getElementById('library-import-execution-apply').addEventListener('click', event => executeApprovedAlbum(false, event.currentTarget));
+      async function applyPreviewedAlbum(button) {
+        const result = document.getElementById('library-import-execution-result');
+        const importButton = document.getElementById('library-import-in-place');
+        button.disabled = true; importButton.disabled = true;
+        button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
+        result.textContent = 'Registering files and applying approved metadata in place…';
+        try {
+          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/execute`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || data.description || 'Unable to import this album.');
+          result.dataset.busy = 'false';
+          result.textContent = `${data.files} files imported in place; no files were moved or copied.`;
+          selectedAlbumIds.delete(activeAlbum.id);
+          await loadReviewItems();
+          closeReview(false);
+          const nextId = reviewSequence.shift();
+          const nextAlbum = albumReviews.find(album => album.id === nextId);
+          const nextButton = reviewList.querySelector(`.review-album[data-album-id="${nextId}"]`);
+          if (nextAlbum && nextButton) openReview(nextAlbum, nextButton);
+        } catch (error) {
+          result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to import this album.';
+          button.disabled = false; importButton.disabled = false;
+        } finally {
+          button.setAttribute('aria-busy', 'false');
+        }
+      }
+      document.getElementById('library-import-in-place').addEventListener('click', event => previewSelectedAlbum(event.currentTarget));
+      document.getElementById('library-import-execution-apply').addEventListener('click', event => applyPreviewedAlbum(event.currentTarget));
+      document.getElementById('library-import-duplicate-action').addEventListener('change', resetImportPreview);
       document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
         event.preventDefault();
         const input = document.getElementById('library-import-mbid');
@@ -1324,6 +1362,7 @@
             throw new Error(fallback || data.error || `Unable to rematch this album (HTTP ${response.status}).`);
           }
           activeAlbum = data; activeCandidateId = data.selected_candidate_id; input.value = '';
+          resetImportPreview();
           const index = albumReviews.findIndex(album => album.id === data.id);
           if (index >= 0) albumReviews[index] = data;
           renderAlbumMatch(); message.textContent = 'MusicBrainz release selected by ID. Confidence remains based on metadata evidence. No files were changed.';

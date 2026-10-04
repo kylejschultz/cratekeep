@@ -399,7 +399,11 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'data-review-decision="rejected"' not in modal
-    assert b'id="library-import-queue" class="approve-button" data-review-decision="approved">Queue import' in modal
+    assert b'id="library-import-in-place" class="approve-button">Import in place' in modal
+    assert b'id="library-import-confirmation" hidden' in modal
+    assert b'id="library-import-execution-apply" type="button">Confirm import' in modal
+    assert b'Queue import' not in modal
+    assert b"/preview" in modal
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
@@ -999,6 +1003,85 @@ def test_album_as_is_selection_uses_null_candidate_without_changing_musicbrainz_
     }
     assert [candidate["id"] for candidate in response.json["candidates"]] == candidate_ids
     assert response.json["proposed_match"]["provider_id"] == "release-1"
+
+
+def test_match_screen_preview_then_apply_imports_in_place_without_queue_step(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    original = path.read_bytes()
+    original_mtime = path.stat().st_mtime_ns
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+
+    preview = client.post(
+        f'/api/library-import/albums/{album["id"]}/preview', json={"candidate_id": None}
+    )
+
+    assert preview.status_code == 200
+    assert preview.json["status"] == "preview"
+    assert preview.json["selection_mode"] == "as-is"
+    assert preview.json["registered"] == 1
+    assert list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()) == []
+    assert path.read_bytes() == original
+    assert path.stat().st_mtime_ns == original_mtime
+
+    applied = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+
+    assert applied.status_code == 201
+    assert client.get("/api/library-import/reviews").json["albums"] == []
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    assert Path(item.path.decode()).resolve() == path.resolve()
+    assert path.read_bytes() == original
+    assert path.stat().st_mtime_ns == original_mtime
+    repeated = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert repeated.status_code == 200
+    assert repeated.json["already_complete"] is True
+    repeated_direct = client.post(
+        f'/api/library-import/albums/{album["id"]}/preview', json={"candidate_id": None}
+    )
+    assert repeated_direct.status_code == 200
+    assert repeated_direct.json["already_complete"] is True
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute(
+            "SELECT state, execution_status FROM album_reviews WHERE id = ?", (album["id"],)
+        ).fetchone() == ("approved", "complete")
+        assert db.execute(
+            "SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_preview'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_execute'"
+        ).fetchone()[0] == 1
+
+
+def test_match_screen_preview_failure_stays_pending_and_audits_error(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    path.write_bytes(path.read_bytes() + b"changed")
+
+    response = client.post(
+        f'/api/library-import/albums/{album["id"]}/preview', json={"candidate_id": None}
+    )
+
+    assert response.status_code == 409
+    assert response.json["code"] == "inventory_stale"
+    assert [item["id"] for item in client.get("/api/library-import/reviews").json["albums"]] == [album["id"]]
+    assert list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()) == []
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        review = db.execute(
+            "SELECT state, execution_status FROM album_reviews WHERE id = ?", (album["id"],)
+        ).fetchone()
+        job = db.execute(
+            "SELECT status, error FROM adoption_jobs WHERE kind = 'library_import_preview'"
+        ).fetchone()
+        assert review == ("approved", "not-run")
+        assert job[0] == "failed"
+        assert "Library file" in job[1]
 
 
 def test_approved_as_is_execution_registers_in_place_and_honors_track_exceptions(tmp_path):
@@ -1847,7 +1930,8 @@ def test_library_import_operations_expose_visible_live_progress(tmp_path):
     assert b"Scanning source folders, file names, and stats" in html
     assert b"Requesting bounded MusicBrainz matches" in html
     assert b"Rematching through the configured MusicBrainz provider" in html
-    assert b"Queueing this album for import" in html
+    assert b"Checking files and preparing an in-place preview" in html
+    assert b"Registering files and applying approved metadata in place" in html
     assert b"setAttribute('aria-busy', String(busy))" in html
 
 
@@ -1899,16 +1983,18 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"const payload = {decision};" in html
-    assert b"payload.candidate_id = activeCandidateId === 'as-is' ? null : activeCandidateId" in html
-    assert b"payload.duplicate_action = duplicateAction" in html
+    assert b"const payload = {candidate_id: activeCandidateId === 'as-is' ? null : activeCandidateId}" in html
+    assert b"if (duplicateAction) payload.duplicate_action = duplicateAction" in html
     assert b'id="library-import-duplicate-action"' in html
     for action in (b'merge', b'replace', b'keep-both', b'skip'):
         assert b'value="' + action + b'"' in html
     assert b"same MusicBrainz recording ID" in html
     assert b"method: 'PATCH'" in html
+    assert b"/api/library-import/albums/${activeAlbum.id}/preview" in html
+    assert b"/api/library-import/albums/${activeAlbum.id}/execute" in html
     assert b"data-review-decision=\"skipped\"" in html
     assert b"data-review-decision=\"rejected\"" not in html
-    assert b"data-review-decision=\"approved\"" in html
+    assert b"data-review-decision=\"approved\"" not in html
     assert b"beet import" not in html
     assert b"/api/imports/" not in html
 
