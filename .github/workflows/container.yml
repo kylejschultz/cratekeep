@@ -1,12 +1,13 @@
 name: Test and publish container
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test:
@@ -21,9 +22,27 @@ jobs:
       - run: python -m pytest -q
       - run: python -m compileall -q beets_mvp tests
 
-  publish:
+  build:
+    if: github.event_name == 'pull_request'
     needs: test
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
