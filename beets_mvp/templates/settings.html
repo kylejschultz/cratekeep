@@ -957,10 +957,8 @@
       const preflight = selectedOption.duplicate_preflight || activeAlbum?.duplicate_preflight || {status:'clear', warnings:[]};
       const warning = document.getElementById('library-import-duplicate-warning');
       const policy = document.getElementById('library-import-duplicate-policy');
-      const queueButton = document.getElementById('library-import-queue');
       warning.hidden = preflight.status === 'clear';
       policy.hidden = preflight.status !== 'possible';
-      queueButton.disabled = preflight.status === 'ambiguous';
       document.getElementById('library-import-duplicate-message').textContent = preflight.message || '';
       document.getElementById('library-import-duplicate-files').replaceChildren(...(preflight.warnings || []).map(item => {
         const entry = document.createElement('li');

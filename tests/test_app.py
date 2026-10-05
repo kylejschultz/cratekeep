@@ -349,6 +349,18 @@ def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
     assert b"window.addEventListener('hashchange'" in html
 
 
+def test_settings_script_initializes_inventory_and_theme_without_stale_queue_reference(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
+
+    assert "library-import-queue" not in script
+    assert "const inventoryButton = document.getElementById('inventory-preview');" in script
+    assert "if (inventoryButton) inventoryButton.addEventListener('click'" in script
+    assert "const themeButton = document.getElementById('theme-toggle');" in script
+    assert "localStorage.getItem('cratekeep-theme') === 'dark'" in script
+    assert "themeButton.addEventListener('click'" in script
+
+
 def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
     modal = html[html.index(b'id="library-import-modal"'):]
@@ -1876,14 +1888,15 @@ def test_album_review_multi_select_keeps_sequential_single_album_flow(tmp_path):
     assert b"if (nextAlbum && nextButton) openReview(nextAlbum, nextButton)" in html
 
 
-def test_duplicate_warning_is_preflighted_and_gates_only_the_review_queue(tmp_path):
+def test_duplicate_warning_is_preflighted_and_gates_direct_import(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b'id="library-import-duplicate-warning"' in html
     assert b'id="library-import-duplicate-policy"' in html
     assert b"warning.hidden = preflight.status === 'clear'" in html
     assert b"policy.hidden = preflight.status !== 'possible'" in html
-    assert b"queueButton.disabled = preflight.status === 'ambiguous'" in html
+    assert b"library-import-queue" not in html
+    assert b"if (preflight.status === 'ambiguous')" in html
     assert b"if (preflight.status === 'possible' && !duplicateAction)" in html
     assert b"/execute" in html
 
