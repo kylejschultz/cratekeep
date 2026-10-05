@@ -21,6 +21,7 @@ from runtime_app import ARTWORK_JPEG, EXISTING_ARTWORK_JPEG
 
 
 TRACKS = {
+    "case": Path("+44") / "When Your Heart Stops Beating" / "01 Lycanthrope.wav",
     "as_is": Path("As Is Artist") / "As Is Album" / "01 As Is Song.wav",
     "sidecar": Path("Sidecar Artist") / "Sidecar Album" / "01 Sidecar Song.wav",
     "embed": Path("Embed Artist") / "Embed Album" / "01 Embed Song.wav",
@@ -28,7 +29,8 @@ TRACKS = {
     "replace": Path("Replace Artist") / "Replace Album" / "01 Replace Song.wav",
     "missing": Path("Missing Art Artist") / "Missing Art Album" / "01 Missing Art Song.wav",
 }
-GENRES = {"sidecar": "Rock", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient"}
+GENRES = {"case": "Alternative Rock", "sidecar": "Rock", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient"}
+CASE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174099"
 
 
 def request_json(url: str):
@@ -66,17 +68,23 @@ def make_fixture(root: Path) -> dict[str, Path]:
         tags.album = track.parent.name
         if name in GENRES:
             tags.genre = GENRES[name]
+        if name == "case":
+            tags.mb_albumid = CASE_RELEASE_ID
         if name in {"preserve", "replace", "missing"}:
             tags.images = [MediaImage(EXISTING_ARTWORK_JPEG, desc="Existing front cover", type=ImageType.front)]
         tags.save()
         if name in {"preserve", "replace", "missing"}:
             (track.parent / "cover.jpg").write_bytes(EXISTING_ARTWORK_JPEG)
+    for number in range(51):
+        pagination = root / "library" / f"ZZ Pagination Artist {number // 4:02d}" / f"Album {number:02d}" / "01 Track.wav"
+        write_wav(pagination)
     return tracks
 
 
 def install_provider_fixtures(state_path: Path) -> dict[str, int]:
     """Persist deterministic MusicBrainz/CAA evidence after inventory."""
     genre_evidence = {
+        "case": {"counts": [{"name": "alternative rock", "count": 4}], "selected": "alternative rock"},
         "sidecar": {"counts": [{"name": "electronic", "count": 4}, {"name": "rock", "count": 1}], "selected": "electronic"},
         "embed": {"counts": [{"name": "jazz", "count": 1}], "selected": None},
         "preserve": {"counts": [{"name": "blues", "count": 3}, {"name": "rock", "count": 3}], "selected": None},
@@ -85,20 +93,20 @@ def install_provider_fixtures(state_path: Path) -> dict[str, int]:
     }
     candidate_ids = {}
     with sqlite3.connect(state_path / "app.db", timeout=10) as database:
-        for index, name in enumerate(("sidecar", "embed", "preserve", "replace", "missing"), 1):
+        for index, name in enumerate(("case", "sidecar", "embed", "preserve", "replace", "missing"), 1):
             relative = TRACKS[name]
             artist, album_name = relative.parts[:2]
             album = database.execute(
                 "SELECT id FROM album_reviews WHERE artist = ? AND album = ?", (artist, album_name)
             ).fetchone()
             assert album is not None, f"{name} fixture album was not inventoried"
-            release_id = f"123e4567-e89b-42d3-a456-4266141740{index:02d}"
+            release_id = CASE_RELEASE_ID if name == "case" else f"123e4567-e89b-42d3-a456-4266141740{index:02d}"
             recording_id = f"223e4567-e89b-42d3-a456-4266141740{index:02d}"
             evidence = {"source": "musicbrainz-release-group-genres",
                         "rule": "top positive canonical genre has at least 2 votes and strictly exceeds runner-up",
                         **genre_evidence[name]}
             provider_data = {
-                "provider_id": release_id, "release_group_id": f"323e4567-e89b-42d3-a456-4266141740{index:02d}",
+                "provider_id": release_id,
                 "artist": artist, "album": album_name,
                 "genre": evidence["selected"], "genre_evidence": evidence,
                 "date": "2024-03-02", "year": "2024", "release_type": "Album", "country": "GB",
@@ -107,12 +115,19 @@ def install_provider_fixtures(state_path: Path) -> dict[str, int]:
                             "recording_id": recording_id}],
                 "retrieval": {"search_score": None, "source": "deterministic-provider-fixture-mock"},
             }
-            if name != "missing":
+            if name == "case":
+                provider_data = {
+                    key: provider_data[key]
+                    for key in ("provider_id", "artist", "album", "genre", "genre_evidence", "retrieval")
+                }
+            else:
+                provider_data["release_group_id"] = f"323e4567-e89b-42d3-a456-4266141740{index:02d}"
+            if name not in {"case", "missing"}:
                 provider_data["artwork"] = {
                     "available": True, "source": "cover-art-archive", "entity": "release", "mbid": release_id,
                     "thumbnail_url": f"https://coverartarchive.org/release/{release_id}/front-250",
                 }
-            proposed_diff = ({"genre": {"from": GENRES[name], "to": "electronic"}} if name == "sidecar" else {})
+            proposed_diff = ({"genre": {"from": GENRES[name], "to": "Electronic"}} if name == "sidecar" else {})
             now = datetime.now(timezone.utc).isoformat()
             candidate_ids[name] = database.execute(
                 """INSERT INTO metadata_candidates(
@@ -203,12 +218,41 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
             page.locator("#inventory-preview").click()
         assert response_info.value.status == 201
         page.locator("#inventory-status").get_by_text("complete", exact=False).wait_for()
-        assert "Files: 6" in page.locator("#inventory-summary").inner_text()
+        assert "Files: 58" in page.locator("#inventory-summary").inner_text()
         assert not page.locator("#candidate-generate").is_disabled()
+
+        page.locator("#library-import-review-page").get_by_text("Albums 1–25 of 58", exact=True).wait_for()
+        seen_album_labels = []
+        for page_number, expected_count in enumerate((25, 25, 8), 1):
+            assert page.locator(".review-album-row").count() == expected_count
+            seen_album_labels.extend(page.locator(".review-album").evaluate_all(
+                "elements => elements.map(element => element.getAttribute('aria-label'))"
+            ))
+            review_box = page.locator("#library-import-review-list").evaluate(
+                "element => ({clientHeight: element.clientHeight, scrollHeight: element.scrollHeight})"
+            )
+            assert review_box["clientHeight"] == review_box["scrollHeight"], "review list must not create an inner scroll"
+            page.screenshot(path=evidence / f"pagination-{page_number}-desktop.png", full_page=True)
+            if page_number < 3:
+                page.locator("#library-import-review-next").click()
+                page.locator("#library-import-review-page").get_by_text(
+                    f"Albums {page_number * 25 + 1}–{min((page_number + 1) * 25, 58)} of 58", exact=True
+                ).wait_for()
+        assert len(seen_album_labels) == len(set(seen_album_labels)) == 58
+        assert page.locator("#library-import-review-next").is_disabled()
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator(".review-album-row").count() == 8
+        page.screenshot(path=evidence / "pagination-3-narrow.png", full_page=True)
+        page.locator("#library-import-review-previous").click()
+        page.locator("#library-import-review-page").get_by_text("Albums 26–50 of 58", exact=True).wait_for()
+        page.locator("#library-import-review-previous").click()
+        page.locator("#library-import-review-page").get_by_text("Albums 1–25 of 58", exact=True).wait_for()
+        assert page.locator("#library-import-review-previous").is_disabled()
+        page.set_viewport_size({"width": 1440, "height": 1000})
 
         page.reload(wait_until="networkidle")
         page.locator("#settings-tab-library-import").click()
-        assert "Files: 6" in page.locator("#inventory-summary").inner_text()
+        assert "Files: 58" in page.locator("#inventory-summary").inner_text()
         assert page.locator("#candidate-generate").is_disabled(), "restored state must not unlock candidate lookup"
         page.screenshot(path=evidence / "03-inventory-restored.png", full_page=True)
 
@@ -251,10 +295,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
         def import_candidate(name: str, *, has_art: bool, screenshot: str, mock_failure: bool = False) -> dict:
             page.goto(f"{base_url}/settings#library-import", wait_until="networkidle")
             page.locator("#settings-tab-library-import").click()
-            review = page.get_by_role("button", name=re.compile(TRACKS[name].parts[0]))
+            review = page.get_by_role("button", name=re.compile(re.escape(TRACKS[name].parts[0])))
             review.wait_for(); review.click()
             page.locator("#library-import-modal:not([hidden])").wait_for()
-            candidate = page.get_by_role("radio", name=re.compile(TRACKS[name].parts[0] + " — ")).first
+            candidate = page.get_by_role("radio", name=re.compile(re.escape(TRACKS[name].parts[0] + " — "))).first
             candidate.click()  # Explicitly select the provider candidate whose artwork is under test.
             if has_art:
                 assert page.locator(".candidate-artwork").count() == 1
@@ -309,6 +353,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
         missing_result = import_candidate("missing", has_art=False, screenshot="08-missing-art-preview.png")
         assert missing_result["artwork"]["status"] == "unavailable"
 
+        case_result = import_candidate("case", has_art=False, screenshot="09-case-preserved-preview.png")
+        assert not case_result["items"][0]["changes"].get("genre")
+
         as_is_review = page.get_by_role("button", name=re.compile("As Is Artist"))
         as_is_review.wait_for()
         as_is_review.click()
@@ -317,7 +364,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
             page.locator("#library-import-in-place").click()
         assert response_info.value.status == 200, response_info.value.status
         page.locator("#library-import-confirmation:not([hidden])").wait_for()
-        page.screenshot(path=evidence / "09-as-is-preview.png", full_page=True)
+        page.screenshot(path=evidence / "10-as-is-preview.png", full_page=True)
         with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.url.endswith("/execute")) as response_info:
             page.locator("#library-import-execution-apply").click()
         assert response_info.value.status in {200, 201}, response_info.value.status
@@ -326,7 +373,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
         assert page.locator("#library-import-in-place").inner_text() == "Close"
         page.locator("#library-import-in-place").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
-        assert page.locator(".review-album").count() == 0
+        assert page.locator(".review-album").count() == 25
         browser.close()
 
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
@@ -395,7 +442,7 @@ def main() -> None:
     assert (tracks["missing"].parent / "cover.jpg").read_bytes() == EXISTING_ARTWORK_JPEG
     assert missing_tags.images[0].data == EXISTING_ARTWORK_JPEG
     expected_genres = {
-        "sidecar": "electronic", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient",
+        "case": "Alternative Rock", "sidecar": "Electronic", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient",
     }
     assert {name: by_path[path.name]["genre"] for name, path in tracks.items() if name in GENRES} == expected_genres
     file_genres = {name: MediaFile(str(tracks[name])).genre for name in GENRES}

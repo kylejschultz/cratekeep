@@ -357,9 +357,9 @@
       </div>
       <div id="library-import-review-list" class="review-list"></div>
       <nav class="review-pagination" aria-label="Library import review pages">
-        <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous artists</button>
+        <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous albums</button>
         <span id="library-import-review-page" aria-live="polite"></span>
-        <button id="library-import-review-next" class="secondary" type="button" disabled>Next artists</button>
+        <button id="library-import-review-next" class="secondary" type="button" disabled>Next albums</button>
       </nav>
     </section>
     </div>
@@ -695,8 +695,8 @@
     let reviewOpeningState = '', reviewPreviewReady = false, reviewSucceeded = false;
     const selectedAlbumIds = new Set();
     let reviewSequence = [];
-    const reviewArtistLimit = 25;
-    let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalArtists = 0, reviewPageArtistCount = 0;
+    const reviewAlbumLimit = 25;
+    let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalAlbums = 0, reviewPageAlbumCount = 0;
     let inventoryPreviewReady = false;
 
     function setCandidateAvailability(ready) {
@@ -741,7 +741,7 @@
         sessionStorage.setItem(inventoryStorageKey, JSON.stringify({
           preview: latestInventoryPreview,
           reviews: {items: reviewItems, groups: reviewGroups, albums: albumReviews, has_more: reviewHasMore,
-                    offset: reviewOffset, total_artists: reviewTotalArtists, artist_count: reviewPageArtistCount},
+                    offset: reviewOffset, total_albums: reviewTotalAlbums, album_count: reviewPageAlbumCount},
         }));
       } catch (error) {
         // Storage can be unavailable in privacy-restricted browser contexts.
@@ -760,8 +760,8 @@
           albumReviews = Array.isArray(stored.reviews.albums) ? stored.reviews.albums : [];
           reviewHasMore = Boolean(stored.reviews.has_more);
           reviewOffset = Number.isInteger(stored.reviews.offset) ? stored.reviews.offset : 0;
-          reviewTotalArtists = Number.isInteger(stored.reviews.total_artists) ? stored.reviews.total_artists : 0;
-          reviewPageArtistCount = Number.isInteger(stored.reviews.artist_count) ? stored.reviews.artist_count : reviewGroups.length;
+          reviewTotalAlbums = Number.isInteger(stored.reviews.total_albums) ? stored.reviews.total_albums : 0;
+          reviewPageAlbumCount = Number.isInteger(stored.reviews.album_count) ? stored.reviews.album_count : albumReviews.length;
           renderReviewItems();
         }
         return true;
@@ -833,7 +833,9 @@
           else album.disabled = true;
           return {status, score, album};
       }
-      function renderAlbum(albumReview, folderPath) {
+      function renderAlbum(albumReview) {
+          const sourcePaths = albumReview.source_paths.length ? albumReview.source_paths : ['.'];
+          const folderPath = sourcePaths.join(' · ');
           const row = document.createElement('article'); row.className = 'review-album-row';
         const select = document.createElement('input'); select.type = 'checkbox'; select.className = 'review-select';
         select.checked = selectedAlbumIds.has(albumReview.id);
@@ -849,8 +851,7 @@
         const path = document.createElement('span'); path.className = 'review-folder-path';
         path.textContent = folderPath === '.' ? 'Library root' : folderPath;
         path.title = folderPath === '.' ? 'Library root' : folderPath;
-        const songs = reviewItems.filter(item => albumReview.tracks.some(track => track.id === item.id)
-          && (folderPath === '.' ? !item.path.includes('/') : item.path.slice(0, item.path.lastIndexOf('/')) === folderPath));
+        const songs = reviewItems.filter(item => albumReview.tracks.some(track => track.id === item.id));
         const parts = albumRowParts(albumReview, folderPath, songs);
         const count = document.createElement('span'); count.className = 'review-track-count';
         count.textContent = `${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`;
@@ -862,15 +863,15 @@
         row.append(select, identity, count, duplicate, parts.status, parts.score, parts.album);
         return row;
       }
-      const albumCards = albumReviews.flatMap(album => album.source_paths.map(path => renderAlbum(album, path)));
+      const albumCards = albumReviews.map(renderAlbum);
       reviewList.replaceChildren(...albumCards);
       reviewStatus.dataset.busy = 'false';
       reviewStatus.textContent = reviewItems.length
         ? `${albumCards.length} album ${albumCards.length === 1 ? 'folder' : 'folders'}, ${reviewItems.length} tracks on this page.`
         : 'No current inventory review items.';
-      const pageStart = reviewTotalArtists ? reviewOffset + 1 : 0;
-      const pageEnd = Math.min(reviewOffset + reviewPageArtistCount, reviewTotalArtists);
-      reviewPage.textContent = `${pageStart}–${pageEnd} of ${reviewTotalArtists} artists`;
+      const pageStart = reviewPageAlbumCount ? reviewOffset + 1 : 0;
+      const pageEnd = reviewPageAlbumCount ? Math.min(reviewOffset + reviewPageAlbumCount, reviewTotalAlbums) : 0;
+      reviewPage.textContent = `Albums ${pageStart}–${pageEnd} of ${reviewTotalAlbums}`;
       reviewPrevious.disabled = reviewOffset === 0;
       reviewNext.disabled = !reviewHasMore;
       updateBulkActions();
@@ -894,7 +895,7 @@
         reviewPrevious.disabled = true; reviewNext.disabled = true;
         reviewStatus.dataset.busy = 'true';
         reviewStatus.textContent = 'Loading inventory review rows…';
-        const response = await fetch(`/api/library-import/reviews?limit=${reviewArtistLimit}&offset=${offset}`);
+        const response = await fetch(`/api/library-import/reviews?limit=${reviewAlbumLimit}&offset=${offset}`);
         const data = await readApiResponse(response, 'Unable to load review items');
         reviewItems = data.items;
         reviewGroups = data.groups;
@@ -903,8 +904,8 @@
         selectedAlbumIds.forEach(id => { if (!pageAlbumIds.has(id)) selectedAlbumIds.delete(id); });
         reviewHasMore = Boolean(data.has_more);
         reviewOffset = data.offset;
-        reviewTotalArtists = data.total_artists;
-        reviewPageArtistCount = data.artist_count;
+        reviewTotalAlbums = data.total_albums;
+        reviewPageAlbumCount = data.album_count;
         renderReviewItems();
         persistInventoryPreview();
       } catch (error) {
@@ -913,8 +914,8 @@
       }
     }
 
-    reviewPrevious.addEventListener('click', () => loadReviewItems(Math.max(0, reviewOffset - reviewArtistLimit)));
-    reviewNext.addEventListener('click', () => { if (reviewHasMore) loadReviewItems(reviewOffset + reviewPageArtistCount); });
+    reviewPrevious.addEventListener('click', () => loadReviewItems(Math.max(0, reviewOffset - reviewAlbumLimit)));
+    reviewNext.addEventListener('click', () => { if (reviewHasMore) loadReviewItems(reviewOffset + reviewPageAlbumCount); });
 
     function appendTrackCell(row, text, {changed = false, missing = false, label = ''} = {}) {
       const cell = document.createElement('td');

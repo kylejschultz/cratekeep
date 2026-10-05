@@ -36,10 +36,10 @@ MAX_ARTWORK_BYTES = 10 * 1024 * 1024
 TRUSTED_ARTWORK_HOSTS = {"coverartarchive.org", "archive.org"}
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
-MAX_LIBRARY_IMPORT_ARTISTS = 50
+MAX_LIBRARY_IMPORT_ALBUMS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
-CANDIDATE_SCHEMA_VERSION = 2
+CANDIDATE_SCHEMA_VERSION = 3
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip"}
 MUSICBRAINZ_ID_PATTERN = re.compile(
@@ -178,17 +178,16 @@ def create_app(test_config: dict | None = None) -> Flask:
             offset = int(request.args.get("offset", "0"))
         except ValueError:
             return jsonify(error="limit and offset must be integers"), 400
-        if not 1 <= limit <= MAX_LIBRARY_IMPORT_ARTISTS:
-            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_ARTISTS}"), 400
+        if not 1 <= limit <= MAX_LIBRARY_IMPORT_ALBUMS:
+            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_ALBUMS}"), 400
         if offset < 0:
             return jsonify(error="offset must be zero or greater"), 400
-        album_ids, artist_count, has_more, total_artists = _library_import_review_artist_page(app, limit, offset)
+        album_ids, has_more, total_albums = _library_import_review_album_page(app, limit, offset)
         items = _library_import_review_items(app, album_ids)
         return jsonify(items=items, groups=_group_library_import_review_items(items),
                        albums=_album_review_payloads(app, album_ids), limit=limit, offset=offset,
-                       artist_count=artist_count, total_artists=total_artists,
-                       album_count=len(album_ids), has_more=has_more,
-                       next_offset=(offset + artist_count) if has_more else None)
+                       album_count=len(album_ids), total_albums=total_albums, has_more=has_more,
+                       next_offset=(offset + len(album_ids)) if has_more else None)
 
     @app.post("/api/library-import/candidates")
     def generate_library_import_candidates():
@@ -571,13 +570,13 @@ def _init_db(path: str) -> None:
         _ensure_column(db, "album_reviews", "duplicate_action", "TEXT")
         _ensure_column(db, "metadata_candidates", "schema_version", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(db, "adoption_reviews", "imported_at", "TEXT")
-        # Pre-artwork candidates remain visible for audit and keep all review
-        # decisions, but are explicitly queued ahead of complete rows for a
-        # bounded refresh on the next candidate-generation run.
+        # Older candidate evidence remains visible for audit and keeps all
+        # review decisions, but is queued ahead of complete rows for a bounded
+        # refresh after evidence or presentation rules change.
         db.execute(
             """UPDATE album_reviews
                   SET candidate_status = 'stale',
-                      candidate_error = 'Candidate evidence predates artwork discovery; refresh candidates.'
+                      candidate_error = 'Candidate evidence predates the current schema; refresh candidates.'
                 WHERE execution_status != 'complete'
                   AND candidate_status = 'complete'
                   AND EXISTS (
@@ -947,39 +946,26 @@ def _latest_inventory_summary(app: Flask) -> dict | None:
     return json.loads(row["summary_json"]) if row else None
 
 
-def _library_import_review_artist_page(app: Flask, limit: int, offset: int) -> tuple[list[int], int, bool, int]:
+def _library_import_review_album_page(app: Flask, limit: int, offset: int) -> tuple[list[int], bool, int]:
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
     with _connect(app.config["APP_DB"]) as db:
-        artists = db.execute(
-            """SELECT albums.artist_key FROM album_reviews AS albums
+        albums = db.execute(
+            """SELECT albums.id FROM album_reviews AS albums
                 WHERE albums.root_path = ?
                   AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
-                GROUP BY albums.artist_key
-                ORDER BY albums.artist_key
+                ORDER BY albums.artist_key, albums.album_key, albums.id
                 LIMIT ? OFFSET ?""",
             (root, limit + 1, offset),
         ).fetchall()
         total = db.execute(
-            """SELECT COUNT(DISTINCT albums.artist_key) FROM album_reviews AS albums
+            """SELECT COUNT(*) FROM album_reviews AS albums
                 WHERE albums.root_path = ?
                   AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)""",
             (root,),
         ).fetchone()[0]
-        page_artist_keys = [row["artist_key"] for row in artists[:limit]]
-        if not page_artist_keys:
-            return [], 0, False, total
-        placeholders = ", ".join("?" for _ in page_artist_keys)
-        albums = db.execute(
-            f"""SELECT albums.id FROM album_reviews AS albums
-                 WHERE albums.root_path = ? AND albums.artist_key IN ({placeholders})
-                   AND albums.execution_status != 'complete'
-                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
-                 ORDER BY albums.artist_key, albums.album_key, albums.id""",
-            (root, *page_artist_keys),
-        ).fetchall()
-    return [row["id"] for row in albums], len(page_artist_keys), len(artists) > limit, total
+    return [row["id"] for row in albums[:limit]], len(albums) > limit, total
 
 
 def _library_import_review_items(app: Flask, album_ids: list[int]) -> list[dict]:
@@ -1053,6 +1039,16 @@ def _set_item_value(item: Item, field: str, value: object) -> None:
 
 def _metadata_key(value: object) -> str:
     return _normalize_metadata(value).casefold()
+
+
+def _genre_presentation_key(value: object) -> str:
+    """Compare genre presentation using only whitespace folding and Unicode casefolding."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _format_genre(value: object) -> str:
+    """Title-case one genre after whitespace cleanup while preserving its punctuation."""
+    return " ".join(str(value or "").split()).title()
 
 
 def _normalize_track_title(value: object) -> str:
@@ -1254,7 +1250,7 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
         if value and _metadata_key(value) != _metadata_key(query[key]):
             proposed[key] = {"from": query[key], "to": value}
     genre = _candidate_genre(candidate)
-    if genre and _metadata_key(genre) != _metadata_key(query.get("genre")):
+    if genre and _genre_presentation_key(genre) != _genre_presentation_key(query.get("genre")):
         proposed["genre"] = {"from": query.get("genre"), "to": genre}
     count = candidate.get("track_count")
     if isinstance(count, int) and count != len(query["tracks"]):
@@ -1278,9 +1274,9 @@ def _candidate_genre(candidate: dict) -> str:
     evidence = candidate.get("genre_evidence")
     if not isinstance(evidence, dict) or evidence.get("source") != "musicbrainz-release-group-genres":
         return ""
-    selected = _normalize_metadata(evidence.get("selected"))
-    genre = _normalize_metadata(candidate.get("genre"))
-    return genre if genre and genre == selected else ""
+    selected = " ".join(str(evidence.get("selected") or "").split())
+    genre = " ".join(str(candidate.get("genre") or "").split())
+    return _format_genre(genre) if genre and _genre_presentation_key(genre) == _genre_presentation_key(selected) else ""
 
 
 def _candidate_track_details(query: dict, candidate: dict) -> list[dict]:
@@ -1913,8 +1909,13 @@ def _library_import_plans(
                 action = "merge"
                 comparison_item = duplicate
         changes = {}
-        for field, value in values.items():
+        for field, value in list(values.items()):
             current = _item_genre(comparison_item) if field == "genre" else comparison_item.get(field)
+            if field == "genre" and _genre_presentation_key(current) == _genre_presentation_key(value):
+                # Preserve the exact existing spelling and avoid both tag and
+                # database writes for presentation-only differences.
+                del values[field]
+                continue
             if current != value:
                 changes[field] = {"from": current, "to": value}
         plans.append({

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from io import BytesIO
 import shutil
@@ -14,7 +15,8 @@ from PIL import Image as PillowImage
 
 from beets_mvp import (
     LibraryImportExecutionError, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
-    _group_library_import_review_items, _init_db, _SafeArtworkRedirect, create_app,
+    _format_genre, _genre_presentation_key, _group_library_import_review_items, _init_db,
+    _item_genre, _SafeArtworkRedirect, create_app,
 )
 from beets_mvp.musicbrainz import ProviderError, _cover_art_evidence, _genre_evidence, search_releases
 from beets_mvp.matching import score_release
@@ -819,44 +821,119 @@ def test_library_import_review_groups_preserve_source_folder_hierarchy(tmp_path)
     assert _group_library_import_review_items(payload["items"]) == payload["groups"]
 
 
-def test_library_import_review_paginates_25_artists_and_keeps_complete_albums(tmp_path):
+def test_library_import_review_paginates_25_albums_without_gaps_or_duplicates(tmp_path):
     app = make_app(tmp_path)
     root = tmp_path / "library"
-    large_album = root / "000 Large Artist" / "Complete Album"
-    for number in range(125):
-        path = large_album / f"{number + 1:03d} Track.mp3"
+    expected_paths = []
+    for number in range(53):
+        artist = f"Artist {number // 4:03d}"
+        album = f"Album {number:03d}"
+        path = root / artist / album / "01 Track.mp3"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"synthetic")
-    for number in range(26):
-        path = root / f"Artist {number:03d}" / "Only Album" / "01 Track.mp3"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"synthetic")
+        expected_paths.append(path.relative_to(root).as_posix())
 
     client = app.test_client()
     assert client.post("/api/library/inventory/preview").status_code == 201
 
-    first = client.get("/api/library-import/reviews?limit=25&offset=0")
-    assert first.status_code == 200
-    assert first.json["total_artists"] == 27
-    assert first.json["artist_count"] == 25
-    assert first.json["album_count"] == 25
-    assert first.json["has_more"] is True
-    assert first.json["next_offset"] == 25
-    assert len(first.json["items"]) == 149
-    complete = first.json["albums"][0]
-    assert complete["album"] == "Complete Album"
-    assert len(complete["tracks"]) == 125
-    assert len(first.json["groups"][0]["folders"][0]["albums"][0]["songs"]) == 125
-
-    last = client.get("/api/library-import/reviews?limit=25&offset=25")
-    assert last.status_code == 200
-    assert last.json["artist_count"] == 2
-    assert last.json["album_count"] == 2
-    assert len(last.json["items"]) == 2
-    assert last.json["has_more"] is False
-    assert last.json["next_offset"] is None
+    pages = [client.get(f"/api/library-import/reviews?limit=25&offset={offset}") for offset in (0, 25, 50)]
+    assert all(page.status_code == 200 for page in pages)
+    assert [page.json["album_count"] for page in pages] == [25, 25, 3]
+    assert [page.json["total_albums"] for page in pages] == [53, 53, 53]
+    assert [page.json["has_more"] for page in pages] == [True, True, False]
+    assert [page.json["next_offset"] for page in pages] == [25, 50, None]
+    actual_paths = [item["path"] for page in pages for item in page.json["items"]]
+    assert actual_paths == expected_paths
+    assert len(actual_paths) == len(set(actual_paths)) == 53
+    assert all(len(page.json["albums"]) <= 25 for page in pages)
+    queried_albums = []
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: queried_albums.append(query["album"]) or []
+    generated = client.post("/api/library-import/candidates", json={"limit": 25})
+    assert generated.status_code == 201
+    assert generated.json["albums"] == 25
+    assert queried_albums == [f"Album {number:03d}" for number in range(25)]
     assert client.get("/api/library-import/reviews?offset=-1").status_code == 400
     assert client.get("/api/library-import/reviews?limit=51").status_code == 400
+
+
+def test_genre_presentation_helpers_are_conservative_and_deterministic():
+    assert _genre_presentation_key("  Alternative\t Rock ") == _genre_presentation_key("alternative rock")
+    assert _genre_presentation_key("post-punk") != _genre_presentation_key("post punk")
+    assert _genre_presentation_key("Ｒ＆Ｂ") != _genre_presentation_key("R&B")
+    assert [_format_genre(value) for value in ("alternative rock", "post-punk", "r&b")] == [
+        "Alternative Rock", "Post-Punk", "R&B",
+    ]
+
+
+@pytest.mark.parametrize(
+    "current_genre, provider_genre, expected_genre, expected_change",
+    [
+        ("Alternative Rock", "alternative rock", "Alternative Rock", None),
+        ("", "alternative rock", "Alternative Rock", {"from": None, "to": "Alternative Rock"}),
+        ("Rock", "post-punk", "Post-Punk", {"from": "Rock", "to": "Post-Punk"}),
+    ],
+)
+def test_reliable_genre_preview_and_write_preserve_equivalent_or_apply_display_form(
+    tmp_path, current_genre, provider_genre, expected_genre, expected_change,
+):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "+44" / "When Your Heart Stops Beating" / "01 Lycanthrope.wav"
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = "Lycanthrope"
+    media.artist = media.albumartist = "+44"
+    media.album = "When Your Heart Stops Beating"
+    media.genre = current_genre
+    media.mb_albumid = "release-1"
+    media.save()
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    item = Item.from_path(path)
+    library.add(item)
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    candidate = {
+        "provider_id": "release-1", "artist": "+44", "album": "When Your Heart Stops Beating",
+        "genre": provider_genre,
+        "genre_evidence": {
+            "source": "musicbrainz-release-group-genres", "selected": provider_genre,
+            "counts": [{"name": provider_genre, "count": 3}],
+        },
+    }
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [candidate]
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert album["candidates"][0]["genre"] == expected_genre
+    candidate_change = album["candidates"][0]["proposed_diff"].get("genre")
+    assert (candidate_change or {}).get("to") == (expected_change or {}).get("to")
+    assert bool(candidate_change) is bool(expected_change)
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"],
+    })
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    preview_change = preview.json["items"][0]["changes"].get("genre")
+    assert (preview_change or {}).get("to") == (expected_change or {}).get("to")
+    assert bool(preview_change) is bool(expected_change)
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    stored = library.get_item(item.id)
+    assert _item_genre(stored) == expected_genre
+    assert MediaFile(str(path)).genre == expected_genre
+    if expected_change is None:
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize("evidence", [
+    {"source": "musicbrainz-release-group-genres", "selected": None,
+     "counts": [{"name": "alternative rock", "count": 1}]},
+    {"source": "musicbrainz-release-group-genres", "selected": None,
+     "counts": [{"name": "rock", "count": 3}, {"name": "pop", "count": 3}]},
+    None,
+])
+def test_weak_tied_or_missing_genre_evidence_preserves_existing_spelling(evidence):
+    candidate = {"genre": None, "genre_evidence": evidence}
+    assert _candidate_diff({"artist": "A", "album": "B", "genre": "aLtErNaTiVe  ROCK", "tracks": []}, candidate).get("genre") is None
 
 
 def test_album_review_source_path_preserves_literal_filesystem_spelling(tmp_path):
@@ -946,7 +1023,7 @@ def test_candidate_refresh_replaces_results_and_provider_errors_are_persisted(tm
     assert album["candidates"][0]["provider_id"] == "old"
 
 
-@pytest.mark.parametrize("provider_genre, expected_genre", [(None, None), ("jazz", {"from": "Rock", "to": "jazz"})])
+@pytest.mark.parametrize("provider_genre, expected_genre", [(None, None), ("jazz", {"from": "Rock", "to": "Jazz"})])
 def test_candidate_genre_is_explicit_and_only_proposed_when_real(tmp_path, provider_genre, expected_genre):
     app = make_app(tmp_path)
     path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
@@ -970,7 +1047,7 @@ def test_candidate_genre_is_explicit_and_only_proposed_when_real(tmp_path, provi
     album = client.get("/api/library-import/reviews").json["albums"][0]
 
     assert album["current_metadata"]["genre"] == "Rock"
-    assert album["candidates"][0]["genre"] == provider_genre
+    assert album["candidates"][0]["genre"] == (_format_genre(provider_genre) if provider_genre else None)
     assert album["candidates"][0]["proposed_diff"].get("genre") == expected_genre
     client.patch(f'/api/library-import/albums/{album["id"]}', json={
         "decision": "approved", "candidate_id": album["candidates"][0]["id"],
@@ -1671,7 +1748,7 @@ def test_library_execution_rerun_is_idempotent(tmp_path):
     pending = client.get("/api/library-import/reviews").json
     assert pending["items"] == []
     assert pending["albums"] == []
-    assert pending["total_artists"] == 0
+    assert pending["total_albums"] == 0
     second = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
 
     assert first.status_code == 201
@@ -2142,7 +2219,7 @@ def test_library_import_review_markup_is_album_folder_first(tmp_path):
     assert b"document.createElement('details')" in html
     assert b"document.createElement('summary')" in html
     assert b"review-folder" in html and b"review-album" in html
-    assert b"albumReviews.flatMap(album => album.source_paths.map(path => renderAlbum(album, path)))" in html
+    assert b"albumReviews.map(renderAlbum)" in html
     assert b"path.textContent = folderPath === '.' ? 'Library root' : folderPath" in html
     assert b"reviewList.replaceChildren(...reviewItems.map" not in html
     assert b"reviews?limit=50" not in html
@@ -2191,19 +2268,19 @@ def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     assert b"count.className = 'review-track-count'" in html
     assert b"count.textContent = `${songs.length} ${songs.length === 1 ? 'track' : 'tracks'}`" in html
     assert b"renderTrackList" not in html
-    assert b"album.source_paths.map(path => renderAlbum(album, path))" in html
+    assert b"const sourcePaths = albumReview.source_paths.length ? albumReview.source_paths : ['.']" in html
     assert b"status.className = 'status-pill'" in html
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html
-    assert b"of ${reviewTotalArtists} artists" in html
-    assert b"Previous artists" in html and b"Next artists" in html
+    assert b"Albums ${pageStart}\xe2\x80\x93${pageEnd} of ${reviewTotalAlbums}" in html
+    assert b"Previous albums" in html and b"Next albums" in html
 
 
 def test_album_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b"row.append(select, identity, count, duplicate, parts.status, parts.score, parts.album)" in html
-    assert b"const albumCards = albumReviews.flatMap" in html
+    assert b"const albumCards = albumReviews.map(renderAlbum)" in html
     assert b"renderTrackList" not in html
     assert b"review-track-list" not in html
     assert b"event.stopPropagation(); openReview(albumReview, album)" in html
@@ -2365,7 +2442,7 @@ def test_legacy_candidates_are_marked_stale_then_refreshed_without_losing_decisi
     assert refreshed["selected_candidate_id"] == refreshed["candidates"][0]["id"]
     assert refreshed["candidate_status"] == "complete"
     with sqlite3.connect(app.config["APP_DB"]) as db:
-        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 2
+        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 3
 
     restarted.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
         "provider_id": "different-release", "artist": query["artist"], "album": query["album"],
@@ -2467,7 +2544,7 @@ def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
     assert b"sessionStorage.setItem(inventoryStorageKey, JSON.stringify({" in first
     assert b"preview: latestInventoryPreview" in first
     assert b"reviews: {items: reviewItems, groups: reviewGroups, albums: albumReviews, has_more: reviewHasMore," in first
-    assert b"/api/library-import/reviews?limit=${reviewArtistLimit}&offset=${offset}" in first
+    assert b"/api/library-import/reviews?limit=${reviewAlbumLimit}&offset=${offset}" in first
     assert b'id="library-import-review-previous"' in first
     assert b'id="library-import-review-next"' in first
     assert b"sessionStorage.getItem(inventoryStorageKey)" in first
