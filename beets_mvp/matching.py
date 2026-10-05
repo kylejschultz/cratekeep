@@ -15,6 +15,13 @@ import unicodedata
 FIELD_WEIGHTS = {"artist": 0.20, "album": 0.30, "date": 0.10, "tracks": 0.40}
 TRACK_WEIGHTS = {"title": 0.70, "duration": 0.20, "order": 0.10}
 
+TRAILING_FEATURE_CREDIT = re.compile(
+    r"(?:\s*\(\s*(?:feat(?:uring)?|ft)\.?\s+[^()]+\)"
+    r"|\s*\[\s*(?:feat(?:uring)?|ft)\.?\s+[^\[\]]+\]"
+    r"|\s+(?:[-\u2013\u2014,:]\s*)?(?:feat(?:uring)?|ft)\.?\s+[^()[\]]+)\s*$",
+    re.IGNORECASE,
+)
+
 
 def _text(value: object) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).strip()
@@ -35,7 +42,11 @@ def _track_title(track: object) -> str:
 
 
 def _track_title_key(track: object) -> str:
-    return _track_title(track).casefold().translate(str.maketrans({
+    title = _track_title(track)
+    without_credit = TRAILING_FEATURE_CREDIT.sub("", title).rstrip()
+    # A title consisting only of a feature marker is not evidence of a base title.
+    title = without_credit or title
+    return title.casefold().translate(str.maketrans({
         "‘": "'", "’": "'", "‚": "'", "‛": "'", "ʼ": "'", "＇": "'",
         "“": '"', "”": '"', "„": '"', "‟": '"', "＂": '"',
     }))

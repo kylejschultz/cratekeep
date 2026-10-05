@@ -373,7 +373,7 @@ def test_settings_script_initializes_without_stale_direct_import_references(tmp_
     assert "const themeButton = document.getElementById('theme-toggle');" in script
     assert "localStorage.getItem('cratekeep-theme') === 'dark'" in script
     assert "themeButton.addEventListener('click'" in script
-    assert script.index("function resetImportPreview()") < script.index("function renderAlbumMatch()")
+    assert script.index("function resetImportAction()") < script.index("function renderAlbumMatch()")
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for rendered JavaScript syntax validation")
@@ -386,103 +386,6 @@ def test_rendered_settings_javascript_has_valid_syntax(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
-def test_import_preview_groups_repeated_and_mixed_metadata_changes_deterministically(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    start = html.index("function comparePreviewText")
-    end = html.index("function renderImportPreview", start)
-    helpers = html[start:end]
-    probe = r"""
-const repeated = Array.from({length: 17}, (_, index) => ({
-  path: `Artist/Album/${String(17 - index).padStart(2, '0')} Track ${17 - index}.flac`,
-  changes: {genre: {from: 'Hip-Hop', to: 'Southern Hip Hop'}},
-}));
-const mixed = [
-  {path:'z.flac', changes:{genre:{from:'Rock',to:'Pop'}, title:{from:'Old',to:'New'}}},
-  {path:'a.flac', changes:{genre:{from:'Hip-Hop',to:'Southern Hip Hop'}}},
-  {path:'b.flac', changes:{genre:{from:'Rock',to:'Pop'}, artist:{from:null,to:'Artist'}}},
-];
-const simplify = groups => groups.map(({field,label,from,to,paths}) => ({field,label,from,to,paths}));
-console.log(JSON.stringify({
-  repeated:simplify(groupImportPreviewChanges(repeated)),
-  mixed:simplify(groupImportPreviewChanges(mixed)),
-  registrations:simplify(groupImportPreviewChanges([{path:'new.flac',changes:{}}])),
-  empty:simplify(groupImportPreviewChanges([])),
-}));
-"""
-    completed = subprocess.run(["node", "-e", f"{helpers}\n{probe}"], check=True, capture_output=True, text=True)
-    result = json.loads(completed.stdout)
-
-    assert result["repeated"] == [{
-        "field": "genre", "label": "Genre", "from": "Hip-Hop", "to": "Southern Hip Hop",
-        "paths": [f"Artist/Album/{index:02d} Track {index}.flac" for index in range(1, 18)],
-    }]
-    assert [(group["field"], group["from"], group["to"], group["paths"]) for group in result["mixed"]] == [
-        ("artist", "Not provided", "Artist", ["b.flac"]),
-        ("genre", "Hip-Hop", "Southern Hip Hop", ["a.flac"]),
-        ("genre", "Rock", "Pop", ["b.flac", "z.flac"]),
-        ("title", "Old", "New", ["z.flac"]),
-    ]
-    assert result["registrations"] == result["empty"] == []
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
-def test_import_preview_renderer_keeps_details_collapsed_text_only_and_handles_empty_states(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    start = html.index("function comparePreviewText")
-    end = html.index("function resetImportPreview", start)
-    helpers = html[start:end]
-    probe = r"""
-class Element {
-  constructor(tagName) { this.tagName=tagName; this.children=[]; this.attributes={}; this.hidden=false; this._text=''; }
-  set textContent(value) { this._text=String(value); this.children=[]; }
-  get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this._text=''; this.children=children; }
-  setAttribute(name, value) { this.attributes[name]=String(value); }
-}
-const preview = new Element('div'); preview.hidden=true;
-globalThis.document = {
-  createElement: tagName => new Element(tagName),
-  getElementById: id => id === 'library-import-preview' ? preview : null,
-};
-const find = (root, className) => [root, ...root.children.flatMap(child => find(child, className))]
-  .filter(element => element.className === className);
-const snapshot = () => ({
-  text:preview.textContent,
-  groups:find(preview,'import-change-group').length,
-  details:find(preview,'import-change-details').map(detail => ({open:Boolean(detail.open), text:detail.textContent})),
-  paths:find(preview,'import-change-path').map(path => ({text:path.textContent,title:path.title})),
-});
-const items = Array.from({length:17}, (_, index) => ({
-  path:index === 0 ? 'Artist/<script>alert(1)</script>/a-very-long-track-name-that-must-wrap.flac' : `Artist/Album/${index + 1}.flac`,
-  changes:{genre:{from:'Hip-Hop',to:'Southern Hip Hop'}},
-}));
-renderImportPreview({files:17,registered:17,metadata_updates:17,items});
-const repeated = snapshot();
-renderImportPreview({files:2,registered:2,metadata_updates:0,items:[{path:'one.flac',changes:{}},{path:'two.flac',changes:{}}]});
-const registrations = snapshot();
-renderImportPreview({files:0,registered:0,metadata_updates:0,items:[]});
-const empty = snapshot();
-console.log(JSON.stringify({repeated,registrations,empty}));
-"""
-    completed = subprocess.run(["node", "-e", f"{helpers}\n{probe}"], check=True, capture_output=True, text=True)
-    result = json.loads(completed.stdout)
-
-    repeated = result["repeated"]
-    assert repeated["groups"] == 1
-    assert "Files checked17Registrations17Metadata updates17" in repeated["text"]
-    assert "Genre17 tracksHip-Hop→Southern Hip HopShow 17 affected tracks" in repeated["text"]
-    assert repeated["details"][0]["open"] is False
-    assert len(repeated["paths"]) == 17
-    assert repeated["paths"][0]["text"] == repeated["paths"][0]["title"]
-    assert "<script>alert(1)</script>" in repeated["text"]
-    assert result["registrations"]["groups"] == 0
-    assert "No metadata changes are needed." in result["registrations"]["text"]
-    assert result["empty"]["groups"] == 0
-    assert "No files were checked. Nothing is ready to import." in result["empty"]["text"]
-
-
 def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
     modal = html[html.index(b'id="library-import-modal"'):]
@@ -490,7 +393,7 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'role="dialog" aria-modal="true"' in modal
     assert b'aria-labelledby="library-import-modal-title"' in modal
     assert b'aria-describedby="library-import-modal-description"' in modal
-    assert b'This decision does not change music files.' in modal
+    assert b'Import validates the current files, then applies the selected metadata in place.' in modal
     assert b'class="album-modal-section alternatives-section"' in modal
     assert b'>Choose album metadata<' in modal
     assert b'role="radiogroup" aria-label="Album metadata candidates"' in modal
@@ -535,11 +438,11 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'data-review-decision="rejected"' not in modal
     assert b'id="library-import-in-place" class="approve-button">Import' in modal
     assert b'Skip for now' not in modal
-    assert b'id="library-import-preview" class="import-preview" hidden' in modal
+    assert b'id="library-import-preview"' not in modal
     assert b'id="library-import-execution-apply"' not in modal
-    assert b"button.textContent = 'Confirm import'" in modal
+    assert b"Confirm import" not in modal
     assert b'Queue import' not in modal
-    assert b"/preview" in modal
+    assert b"/api/library-import/albums/${activeAlbum.id}/preview" not in modal
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
     assert b"reviewReturnFocus.focus()" in modal
@@ -1527,6 +1430,50 @@ def test_match_screen_preview_then_apply_imports_in_place_without_queue_step(tmp
         ).fetchone()[0] == 1
 
 
+def test_match_screen_execute_persists_selection_and_imports_in_one_request(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+
+    response = client.post(
+        f'/api/library-import/albums/{album["id"]}/execute', json={"candidate_id": None}
+    )
+
+    assert response.status_code == 201
+    assert response.json["status"] == "complete"
+    assert response.json["selection_mode"] == "as-is"
+    assert client.get("/api/library-import/reviews").json["albums"] == []
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    assert Path(item.path.decode()).resolve() == path.resolve()
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute(
+            "SELECT state, selected_candidate_id, execution_status FROM album_reviews WHERE id = ?",
+            (album["id"],),
+        ).fetchone() == ("approved", None, "complete")
+        assert db.execute(
+            "SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_preview'"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_execute'"
+        ).fetchone()[0] == 1
+
+    repeated = client.post(
+        f'/api/library-import/albums/{album["id"]}/execute', json={"candidate_id": None}
+    )
+    assert repeated.status_code == 200
+    assert repeated.json["already_complete"] is True
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute(
+            "SELECT execution_status FROM album_reviews WHERE id = ?", (album["id"],)
+        ).fetchone() == ("complete",)
+        assert db.execute(
+            "SELECT COUNT(*) FROM adoption_jobs WHERE kind = 'library_import_execute'"
+        ).fetchone()[0] == 1
+
+
 def test_match_screen_preview_failure_stays_pending_and_audits_error(tmp_path):
     app = make_app(tmp_path)
     path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
@@ -2238,6 +2185,73 @@ def test_matching_assigns_tracks_reports_explicit_mismatches_and_bounds_count_co
     assert {penalty["field"] for penalty in match["penalties"]} == {"artist", "album", "date", "tracks"}
 
 
+@pytest.mark.parametrize("local_title", [
+    "Extra feat. Rich Homie Quan",
+    "EXTRA FT RICH HOMIE QUAN",
+    "Extra (featuring Rich Homie Quan)",
+    "Extra [Feat Rich Homie Quan]",
+    "Extra — ft. Rich Homie Quan",
+])
+def test_matching_pairs_trailing_feature_credits_without_hiding_title_changes(local_title):
+    query = {"artist": "2 Chainz", "album": "B.O.A.T.S. II #METIME", "tracks": [{
+        "title": local_title, "duration": 288, "disc": 1, "track": 8,
+    }]}
+    candidate = {"artist": "2 Chainz", "album": "B.O.A.T.S. II #METIME", "tracks": [{
+        "title": "Extra", "length_ms": 287000, "medium_position": 1, "position": 8,
+    }]}
+
+    result = score_release(query, candidate)
+    detail = result["track_details"][0]
+
+    assert detail["local"] == local_title
+    assert detail["proposed"] == "Extra"
+    assert detail["status"] in {"matched", "title-mismatch"}
+    assert not {"unmatched", "missing", "extra"}.intersection(detail["issues"])
+    assert "unmatched_tracks" not in result["hard_mismatches"]
+    assert result["matched_track_count"] == 1
+    assert _candidate_diff(query, candidate)["tracks"] == {
+        "from": [local_title], "to": ["Extra"],
+    }
+
+
+@pytest.mark.parametrize("local_title, canonical_title", [
+    ("I Do It feat. Lil Wayne", "I Do It"),
+    ("Netflix ft. Fergie", "Netflix"),
+    ("Beautiful Pain (featuring Ma$e)", "Beautiful Pain"),
+])
+def test_nearby_feature_credit_tracks_pair_and_keep_raw_titles(local_title, canonical_title):
+    result = score_release(
+        {"artist": "2 Chainz", "album": "Album", "tracks": [{"title": local_title}]},
+        {"artist": "2 Chainz", "album": "Album", "tracks": [{"title": canonical_title}]},
+    )
+
+    assert result["track_details"][0]["status"] in {"matched", "title-mismatch"}
+    assert result["track_details"][0]["local"] == local_title
+    assert result["track_details"][0]["proposed"] == canonical_title
+    assert "unmatched_tracks" not in result["hard_mismatches"]
+
+
+@pytest.mark.parametrize("left, right", [
+    ("Featuring Artist", "Artist"),
+    ("Feat. of Strength", "Strength"),
+    ("The Featuring", "The"),
+    ("Song feat. Artist (Live)", "Song"),
+    ("A Feature Presentation", "A"),
+    ("Song (feat. Artist]", "Song"),
+    ("Song [ft. Artist)", "Song"),
+])
+def test_feature_words_outside_a_trailing_credit_do_not_match(left, right):
+    result = score_release(
+        {"artist": "Artist", "album": "Album", "tracks": [{"title": left}]},
+        {"artist": "Artist", "album": "Album", "tracks": [{"title": right}]},
+    )
+
+    detail = result["track_details"][0]
+    assert detail["distance"] > 0
+    assert "title-mismatch" in detail["issues"]
+    assert result["confidence"] < 1
+
+
 def test_exact_release_id_selects_but_does_not_override_unrelated_evidence():
     result = score_release({"artist": "Wrong", "album": "Wrong", "tracks": [{"title": "One"}]}, {
         "provider_id": "release", "artist": "Canonical", "album": "Canonical", "tracks": [],
@@ -2452,8 +2466,7 @@ def test_library_import_operations_expose_visible_live_progress(tmp_path):
     assert b"Scanning source folders, file names, and stats" in html
     assert b"Requesting bounded MusicBrainz matches" in html
     assert b"Rematching through the configured MusicBrainz provider" in html
-    assert b"Checking files and preparing an in-place preview" in html
-    assert b"Registering files and applying approved metadata in place" in html
+    assert b"Validating files, registering them, and applying approved metadata in place" in html
     assert b"setAttribute('aria-busy', String(busy))" in html
 
 
@@ -2620,7 +2633,7 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
         assert b'value="' + action + b'"' in html
     assert b"same MusicBrainz recording ID" in html
     assert b"method: 'PATCH'" in html
-    assert b"/api/library-import/albums/${activeAlbum.id}/preview" in html
+    assert b"/api/library-import/albums/${activeAlbum.id}/preview" not in html
     assert b"/api/library-import/albums/${activeAlbum.id}/execute" in html
     assert b"data-review-decision=\"skipped\"" not in html
     assert b"Skip for now" not in html

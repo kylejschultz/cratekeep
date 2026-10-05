@@ -96,7 +96,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `PATCH /api/library-import/albums/<id>` — save an album decision, selected candidate, track exceptions, and optional persisted `duplicate_action` (`merge`, `replace`, `keep-both`, or `skip`); send `candidate_id: null` with an approved decision to explicitly keep the incoming metadata “As Is” with no MusicBrainz association
 - `POST /api/library-import/albums/<id>/rematch` — validate a MusicBrainz release UUID and rematch through the configured provider
 - `POST /api/library-import/albums/<id>/preview` — save the match-screen selection and dry-run the in-place import without queueing it through Inbox
-- `POST /api/library-import/albums/<id>/execute` — preview or execute an approved album in place; send `{"dry_run":true}` to validate the inventory snapshot and return registrations/tag changes without mutation
+- `POST /api/library-import/albums/<id>/execute` — preview or execute an approved album in place; the match screen sends `candidate_id` and optional `duplicate_action` so the selection is saved before execution, while API clients may send `{"dry_run":true}` to validate without mutation
 - `POST /api/imports/preview` — snapshot an inbox selection for review
 - `POST /api/imports/<id>/execute` — execute a reviewed import
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
@@ -113,7 +113,7 @@ The Library import inventory presents one compact card per album review and disp
 | `Imported` | Every track in the album is already tracked in the library. |
 | `Needs attention` | Matching is incomplete or failed, or the album was rejected or skipped during review. |
 
-Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only an indicator; Cratekeep never automatically imports albums. **Import** saves the selected candidate and runs a non-mutating preview; after review, the same sticky action becomes **Confirm import** and applies that preview. This match-screen path does not require the Inbox queue. After success the modal remains open with its success message and the control becomes **Close**.
+Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only an indicator; Cratekeep never automatically imports albums. Candidate facts and the changed-track dialog are the review surfaces. **Import** saves the selected candidate and duplicate policy, performs the server preflight, and executes the in-place import directly; it does not require the Inbox queue or a second confirmation. After success the modal remains open with its success message and the control becomes **Close**. A failure leaves the modal open with **Import** available to retry.
 
 Genre proposals use canonical MusicBrainz release-group genres only. Cratekeep chooses one genre when the top positive count has at least two votes and strictly exceeds the runner-up; tied, weak, missing, or non-canonical evidence preserves the existing genre. Existing and reliable proposed genres are presentation-equivalent only when whitespace-normalized Unicode casefolded text matches; punctuation, synonyms, taxonomies, and multiple genres are not mapped. Equivalent values preserve the existing spelling and cause no tag write. New or genuinely different values use Python's deterministic Unicode title casing after whitespace cleanup, so `alternative rock`, `post-punk`, and `r&b` become `Alternative Rock`, `Post-Punk`, and `R&B`. This intentionally small rule preserves punctuation but does not implement language-specific title conventions or acronym dictionaries. Provider source and positive counts remain in persisted candidate evidence for audit.
 
@@ -142,12 +142,12 @@ The procedure uses valid generated WAV files. It labels and persists determinist
 MusicBrainz genre evidence, routes a deterministic mocked CAA thumbnail, and injects deterministic
 server-side JPEG bytes through a smoke-only app factory without external provider traffic. It verifies
 artwork-visible/missing states, sidecar-only and embed-only writes, preservation, explicit replacement,
-missing-art no-op, reliable/weak/tied/missing genre outcomes, preview, an intentional visible failure
+missing-art no-op, reliable/weak/tied/missing genre outcomes, direct single-request execution, an intentional visible failure
 and retry, persistent success with Import-to-Close transition, database registration, exact artwork
 bytes, and unchanged file paths. It also covers As-Is import, guarded dirty backdrop/Escape
 closure, busy close lockout, focus restoration, empty and restored session storage, dark-mode
 persistence, fresh-inventory candidate gating, unexpected browser console/network errors,
-screenshots, and a SHA256 evidence manifest. Unit/API coverage also verifies both destinations together.
+desktop/narrow changed-track screenshots (including a trailing featured-artist title change), and a SHA256 evidence manifest. Unit/API coverage also verifies both destinations together.
 
 To validate an exact local image with isolated mounts, use:
 

@@ -234,24 +234,6 @@
     .review-footer-group { display:flex; flex-wrap:wrap; gap:.5rem; }
     .review-footer button { margin:0; padding:.55rem .8rem; }
     .browser-actions .approve-button { min-width:6.5rem; font-weight:750; }
-    .import-preview[hidden] { display:none; }
-    .import-preview { display:grid; gap:.7rem; margin-top:.7rem; }
-    .import-preview-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.45rem; margin:0; }
-    .import-preview-metric { min-width:0; padding:.55rem .65rem; border:1px solid var(--modal-border); border-radius:.35rem; background:var(--modal-subtle); }
-    .import-preview-metric dt { color:var(--muted); font-size:.67rem; font-weight:750; letter-spacing:.03em; line-height:1.2; text-transform:uppercase; }
-    .import-preview-metric dd { margin:.12rem 0 0; font-size:1.05rem; font-weight:750; }
-    .import-preview-empty { margin:0; color:var(--muted); font-size:.82rem; }
-    .import-change-list { display:grid; gap:.55rem; }
-    .import-change-list h4 { margin:.05rem 0 0; font-size:.82rem; }
-    .import-change-group { min-width:0; overflow:hidden; border:1px solid var(--modal-border); border-radius:.35rem; background:var(--modal-panel); }
-    .import-change-header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.35rem .75rem; align-items:center; padding:.55rem .65rem; }
-    .import-change-field { margin:0; font-size:.8rem; }
-    .import-change-count { grid-column:2; grid-row:1 / span 2; color:var(--muted); font-size:.75rem; font-weight:700; white-space:nowrap; }
-    .import-change-values { min-width:0; margin:0; overflow-wrap:anywhere; font-size:.8rem; }
-    .import-change-details { border-top:1px solid var(--modal-border); }
-    .import-change-details summary { padding:.48rem .65rem; color:var(--modal-accent); cursor:pointer; font-size:.75rem; font-weight:700; }
-    .import-change-paths { display:grid; gap:.28rem; margin:0; padding:.05rem .65rem .6rem 1.75rem; }
-    .import-change-path { min-width:0; overflow-wrap:anywhere; font:.72rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
     @media (max-width: 760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
       .content,body.sidebar-collapsed .content { margin-left:0; }
@@ -282,9 +264,6 @@
       .candidate-detail { grid-template-columns:minmax(0,1fr); padding-left:.75rem; }
       .candidate-facts,.candidate-detail > .candidate-facts:first-child { grid-column:1; grid-template-columns:minmax(0,1fr); }
       .track-comparison-table { min-width:640px; }
-      .import-preview-summary { grid-template-columns:minmax(0,1fr); }
-      .import-change-header { grid-template-columns:minmax(0,1fr); }
-      .import-change-count { grid-column:1; grid-row:auto; }
       .review-footer { align-items:stretch; flex-direction:column-reverse; }
       .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
       .review-footer button { width:100%; }
@@ -421,7 +400,7 @@
         <button type="button" class="browser-close" id="library-import-modal-close-icon" aria-label="Close review">&times;</button>
       </header>
       <div class="browser-body">
-        <p id="library-import-modal-description" class="visually-hidden">Review and choose one metadata match for this album. This decision does not change music files.</p>
+        <p id="library-import-modal-description" class="visually-hidden">Review and choose one metadata match for this album. Import validates the current files, then applies the selected metadata in place.</p>
         <section id="library-import-duplicate-warning" class="album-modal-section duplicate-warning" role="alert" aria-labelledby="duplicate-warning-title" hidden>
           <h3 id="duplicate-warning-title">This album may already be managed</h3>
           <p id="library-import-duplicate-message"></p>
@@ -453,9 +432,8 @@
           <small>Merge and replace require one unambiguous recording-ID match and a current, path-safe inventory snapshot. Cratekeep stops on missing or ambiguous identity instead of guessing.</small>
         </section>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
-        <section class="album-modal-section" aria-label="Import preview">
-          <p>Review exact registrations and tag changes before applying them. Files are never moved or copied.</p>
-          <div id="library-import-preview" class="import-preview" hidden></div>
+        <section class="album-modal-section" aria-label="Import action">
+          <p>The candidate details and track changes above are the review. Import validates the current files, then registers them and applies approved tags in place. Files are never moved or copied.</p>
           <p id="library-import-execution-result" class="operation-status" role="status" aria-live="polite"></p>
         </section>
       </div>
@@ -476,7 +454,7 @@
         <button type="button" class="browser-close" id="track-comparison-close-icon" aria-label="Close track comparison">&times;</button>
       </header>
       <div class="browser-body">
-        <p id="track-comparison-description">Local track metadata compared with the proposed MusicBrainz release.</p>
+        <p id="track-comparison-description">Only changed or unpaired tracks are shown, with local metadata compared with the proposed MusicBrainz release.</p>
         <div class="track-table-wrap">
           <table class="track-comparison-table">
             <thead><tr><th scope="col">Position</th><th scope="col">Local title</th><th scope="col">MusicBrainz title</th><th scope="col">Local duration</th><th scope="col">Proposed duration</th></tr></thead>
@@ -710,7 +688,7 @@
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
     let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null, trackComparisonReturnFocus = null;
-    let reviewOpeningState = '', reviewPreviewReady = false, reviewSucceeded = false;
+    let reviewOpeningState = '', reviewSucceeded = false;
     const selectedAlbumIds = new Set();
     let reviewSequence = [];
     const reviewAlbumLimit = 25;
@@ -991,121 +969,12 @@
       reviewDialog.inert = true; reviewDialog.setAttribute('aria-hidden', 'true');
     }
 
-    function comparePreviewText(left, right) {
-      return left < right ? -1 : (left > right ? 1 : 0);
-    }
-
-    function serializedPreviewValue(value) {
-      const serialized = JSON.stringify(value == null ? null : value);
-      return serialized === undefined ? JSON.stringify(String(value)) : serialized;
-    }
-
-    function previewDisplayValue(value) {
-      if (value == null || value === '') return 'Not provided';
-      if (typeof value === 'string') return value;
-      const serialized = JSON.stringify(value);
-      return serialized === undefined ? String(value) : serialized;
-    }
-
-    function previewFieldLabel(field) {
-      const labels = {
-        album:'Album', albumartist:'Album artist', albumtype:'Release type', artist:'Artist', country:'Country',
-        day:'Day', disc:'Disc', disctotal:'Disc total', genre:'Genre', mb_albumid:'MusicBrainz album ID',
-        mb_releasegroupid:'MusicBrainz release group ID', mb_trackid:'MusicBrainz recording ID', media:'Media',
-        month:'Month', title:'Title', track:'Track', tracktotal:'Track total', year:'Year',
-      };
-      return labels[field] || String(field).split('_').filter(Boolean)
-        .map((part, index) => index ? part.toLowerCase() : `${part.charAt(0).toUpperCase()}${part.slice(1).toLowerCase()}`)
-        .join(' ');
-    }
-
-    function groupImportPreviewChanges(items) {
-      const grouped = new Map();
-      (Array.isArray(items) ? items : []).forEach((item, itemIndex) => {
-        const changes = item?.changes && typeof item.changes === 'object' ? item.changes : {};
-        Object.keys(changes).forEach(field => {
-          const change = changes[field] && typeof changes[field] === 'object' ? changes[field] : {};
-          const fromKey = serializedPreviewValue(change.from);
-          const toKey = serializedPreviewValue(change.to);
-          const key = JSON.stringify([field, fromKey, toKey]);
-          if (!grouped.has(key)) grouped.set(key, {
-            field, label:previewFieldLabel(field), from:previewDisplayValue(change.from),
-            to:previewDisplayValue(change.to), fromKey, toKey, paths:[], firstIndex:itemIndex,
-          });
-          grouped.get(key).paths.push(String(item.path || 'Unnamed track'));
-        });
-      });
-      return [...grouped.values()].sort((left, right) =>
-        comparePreviewText(left.field, right.field)
-        || comparePreviewText(left.fromKey, right.fromKey)
-        || comparePreviewText(left.toKey, right.toKey)
-        || left.firstIndex - right.firstIndex
-      ).map(group => ({...group, paths:group.paths.sort(comparePreviewText)}));
-    }
-
-    function renderImportPreview(data) {
-      const preview = document.getElementById('library-import-preview');
-      const summary = document.createElement('dl'); summary.className = 'import-preview-summary';
-      [
-        ['Files checked', data.files ?? 0],
-        ['Registrations', data.registered ?? 0],
-        ['Metadata updates', data.metadata_updates ?? 0],
-      ].forEach(([label, value]) => {
-        const metric = document.createElement('div'); metric.className = 'import-preview-metric';
-        const term = document.createElement('dt'); term.textContent = label;
-        const amount = document.createElement('dd'); amount.textContent = String(value);
-        metric.append(term, amount); summary.append(metric);
-      });
-      const groups = groupImportPreviewChanges(data.items);
-      const contents = [summary];
-      if (groups.length) {
-        const changes = document.createElement('section'); changes.className = 'import-change-list';
-        changes.setAttribute('aria-labelledby', 'library-import-changes-title');
-        const title = document.createElement('h4'); title.id = 'library-import-changes-title'; title.textContent = 'Metadata changes';
-        changes.append(title, ...groups.map(group => {
-          const card = document.createElement('article'); card.className = 'import-change-group';
-          const header = document.createElement('div'); header.className = 'import-change-header';
-          const field = document.createElement('h5'); field.className = 'import-change-field'; field.textContent = group.label;
-          const count = document.createElement('span'); count.className = 'import-change-count';
-          count.textContent = `${group.paths.length} ${group.paths.length === 1 ? 'track' : 'tracks'}`;
-          const values = document.createElement('p'); values.className = 'import-change-values';
-          values.setAttribute('aria-label', `${group.from} changed to ${group.to}`);
-          const oldValue = document.createElement('span'); oldValue.className = 'metadata-old'; oldValue.textContent = group.from;
-          const arrow = document.createElement('span'); arrow.className = 'metadata-arrow'; arrow.setAttribute('aria-hidden', 'true'); arrow.textContent = '→';
-          const newValue = document.createElement('span'); newValue.className = 'metadata-new'; newValue.textContent = group.to;
-          values.append(oldValue, arrow, newValue); header.append(field, count, values);
-          const details = document.createElement('details'); details.className = 'import-change-details';
-          const disclosure = document.createElement('summary');
-          disclosure.textContent = `Show ${group.paths.length} affected ${group.paths.length === 1 ? 'track' : 'tracks'}`;
-          const paths = document.createElement('ul'); paths.className = 'import-change-paths';
-          paths.append(...group.paths.map(path => {
-            const entry = document.createElement('li'); entry.className = 'import-change-path'; entry.textContent = path; entry.title = path;
-            return entry;
-          }));
-          details.append(disclosure, paths); card.append(header, details); return card;
-        }));
-        contents.push(changes);
-      } else {
-        const empty = document.createElement('p'); empty.className = 'import-preview-empty';
-        empty.textContent = Number(data.files || 0) === 0
-          ? 'No files were checked. Nothing is ready to import.'
-          : (Number(data.metadata_updates || 0) === 0
-            ? 'No metadata changes are needed.'
-            : 'No itemized metadata changes were returned.');
-        contents.push(empty);
-      }
-      preview.replaceChildren(...contents); preview.hidden = false;
-    }
-
-    function resetImportPreview() {
-      const preview = document.getElementById('library-import-preview');
+    function resetImportAction() {
       const importButton = document.getElementById('library-import-in-place');
-      preview.hidden = true; preview.replaceChildren();
       importButton.textContent = 'Import'; importButton.disabled = false;
       const result = document.getElementById('library-import-execution-result');
       result.dataset.busy = 'false';
-      result.textContent = 'Choose metadata, then preview the in-place import. Files will remain at their current paths.';
-      reviewPreviewReady = false;
+      result.textContent = 'Choose metadata, then import in place. The server validates every file before writing.';
     }
 
     function renderAlbumMatch() {
@@ -1260,7 +1129,7 @@
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
           {kind:'genre', label:'Genre', value:genreEvidence, changed:!value.is_as_is && Boolean(value.genre) && metadataChanged(current.genre, value.genre)},
           {kind:'year', label:'Release Year', value:year.value, changed:year.changed, localYear:year.localYear, proposedYear:year.proposedYear, comparison:year.changed},
-          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'All tracks matched', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks, expandable:!value.is_as_is},
+          {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'All tracks matched', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks:trackChanges, expandable:!value.is_as_is},
           {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
           {kind:'region', label:'Release Region', value:value.country || (value.is_as_is ? 'Not present in current metadata' : 'Region not provided'), changed:!value.is_as_is && Boolean(current.country) && metadataChanged(current.country, value.country)},
           {kind:'local', label:'Local tracks found online', value:value.is_as_is ? 'Not applicable — As Is' : (unmatchedLocal === 0 ? `All ${localTrackCount} local tracks found online` : `${unmatchedLocal} local ${unmatchedLocal === 1 ? 'track was' : 'tracks were'} not found online`), changed:unmatchedLocal > 0},
@@ -1291,7 +1160,7 @@
         summary.setAttribute('aria-label', `Option ${index + 1}: ${name.textContent}. ${recommendation.textContent}. ${selected ? 'Selected' : 'Select'}. ${optionFacts.map(fact => `${fact.label}: ${fact.value}`).join('. ')}. Toggle details.`);
         summary.append(marker, name, recommendation, signals, toggle);
         summary.addEventListener('click', () => {
-          if (!selected) { activeCandidateId = value.id; resetImportPreview(); renderAlbumMatch(); candidates.querySelector('[aria-checked="true"]')?.focus(); }
+          if (!selected) { activeCandidateId = value.id; resetImportAction(); renderAlbumMatch(); candidates.querySelector('[aria-checked="true"]')?.focus(); }
         });
         summary.addEventListener('keydown', event => {
           if (!['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
@@ -1299,7 +1168,7 @@
           const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
             : (index + (['ArrowDown', 'ArrowRight'].includes(event.key) ? 1 : -1) + options.length) % options.length;
           activeCandidateId = options[nextIndex].id;
-          resetImportPreview();
+          resetImportAction();
           renderAlbumMatch();
           candidates.querySelector('[aria-checked="true"]')?.focus();
         });
@@ -1345,14 +1214,12 @@
       const message = document.getElementById('library-import-modal-message');
       message.dataset.busy = 'false'; message.textContent = '';
       const executionResult = document.getElementById('library-import-execution-result');
-      const importPreview = document.getElementById('library-import-preview');
-      importPreview.hidden = true; importPreview.replaceChildren();
       const importButton = document.getElementById('library-import-in-place');
       importButton.disabled = album.execution_status === 'complete'; importButton.textContent = 'Import';
-      reviewSucceeded = album.execution_status === 'complete'; reviewPreviewReady = false;
+      reviewSucceeded = album.execution_status === 'complete';
       executionResult.textContent = album.execution_status === 'complete'
         ? 'This album has already been imported.'
-        : 'Choose metadata, then preview the in-place import. Files will remain at their current paths.';
+        : 'Choose metadata, then import in place. The server validates every file before writing.';
       document.getElementById('library-import-mbid').value = '';
       document.getElementById('library-import-duplicate-action').value = album.duplicate_action || '';
       document.getElementById('library-import-modal-close').hidden = false;
@@ -1366,7 +1233,7 @@
     function reviewState() {
       return JSON.stringify({candidate:activeCandidateId,
         duplicate:document.getElementById('library-import-duplicate-action').value,
-        rematch:document.getElementById('library-import-mbid').value, preview:reviewPreviewReady});
+        rematch:document.getElementById('library-import-mbid').value});
     }
 
     function reviewBusy() {
@@ -1446,7 +1313,7 @@
           decisionButtons.forEach(action => { action.disabled = false; action.setAttribute('aria-busy', 'false'); });
         }
       }));
-      async function previewSelectedAlbum(button) {
+      async function importSelectedAlbum(button) {
         const result = document.getElementById('library-import-execution-result');
         const selected = activeAlbum.candidates.find(candidate => candidate.id === activeCandidateId);
         const preflight = selected?.duplicate_preflight || activeAlbum.duplicate_preflight || {status:'clear'};
@@ -1460,39 +1327,13 @@
           return;
         }
         button.disabled = true;
-        document.getElementById('library-import-preview').hidden = true;
         button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
-        result.textContent = 'Checking files and preparing an in-place preview…';
+        result.textContent = 'Validating files, registering them, and applying approved metadata in place…';
         try {
           const payload = {candidate_id: activeCandidateId === 'as-is' ? null : activeCandidateId};
           if (duplicateAction) payload.duplicate_action = duplicateAction;
-          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/preview`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
-          });
-          const data = await readApiResponse(response, 'Unable to preview this import');
-          result.dataset.busy = 'false';
-          renderImportPreview(data);
-          result.textContent = 'Preview ready. Review the summary before confirming.';
-          reviewPreviewReady = true;
-          button.textContent = 'Confirm import';
-        } catch (error) {
-          result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to preview this import.';
-          reviewPreviewReady = false;
-          button.textContent = 'Import';
-        } finally {
-          button.setAttribute('aria-busy', 'false');
-          button.disabled = false;
-          button.focus();
-        }
-      }
-      async function applyPreviewedAlbum(button) {
-        const result = document.getElementById('library-import-execution-result');
-        button.disabled = true;
-        button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
-        result.textContent = 'Registering files and applying approved metadata in place…';
-        try {
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/execute`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
           });
           const data = await readApiResponse(response, 'Unable to import this album');
           result.dataset.busy = 'false';
@@ -1500,23 +1341,22 @@
           result.textContent = `${data.files} files imported in place; no files were moved or copied.${artMessage}`;
           selectedAlbumIds.delete(activeAlbum.id);
           await loadReviewItems();
-          reviewSucceeded = true; reviewPreviewReady = false;
+          reviewSucceeded = true;
           document.getElementById('library-import-modal-close').hidden = true;
           button.textContent = 'Close'; button.disabled = false; button.focus();
         } catch (error) {
           result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to import this album.';
-          button.textContent = 'Confirm import'; button.disabled = false;
+          button.textContent = 'Import'; button.disabled = false;
         } finally {
           button.setAttribute('aria-busy', 'false');
         }
       }
       document.getElementById('library-import-in-place').addEventListener('click', event => {
         if (reviewSucceeded) closeReview();
-        else if (reviewPreviewReady) applyPreviewedAlbum(event.currentTarget);
-        else previewSelectedAlbum(event.currentTarget);
+        else importSelectedAlbum(event.currentTarget);
       });
-      document.getElementById('library-import-duplicate-action').addEventListener('change', resetImportPreview);
-      document.getElementById('library-import-mbid').addEventListener('input', resetImportPreview);
+      document.getElementById('library-import-duplicate-action').addEventListener('change', resetImportAction);
+      document.getElementById('library-import-mbid').addEventListener('input', resetImportAction);
       document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
         event.preventDefault();
         const input = document.getElementById('library-import-mbid');
@@ -1545,7 +1385,7 @@
             throw new Error(fallback || data.error || `Unable to rematch this album (HTTP ${response.status}).`);
           }
           activeAlbum = data; activeCandidateId = data.selected_candidate_id; input.value = '';
-          resetImportPreview();
+          resetImportAction();
           const index = albumReviews.findIndex(album => album.id === data.id);
           if (index >= 0) albumReviews[index] = data;
           renderAlbumMatch(); message.textContent = 'MusicBrainz release selected by ID. Confidence remains based on metadata evidence. No files were changed.';
