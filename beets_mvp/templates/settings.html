@@ -475,6 +475,26 @@
 </main>
 {% if not first_run %}</div>{% endif %}
   <script>
+    async function readApiResponse(response, fallbackMessage, {acceptedStatuses = [], deferHttpError = false} = {}) {
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      const body = await response.text();
+      let data;
+      try {
+        data = body ? JSON.parse(body) : {};
+      } catch (_) {
+        const status = response.status ? `HTTP ${response.status}` : 'an unknown HTTP status';
+        const kind = contentType.includes('html') || /^\s*</.test(body) ? 'HTML' : 'a non-JSON response';
+        throw new Error(`${fallbackMessage} (${status}). The server returned ${kind}; check the proxy route and application logs.`);
+      }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error(`${fallbackMessage} (HTTP ${response.status}). The server returned an invalid JSON payload.`);
+      }
+      if (!response.ok && !acceptedStatuses.includes(response.status) && !deferHttpError) {
+        throw new Error(data.error || data.description || `${fallbackMessage} (HTTP ${response.status}).`);
+      }
+      return data;
+    }
+
     const browser = document.getElementById('browser');
     const dialog = browser.querySelector('.browser-dialog');
     const browserPath = document.getElementById('browser-path');
@@ -593,9 +613,8 @@
         const response = await fetch('/api/browse?path=' + encodeURIComponent(path));
         if (!response.ok) {
           if (path && allowFallback) return loadDirectory('', false);
-          throw new Error('No mounted directories are available inside the container.');
         }
-        const data = await response.json();
+        const data = await readApiResponse(response, 'Unable to load mounted directories');
         currentPath = data.path;
         parentPath = data.parent;
         directoryEntries = data.entries;
@@ -876,8 +895,7 @@
         reviewStatus.dataset.busy = 'true';
         reviewStatus.textContent = 'Loading inventory review rows…';
         const response = await fetch(`/api/library-import/reviews?limit=${reviewArtistLimit}&offset=${offset}`);
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || data.description || 'Unable to load review items.');
+        const data = await readApiResponse(response, 'Unable to load review items');
         reviewItems = data.items;
         reviewGroups = data.groups;
         albumReviews = data.albums || [];
@@ -1163,7 +1181,11 @@
           artwork.src = value.artwork_url; artwork.alt = `Cover Art Archive front artwork for ${value.album}`; body.append(artwork);
         } else {
           const missingArtwork = document.createElement('span'); missingArtwork.className = 'candidate-artwork-missing';
-          missingArtwork.textContent = value.is_as_is ? 'Current artwork unchanged' : 'No candidate artwork available'; body.append(missingArtwork);
+          missingArtwork.textContent = value.is_as_is ? 'Current artwork unchanged'
+            : (value.artwork?.status === 'lookup-error'
+              ? 'Artwork lookup unavailable — candidate metadata is still usable'
+              : 'No candidate artwork available');
+          body.append(missingArtwork);
         }
         const facts = document.createElement('dl'); facts.className = 'candidate-facts';
         optionFacts.forEach(fact => {
@@ -1279,8 +1301,7 @@
             method: 'PATCH', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload),
           });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || data.description || 'Unable to save review decision.');
+          const data = await readApiResponse(response, 'Unable to save review decision');
           selectedAlbumIds.delete(activeAlbum.id);
           const nextId = reviewSequence.shift();
           await loadReviewItems();
@@ -1323,8 +1344,7 @@
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/preview`, {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
           });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || data.description || 'Unable to preview this import.');
+          const data = await readApiResponse(response, 'Unable to preview this import');
           result.dataset.busy = 'false';
           const genreChanges = data.items?.filter(item => item.changes?.genre)
             .map(item => `${item.path}: ${item.changes.genre.from || 'Not provided'} → ${item.changes.genre.to}`) || [];
@@ -1351,8 +1371,7 @@
           const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/execute`, {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
           });
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || data.description || 'Unable to import this album.');
+          const data = await readApiResponse(response, 'Unable to import this album');
           result.dataset.busy = 'false';
           const artMessage = data.artwork?.message ? ` ${data.artwork.message}` : '';
           result.textContent = `${data.files} files imported in place; no files were moved or copied.${artMessage}`;
@@ -1388,8 +1407,7 @@
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({musicbrainz_id: input.value}),
           });
-          let data = {};
-          try { data = await response.json(); } catch (_) { /* Use the status-aware fallback below. */ }
+          const data = await readApiResponse(response, 'Unable to rematch this album', {deferHttpError: true});
           if (!response.ok) {
             const fallback = {
               invalid_musicbrainz_id: 'Enter a canonical MusicBrainz release UUID.',
@@ -1422,8 +1440,7 @@
       setOperationBusy(inventoryButton, inventoryStatus, true, 'Scanning source folders, file names, and stats…');
       try {
         const response = await fetch('/api/library/inventory/preview', { method: 'POST' });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || data.description || 'Inventory preview failed.');
+        const data = await readApiResponse(response, 'Inventory preview failed');
         latestInventoryPreview = data;
         renderInventoryPreview(data);
         persistInventoryPreview();
@@ -1443,8 +1460,7 @@
         const response = await fetch('/api/library-import/candidates', {
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({limit: 25}),
         });
-        const data = await response.json();
-        if (!response.ok && response.status !== 207) throw new Error(data.error || 'Candidate generation failed.');
+        const data = await readApiResponse(response, 'Candidate generation failed', {acceptedStatuses: [207]});
         await loadReviewItems();
         if (data.errors?.length) reviewStatus.textContent += ` ${data.errors.length} album lookup(s) can be retried.`;
       } catch (error) {

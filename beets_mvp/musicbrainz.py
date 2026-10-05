@@ -68,6 +68,7 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
         releases = detailed
     release_groups: dict[str, dict] = {}
     results = []
+    artwork_documents: dict[tuple[str, str], dict | ProviderError] = {}
     for release in releases:
         result = _normalize_release(release, exact=bool(musicbrainz_id))
         if not result["provider_id"]:
@@ -80,7 +81,9 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
                     f"https://musicbrainz.org/ws/2/release-group/{urllib.parse.quote(group_id)}?{params}", timeout
                 )
             result.update(_genre_evidence(release_groups[group_id].get("genres")))
-        result["artwork"] = _cover_art_evidence(result["provider_id"], group_id, timeout)
+        result["artwork"] = _cover_art_evidence(
+            result["provider_id"], group_id, timeout, cache=artwork_documents
+        )
         results.append(result)
     return results
 
@@ -97,38 +100,51 @@ def _request_json(url: str, timeout: int) -> dict:
         url,
         headers={"Accept": "application/json", "User-Agent": "Cratekeep/0.1 (https://github.com/kylejschultz/cratekeep)"},
     )
+    hostname = (urllib.parse.urlparse(url).hostname or "").lower()
+    provider = "Cover Art Archive" if hostname == "coverartarchive.org" else "MusicBrainz"
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read(512 * 1024)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise ProviderError(
-                "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
-                code="release_not_found",
+                ("No Cover Art Archive record exists for this identity"
+                 if provider == "Cover Art Archive" else
+                 "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID."),
+                code="artwork_not_found" if provider == "Cover Art Archive" else "release_not_found",
                 upstream_status=exc.code,
             ) from exc
         if exc.code == 429:
             raise ProviderError(
-                "MusicBrainz rate limit reached; try again later",
+                f"{provider} rate limit reached; try again later",
                 retryable=True,
-                code="provider_http_error",
+                code="artwork_http_error" if provider == "Cover Art Archive" else "provider_http_error",
                 upstream_status=exc.code,
             ) from exc
         raise ProviderError(
-            f"MusicBrainz returned HTTP {exc.code}",
+            f"{provider} returned HTTP {exc.code}",
             retryable=exc.code >= 500,
-            code="provider_http_error",
+            code="artwork_http_error" if provider == "Cover Art Archive" else "provider_http_error",
             upstream_status=exc.code,
         ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise ProviderError("MusicBrainz could not be reached", retryable=True, code="provider_unavailable") from exc
+        raise ProviderError(
+            f"{provider} could not be reached", retryable=True,
+            code="artwork_unavailable" if provider == "Cover Art Archive" else "provider_unavailable",
+        ) from exc
     try:
         document = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProviderError("MusicBrainz returned an invalid response", code="provider_invalid_response") from exc
+        raise ProviderError(
+            f"{provider} returned an invalid response",
+            code="artwork_invalid_response" if provider == "Cover Art Archive" else "provider_invalid_response",
+        ) from exc
 
     if not isinstance(document, dict):
-        raise ProviderError("MusicBrainz returned an invalid response", code="provider_invalid_response")
+        raise ProviderError(
+            f"{provider} returned an invalid response",
+            code="artwork_invalid_response" if provider == "Cover Art Archive" else "provider_invalid_response",
+        )
     return document
 
 
@@ -200,19 +216,40 @@ def _genre_evidence(genres: object) -> dict:
     }
 
 
-def _cover_art_evidence(release_id: str, release_group_id: str | None, timeout: int) -> dict | None:
-    """Persist only provider-derived CAA identity and a bounded browser thumbnail."""
+def _cover_art_evidence(
+    release_id: str,
+    release_group_id: str | None,
+    timeout: int,
+    *,
+    cache: dict[tuple[str, str], dict | ProviderError] | None = None,
+) -> dict:
+    """Return bounded CAA evidence without making optional art fatal to metadata."""
+    attempts = []
     for entity, mbid in (("release", release_id), ("release-group", release_group_id)):
         if not mbid:
             continue
+        key = (entity, mbid)
         try:
-            document = _request_json(f"{CAA_BASE}/{entity}/{urllib.parse.quote(mbid)}/", timeout)
+            if cache is not None and key in cache:
+                document = cache[key]
+                if isinstance(document, ProviderError):
+                    raise document
+            else:
+                document = _request_json(f"{CAA_BASE}/{entity}/{urllib.parse.quote(mbid)}/", timeout)
+            if cache is not None and key not in cache:
+                cache[key] = document
         except ProviderError as exc:
-            if exc.code == "release_not_found":
-                continue
-            raise
+            if cache is not None:
+                cache[key] = exc
+            attempts.append({
+                "entity": entity, "mbid": mbid,
+                "status": "missing" if exc.code == "artwork_not_found" else "lookup-error",
+                "code": exc.code, "upstream_status": exc.upstream_status,
+                "retryable": exc.retryable,
+            })
+            continue
         images = document.get("images") if isinstance(document, dict) else None
-        front = next((image for image in images or [] if isinstance(image, dict) and image.get("front") is True), None)
+        front = next((image for image in images or [] if _is_front_image(image)), None)
         if front:
             thumbnails = front.get("thumbnails") if isinstance(front.get("thumbnails"), dict) else {}
             thumbnail = thumbnails.get("250") or thumbnails.get("small")
@@ -222,8 +259,30 @@ def _cover_art_evidence(release_id: str, release_group_id: str | None, timeout: 
                 "entity": entity,
                 "mbid": mbid,
                 "thumbnail_url": thumbnail if _trusted_caa_url(thumbnail) else f"{CAA_BASE}/{entity}/{mbid}/front-250",
+                "status": "available",
+                "attempts": attempts + [{"entity": entity, "mbid": mbid, "status": "available"}],
             }
-    return None
+        attempts.append({"entity": entity, "mbid": mbid, "status": "missing"})
+    had_error = any(attempt["status"] == "lookup-error" for attempt in attempts)
+    return {
+        "available": False,
+        "source": "cover-art-archive",
+        "status": "lookup-error" if had_error else "missing",
+        "message": ("Artwork lookup was temporarily unavailable; metadata is still usable."
+                    if had_error else "No front artwork is available from Cover Art Archive."),
+        "attempts": attempts,
+    }
+
+
+def _is_front_image(image: object) -> bool:
+    """CAA normally supplies both fields; accept either explicit front marker."""
+    if not isinstance(image, dict):
+        return False
+    types = image.get("types")
+    typed_front = isinstance(types, list) and any(
+        isinstance(value, str) and value.casefold() == "front" for value in types
+    )
+    return image.get("front") is True or typed_front
 
 
 def _trusted_caa_url(value: object) -> bool:

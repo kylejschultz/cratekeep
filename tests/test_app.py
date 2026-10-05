@@ -14,7 +14,7 @@ from PIL import Image as PillowImage
 
 from beets_mvp import (
     LibraryImportExecutionError, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
-    _group_library_import_review_items, _SafeArtworkRedirect, create_app,
+    _group_library_import_review_items, _init_db, _SafeArtworkRedirect, create_app,
 )
 from beets_mvp.musicbrainz import ProviderError, _cover_art_evidence, _genre_evidence, search_releases
 from beets_mvp.matching import score_release
@@ -1124,6 +1124,93 @@ def test_caa_exact_release_precedes_release_group_and_missing_falls_back(monkeyp
     evidence = _cover_art_evidence("release-id", "group-id", 10)
     assert calls == list(responses)
     assert evidence["entity"] == "release-group" and evidence["mbid"] == "group-id"
+
+
+@pytest.mark.parametrize("failure, expected_status", [
+    (ProviderError("missing", code="artwork_not_found", upstream_status=404), "missing"),
+    (ProviderError("bad HTML", code="artwork_invalid_response", retryable=True), "lookup-error"),
+    (ProviderError("temporary", code="artwork_http_error", retryable=True, upstream_status=503), "lookup-error"),
+])
+def test_caa_absence_and_failures_are_bounded_optional_evidence(monkeypatch, failure, expected_status):
+    monkeypatch.setattr("beets_mvp.musicbrainz._request_json", lambda url, timeout: (_ for _ in ()).throw(failure))
+
+    evidence = _cover_art_evidence("release-id", "group-id", 10)
+
+    assert evidence["available"] is False
+    assert evidence["status"] == expected_status
+    assert [attempt["entity"] for attempt in evidence["attempts"]] == ["release", "release-group"]
+    assert all(len(attempt["mbid"]) <= len("release-id") for attempt in evidence["attempts"])
+
+
+def test_caa_front_types_fallback_and_shared_group_cache(monkeypatch):
+    calls = []
+
+    def fake_request(url, timeout):
+        calls.append(url)
+        if "/release/" in url:
+            raise ProviderError("missing", code="artwork_not_found", upstream_status=404)
+        return {"images": [{
+            "front": False, "types": ["Front"],
+            "thumbnails": {"small": "https://ia800.example.archive.org/items/example/cover.jpg"},
+        }]}
+
+    monkeypatch.setattr("beets_mvp.musicbrainz._request_json", fake_request)
+    cache = {}
+    first = _cover_art_evidence("release-1", "shared-group", 10, cache=cache)
+    second = _cover_art_evidence("release-2", "shared-group", 10, cache=cache)
+
+    assert first["entity"] == second["entity"] == "release-group"
+    assert first["thumbnail_url"].startswith("https://ia800.example.archive.org/")
+    assert calls.count("https://coverartarchive.org/release-group/shared-group/") == 1
+
+
+def test_caa_cache_reuses_empty_documents_and_errors(monkeypatch):
+    calls = []
+
+    def unexpected_request(url, timeout):
+        calls.append(url)
+        raise AssertionError("cached CAA evidence must not be fetched again")
+
+    monkeypatch.setattr("beets_mvp.musicbrainz._request_json", unexpected_request)
+    cached_error = ProviderError("temporary", code="artwork_http_error", retryable=True, upstream_status=503)
+    cache = {("release", "empty-release"): {}, ("release-group", "error-group"): cached_error}
+
+    evidence = _cover_art_evidence("empty-release", "error-group", 10, cache=cache)
+
+    assert calls == []
+    assert evidence["available"] is False
+    assert evidence["status"] == "lookup-error"
+    assert evidence["attempts"] == [
+        {"entity": "release", "mbid": "empty-release", "status": "missing"},
+        {"entity": "release-group", "mbid": "error-group", "status": "lookup-error",
+         "code": "artwork_http_error", "upstream_status": 503, "retryable": True},
+    ]
+
+
+def test_caa_invalid_html_response_does_not_discard_valid_musicbrainz_candidate(monkeypatch):
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, size): return self.payload
+
+    def urlopen(request, timeout):
+        if "coverartarchive.org" in request.full_url:
+            return Response(b"<!DOCTYPE html><title>temporary proxy error</title>")
+        if "musicbrainz.org/ws/2/release-group/" in request.full_url:
+            return Response(b'{"genres":[]}')
+        return Response(
+            b'{"id":"release-id","title":"Album","release-group":{"id":"group-id"},'
+            b'"artist-credit":[{"name":"Artist"}],"media":[]}'
+        )
+
+    monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", urlopen)
+    candidate = search_releases({"musicbrainz_id": "release-id"}, limit=1)[0]
+
+    assert candidate["provider_id"] == "release-id"
+    assert candidate["artwork"]["available"] is False
+    assert candidate["artwork"]["status"] == "lookup-error"
+    assert {attempt["code"] for attempt in candidate["artwork"]["attempts"]} == {"artwork_invalid_response"}
 
 
 def test_artwork_fetch_rejects_untrusted_redirect_and_normalizes_actual_image(monkeypatch):
@@ -2241,6 +2328,112 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     assert b"innerHTML" not in html
 
 
+def test_legacy_candidates_are_marked_stale_then_refreshed_without_losing_decision(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    provider = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": query["artist"], "album": query["album"],
+        "track_count": 1, "artwork": {"available": False, "source": "cover-art-archive", "status": "missing"},
+    }]
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"],
+    })
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        db.execute("UPDATE metadata_candidates SET schema_version = 1")
+
+    restarted = create_app({
+        "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": app.config["STATE_PATH"],
+        "BROWSE_ROOTS": [str(tmp_path)], "MUSICBRAINZ_PROVIDER": provider,
+    })
+    restarted_client = restarted.test_client()
+    stale = restarted_client.get("/api/library-import/reviews").json["albums"][0]
+    assert stale["decision"] == "approved"
+    assert stale["selected_candidate_id"] is not None
+    assert stale["candidate_status"] == "stale"
+    assert "refresh" in stale["candidate_error"].lower()
+
+    assert restarted_client.post("/api/library-import/candidates", json={"limit": 1}).status_code == 201
+    refreshed = restarted_client.get("/api/library-import/reviews").json["albums"][0]
+    assert refreshed["decision"] == "approved"
+    assert refreshed["selected_candidate_id"] == refreshed["candidates"][0]["id"]
+    assert refreshed["candidate_status"] == "complete"
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 2
+
+    restarted.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "different-release", "artist": query["artist"], "album": query["album"],
+    }]
+    selected_id = refreshed["selected_candidate_id"]
+    assert restarted_client.post("/api/library-import/candidates", json={"limit": 1}).status_code == 207
+    preserved = restarted_client.get("/api/library-import/reviews").json["albums"][0]
+    assert preserved["decision"] == "approved"
+    assert preserved["selected_candidate_id"] == selected_id
+    assert preserved["candidates"][0]["provider_id"] == "release-1"
+    assert preserved["candidate_status"] == "stale"
+
+
+def test_candidate_schema_defaults_distinguish_fresh_and_upgraded_databases(tmp_path):
+    fresh_path = tmp_path / "fresh.db"
+    _init_db(str(fresh_path))
+    with sqlite3.connect(fresh_path) as db:
+        fresh_default = next(row[4] for row in db.execute("PRAGMA table_info(metadata_candidates)")
+                             if row[1] == "schema_version")
+    assert fresh_default == "2"
+
+    upgraded_path = tmp_path / "upgraded.db"
+    with sqlite3.connect(upgraded_path) as db:
+        db.execute("""CREATE TABLE album_reviews (
+            id INTEGER PRIMARY KEY, root_path TEXT NOT NULL, artist_key TEXT NOT NULL,
+            album_key TEXT NOT NULL, artist TEXT NOT NULL, album TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', selected_candidate_id INTEGER,
+            candidate_status TEXT NOT NULL DEFAULT 'not-run', candidate_error TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL, execution_status TEXT NOT NULL DEFAULT 'not-run'
+        )""")
+        db.execute("""CREATE TABLE metadata_candidates (
+            id INTEGER PRIMARY KEY, album_review_id INTEGER NOT NULL, provider TEXT NOT NULL,
+            provider_id TEXT NOT NULL, rank INTEGER NOT NULL, confidence REAL NOT NULL,
+            artist TEXT NOT NULL, album TEXT NOT NULL, year TEXT, proposed_diff_json TEXT NOT NULL,
+            provider_data_json TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+        for album_id, execution_status in ((1, "not-run"), (2, "complete")):
+            db.execute(
+                """INSERT INTO album_reviews(
+                       id, root_path, artist_key, album_key, artist, album, state,
+                       selected_candidate_id, candidate_status, updated_at, execution_status
+                   ) VALUES (?, '/library', ?, ?, 'Artist', 'Album', 'approved', ?, 'complete', 'now', ?)""",
+                (album_id, f"artist-{album_id}", f"album-{album_id}", album_id, execution_status),
+            )
+            db.execute(
+                """INSERT INTO metadata_candidates(
+                       id, album_review_id, provider, provider_id, rank, confidence, artist, album,
+                       proposed_diff_json, provider_data_json, created_at
+                   ) VALUES (?, ?, 'musicbrainz', ?, 1, 1.0, 'Artist', 'Album', '{}', '{}', 'now')""",
+                (album_id, album_id, f"release-{album_id}"),
+            )
+
+    _init_db(str(upgraded_path))
+    with sqlite3.connect(upgraded_path) as db:
+        upgraded_default = next(row[4] for row in db.execute("PRAGMA table_info(metadata_candidates)")
+                                if row[1] == "schema_version")
+        rows = db.execute(
+            "SELECT id, state, selected_candidate_id, candidate_status, execution_status FROM album_reviews ORDER BY id"
+        ).fetchall()
+        versions = db.execute("SELECT schema_version FROM metadata_candidates ORDER BY id").fetchall()
+    assert upgraded_default == "1"
+    assert rows == [
+        (1, "approved", 1, "stale", "not-run"),
+        (2, "approved", 2, "complete", "complete"),
+    ]
+    assert versions == [(1,), (1,)]
+
+
 def test_album_modal_actions_remain_workflow_only(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
@@ -2291,7 +2484,7 @@ def test_musicbrainz_candidates_require_successful_preview_in_current_page_sessi
     assert "Run inventory preview in this browser session before finding candidates." in html
     assert html.count("setCandidateAvailability(true);") == 1
     preview_success = html.index("setCandidateAvailability(true);")
-    assert html.index("if (!response.ok) throw new Error", html.index("/api/library/inventory/preview")) < preview_success
+    assert html.index("readApiResponse(response, 'Inventory preview failed'", html.index("/api/library/inventory/preview")) < preview_success
     assert preview_success < html.index("await loadReviewItems(0);")
 
     start = html.index("let inventoryPreviewReady = false;")
@@ -2324,6 +2517,36 @@ console.log(JSON.stringify({{before, after}}));
             "help": "Inventory preview complete. Candidate lookup uses the current inventory.",
         },
     }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_shared_response_reader_preserves_json_errors_and_explains_html(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    start = html.index("async function readApiResponse")
+    end = html.index("const browser =", start)
+    helper = html[start:end]
+    probe = f"""
+{helper}
+const headers = value => ({{get(name) {{ return name === 'content-type' ? value : null; }}}});
+const structured = await readApiResponse({{
+  ok:false, status:409, headers:headers('application/json'), async text() {{ return '{{"error":"inventory is stale"}}'; }}
+}}, 'Unable to preview').catch(error => error.message);
+const htmlError = await readApiResponse({{
+  ok:false, status:502, headers:headers('text/html'), async text() {{ return '<!DOCTYPE html><title>Bad Gateway</title>'; }}
+}}, 'Candidate generation failed').catch(error => error.message);
+console.log(JSON.stringify({{structured, htmlError}}));
+"""
+    completed = subprocess.run(
+        [shutil.which("node"), "--input-type=module", "--eval", probe],
+        check=True, capture_output=True, text=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["structured"] == "inventory is stale"
+    assert result["htmlError"] == (
+        "Candidate generation failed (HTTP 502). The server returned HTML; "
+        "check the proxy route and application logs."
+    )
+    assert "response.json()" not in html
 
 
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):

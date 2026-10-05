@@ -39,6 +39,7 @@ MAX_INVENTORY_SAMPLE = 50
 MAX_LIBRARY_IMPORT_ARTISTS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
+CANDIDATE_SCHEMA_VERSION = 2
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip"}
 MUSICBRAINZ_ID_PATTERN = re.compile(
@@ -559,6 +560,7 @@ def _init_db(path: str) -> None:
             year TEXT,
             proposed_diff_json TEXT NOT NULL,
             provider_data_json TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 2,
             created_at TEXT NOT NULL,
             UNIQUE(album_review_id, provider, provider_id)
         )""")
@@ -567,7 +569,23 @@ def _init_db(path: str) -> None:
         _ensure_column(db, "album_reviews", "last_execution_job_id", "INTEGER")
         _ensure_column(db, "album_reviews", "executed_at", "TEXT")
         _ensure_column(db, "album_reviews", "duplicate_action", "TEXT")
+        _ensure_column(db, "metadata_candidates", "schema_version", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(db, "adoption_reviews", "imported_at", "TEXT")
+        # Pre-artwork candidates remain visible for audit and keep all review
+        # decisions, but are explicitly queued ahead of complete rows for a
+        # bounded refresh on the next candidate-generation run.
+        db.execute(
+            """UPDATE album_reviews
+                  SET candidate_status = 'stale',
+                      candidate_error = 'Candidate evidence predates artwork discovery; refresh candidates.'
+                WHERE execution_status != 'complete'
+                  AND candidate_status = 'complete'
+                  AND EXISTS (
+                      SELECT 1 FROM metadata_candidates
+                       WHERE album_review_id = album_reviews.id AND schema_version < ?
+                  )""",
+            (CANDIDATE_SCHEMA_VERSION,),
+        )
         db.execute(
             """UPDATE adoption_reviews
                   SET imported_at = COALESCE((
@@ -1124,7 +1142,10 @@ def _candidate_album_rows(app: Flask, limit: int) -> list[sqlite3.Row]:
                 WHERE albums.root_path = ?
                   AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
-                ORDER BY albums.artist_key, albums.album_key, albums.id LIMIT ?""",
+                ORDER BY CASE albums.candidate_status
+                           WHEN 'stale' THEN 0 WHEN 'not-run' THEN 1 WHEN 'error' THEN 2 ELSE 3
+                         END,
+                         albums.artist_key, albums.album_key, albums.id LIMIT ?""",
             (root, limit),
         ).fetchall()
 
@@ -1309,16 +1330,17 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
             candidate_id = existing["id"]
             db.execute(
                 """UPDATE metadata_candidates SET rank = ?, confidence = ?, artist = ?, album = ?, year = ?,
-                          proposed_diff_json = ?, provider_data_json = ?, created_at = ? WHERE id = ?""",
-                (*values, candidate_id),
+                          proposed_diff_json = ?, provider_data_json = ?, schema_version = ?, created_at = ?
+                    WHERE id = ?""",
+                (*values[:-1], CANDIDATE_SCHEMA_VERSION, values[-1], candidate_id),
             )
         else:
             candidate_id = db.execute(
                 """INSERT INTO metadata_candidates(
                        album_review_id, provider, provider_id, rank, confidence, artist, album, year,
-                       proposed_diff_json, provider_data_json, created_at
-                   ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (album_review_id, musicbrainz_id, *values),
+                       proposed_diff_json, provider_data_json, schema_version, created_at
+                   ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (album_review_id, musicbrainz_id, *values[:-1], CANDIDATE_SCHEMA_VERSION, values[-1]),
             ).lastrowid
         db.execute(
             """UPDATE album_reviews SET selected_candidate_id = ?, candidate_status = 'complete',
@@ -1350,23 +1372,51 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
             ]
             candidates.sort(key=lambda candidate: (-_candidate_confidence(query, candidate), str(candidate["provider_id"])))
             with _connect(app.config["APP_DB"]) as db:
-                db.execute("UPDATE album_reviews SET selected_candidate_id = NULL WHERE id = ?", (album["id"],))
+                selected = db.execute(
+                    """SELECT candidates.provider, candidates.provider_id
+                         FROM album_reviews AS albums
+                         JOIN metadata_candidates AS candidates ON candidates.id = albums.selected_candidate_id
+                        WHERE albums.id = ?""",
+                    (album["id"],),
+                ).fetchone()
+                if selected is not None and not any(
+                    selected["provider"] == "musicbrainz"
+                    and str(candidate["provider_id"]) == selected["provider_id"]
+                    for candidate in candidates
+                ):
+                    message = "The selected candidate was not returned during refresh; review it before importing."
+                    db.execute(
+                        """UPDATE album_reviews SET candidate_status = 'stale', candidate_error = ?,
+                                  updated_at = ? WHERE id = ?""",
+                        (message, _now(), album["id"]),
+                    )
+                    errors.append({"album_review_id": album["id"], "error": message, "retryable": False})
+                    continue
                 db.execute("DELETE FROM metadata_candidates WHERE album_review_id = ?", (album["id"],))
                 for rank, candidate in enumerate(candidates, 1):
                     db.execute(
                         """INSERT INTO metadata_candidates(
                                album_review_id, provider, provider_id, rank, confidence, artist, album,
-                               year, proposed_diff_json, provider_data_json, created_at
-                           ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               year, proposed_diff_json, provider_data_json, schema_version, created_at
+                           ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (album["id"], str(candidate["provider_id"]), rank, _candidate_confidence(query, candidate),
                          _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
                          str(candidate.get("year")) if candidate.get("year") else None,
                          json.dumps(_candidate_diff(query, candidate), sort_keys=True),
-                         json.dumps(candidate, sort_keys=True), _now()),
+                         json.dumps(candidate, sort_keys=True), CANDIDATE_SCHEMA_VERSION, _now()),
                     )
+                selected_id = None
+                if selected is not None:
+                    refreshed = db.execute(
+                        """SELECT id FROM metadata_candidates
+                            WHERE album_review_id = ? AND provider = ? AND provider_id = ?""",
+                        (album["id"], selected["provider"], selected["provider_id"]),
+                    ).fetchone()
+                    selected_id = refreshed["id"] if refreshed else None
                 db.execute(
-                    "UPDATE album_reviews SET candidate_status = 'complete', candidate_error = '', updated_at = ? WHERE id = ?",
-                    (_now(), album["id"]),
+                    """UPDATE album_reviews SET selected_candidate_id = ?, candidate_status = 'complete',
+                              candidate_error = '', updated_at = ? WHERE id = ?""",
+                    (selected_id, _now(), album["id"]),
                 )
             generated += len(candidates)
         except (ProviderError, OSError, ValueError, TypeError) as exc:
