@@ -386,6 +386,103 @@ def test_rendered_settings_javascript_has_valid_syntax(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_import_preview_groups_repeated_and_mixed_metadata_changes_deterministically(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    start = html.index("function comparePreviewText")
+    end = html.index("function renderImportPreview", start)
+    helpers = html[start:end]
+    probe = r"""
+const repeated = Array.from({length: 17}, (_, index) => ({
+  path: `Artist/Album/${String(17 - index).padStart(2, '0')} Track ${17 - index}.flac`,
+  changes: {genre: {from: 'Hip-Hop', to: 'Southern Hip Hop'}},
+}));
+const mixed = [
+  {path:'z.flac', changes:{genre:{from:'Rock',to:'Pop'}, title:{from:'Old',to:'New'}}},
+  {path:'a.flac', changes:{genre:{from:'Hip-Hop',to:'Southern Hip Hop'}}},
+  {path:'b.flac', changes:{genre:{from:'Rock',to:'Pop'}, artist:{from:null,to:'Artist'}}},
+];
+const simplify = groups => groups.map(({field,label,from,to,paths}) => ({field,label,from,to,paths}));
+console.log(JSON.stringify({
+  repeated:simplify(groupImportPreviewChanges(repeated)),
+  mixed:simplify(groupImportPreviewChanges(mixed)),
+  registrations:simplify(groupImportPreviewChanges([{path:'new.flac',changes:{}}])),
+  empty:simplify(groupImportPreviewChanges([])),
+}));
+"""
+    completed = subprocess.run(["node", "-e", f"{helpers}\n{probe}"], check=True, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+
+    assert result["repeated"] == [{
+        "field": "genre", "label": "Genre", "from": "Hip-Hop", "to": "Southern Hip Hop",
+        "paths": [f"Artist/Album/{index:02d} Track {index}.flac" for index in range(1, 18)],
+    }]
+    assert [(group["field"], group["from"], group["to"], group["paths"]) for group in result["mixed"]] == [
+        ("artist", "Not provided", "Artist", ["b.flac"]),
+        ("genre", "Hip-Hop", "Southern Hip Hop", ["a.flac"]),
+        ("genre", "Rock", "Pop", ["b.flac", "z.flac"]),
+        ("title", "Old", "New", ["z.flac"]),
+    ]
+    assert result["registrations"] == result["empty"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
+def test_import_preview_renderer_keeps_details_collapsed_text_only_and_handles_empty_states(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    start = html.index("function comparePreviewText")
+    end = html.index("function resetImportPreview", start)
+    helpers = html[start:end]
+    probe = r"""
+class Element {
+  constructor(tagName) { this.tagName=tagName; this.children=[]; this.attributes={}; this.hidden=false; this._text=''; }
+  set textContent(value) { this._text=String(value); this.children=[]; }
+  get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this._text=''; this.children=children; }
+  setAttribute(name, value) { this.attributes[name]=String(value); }
+}
+const preview = new Element('div'); preview.hidden=true;
+globalThis.document = {
+  createElement: tagName => new Element(tagName),
+  getElementById: id => id === 'library-import-preview' ? preview : null,
+};
+const find = (root, className) => [root, ...root.children.flatMap(child => find(child, className))]
+  .filter(element => element.className === className);
+const snapshot = () => ({
+  text:preview.textContent,
+  groups:find(preview,'import-change-group').length,
+  details:find(preview,'import-change-details').map(detail => ({open:Boolean(detail.open), text:detail.textContent})),
+  paths:find(preview,'import-change-path').map(path => ({text:path.textContent,title:path.title})),
+});
+const items = Array.from({length:17}, (_, index) => ({
+  path:index === 0 ? 'Artist/<script>alert(1)</script>/a-very-long-track-name-that-must-wrap.flac' : `Artist/Album/${index + 1}.flac`,
+  changes:{genre:{from:'Hip-Hop',to:'Southern Hip Hop'}},
+}));
+renderImportPreview({files:17,registered:17,metadata_updates:17,items});
+const repeated = snapshot();
+renderImportPreview({files:2,registered:2,metadata_updates:0,items:[{path:'one.flac',changes:{}},{path:'two.flac',changes:{}}]});
+const registrations = snapshot();
+renderImportPreview({files:0,registered:0,metadata_updates:0,items:[]});
+const empty = snapshot();
+console.log(JSON.stringify({repeated,registrations,empty}));
+"""
+    completed = subprocess.run(["node", "-e", f"{helpers}\n{probe}"], check=True, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+
+    repeated = result["repeated"]
+    assert repeated["groups"] == 1
+    assert "Files checked17Registrations17Metadata updates17" in repeated["text"]
+    assert "Genre17 tracksHip-Hop→Southern Hip HopShow 17 affected tracks" in repeated["text"]
+    assert repeated["details"][0]["open"] is False
+    assert len(repeated["paths"]) == 17
+    assert repeated["paths"][0]["text"] == repeated["paths"][0]["title"]
+    assert "<script>alert(1)</script>" in repeated["text"]
+    assert result["registrations"]["groups"] == 0
+    assert "No metadata changes are needed." in result["registrations"]["text"]
+    assert result["empty"]["groups"] == 0
+    assert "No files were checked. Nothing is ready to import." in result["empty"]["text"]
+
+
 def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
     modal = html[html.index(b'id="library-import-modal"'):]
@@ -438,8 +535,9 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'data-review-decision="rejected"' not in modal
     assert b'id="library-import-in-place" class="approve-button">Import' in modal
     assert b'Skip for now' not in modal
-    assert b'id="library-import-confirmation" hidden' in modal
-    assert b'id="library-import-execution-apply" type="button">Confirm import' in modal
+    assert b'id="library-import-preview" class="import-preview" hidden' in modal
+    assert b'id="library-import-execution-apply"' not in modal
+    assert b"button.textContent = 'Confirm import'" in modal
     assert b'Queue import' not in modal
     assert b"/preview" in modal
     assert b"if (event.key === 'Escape')" in modal

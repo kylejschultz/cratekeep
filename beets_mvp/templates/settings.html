@@ -234,6 +234,24 @@
     .review-footer-group { display:flex; flex-wrap:wrap; gap:.5rem; }
     .review-footer button { margin:0; padding:.55rem .8rem; }
     .browser-actions .approve-button { min-width:6.5rem; font-weight:750; }
+    .import-preview[hidden] { display:none; }
+    .import-preview { display:grid; gap:.7rem; margin-top:.7rem; }
+    .import-preview-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.45rem; margin:0; }
+    .import-preview-metric { min-width:0; padding:.55rem .65rem; border:1px solid var(--modal-border); border-radius:.35rem; background:var(--modal-subtle); }
+    .import-preview-metric dt { color:var(--muted); font-size:.67rem; font-weight:750; letter-spacing:.03em; line-height:1.2; text-transform:uppercase; }
+    .import-preview-metric dd { margin:.12rem 0 0; font-size:1.05rem; font-weight:750; }
+    .import-preview-empty { margin:0; color:var(--muted); font-size:.82rem; }
+    .import-change-list { display:grid; gap:.55rem; }
+    .import-change-list h4 { margin:.05rem 0 0; font-size:.82rem; }
+    .import-change-group { min-width:0; overflow:hidden; border:1px solid var(--modal-border); border-radius:.35rem; background:var(--modal-panel); }
+    .import-change-header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.35rem .75rem; align-items:center; padding:.55rem .65rem; }
+    .import-change-field { margin:0; font-size:.8rem; }
+    .import-change-count { grid-column:2; grid-row:1 / span 2; color:var(--muted); font-size:.75rem; font-weight:700; white-space:nowrap; }
+    .import-change-values { min-width:0; margin:0; overflow-wrap:anywhere; font-size:.8rem; }
+    .import-change-details { border-top:1px solid var(--modal-border); }
+    .import-change-details summary { padding:.48rem .65rem; color:var(--modal-accent); cursor:pointer; font-size:.75rem; font-weight:700; }
+    .import-change-paths { display:grid; gap:.28rem; margin:0; padding:.05rem .65rem .6rem 1.75rem; }
+    .import-change-path { min-width:0; overflow-wrap:anywhere; font:.72rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
     @media (max-width: 760px) {
       .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
       .content,body.sidebar-collapsed .content { margin-left:0; }
@@ -264,6 +282,9 @@
       .candidate-detail { grid-template-columns:minmax(0,1fr); padding-left:.75rem; }
       .candidate-facts,.candidate-detail > .candidate-facts:first-child { grid-column:1; grid-template-columns:minmax(0,1fr); }
       .track-comparison-table { min-width:640px; }
+      .import-preview-summary { grid-template-columns:minmax(0,1fr); }
+      .import-change-header { grid-template-columns:minmax(0,1fr); }
+      .import-change-count { grid-column:1; grid-row:auto; }
       .review-footer { align-items:stretch; flex-direction:column-reverse; }
       .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
       .review-footer button { width:100%; }
@@ -432,12 +453,9 @@
           <small>Merge and replace require one unambiguous recording-ID match and a current, path-safe inventory snapshot. Cratekeep stops on missing or ambiguous identity instead of guessing.</small>
         </section>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
-        <section class="album-modal-section" aria-labelledby="library-import-execution-title">
-          <h3 id="library-import-execution-title">Import</h3>
-          <p>Cratekeep checks the exact registrations and tag changes first. Confirm the preview to apply them without moving or copying files.</p>
-          <div id="library-import-confirmation" hidden>
-            <button id="library-import-execution-apply" type="button">Confirm import</button>
-          </div>
+        <section class="album-modal-section" aria-label="Import preview">
+          <p>Review exact registrations and tag changes before applying them. Files are never moved or copied.</p>
+          <div id="library-import-preview" class="import-preview" hidden></div>
           <p id="library-import-execution-result" class="operation-status" role="status" aria-live="polite"></p>
         </section>
       </div>
@@ -973,11 +991,120 @@
       reviewDialog.inert = true; reviewDialog.setAttribute('aria-hidden', 'true');
     }
 
+    function comparePreviewText(left, right) {
+      return left < right ? -1 : (left > right ? 1 : 0);
+    }
+
+    function serializedPreviewValue(value) {
+      const serialized = JSON.stringify(value == null ? null : value);
+      return serialized === undefined ? JSON.stringify(String(value)) : serialized;
+    }
+
+    function previewDisplayValue(value) {
+      if (value == null || value === '') return 'Not provided';
+      if (typeof value === 'string') return value;
+      const serialized = JSON.stringify(value);
+      return serialized === undefined ? String(value) : serialized;
+    }
+
+    function previewFieldLabel(field) {
+      const labels = {
+        album:'Album', albumartist:'Album artist', albumtype:'Release type', artist:'Artist', country:'Country',
+        day:'Day', disc:'Disc', disctotal:'Disc total', genre:'Genre', mb_albumid:'MusicBrainz album ID',
+        mb_releasegroupid:'MusicBrainz release group ID', mb_trackid:'MusicBrainz recording ID', media:'Media',
+        month:'Month', title:'Title', track:'Track', tracktotal:'Track total', year:'Year',
+      };
+      return labels[field] || String(field).split('_').filter(Boolean)
+        .map((part, index) => index ? part.toLowerCase() : `${part.charAt(0).toUpperCase()}${part.slice(1).toLowerCase()}`)
+        .join(' ');
+    }
+
+    function groupImportPreviewChanges(items) {
+      const grouped = new Map();
+      (Array.isArray(items) ? items : []).forEach((item, itemIndex) => {
+        const changes = item?.changes && typeof item.changes === 'object' ? item.changes : {};
+        Object.keys(changes).forEach(field => {
+          const change = changes[field] && typeof changes[field] === 'object' ? changes[field] : {};
+          const fromKey = serializedPreviewValue(change.from);
+          const toKey = serializedPreviewValue(change.to);
+          const key = JSON.stringify([field, fromKey, toKey]);
+          if (!grouped.has(key)) grouped.set(key, {
+            field, label:previewFieldLabel(field), from:previewDisplayValue(change.from),
+            to:previewDisplayValue(change.to), fromKey, toKey, paths:[], firstIndex:itemIndex,
+          });
+          grouped.get(key).paths.push(String(item.path || 'Unnamed track'));
+        });
+      });
+      return [...grouped.values()].sort((left, right) =>
+        comparePreviewText(left.field, right.field)
+        || comparePreviewText(left.fromKey, right.fromKey)
+        || comparePreviewText(left.toKey, right.toKey)
+        || left.firstIndex - right.firstIndex
+      ).map(group => ({...group, paths:group.paths.sort(comparePreviewText)}));
+    }
+
+    function renderImportPreview(data) {
+      const preview = document.getElementById('library-import-preview');
+      const summary = document.createElement('dl'); summary.className = 'import-preview-summary';
+      [
+        ['Files checked', data.files ?? 0],
+        ['Registrations', data.registered ?? 0],
+        ['Metadata updates', data.metadata_updates ?? 0],
+      ].forEach(([label, value]) => {
+        const metric = document.createElement('div'); metric.className = 'import-preview-metric';
+        const term = document.createElement('dt'); term.textContent = label;
+        const amount = document.createElement('dd'); amount.textContent = String(value);
+        metric.append(term, amount); summary.append(metric);
+      });
+      const groups = groupImportPreviewChanges(data.items);
+      const contents = [summary];
+      if (groups.length) {
+        const changes = document.createElement('section'); changes.className = 'import-change-list';
+        changes.setAttribute('aria-labelledby', 'library-import-changes-title');
+        const title = document.createElement('h4'); title.id = 'library-import-changes-title'; title.textContent = 'Metadata changes';
+        changes.append(title, ...groups.map(group => {
+          const card = document.createElement('article'); card.className = 'import-change-group';
+          const header = document.createElement('div'); header.className = 'import-change-header';
+          const field = document.createElement('h5'); field.className = 'import-change-field'; field.textContent = group.label;
+          const count = document.createElement('span'); count.className = 'import-change-count';
+          count.textContent = `${group.paths.length} ${group.paths.length === 1 ? 'track' : 'tracks'}`;
+          const values = document.createElement('p'); values.className = 'import-change-values';
+          values.setAttribute('aria-label', `${group.from} changed to ${group.to}`);
+          const oldValue = document.createElement('span'); oldValue.className = 'metadata-old'; oldValue.textContent = group.from;
+          const arrow = document.createElement('span'); arrow.className = 'metadata-arrow'; arrow.setAttribute('aria-hidden', 'true'); arrow.textContent = '→';
+          const newValue = document.createElement('span'); newValue.className = 'metadata-new'; newValue.textContent = group.to;
+          values.append(oldValue, arrow, newValue); header.append(field, count, values);
+          const details = document.createElement('details'); details.className = 'import-change-details';
+          const disclosure = document.createElement('summary');
+          disclosure.textContent = `Show ${group.paths.length} affected ${group.paths.length === 1 ? 'track' : 'tracks'}`;
+          const paths = document.createElement('ul'); paths.className = 'import-change-paths';
+          paths.append(...group.paths.map(path => {
+            const entry = document.createElement('li'); entry.className = 'import-change-path'; entry.textContent = path; entry.title = path;
+            return entry;
+          }));
+          details.append(disclosure, paths); card.append(header, details); return card;
+        }));
+        contents.push(changes);
+      } else {
+        const empty = document.createElement('p'); empty.className = 'import-preview-empty';
+        empty.textContent = Number(data.files || 0) === 0
+          ? 'No files were checked. Nothing is ready to import.'
+          : (Number(data.metadata_updates || 0) === 0
+            ? 'No metadata changes are needed.'
+            : 'No itemized metadata changes were returned.');
+        contents.push(empty);
+      }
+      preview.replaceChildren(...contents); preview.hidden = false;
+    }
+
     function resetImportPreview() {
-      const confirmation = document.getElementById('library-import-confirmation');
-      const applyButton = document.getElementById('library-import-execution-apply');
-      if (confirmation) confirmation.hidden = true;
-      if (applyButton) applyButton.disabled = true;
+      const preview = document.getElementById('library-import-preview');
+      const importButton = document.getElementById('library-import-in-place');
+      preview.hidden = true; preview.replaceChildren();
+      importButton.textContent = 'Import'; importButton.disabled = false;
+      const result = document.getElementById('library-import-execution-result');
+      result.dataset.busy = 'false';
+      result.textContent = 'Choose metadata, then preview the in-place import. Files will remain at their current paths.';
       reviewPreviewReady = false;
     }
 
@@ -1218,8 +1345,8 @@
       const message = document.getElementById('library-import-modal-message');
       message.dataset.busy = 'false'; message.textContent = '';
       const executionResult = document.getElementById('library-import-execution-result');
-      document.getElementById('library-import-confirmation').hidden = true;
-      document.getElementById('library-import-execution-apply').disabled = true;
+      const importPreview = document.getElementById('library-import-preview');
+      importPreview.hidden = true; importPreview.replaceChildren();
       const importButton = document.getElementById('library-import-in-place');
       importButton.disabled = album.execution_status === 'complete'; importButton.textContent = 'Import';
       reviewSucceeded = album.execution_status === 'complete'; reviewPreviewReady = false;
@@ -1321,8 +1448,6 @@
       }));
       async function previewSelectedAlbum(button) {
         const result = document.getElementById('library-import-execution-result');
-        const applyButton = document.getElementById('library-import-execution-apply');
-        const confirmation = document.getElementById('library-import-confirmation');
         const selected = activeAlbum.candidates.find(candidate => candidate.id === activeCandidateId);
         const preflight = selected?.duplicate_preflight || activeAlbum.duplicate_preflight || {status:'clear'};
         if (preflight.status === 'ambiguous') {
@@ -1335,8 +1460,7 @@
           return;
         }
         button.disabled = true;
-        applyButton.disabled = true;
-        confirmation.hidden = true;
+        document.getElementById('library-import-preview').hidden = true;
         button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
         result.textContent = 'Checking files and preparing an in-place preview…';
         try {
@@ -1347,25 +1471,23 @@
           });
           const data = await readApiResponse(response, 'Unable to preview this import');
           result.dataset.busy = 'false';
-          const genreChanges = data.items?.filter(item => item.changes?.genre)
-            .map(item => `${item.path}: ${item.changes.genre.from || 'Not provided'} → ${item.changes.genre.to}`) || [];
-          result.textContent = `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.${genreChanges.length ? ` Genre: ${genreChanges.join('; ')}.` : ''}`;
-          confirmation.hidden = false;
+          renderImportPreview(data);
+          result.textContent = 'Preview ready. Review the summary before confirming.';
           reviewPreviewReady = true;
-          applyButton.disabled = false;
-          applyButton.focus();
+          button.textContent = 'Confirm import';
         } catch (error) {
           result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to preview this import.';
           reviewPreviewReady = false;
+          button.textContent = 'Import';
         } finally {
           button.setAttribute('aria-busy', 'false');
           button.disabled = false;
+          button.focus();
         }
       }
       async function applyPreviewedAlbum(button) {
         const result = document.getElementById('library-import-execution-result');
-        const importButton = document.getElementById('library-import-in-place');
-        button.disabled = true; importButton.disabled = true;
+        button.disabled = true;
         button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
         result.textContent = 'Registering files and applying approved metadata in place…';
         try {
@@ -1379,20 +1501,20 @@
           selectedAlbumIds.delete(activeAlbum.id);
           await loadReviewItems();
           reviewSucceeded = true; reviewPreviewReady = false;
-          document.getElementById('library-import-confirmation').hidden = true;
           document.getElementById('library-import-modal-close').hidden = true;
-          importButton.textContent = 'Close'; importButton.disabled = false; importButton.focus();
+          button.textContent = 'Close'; button.disabled = false; button.focus();
         } catch (error) {
           result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to import this album.';
-          button.disabled = false; importButton.disabled = false;
+          button.textContent = 'Confirm import'; button.disabled = false;
         } finally {
           button.setAttribute('aria-busy', 'false');
         }
       }
       document.getElementById('library-import-in-place').addEventListener('click', event => {
-        if (reviewSucceeded) closeReview(); else previewSelectedAlbum(event.currentTarget);
+        if (reviewSucceeded) closeReview();
+        else if (reviewPreviewReady) applyPreviewedAlbum(event.currentTarget);
+        else previewSelectedAlbum(event.currentTarget);
       });
-      document.getElementById('library-import-execution-apply').addEventListener('click', event => applyPreviewedAlbum(event.currentTarget));
       document.getElementById('library-import-duplicate-action').addEventListener('change', resetImportPreview);
       document.getElementById('library-import-mbid').addEventListener('input', resetImportPreview);
       document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
