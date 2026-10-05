@@ -7,9 +7,15 @@ This default implementation deliberately performs only metadata reads.
 from __future__ import annotations
 
 import json
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+CAA_BASE = "https://coverartarchive.org"
+_RATE_LOCK = threading.Lock()
+_LAST_MUSICBRAINZ_REQUEST = 0.0
 
 
 class ProviderError(RuntimeError):
@@ -60,10 +66,33 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
             detail["score"] = release.get("score")
             detailed.append(detail)
         releases = detailed
-    return [result for release in releases if (result := _normalize_release(release, exact=bool(musicbrainz_id)))["provider_id"]]
+    release_groups: dict[str, dict] = {}
+    results = []
+    for release in releases:
+        result = _normalize_release(release, exact=bool(musicbrainz_id))
+        if not result["provider_id"]:
+            continue
+        group_id = result.get("release_group_id")
+        if group_id:
+            if group_id not in release_groups:
+                params = urllib.parse.urlencode({"inc": "genres", "fmt": "json"})
+                release_groups[group_id] = _request_json(
+                    f"https://musicbrainz.org/ws/2/release-group/{urllib.parse.quote(group_id)}?{params}", timeout
+                )
+            result.update(_genre_evidence(release_groups[group_id].get("genres")))
+        result["artwork"] = _cover_art_evidence(result["provider_id"], group_id, timeout)
+        results.append(result)
+    return results
 
 
 def _request_json(url: str, timeout: int) -> dict:
+    global _LAST_MUSICBRAINZ_REQUEST
+    if urllib.parse.urlparse(url).hostname == "musicbrainz.org":
+        with _RATE_LOCK:
+            delay = 1.0 - (time.monotonic() - _LAST_MUSICBRAINZ_REQUEST)
+            if delay > 0:
+                time.sleep(delay)
+            _LAST_MUSICBRAINZ_REQUEST = time.monotonic()
     request = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": "Cratekeep/0.1 (https://github.com/kylejschultz/cratekeep)"},
@@ -140,6 +169,69 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
         "media": media, "tracks": flattened,
         "retrieval": {"search_score": search_score, "source": "musicbrainz-search" if not exact else "release-id"},
     }
+
+
+def _genre_evidence(genres: object) -> dict:
+    """Choose one canonical MusicBrainz genre only from decisive positive evidence."""
+    evidence = []
+    if isinstance(genres, list):
+        for genre in genres:
+            if not isinstance(genre, dict):
+                continue
+            name = " ".join(str(genre.get("name") or "").split())
+            try:
+                count = int(genre.get("count", 0))
+            except (TypeError, ValueError):
+                continue
+            if name and count > 0:
+                evidence.append({"name": name, "count": count})
+    evidence.sort(key=lambda item: (-item["count"], item["name"].casefold(), item["name"]))
+    top = evidence[0] if evidence else None
+    runner_up = evidence[1] if len(evidence) > 1 else None
+    selected = top["name"] if top and top["count"] >= 2 and (runner_up is None or top["count"] > runner_up["count"]) else None
+    return {
+        "genre": selected,
+        "genre_evidence": {
+            "source": "musicbrainz-release-group-genres",
+            "rule": "top positive canonical genre has at least 2 votes and strictly exceeds runner-up",
+            "counts": evidence,
+            "selected": selected,
+        },
+    }
+
+
+def _cover_art_evidence(release_id: str, release_group_id: str | None, timeout: int) -> dict | None:
+    """Persist only provider-derived CAA identity and a bounded browser thumbnail."""
+    for entity, mbid in (("release", release_id), ("release-group", release_group_id)):
+        if not mbid:
+            continue
+        try:
+            document = _request_json(f"{CAA_BASE}/{entity}/{urllib.parse.quote(mbid)}/", timeout)
+        except ProviderError as exc:
+            if exc.code == "release_not_found":
+                continue
+            raise
+        images = document.get("images") if isinstance(document, dict) else None
+        front = next((image for image in images or [] if isinstance(image, dict) and image.get("front") is True), None)
+        if front:
+            thumbnails = front.get("thumbnails") if isinstance(front.get("thumbnails"), dict) else {}
+            thumbnail = thumbnails.get("250") or thumbnails.get("small")
+            return {
+                "available": True,
+                "source": "cover-art-archive",
+                "entity": entity,
+                "mbid": mbid,
+                "thumbnail_url": thumbnail if _trusted_caa_url(thumbnail) else f"{CAA_BASE}/{entity}/{mbid}/front-250",
+            }
+    return None
+
+
+def _trusted_caa_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlparse(value)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "coverartarchive.org" or host == "archive.org" or host.endswith(".archive.org"))
 
 
 def _escape(value: str) -> str:

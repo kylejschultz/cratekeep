@@ -198,6 +198,7 @@
     .candidate-option:not([open]) .candidate-toggle { transform:rotate(-90deg); }
     .candidate-detail { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.75rem; padding:.7rem .8rem .8rem 2.05rem; border-top:1px solid var(--modal-border); }
     .candidate-artwork { width:5rem; height:5rem; object-fit:cover; border:1px solid var(--modal-border); border-radius:.3rem; }
+    .candidate-artwork-missing { display:grid; place-items:center; width:5rem; height:5rem; padding:.35rem; border:1px dashed var(--modal-border); border-radius:.3rem; color:var(--muted); text-align:center; font-size:.66rem; }
     .candidate-facts { grid-column:2; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.45rem 1rem; margin:0; }
     .candidate-detail > .candidate-facts:first-child { grid-column:1 / -1; }
     .candidate-fact { display:grid; grid-template-columns:1.15rem minmax(0,1fr); grid-template-rows:auto auto; column-gap:.35rem; min-width:0; }
@@ -323,8 +324,12 @@
     </div>
     <div class="settings-panel" id="settings-panel-metadata" role="tabpanel" aria-labelledby="settings-tab-metadata" data-settings-panel="metadata" hidden>
     <section class="settings-section" aria-labelledby="artwork-title">
-      <h2 id="artwork-title">Artwork</h2><p>Artwork downloading is off unless explicitly enabled.</p>
-      <label class="check-label"><input name="fetch_art" type="checkbox" value="1"{% if settings.get('fetch_art') == '1' %} checked{% endif %}> Fetch album artwork during beets operations</label>
+      <h2 id="artwork-title">Artwork</h2><p>Artwork fetching is opt-in. Cratekeep uses the selected MusicBrainz release: exact-release Cover Art Archive front art first, then release-group front art only when exact art is unavailable.</p>
+      <label class="check-label"><input name="fetch_art" type="checkbox" value="1"{% if settings.get('fetch_art') == '1' %} checked{% endif %}> Fetch selected candidate artwork during import</label>
+      <label class="check-label"><input name="art_sidecar" type="checkbox" value="1"{% if settings.get('art_sidecar', '1') == '1' %} checked{% endif %}> Save JPEG sidecar as <code>cover.jpg</code> in each imported album folder</label>
+      <label class="check-label"><input name="art_embed" type="checkbox" value="1"{% if settings.get('art_embed') == '1' %} checked{% endif %}> Embed artwork in imported music files</label>
+      <label class="check-label"><input name="art_replace" type="checkbox" value="1"{% if settings.get('art_replace') == '1' %} checked{% endif %}> Replace existing sidecar and embedded artwork</label>
+      <small>Sidecar and embedding are independent. Existing <code>cover.jpg</code> files and embedded art are preserved unless replacement is enabled. Missing candidate art is a visible no-op and never removes existing art.</small>
     </section>
     <section class="settings-section" aria-labelledby="beets-title">
       <h2 id="beets-title">Beets configuration</h2>
@@ -403,6 +408,7 @@
         </section>
         <section class="album-modal-section alternatives-section" aria-labelledby="candidate-alternatives-title">
           <h3 id="candidate-alternatives-title">Choose album metadata</h3>
+          <p class="section-note">A genre changes only when the top canonical MusicBrainz release-group genre has at least 2 positive votes and strictly exceeds the runner-up. Weak, tied, or missing evidence preserves the current genre.</p>
           <div id="library-import-modal-candidates" class="candidate-list" role="radiogroup" aria-label="Album metadata candidates"></div>
         </section>
         <form id="library-import-rematch-form" class="override-form">
@@ -427,7 +433,7 @@
         </section>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
         <section class="album-modal-section" aria-labelledby="library-import-execution-title">
-          <h3 id="library-import-execution-title">Import in place</h3>
+          <h3 id="library-import-execution-title">Import</h3>
           <p>Cratekeep checks the exact registrations and tag changes first. Confirm the preview to apply them without moving or copying files.</p>
           <div id="library-import-confirmation" hidden>
             <button id="library-import-execution-apply" type="button">Confirm import</button>
@@ -438,10 +444,9 @@
       <footer class="browser-actions review-footer">
         <div class="review-footer-group">
           <button type="button" class="secondary" id="library-import-modal-close">Cancel</button>
-          <button type="button" class="secondary" data-review-decision="skipped">Skip for now</button>
         </div>
         <div class="review-footer-group">
-          <button type="button" id="library-import-in-place" class="approve-button">Import in place</button>
+          <button type="button" id="library-import-in-place" class="approve-button">Import</button>
         </div>
       </footer>
     </section>
@@ -668,6 +673,7 @@
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
     let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null, trackComparisonReturnFocus = null;
+    let reviewOpeningState = '', reviewPreviewReady = false, reviewSucceeded = false;
     const selectedAlbumIds = new Set();
     let reviewSequence = [];
     const reviewArtistLimit = 25;
@@ -953,6 +959,7 @@
       const applyButton = document.getElementById('library-import-execution-apply');
       if (confirmation) confirmation.hidden = true;
       if (applyButton) applyButton.disabled = true;
+      reviewPreviewReady = false;
     }
 
     function renderAlbumMatch() {
@@ -1096,10 +1103,16 @@
         );
         const localTrackCount = value.track_count || activeAlbum?.tracks?.length || 0;
         const year = releaseYearEvidence(current, value, value.is_as_is);
+        const genreCounts = Array.isArray(value.genre_evidence?.counts) ? value.genre_evidence.counts : [];
+        const genreRunnerUp = genreCounts[1];
+        const genreEvidence = value.genre
+          ? `${value.genre} (${genreCounts[0]?.count ?? '?'} positive votes${genreRunnerUp ? `; runner-up ${genreRunnerUp.name} ${genreRunnerUp.count}` : '; no runner-up'})`
+          : (value.is_as_is ? (current.genre || 'Not present in current metadata')
+            : `No decisive MusicBrainz genre; preserving ${current.genre || 'no current genre'}`);
         return [
           {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
-          {kind:'genre', label:'Genre', value:value.genre || (value.is_as_is ? (current.genre || 'Not present in current metadata') : `Not provided by MusicBrainz; preserving ${current.genre || 'no current genre'}`), changed:!value.is_as_is && Boolean(value.genre) && metadataChanged(current.genre, value.genre)},
+          {kind:'genre', label:'Genre', value:genreEvidence, changed:!value.is_as_is && Boolean(value.genre) && metadataChanged(current.genre, value.genre)},
           {kind:'year', label:'Release Year', value:year.value, changed:year.changed, localYear:year.localYear, proposedYear:year.proposedYear, comparison:year.changed},
           {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'All tracks matched', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks, expandable:!value.is_as_is},
           {kind:'media', label:'Release Type/media', value:releaseMedia, changed:Boolean(releaseMediaChanged)},
@@ -1147,7 +1160,10 @@
         const body = document.createElement('div'); body.className = 'candidate-detail';
         if (value.artwork_url) {
           const artwork = document.createElement('img'); artwork.className = 'candidate-artwork';
-          artwork.src = value.artwork_url; artwork.alt = `Persisted cover art for ${value.album}`; body.append(artwork);
+          artwork.src = value.artwork_url; artwork.alt = `Cover Art Archive front artwork for ${value.album}`; body.append(artwork);
+        } else {
+          const missingArtwork = document.createElement('span'); missingArtwork.className = 'candidate-artwork-missing';
+          missingArtwork.textContent = value.is_as_is ? 'Current artwork unchanged' : 'No candidate artwork available'; body.append(missingArtwork);
         }
         const facts = document.createElement('dl'); facts.className = 'candidate-facts';
         optionFacts.forEach(fact => {
@@ -1181,16 +1197,31 @@
       const executionResult = document.getElementById('library-import-execution-result');
       document.getElementById('library-import-confirmation').hidden = true;
       document.getElementById('library-import-execution-apply').disabled = true;
-      document.getElementById('library-import-in-place').disabled = album.execution_status === 'complete';
+      const importButton = document.getElementById('library-import-in-place');
+      importButton.disabled = album.execution_status === 'complete'; importButton.textContent = 'Import';
+      reviewSucceeded = album.execution_status === 'complete'; reviewPreviewReady = false;
       executionResult.textContent = album.execution_status === 'complete'
         ? 'This album has already been imported.'
         : 'Choose metadata, then preview the in-place import. Files will remain at their current paths.';
       document.getElementById('library-import-mbid').value = '';
       document.getElementById('library-import-duplicate-action').value = album.duplicate_action || '';
+      document.getElementById('library-import-modal-close').hidden = false;
       renderAlbumMatch();
+      reviewOpeningState = reviewState();
       reviewModal.hidden = false;
       document.body.classList.add('modal-open');
       reviewModal.querySelector('.browser-dialog').focus();
+    }
+
+    function reviewState() {
+      return JSON.stringify({candidate:activeCandidateId,
+        duplicate:document.getElementById('library-import-duplicate-action').value,
+        rematch:document.getElementById('library-import-mbid').value, preview:reviewPreviewReady});
+    }
+
+    function reviewBusy() {
+      return reviewModal.querySelector('[aria-busy="true"]') !== null
+        || reviewModal.querySelector('[data-busy="true"]') !== null;
     }
 
     function closeReview(clearSequence = true) {
@@ -1199,6 +1230,13 @@
       document.body.classList.remove('modal-open');
       if (clearSequence) reviewSequence = [];
       if (reviewReturnFocus) reviewReturnFocus.focus();
+    }
+
+    function requestCloseReview(clearSequence = true) {
+      if (reviewBusy()) return false;
+      if (!reviewSucceeded && reviewState() !== reviewOpeningState
+          && !window.confirm('Discard changes to this album review?')) return false;
+      closeReview(clearSequence); return true;
     }
 
     if (trackComparisonModal) {
@@ -1216,11 +1254,11 @@
     }
 
     if (reviewModal) {
-      document.getElementById('library-import-modal-close').addEventListener('click', closeReview);
-      document.getElementById('library-import-modal-close-icon').addEventListener('click', closeReview);
-      reviewModal.addEventListener('mousedown', event => { if (event.target === reviewModal) closeReview(); });
+      document.getElementById('library-import-modal-close').addEventListener('click', () => requestCloseReview());
+      document.getElementById('library-import-modal-close-icon').addEventListener('click', () => requestCloseReview());
+      reviewModal.addEventListener('mousedown', event => { if (event.target === reviewModal) requestCloseReview(); });
       reviewModal.addEventListener('keydown', event => {
-        if (event.key === 'Escape') { event.preventDefault(); closeReview(); return; }
+        if (event.key === 'Escape') { event.preventDefault(); requestCloseReview(); return; }
         if (event.key !== 'Tab') return;
         const focusable = [...reviewModal.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])')]
           .filter(element => !element.closest('details:not([open])') && !element.closest('[hidden]'));
@@ -1292,10 +1330,12 @@
             .map(item => `${item.path}: ${item.changes.genre.from || 'Not provided'} → ${item.changes.genre.to}`) || [];
           result.textContent = `${data.files} files checked; ${data.registered} registrations and ${data.metadata_updates} metadata updates are ready.${genreChanges.length ? ` Genre: ${genreChanges.join('; ')}.` : ''}`;
           confirmation.hidden = false;
+          reviewPreviewReady = true;
           applyButton.disabled = false;
           applyButton.focus();
         } catch (error) {
           result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to preview this import.';
+          reviewPreviewReady = false;
         } finally {
           button.setAttribute('aria-busy', 'false');
           button.disabled = false;
@@ -1314,14 +1354,14 @@
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || data.description || 'Unable to import this album.');
           result.dataset.busy = 'false';
-          result.textContent = `${data.files} files imported in place; no files were moved or copied.`;
+          const artMessage = data.artwork?.message ? ` ${data.artwork.message}` : '';
+          result.textContent = `${data.files} files imported in place; no files were moved or copied.${artMessage}`;
           selectedAlbumIds.delete(activeAlbum.id);
           await loadReviewItems();
-          closeReview(false);
-          const nextId = reviewSequence.shift();
-          const nextAlbum = albumReviews.find(album => album.id === nextId);
-          const nextButton = reviewList.querySelector(`.review-album[data-album-id="${nextId}"]`);
-          if (nextAlbum && nextButton) openReview(nextAlbum, nextButton);
+          reviewSucceeded = true; reviewPreviewReady = false;
+          document.getElementById('library-import-confirmation').hidden = true;
+          document.getElementById('library-import-modal-close').hidden = true;
+          importButton.textContent = 'Close'; importButton.disabled = false; importButton.focus();
         } catch (error) {
           result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to import this album.';
           button.disabled = false; importButton.disabled = false;
@@ -1329,9 +1369,12 @@
           button.setAttribute('aria-busy', 'false');
         }
       }
-      document.getElementById('library-import-in-place').addEventListener('click', event => previewSelectedAlbum(event.currentTarget));
+      document.getElementById('library-import-in-place').addEventListener('click', event => {
+        if (reviewSucceeded) closeReview(); else previewSelectedAlbum(event.currentTarget);
+      });
       document.getElementById('library-import-execution-apply').addEventListener('click', event => applyPreviewedAlbum(event.currentTarget));
       document.getElementById('library-import-duplicate-action').addEventListener('change', resetImportPreview);
+      document.getElementById('library-import-mbid').addEventListener('input', resetImportPreview);
       document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
         event.preventDefault();
         const input = document.getElementById('library-import-mbid');

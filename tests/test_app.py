@@ -1,4 +1,5 @@
 import json
+from io import BytesIO
 import shutil
 import sqlite3
 import subprocess
@@ -8,9 +9,14 @@ from pathlib import Path
 
 import pytest
 from beets.library import Item, Library
+from mediafile import Image as MediaImage, ImageType, MediaFile
+from PIL import Image as PillowImage
 
-from beets_mvp import _candidate_diff, _format_bytes, _group_library_import_review_items, create_app
-from beets_mvp.musicbrainz import ProviderError, search_releases
+from beets_mvp import (
+    LibraryImportExecutionError, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
+    _group_library_import_review_items, _SafeArtworkRedirect, create_app,
+)
+from beets_mvp.musicbrainz import ProviderError, _cover_art_evidence, _genre_evidence, search_releases
 from beets_mvp.matching import score_release
 
 def make_app(tmp_path: Path):
@@ -35,6 +41,12 @@ def write_wav(path: Path, seconds: int = 1) -> None:
         audio.setsampwidth(2)
         audio.setframerate(8000)
         audio.writeframes(b"\0\0" * 8000 * seconds)
+
+
+def jpeg_bytes(color: tuple[int, int, int]) -> bytes:
+    output = BytesIO()
+    PillowImage.new("RGB", (8, 8), color).save(output, format="JPEG", quality=90)
+    return output.getvalue()
 
 def test_health_and_empty_lists(tmp_path):
     app = make_app(tmp_path)
@@ -362,6 +374,16 @@ def test_settings_script_initializes_without_stale_direct_import_references(tmp_
     assert script.index("function resetImportPreview()") < script.index("function renderAlbumMatch()")
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for rendered JavaScript syntax validation")
+def test_rendered_settings_javascript_has_valid_syntax(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
+    completed = subprocess.run(
+        [shutil.which("node"), "--check", "-"], input=script, text=True, capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
     modal = html[html.index(b'id="library-import-modal"'):]
@@ -412,7 +434,8 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'Rematch with MusicBrainz release ID' in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'data-review-decision="rejected"' not in modal
-    assert b'id="library-import-in-place" class="approve-button">Import in place' in modal
+    assert b'id="library-import-in-place" class="approve-button">Import' in modal
+    assert b'Skip for now' not in modal
     assert b'id="library-import-confirmation" hidden' in modal
     assert b'id="library-import-execution-apply" type="button">Confirm import' in modal
     assert b'Queue import' not in modal
@@ -923,7 +946,7 @@ def test_candidate_refresh_replaces_results_and_provider_errors_are_persisted(tm
     assert album["candidates"][0]["provider_id"] == "old"
 
 
-@pytest.mark.parametrize("provider_genre, expected_genre", [(None, None), ("Jazz", {"from": "Rock", "to": "Jazz"})])
+@pytest.mark.parametrize("provider_genre, expected_genre", [(None, None), ("jazz", {"from": "Rock", "to": "jazz"})])
 def test_candidate_genre_is_explicit_and_only_proposed_when_real(tmp_path, provider_genre, expected_genre):
     app = make_app(tmp_path)
     path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
@@ -936,6 +959,10 @@ def test_candidate_genre_is_explicit_and_only_proposed_when_real(tmp_path, provi
     }
     if provider_genre:
         candidate["genre"] = provider_genre
+        candidate["genre_evidence"] = {
+            "source": "musicbrainz-release-group-genres", "selected": provider_genre,
+            "counts": [{"name": provider_genre, "count": 3}],
+        }
     app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [candidate]
     client = app.test_client()
     client.post("/api/library/inventory/preview")
@@ -951,6 +978,176 @@ def test_candidate_genre_is_explicit_and_only_proposed_when_real(tmp_path, provi
     preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
     genre_changes = [item["changes"].get("genre") for item in preview.json["items"] if item["changes"].get("genre")]
     assert genre_changes == ([expected_genre] if expected_genre else [])
+
+
+@pytest.mark.parametrize("genres, selected", [
+    ([{"name": "rock", "count": 2}, {"name": "pop", "count": 1}], "rock"),
+    ([{"name": "rock", "count": 1}], None),
+    ([{"name": "rock", "count": 3}, {"name": "pop", "count": 3}], None),
+    ([{"name": "noise", "count": 0}], None),
+    ([], None),
+])
+def test_musicbrainz_genre_rule_requires_decisive_positive_release_group_votes(genres, selected):
+    result = _genre_evidence(genres)
+    assert result["genre"] == selected
+    assert result["genre_evidence"]["selected"] == selected
+    assert result["genre_evidence"]["source"] == "musicbrainz-release-group-genres"
+
+
+@pytest.mark.parametrize("sidecar,embed,replace,existing,available", [
+    (True, False, False, False, True),
+    (False, True, False, False, True),
+    (True, True, False, False, True),
+    (True, True, False, True, True),
+    (True, True, True, True, True),
+    (True, True, True, True, False),
+])
+def test_direct_import_artwork_destinations_preserve_replace_and_missing_noop(
+    tmp_path, sidecar, embed, replace, existing, available,
+):
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=sidecar, ART_EMBED=embed, ART_REPLACE=replace)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    old_art, new_art = jpeg_bytes((120, 10, 10)), jpeg_bytes((10, 120, 10))
+    cover = path.parent / "cover.jpg"
+    if existing:
+        cover.write_bytes(old_art)
+        media = MediaFile(str(path)); media.images = [MediaImage(old_art, type=ImageType.front)]; media.save()
+    candidate = {
+        "provider_id": "123e4567-e89b-42d3-a456-426614174000", "artist": "Artist", "album": "Album",
+        "track_count": 1, "tracks": [{"title": "Song", "position": 1}],
+    }
+    if available:
+        candidate["artwork"] = {
+            "available": True, "source": "cover-art-archive", "entity": "release",
+            "mbid": "123e4567-e89b-42d3-a456-426614174000",
+            "thumbnail_url": "https://coverartarchive.org/release/123e4567-e89b-42d3-a456-426614174000/front-250",
+        }
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [candidate]
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: new_art
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    chosen = album["candidates"][0]
+    assert (chosen["artwork_url"] is not None) is available
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": chosen["id"],
+    }).status_code == 200
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    assert preview.json["artwork"]["status"] == ("ready" if available else "unavailable")
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    images = MediaFile(str(path)).images or []
+    if not available:
+        assert cover.read_bytes() == old_art and images[0].data == old_art
+        assert executed.json["artwork"]["status"] == "unavailable"
+    elif existing and not replace:
+        assert cover.read_bytes() == old_art and images[0].data == old_art
+        assert executed.json["artwork"]["sidecars"]["preserved"]
+        assert executed.json["artwork"]["embedded"]["preserved"]
+    else:
+        assert (cover.exists() and cover.read_bytes() == new_art) is sidecar
+        assert (bool(images) and images[0].data == new_art) is embed
+    assert path.exists()
+    state_before_retry = (
+        cover.read_bytes() if cover.exists() else None,
+        [image.data for image in (MediaFile(str(path)).images or [])],
+    )
+    repeated = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert repeated.status_code == 200 and repeated.json["already_complete"] is True
+    assert state_before_retry == (
+        cover.read_bytes() if cover.exists() else None,
+        [image.data for image in (MediaFile(str(path)).images or [])],
+    )
+    with sqlite3.connect(app.config["APP_DB"]) as database:
+        summary = json.loads(database.execute(
+            "SELECT summary_json FROM adoption_jobs WHERE id = ?", (executed.json["id"],)
+        ).fetchone()[0])
+    assert summary["artwork"] == executed.json["artwork"]
+
+
+def test_artwork_download_failure_precedes_mutation_and_retry_succeeds(tmp_path):
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=True, ART_REPLACE=True)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    original = path.read_bytes()
+    candidate = {
+        "provider_id": "123e4567-e89b-42d3-a456-426614174000", "artist": "Changed", "album": "Changed",
+        "track_count": 1, "tracks": [{"title": "Changed", "position": 1}],
+        "artwork": {"available": True, "source": "cover-art-archive", "entity": "release",
+                    "mbid": "123e4567-e89b-42d3-a456-426614174000"},
+    }
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [candidate]
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"],
+    })
+    app.config["ARTWORK_FETCHER"] = lambda candidate: (_ for _ in ()).throw(
+        LibraryImportExecutionError("mock CAA failure", code="artwork_fetch_failed", status=502)
+    )
+    failed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert failed.status_code == 502 and failed.json["code"] == "artwork_fetch_failed"
+    assert path.read_bytes() == original
+    assert not (path.parent / "cover.jpg").exists()
+    assert list(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()) == []
+
+    replacement = jpeg_bytes((20, 40, 60))
+    app.config["ARTWORK_FETCHER"] = lambda candidate: replacement
+    retried = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert retried.status_code == 201
+    assert (path.parent / "cover.jpg").read_bytes() == replacement
+    assert MediaFile(str(path)).images[0].data == replacement
+
+
+def test_caa_exact_release_precedes_release_group_and_missing_falls_back(monkeypatch):
+    calls = []
+    responses = {
+        "https://coverartarchive.org/release/release-id/": ProviderError("missing", code="release_not_found"),
+        "https://coverartarchive.org/release-group/group-id/": {
+            "images": [{"front": True, "thumbnails": {"250": "https://coverartarchive.org/release-group/group-id/front-250"}}]
+        },
+    }
+    def fake_request(url, timeout):
+        calls.append(url)
+        value = responses[url]
+        if isinstance(value, Exception):
+            raise value
+        return value
+    monkeypatch.setattr("beets_mvp.musicbrainz._request_json", fake_request)
+    evidence = _cover_art_evidence("release-id", "group-id", 10)
+    assert calls == list(responses)
+    assert evidence["entity"] == "release-group" and evidence["mbid"] == "group-id"
+
+
+def test_artwork_fetch_rejects_untrusted_redirect_and_normalizes_actual_image(monkeypatch):
+    handler = _SafeArtworkRedirect()
+    with pytest.raises(urllib.error.URLError, match="untrusted"):
+        handler.redirect_request(None, None, 302, "Found", {}, "https://example.test/cover.jpg")
+
+    png = BytesIO(); PillowImage.new("RGBA", (4, 4), (10, 20, 30, 120)).save(png, format="PNG")
+    seen = {}
+    class Response:
+        headers = {"Content-Length": str(len(png.getvalue()))}
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def read(self, size): seen["read_size"] = size; return png.getvalue()
+    class Opener:
+        def open(self, request, timeout): seen.update(url=request.full_url, timeout=timeout); return Response()
+    monkeypatch.setattr("beets_mvp.urllib.request.build_opener", lambda *handlers: Opener())
+    normalized = _fetch_and_normalize_artwork({"artwork": {
+        "entity": "release", "mbid": "123e4567-e89b-42d3-a456-426614174000",
+    }})
+    assert seen["url"] == "https://coverartarchive.org/release/123e4567-e89b-42d3-a456-426614174000/front"
+    assert seen["timeout"] == 15 and seen["read_size"] == 10 * 1024 * 1024 + 1
+    with PillowImage.open(BytesIO(normalized)) as image:
+        assert image.format == "JPEG" and image.mode == "RGB" and image.size == (4, 4)
 
 
 def test_album_decision_candidate_and_track_exception_persist_across_group_sync(tmp_path):
@@ -1271,6 +1468,47 @@ def test_duplicate_decision_is_persisted_previewed_and_enforced(tmp_path, duplic
     else:
         assert identities[incoming_relative] == managed.id
         assert identities[managed_relative] is None
+
+
+@pytest.mark.parametrize("duplicate_action, expected_target", [("merge", "managed"), ("replace", "incoming")])
+def test_duplicate_artwork_targets_effective_managed_file(tmp_path, duplicate_action, expected_target):
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=True, ART_REPLACE=True)
+    artwork = jpeg_bytes((22, 44, 66))
+    app.config["ARTWORK_FETCHER"] = lambda candidate: artwork
+    managed_path = tmp_path / "library" / "Managed" / "Old Album" / "01 Song.wav"
+    incoming_path = tmp_path / "library" / "Incoming" / "New Album" / "01 Song.wav"
+    write_wav(managed_path)
+    write_wav(incoming_path)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    library.add(Item(title="Song", artist="Managed", album="Old Album", mb_trackid="recording-1",
+                     path=str(managed_path)))
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174000", "artist": query["artist"],
+        "album": query["album"], "track_count": 1,
+        "tracks": [{"title": "Song", "position": 1, "recording_id": "recording-1"}],
+        "artwork": {"available": True, "source": "cover-art-archive", "entity": "release",
+                    "mbid": "123e4567-e89b-42d3-a456-426614174000"},
+    }]
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    client.post("/api/library-import/candidates", json={})
+    album = next(item for item in client.get("/api/library-import/reviews").json["albums"] if item["artist"] == "Incoming")
+    client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"],
+        "duplicate_action": duplicate_action,
+    })
+    result = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert result.status_code == 201
+    target = managed_path if expected_target == "managed" else incoming_path
+    untouched = incoming_path if expected_target == "managed" else managed_path
+    assert (target.parent / "cover.jpg").read_bytes() == artwork
+    assert MediaFile(str(target)).images[0].data == artwork
+    assert not (untouched.parent / "cover.jpg").exists()
+    assert not MediaFile(str(untouched)).images
+    assert result.json["artwork"]["embedded"]["written"] == [
+        target.relative_to(tmp_path / "library").as_posix()
+    ]
 
 
 def test_duplicate_merge_rejects_ambiguous_managed_recording_identity(tmp_path):
@@ -1645,7 +1883,7 @@ def test_album_review_actions_and_rematch_are_metadata_only(tmp_path, monkeypatc
 
 
 def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
-    seen = {}
+    seen = {"urls": []}
 
     class Response:
         def __init__(self, payload): self.payload = payload
@@ -1656,12 +1894,17 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
             return self.payload
 
     def urlopen(request, timeout):
-        seen["url"] = request.full_url
+        seen["urls"].append(request.full_url)
         seen["timeout"] = timeout
+        if "musicbrainz.org/ws/2/release-group/group-1" in request.full_url:
+            return Response(b'{"genres":[{"name":"Rock","count":4},{"name":"Pop","count":2}]}')
+        if "coverartarchive.org/release/id-1" in request.full_url:
+            return Response(b'{"images":[{"front":true,"thumbnails":{"250":"https://coverartarchive.org/release/id-1/front-250"}}]}')
         if "/release/id-1" in request.full_url:
             return Response(b'{"id":"id-1","title":"Album","date":"2024-03-02","country":"GB","release-group":{"id":"group-1","primary-type":"Album"},"artist-credit":[{"name":"Artist"}],"media":[{"position":1,"format":"CD","track-count":1,"tracks":[{"position":1,"number":"1","length":123000,"recording":{"id":"recording-1","title":"Song"}}]}]}')
         return Response(b'{"releases": [{"id": "id-1", "score": 99}]}')
 
+    monkeypatch.setattr("beets_mvp.musicbrainz.time.sleep", lambda delay: None)
     monkeypatch.setattr("beets_mvp.musicbrainz.urllib.request.urlopen", urlopen)
     result = search_releases({"artist": "Artist", "album": "Album"}, limit=100)
     assert result[0]["provider_id"] == "id-1"
@@ -1670,7 +1913,10 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
     assert result[0]["country"] == "GB"
     assert result[0]["tracks"][0] == {"medium_position": 1, "position": 1, "number": "1", "title": "Song", "recording_id": "recording-1", "length_ms": 123000}
     assert result[0]["retrieval"] == {"search_score": 99, "source": "musicbrainz-search"}
-    assert "/release/id-1" in seen["url"]
+    assert result[0]["genre"] == "Rock"
+    assert result[0]["genre_evidence"]["counts"] == [{"name": "Rock", "count": 4}, {"name": "Pop", "count": 2}]
+    assert result[0]["artwork"]["entity"] == "release"
+    assert any("/release/id-1" in url for url in seen["urls"])
     assert seen == {**seen, "timeout": 10, "read_size": 512 * 1024}
 
     def limited(request, timeout):
@@ -1955,7 +2201,9 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
         {
             "provider_id": "safe", "artist": "Artist", "album": "Album", "track_count": 1,
             "tracks": [{"title": "Song", "position": 1}],
-            "artwork_url": "https://images.example.test/cover.jpg",
+            "artwork": {"available": True, "source": "cover-art-archive", "entity": "release",
+                        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+                        "thumbnail_url": "https://coverartarchive.org/release/123e4567-e89b-42d3-a456-426614174000/front-250"},
         },
         {
             "provider_id": "unsafe", "artist": "Artist", "album": "Album", "track_count": 1,
@@ -1978,7 +2226,7 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     album = client.get("/api/library-import/reviews").json["albums"][0]
     assert album["candidate_status"] == "complete"
     assert album["highest_confidence"] == max(candidate["confidence"] for candidate in album["candidates"])
-    assert album["candidates"][0]["artwork_url"] == "https://images.example.test/cover.jpg"
+    assert album["candidates"][0]["artwork_url"].startswith("https://coverartarchive.org/release/")
     assert album["candidates"][1]["artwork_url"] is None
     assert album["current_metadata"]["artwork_url"] == incoming_artwork
     assert {key: album["current_metadata"][key] for key in ("release_type", "media", "country")} == {
@@ -2006,7 +2254,8 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
     assert b"method: 'PATCH'" in html
     assert b"/api/library-import/albums/${activeAlbum.id}/preview" in html
     assert b"/api/library-import/albums/${activeAlbum.id}/execute" in html
-    assert b"data-review-decision=\"skipped\"" in html
+    assert b"data-review-decision=\"skipped\"" not in html
+    assert b"Skip for now" not in html
     assert b"data-review-decision=\"rejected\"" not in html
     assert b"data-review-decision=\"approved\"" not in html
     assert b"beet import" not in html
@@ -2086,6 +2335,9 @@ def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
         "inbox_path": str(tmp_path / "inbox"),
         "library_path": str(new_library),
         "fetch_art": "1",
+        "art_sidecar": "1",
+        "art_embed": "1",
+        "art_replace": "1",
         "beets_config": "directory: /ignored\nlibrary: /ignored.db\nimport:\n  move: false\n  quiet: true\nplugins: [lastgenre]\npaths:\n  default: $albumartist/$album\n",
     })
 
@@ -2107,7 +2359,28 @@ def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
     })
     restarted_page = restarted.test_client().get("/settings")
     assert restarted.config["FETCH_ART"] is True
+    assert restarted.config["ART_SIDECAR"] is True
+    assert restarted.config["ART_EMBED"] is True
+    assert restarted.config["ART_REPLACE"] is True
     assert b'name="fetch_art" type="checkbox" value="1" checked' in restarted_page.data
+    assert b'name="art_sidecar" type="checkbox" value="1" checked' in restarted_page.data
+    assert b'name="art_embed" type="checkbox" value="1" checked' in restarted_page.data
+    assert b'name="art_replace" type="checkbox" value="1" checked' in restarted_page.data
+
+
+def test_existing_fetch_art_setting_migrates_to_sidecar_only_defaults(tmp_path):
+    app = make_app(tmp_path)
+    with sqlite3.connect(app.config["APP_DB"]) as database:
+        database.execute("DELETE FROM app_settings WHERE key IN ('art_sidecar', 'art_embed', 'art_replace')")
+        database.execute("UPDATE app_settings SET value = '1' WHERE key = 'fetch_art'")
+    restarted = create_app({
+        "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": app.config["STATE_PATH"],
+        "BROWSE_ROOTS": [str(tmp_path)],
+    })
+    assert restarted.config["FETCH_ART"] is True
+    assert restarted.config["ART_SIDECAR"] is True
+    assert restarted.config["ART_EMBED"] is False
+    assert restarted.config["ART_REPLACE"] is False
 
 
 def test_invalid_beets_config_is_rejected_without_persisting(tmp_path):

@@ -6,6 +6,7 @@ evidence=${2:-}
 fixture_root=$(mktemp -d "${TMPDIR:-/tmp}/cratekeep-container-smoke.XXXXXX")
 container_name="cratekeep-smoke-$$"
 python_bin=${PYTHON:-python3}
+repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 
 cleanup() {
   docker rm -f "$container_name" >/dev/null 2>&1 || true
@@ -20,13 +21,16 @@ if [ -z "$evidence" ]; then
 fi
 mkdir -p "$evidence"
 
-docker image inspect "$image" --format '{{json .Id}} {{json .Os}}/{{json .Architecture}}' > "$evidence/image-identity.txt"
+docker image inspect "$image" \
+  --format '{{json .Id}} {{json .RepoDigests}} {{json .Os}}/{{json .Architecture}}' > "$evidence/image-identity.txt"
 docker run -d --name "$container_name" \
   --user "$(id -u):$(id -g)" \
+  -e PYTHONPATH=/app:/smoke \
   -p 127.0.0.1::8788 \
   -v "$fixture_root/state:/data/config" \
   -v "$fixture_root/fixtures:/fixtures" \
-  "$image" >/dev/null
+  -v "$repo_root/tests/runtime_app.py:/smoke/runtime_app.py:ro" \
+  "$image" gunicorn --bind=0.0.0.0:8788 --workers=1 --threads=4 'runtime_app:create_app()' >/dev/null
 port=$(docker port "$container_name" 8788/tcp | sed 's/.*://')
 base_url="http://127.0.0.1:$port"
 
@@ -40,7 +44,7 @@ until "$python_bin" -c "import urllib.request; urllib.request.urlopen('$base_url
   sleep 1
 done
 
-"$python_bin" tests/runtime_smoke.py \
+PYTHONPATH="$repo_root:$repo_root/tests${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" tests/runtime_smoke.py \
   --base-url "$base_url" \
   --fixture-root "$fixture_root/fixtures" \
   --app-inbox /fixtures/inbox \

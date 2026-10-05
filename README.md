@@ -73,6 +73,8 @@ Inbox and library paths are chosen during first-run setup. The in-app Settings p
 
 The overview remains at `/`. The dedicated `/inbox` page opens the pending library-import review workspace, while `/library` provides collection counts, recently added tracks, top artists, searchable/sortable browsing, and the existing metadata edit forms.
 
+Artwork fetching is opt-in. When enabled, saving `cover.jpg` is on by default for backward compatibility; embedding is off. The two destinations are independent. Existing sidecars and embedded images are preserved unless **Replace existing sidecar and embedded artwork** is explicitly enabled. Cratekeep uses Cover Art Archive front art for the selected exact MusicBrainz release, falling back to release-group front art only when exact-release art is absent. Missing art is a visible no-op.
+
 ## API overview
 
 Imports require a preview followed by an explicit execute call:
@@ -111,7 +113,9 @@ The Library import inventory presents one compact card per album folder and disp
 | `Imported` | Every track in the album is already tracked in the library. |
 | `Needs attention` | Matching is incomplete or failed, or the album was rejected or skipped during review. |
 
-Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only an indicator; Cratekeep never automatically imports albums. **Import in place** saves the selected candidate and runs a non-mutating preview; a separate **Confirm import** action applies that preview. This match-screen path does not require the Inbox queue.
+Lifecycle status and match confidence are separate indicators. Match confidence pills use three bands: below 75% is red, 75–89% is amber, and 90% or higher is green. The 90% band is only an indicator; Cratekeep never automatically imports albums. **Import** saves the selected candidate and runs a non-mutating preview; a separate **Confirm import** action applies that preview. This match-screen path does not require the Inbox queue. After success the modal remains open with its success message and the Import control becomes **Close**.
+
+Genre proposals use canonical MusicBrainz release-group genres only. Cratekeep chooses one genre when the top positive count has at least two votes and strictly exceeds the runner-up; tied, weak, missing, or non-canonical evidence preserves the existing genre. The provider's canonical spelling and case are retained after whitespace normalization (MusicBrainz canonical genre names are commonly lowercase); Cratekeep does not title-case or map synonyms. Provider source and positive counts remain in persisted candidate evidence for audit.
 
 Library execution is review-gated and synchronous. Before changing anything, Cratekeep verifies each approved track against the size, modification time, device, and inode captured by the latest inventory preview. Missing or changed files are rejected with `409 inventory_stale`; run a fresh inventory preview and review again. Track exceptions are honored, so rejected or skipped tracks are not registered or tagged. **As Is** registers approved files in the beets database without rewriting tags. A selected candidate registers untracked files and writes the approved album/track metadata to each file at its existing path. It never invokes `beet import`, moves, or copies a file. When an incoming track shares a selected MusicBrainz recording ID with a managed track, execution requires the persisted duplicate decision: **skip** leaves the incoming duplicate untouched and unregistered, **keep both** registers it separately, **replace** points the one unambiguous managed record at the incoming path, and **merge** updates the one unambiguous managed track's metadata while leaving both files in place. Merge and replace reject ambiguous identity or a stale/unsafe managed path. Execution and dry-run attempts are audited in `adoption_jobs`; album records retain execution status, errors, the last execution job, and completion time. After successful execution, every track in that album is removed from pending review responses without deleting inventory, review, album, or job history. A completed execution can be safely retried and returns its stored result without another write.
 
@@ -134,11 +138,16 @@ python tests/runtime_smoke.py --base-url http://127.0.0.1:8788 \
   --evidence-dir /tmp/cratekeep-smoke/evidence
 ```
 
-The procedure uses valid generated WAV files. It labels and persists one deterministic mocked
-MusicBrainz candidate without external provider traffic, then verifies its preview, confirmation,
-database registration, written tags, and unchanged file path. It also covers As-Is import, empty
-and restored session storage, dark-mode persistence, fresh-inventory candidate gating, browser
-console/network errors, screenshots, and a SHA256 evidence manifest.
+The procedure uses valid generated WAV files. It labels and persists deterministic mocked
+MusicBrainz genre evidence, routes a deterministic mocked CAA thumbnail, and injects deterministic
+server-side JPEG bytes through a smoke-only app factory without external provider traffic. It verifies
+artwork-visible/missing states, sidecar-only and embed-only writes, preservation, explicit replacement,
+missing-art no-op, reliable/weak/tied/missing genre outcomes, preview, an intentional visible failure
+and retry, persistent success with Import-to-Close transition, database registration, exact artwork
+bytes, and unchanged file paths. It also covers As-Is import, guarded dirty backdrop/Escape
+closure, busy close lockout, focus restoration, empty and restored session storage, dark-mode
+persistence, fresh-inventory candidate gating, unexpected browser console/network errors,
+screenshots, and a SHA256 evidence manifest. Unit/API coverage also verifies both destinations together.
 
 To validate an exact local image with isolated mounts, use:
 
@@ -153,9 +162,9 @@ already-tested image artifact to the main-push publish job. Pull requests never 
 
 - Cratekeep is designed for one trusted user and one process. It has no authentication, authorization, CSRF protection, job queue, or background workers.
 - Imports are synchronous and may occupy the sole Gunicorn worker for up to one hour.
-- MusicBrainz matching is an explicit, bounded metadata-only lookup. Each search hit is resolved to canonical release/release-group type and region, media, position, recording, title, and duration data before a deterministic beets-inspired distance is calculated. The MusicBrainz search score remains retrieval metadata and never contributes to confidence. A supplied release ID selects that canonical candidate but never overrides evidence-based confidence or recommendation. Recommendations and per-field penalties are bounded and explainable, and track-count mismatches can never report 100%. Candidate lookup and review decisions do not mutate media; only the separate execution action for an approved review writes tags. Library execution does not fetch artwork or run a beets import.
-- Duplicate resolution is explicit and recording-ID based. Without a selected candidate recording ID Cratekeep cannot classify a track as a duplicate, and merge/replace reject multiple managed matches; Cratekeep surfaces ambiguity instead of approximating identity. There is no automatic duplicate policy, artwork workflow, progress stream, undo, or delete endpoint.
+- MusicBrainz matching is an explicit, bounded metadata lookup. Each search hit is resolved to canonical release/release-group type and region, media, position, recording, title, duration, genre-vote evidence, and CAA artwork availability before a deterministic beets-inspired distance is calculated. The MusicBrainz search score remains retrieval metadata and never contributes to confidence. A supplied release ID selects that canonical candidate but never overrides evidence-based confidence or recommendation. Recommendations and per-field penalties are bounded and explainable, and track-count mismatches can never report 100%. Candidate lookup and review decisions do not mutate media; only the separate execution action for an approved review writes tags and optional artwork. Library execution never runs a beets import.
+- Duplicate resolution is explicit and recording-ID based. Without a selected candidate recording ID Cratekeep cannot classify a track as a duplicate, and merge/replace reject multiple managed matches; Cratekeep surfaces ambiguity instead of approximating identity. There is no automatic duplicate policy, progress stream, undo, or delete endpoint.
 - A metadata database update occurs before its file-tag write, so a failed tag write can leave them temporarily inconsistent. Keep backups and ensure library files are writable.
 - Navidrome integration is a generic POST with optional bearer authentication and is not automatically run after imports.
-- Artwork fetching is disabled by default and is enabled only through the Settings checkbox.
+- Artwork fetching is disabled by default and is enabled only through Settings. Fetches are bounded and use constructed Cover Art Archive identity URLs; arbitrary provider URLs are never fetched server-side.
 - The Flask signing key is generated on first boot and stored as `$STATE_PATH/secret.key`; keep the config volume persistent. It is not displayed in the UI because Cratekeep does not yet have authentication.

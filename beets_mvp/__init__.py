@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from io import BytesIO
 import math
 import os
 import secrets
@@ -18,14 +20,20 @@ import yaml
 from beets import config as beets_config
 from beets.library import Item, Library
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
-from mediafile import MediaFile, UnreadableFileError
+from mediafile import Image as MediaImage, ImageType, MediaFile, UnreadableFileError
+from PIL import Image as PillowImage, UnidentifiedImageError
 
 from .musicbrainz import ProviderError, search_releases
 from .matching import score_release
 
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
 EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
-SETTING_KEYS = ("inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art")
+SETTING_KEYS = (
+    "inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art",
+    "art_sidecar", "art_embed", "art_replace",
+)
+MAX_ARTWORK_BYTES = 10 * 1024 * 1024
+TRUSTED_ARTWORK_HOSTS = {"coverartarchive.org", "archive.org"}
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
 MAX_LIBRARY_IMPORT_ARTISTS = 50
@@ -55,6 +63,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         SECRET_KEY=os.getenv("SECRET_KEY", ""),
         STATE_PATH=os.getenv("STATE_PATH", str(Path.cwd() / "data/config")),
         MUSICBRAINZ_PROVIDER=search_releases,
+        ARTWORK_FETCHER=_fetch_and_normalize_artwork,
     )
     if test_config:
         app.config.update(test_config)
@@ -362,7 +371,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     value = int(value or 0)
                 except (TypeError, ValueError):
                     abort(400, f"{field} must be an integer")
-            item[field] = value
+            _set_item_value(item, field, value)
         item.store()
         try:
             item.write()
@@ -588,7 +597,12 @@ def _ensure_column(db: sqlite3.Connection, table: str, column: str, declaration:
 def _load_settings(path: str) -> dict[str, str]:
     with _connect(path) as db:
         rows = db.execute("SELECT key, value FROM app_settings").fetchall()
-    return {row["key"]: row["value"] for row in rows if row["key"] in SETTING_KEYS}
+    settings = {row["key"]: row["value"] for row in rows if row["key"] in SETTING_KEYS}
+    # Existing installations that opted into fetching retain beets' historical
+    # cover.jpg behavior. Embedding and replacement always require a new opt-in.
+    if settings.get("fetch_art") == "1" and "art_sidecar" not in settings:
+        settings["art_sidecar"] = "1"
+    return settings
 
 
 def _save_settings(path: str, settings: dict[str, str]) -> None:
@@ -607,6 +621,9 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         NAVIDROME_RESCAN_URL=settings.get("navidrome_rescan_url", ""),
         NAVIDROME_TOKEN=settings.get("navidrome_token", ""),
         FETCH_ART=settings.get("fetch_art", "") == "1",
+        ART_SIDECAR=settings.get("art_sidecar", "") == "1",
+        ART_EMBED=settings.get("art_embed", "") == "1",
+        ART_REPLACE=settings.get("art_replace", "") == "1",
     )
     app.config["SETUP_COMPLETE"] = bool(app.config["INBOX_PATH"] and app.config["LIBRARY_PATH"])
     if app.config["SETUP_COMPLETE"]:
@@ -648,6 +665,9 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             "navidrome_rescan_url": rescan_url,
             "navidrome_token": token,
             "fetch_art": "1" if request.form.get("fetch_art") else "",
+            "art_sidecar": "1" if request.form.get("art_sidecar") else "",
+            "art_embed": "1" if request.form.get("art_embed") else "",
+            "art_replace": "1" if request.form.get("art_replace") else "",
         }
         submitted_config = request.form.get("beets_config", config_text)
         rendered_config = None
@@ -991,6 +1011,28 @@ def _normalize_metadata(value: object) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).strip()
 
 
+def _item_genre(item: Item) -> str:
+    """Read genre across beets' legacy scalar and current multi-value fields."""
+    genre = _normalize_metadata(item.get("genre"))
+    if genre:
+        return genre
+    genres = item.get("genres")
+    if isinstance(genres, (list, tuple)):
+        for value in genres:
+            normalized = _normalize_metadata(value)
+            if normalized:
+                return normalized
+        return ""
+    return _normalize_metadata(genres)
+
+
+def _set_item_value(item: Item, field: str, value: object) -> None:
+    item[field] = value
+    if field == "genre":
+        normalized = _normalize_metadata(value)
+        item["genres"] = [normalized] if normalized else []
+
+
 def _metadata_key(value: object) -> str:
     return _normalize_metadata(value).casefold()
 
@@ -1137,12 +1179,12 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
             for field, values in (("albumtype", release_types), ("media", media_types), ("country", countries)):
                 if item.get(field):
                     values.append(str(item.get(field)))
-            if item.get("genre"):
-                genres.append(str(item.get("genre")))
+            if _item_genre(item):
+                genres.append(_item_genre(item))
             if artwork_url is None:
                 artwork_url = _persisted_artwork_source({
                     key: item.get(key) for key in ("artwork_url", "image_url", "cover_url", "cover_art")
-                })
+                }, allow_data=True)
         tracks.append(track)
     query = {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
     if years:
@@ -1190,7 +1232,7 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
         value = _normalize_metadata(candidate.get(key))
         if value and _metadata_key(value) != _metadata_key(query[key]):
             proposed[key] = {"from": query[key], "to": value}
-    genre = _normalize_metadata(candidate.get("genre"))
+    genre = _candidate_genre(candidate)
     if genre and _metadata_key(genre) != _metadata_key(query.get("genre")):
         proposed["genre"] = {"from": query.get("genre"), "to": genre}
     count = candidate.get("track_count")
@@ -1209,6 +1251,15 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
 
 def _candidate_reasons(query: dict, candidate: dict) -> list[str]:
     return _candidate_match(query, candidate)["reasons"]
+
+
+def _candidate_genre(candidate: dict) -> str:
+    evidence = candidate.get("genre_evidence")
+    if not isinstance(evidence, dict) or evidence.get("source") != "musicbrainz-release-group-genres":
+        return ""
+    selected = _normalize_metadata(evidence.get("selected"))
+    genre = _normalize_metadata(candidate.get("genre"))
+    return genre if genre and genre == selected else ""
 
 
 def _candidate_track_details(query: dict, candidate: dict) -> list[dict]:
@@ -1335,9 +1386,12 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
     return result
 
 
-def _persisted_artwork_source(provider_data: dict) -> str | None:
+def _persisted_artwork_source(provider_data: dict, *, allow_data: bool = False) -> str | None:
     """Expose only an already-persisted, browser-renderable artwork source."""
     values = [provider_data.get(key) for key in ("artwork_url", "image_url", "cover_url")]
+    artwork = provider_data.get("artwork")
+    if isinstance(artwork, dict) and artwork.get("source") == "cover-art-archive":
+        values.insert(0, artwork.get("thumbnail_url"))
     cover_art = provider_data.get("cover_art")
     if isinstance(cover_art, dict):
         values.extend(cover_art.get(key) for key in ("url", "image", "data"))
@@ -1346,9 +1400,14 @@ def _persisted_artwork_source(provider_data: dict) -> str | None:
             continue
         source = value.strip()
         lowered = source.lower()
-        if lowered.startswith(("https://", "http://")) or lowered.startswith(
+        parsed = urllib.parse.urlparse(source)
+        host = (parsed.hostname or "").lower()
+        trusted_remote = parsed.scheme == "https" and (
+            host in TRUSTED_ARTWORK_HOSTS or host.endswith(".archive.org")
+        )
+        if trusted_remote or (allow_data and lowered.startswith(
             ("data:image/png;", "data:image/jpeg;", "data:image/gif;", "data:image/webp;", "data:image/avif;")
-        ):
+        )):
             return source
     return None
 
@@ -1449,11 +1508,13 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "hard_mismatches": match["hard_mismatches"],
                     "selected_by_mbid": match["selected_by_mbid"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
-                    "genre": provider_data.get("genre"),
+                    "genre": _candidate_genre(provider_data) or None,
+                    "genre_evidence": provider_data.get("genre_evidence"),
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
                     "release_type": provider_data.get("release_type"),
                     "release_status": provider_data.get("status"), "country": provider_data.get("country"),
                     "artwork_url": _persisted_artwork_source(provider_data),
+                    "artwork": provider_data.get("artwork"),
                     "media": provider_data.get("media", []), "recordings": provider_data.get("tracks", []),
                     "retrieval": provider_data.get("retrieval", {}),
                     "proposed_diff": json.loads(candidate["proposed_diff_json"]),
@@ -1629,6 +1690,10 @@ def _execute_library_import_album(app: Flask, album_review_id: int, *, dry_run: 
         paths = [_validate_inventory_file(root, row) for _, row in approved]
         provider_data = json.loads(candidate["provider_data_json"]) if candidate else None
         plans = _library_import_plans(app, album, approved, paths, provider_data)
+        artwork = _artwork_plan(app, provider_data, plans)
+        artwork_bytes = None
+        if not dry_run and artwork["status"] == "ready":
+            artwork_bytes = app.config["ARTWORK_FETCHER"](provider_data)
         result = {
             "id": job_id,
             "album_review_id": album_review_id,
@@ -1641,10 +1706,13 @@ def _execute_library_import_album(app: Flask, album_review_id: int, *, dry_run: 
             "duplicate_action": album["duplicate_action"],
             "duplicates": sum(plan["duplicate_of"] is not None for plan in plans),
             "skipped_tracks": len(rows) - len(approved),
+            "artwork": artwork,
             "items": [{key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes", "action", "duplicate_of", "target_path")} for plan in plans],
         }
         if not dry_run:
             _apply_library_import_plans(app, plans)
+            if artwork_bytes is not None:
+                result["artwork"] = _apply_artwork(app, plans, artwork_bytes, artwork)
             result["items"] = [
                 {key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes", "action", "duplicate_of", "target_path")} for plan in plans
             ]
@@ -1774,12 +1842,14 @@ def _library_import_plans(
                 code="duplicate_decision_required",
             )
         target_path = row["relative_path"]
+        artwork_path = path
         action = "update" if row["beets_item_id"] is not None else "register"
         comparison_item = item
         if duplicate is not None:
             if duplicate_action in {"merge", "replace"}:
                 duplicate_path = _validate_duplicate_item(app, root=Path(app.config["LIBRARY_PATH"]).resolve(), item=duplicate)
                 target_path = duplicate_path.relative_to(Path(app.config["LIBRARY_PATH"]).resolve()).as_posix()
+                artwork_path = duplicate_path
             if duplicate_action == "skip":
                 action = "skip"
                 values = {}
@@ -1788,18 +1858,21 @@ def _library_import_plans(
             elif duplicate_action == "replace":
                 action = "replace"
                 target_path = row["relative_path"]
+                artwork_path = path
             elif duplicate_action == "merge":
                 action = "merge"
                 comparison_item = duplicate
-        changes = {
-            field: {"from": comparison_item.get(field), "to": value}
-            for field, value in values.items() if comparison_item.get(field) != value
-        }
+        changes = {}
+        for field, value in values.items():
+            current = _item_genre(comparison_item) if field == "genre" else comparison_item.get(field)
+            if current != value:
+                changes[field] = {"from": current, "to": value}
         plans.append({
             "inventory_id": row["id"], "path": row["relative_path"], "absolute_path": path,
             "beets_item_id": row["beets_item_id"], "item": item, "values": values, "changes": changes,
             "action": action, "duplicate_item": duplicate,
             "duplicate_of": duplicate.id if duplicate is not None else None, "target_path": target_path,
+            "artwork_path": artwork_path,
         })
     return plans
 
@@ -1833,7 +1906,7 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
         values.update(artist=artist, albumartist=artist)
     if album:
         values["album"] = album
-    genre = _normalize_metadata(candidate.get("genre"))
+    genre = _candidate_genre(candidate)
     if genre:
         values["genre"] = genre
     date = str(candidate.get("date") or candidate.get("year") or "")
@@ -1870,6 +1943,103 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
     return values
 
 
+def _artwork_plan(app: Flask, candidate: dict | None, plans: list[dict]) -> dict:
+    destinations = {"sidecar": bool(app.config["ART_SIDECAR"]), "embedded": bool(app.config["ART_EMBED"])}
+    base = {"destinations": destinations, "replace_existing": bool(app.config["ART_REPLACE"])}
+    if not app.config["FETCH_ART"]:
+        return {**base, "status": "disabled", "message": "Artwork fetching is disabled."}
+    if not any(destinations.values()):
+        return {**base, "status": "disabled", "message": "No artwork destination is enabled."}
+    artwork = candidate.get("artwork") if isinstance(candidate, dict) else None
+    if not isinstance(artwork, dict) or not artwork.get("available"):
+        return {**base, "status": "unavailable", "message": "No candidate artwork is available; existing artwork will be preserved."}
+    entity, mbid = artwork.get("entity"), str(artwork.get("mbid") or "")
+    if entity not in {"release", "release-group"} or not MUSICBRAINZ_ID_PATTERN.fullmatch(mbid):
+        raise LibraryImportExecutionError("Candidate artwork identity is invalid.", code="artwork_identity_invalid", status=400)
+    album_folders = sorted({str(plan["artwork_path"].parent) for plan in plans if plan["action"] != "skip"})
+    return {
+        **base, "status": "ready", "source": "cover-art-archive", "entity": entity, "mbid": mbid,
+        "album_folders": album_folders, "message": "Candidate artwork is ready for approved import.",
+    }
+
+
+class _SafeArtworkRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlparse(newurl)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host in TRUSTED_ARTWORK_HOSTS or host.endswith(".archive.org")):
+            raise urllib.error.URLError("Cover Art Archive redirected to an untrusted host")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_and_normalize_artwork(candidate: dict) -> bytes:
+    artwork = candidate["artwork"]
+    url = f"https://coverartarchive.org/{artwork['entity']}/{artwork['mbid']}/front"
+    request_object = urllib.request.Request(
+        url, headers={"Accept": "image/jpeg,image/png,image/webp,image/gif", "User-Agent": "Cratekeep/0.1 (https://github.com/kylejschultz/cratekeep)"}
+    )
+    try:
+        with urllib.request.build_opener(_SafeArtworkRedirect()).open(request_object, timeout=15) as response:
+            length = response.headers.get("Content-Length")
+            if length and int(length) > MAX_ARTWORK_BYTES:
+                raise ValueError("artwork exceeds 10 MB limit")
+            payload = response.read(MAX_ARTWORK_BYTES + 1)
+            if len(payload) > MAX_ARTWORK_BYTES:
+                raise ValueError("artwork exceeds 10 MB limit")
+        with PillowImage.open(BytesIO(payload)) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+                raise ValueError(f"unsupported artwork format {image.format or 'unknown'}")
+            if image.width <= 0 or image.height <= 0 or image.width * image.height > 40_000_000:
+                raise ValueError("artwork dimensions are invalid or too large")
+            image.seek(0)
+            normalized = image.convert("RGB")
+            output = BytesIO()
+            normalized.save(output, format="JPEG", quality=90, optimize=False, progressive=False)
+            return output.getvalue()
+    except (
+        OSError, ValueError, TypeError, urllib.error.URLError,
+        UnidentifiedImageError, PillowImage.DecompressionBombError,
+    ) as exc:
+        raise LibraryImportExecutionError(
+            f"Artwork retrieval failed before artwork was changed: {exc}", code="artwork_fetch_failed", status=502
+        ) from exc
+
+
+def _apply_artwork(app: Flask, plans: list[dict], jpeg: bytes, summary: dict) -> dict:
+    replace = bool(app.config["ART_REPLACE"])
+    sidecars = {"written": [], "preserved": []}
+    embedded = {"written": [], "preserved": []}
+    if app.config["ART_SIDECAR"]:
+        for folder in sorted({plan["artwork_path"].parent for plan in plans if plan["action"] != "skip"}, key=str):
+            destination = folder / "cover.jpg"
+            if destination.exists() and not replace:
+                sidecars["preserved"].append(str(destination))
+                continue
+            temporary = folder / f".cover.{secrets.token_hex(8)}.tmp"
+            try:
+                temporary.write_bytes(jpeg)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            sidecars["written"].append(str(destination))
+    if app.config["ART_EMBED"]:
+        for plan in plans:
+            if plan["action"] == "skip":
+                continue
+            media = MediaFile(str(plan["artwork_path"]))
+            if media.images and not replace:
+                embedded["preserved"].append(plan["target_path"])
+                continue
+            media.images = [MediaImage(jpeg, desc="Front cover", type=ImageType.front)]
+            media.save()
+            embedded["written"].append(plan["target_path"])
+    return {
+        **summary, "status": "applied", "sidecars": sidecars, "embedded": embedded,
+        "sha256": hashlib.sha256(jpeg).hexdigest(),
+        "message": "Artwork applied; pre-existing artwork was preserved unless replacement was enabled.",
+    }
+
+
 def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
     library = _library(app)
     for plan in plans:
@@ -1878,20 +2048,21 @@ def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
         if plan["action"] == "merge":
             item = plan["duplicate_item"]
             for field, value in plan["values"].items():
-                item[field] = value
+                _set_item_value(item, field, value)
             if plan["changes"]:
                 item.write()
                 item.store()
             continue
         item = plan["item"]
         for field, value in plan["values"].items():
-            item[field] = value
+            _set_item_value(item, field, value)
         if plan["action"] == "replace":
             replacement = plan["duplicate_item"]
             for field in ("title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc"):
-                replacement[field] = item.get(field)
+                current = _item_genre(item) if field == "genre" else item.get(field)
+                _set_item_value(replacement, field, current)
             for field, value in plan["values"].items():
-                replacement[field] = value
+                _set_item_value(replacement, field, value)
             replacement.path = os.fsencode(plan["absolute_path"])
             replacement.write()
             replacement.store()
@@ -1978,6 +2149,7 @@ def _group_library_import_review_items(items: list[dict]) -> list[dict]:
 
 def _serialize_item(item) -> dict:
     result = {key: item.get(key) for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")}
+    result["genre"] = _item_genre(item)
     path = item.get("path")
     result["path"] = os.fsdecode(path) if path else ""
     result["bytes"] = Path(result["path"]).stat().st_size if result["path"] and Path(result["path"]).is_file() else None
