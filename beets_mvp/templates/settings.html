@@ -948,6 +948,13 @@
       reviewDialog.inert = true; reviewDialog.setAttribute('aria-hidden', 'true');
     }
 
+    function resetImportPreview() {
+      const confirmation = document.getElementById('library-import-confirmation');
+      const applyButton = document.getElementById('library-import-execution-apply');
+      if (confirmation) confirmation.hidden = true;
+      if (applyButton) applyButton.disabled = true;
+    }
+
     function renderAlbumMatch() {
       const candidates = document.getElementById('library-import-modal-candidates');
       const current = activeAlbum?.current_metadata || {artist:activeAlbum?.artist, album:activeAlbum?.album, track_count:activeAlbum?.tracks?.length || 0};
@@ -1059,12 +1066,6 @@
       }
       function changedTrackEvidence(details) {
         return trackEvidence(details).filter(track => track.titleChanged || track.positionChanged || track.durationChanged || track.unpaired);
-      }
-      function resetImportPreview() {
-        const confirmation = document.getElementById('library-import-confirmation');
-        const applyButton = document.getElementById('library-import-execution-apply');
-        if (confirmation) confirmation.hidden = true;
-        if (applyButton) applyButton.disabled = true;
       }
       function renderTrackChangeFact(dd, fact, value) {
         if (fact.changeCount === 0) {

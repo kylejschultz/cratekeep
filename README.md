@@ -122,6 +122,33 @@ pytest -q
 python -m compileall -q beets_mvp tests
 ```
 
+### Browser and container smoke validation
+
+Install the development requirements and Chromium once, then run the smoke test against a fresh,
+already-running candidate. The state and fixture paths must be private to the run:
+
+```sh
+python -m playwright install chromium
+python tests/runtime_smoke.py --base-url http://127.0.0.1:8788 \
+  --fixture-root /tmp/cratekeep-smoke/fixtures --state-path /tmp/cratekeep-smoke/state \
+  --evidence-dir /tmp/cratekeep-smoke/evidence
+```
+
+The procedure uses valid generated WAV files. It labels and persists one deterministic mocked
+MusicBrainz candidate without external provider traffic, then verifies its preview, confirmation,
+database registration, written tags, and unchanged file path. It also covers As-Is import, empty
+and restored session storage, dark-mode persistence, fresh-inventory candidate gating, browser
+console/network errors, screenshots, and a SHA256 evidence manifest.
+
+To validate an exact local image with isolated mounts, use:
+
+```sh
+tests/container_smoke.sh cratekeep:candidate /tmp/cratekeep-container-evidence
+```
+
+The CI build job runs this container procedure, uploads bounded smoke evidence, and passes the
+already-tested image artifact to the main-push publish job. Pull requests never publish images.
+
 ## Limitations
 
 - Cratekeep is designed for one trusted user and one process. It has no authentication, authorization, CSRF protection, job queue, or background workers.

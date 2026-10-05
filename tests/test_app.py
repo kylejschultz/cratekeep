@@ -349,7 +349,7 @@ def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
     assert b"window.addEventListener('hashchange'" in html
 
 
-def test_settings_script_initializes_inventory_and_theme_without_stale_queue_reference(tmp_path):
+def test_settings_script_initializes_without_stale_direct_import_references(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
     script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
 
@@ -359,6 +359,7 @@ def test_settings_script_initializes_inventory_and_theme_without_stale_queue_ref
     assert "const themeButton = document.getElementById('theme-toggle');" in script
     assert "localStorage.getItem('cratekeep-theme') === 'dark'" in script
     assert "themeButton.addEventListener('click'" in script
+    assert script.index("function resetImportPreview()") < script.index("function renderAlbumMatch()")
 
 
 def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
