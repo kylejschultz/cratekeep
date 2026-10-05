@@ -350,20 +350,34 @@ def main() -> None:
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     tracks = make_fixture(args.fixture_root)
     before = {name: sha256(path) for name, path in tracks.items()}
+    host_identity_before = {
+        name: {"path": str(path.resolve()), "device": path.stat().st_dev, "inode": path.stat().st_ino}
+        for name, path in tracks.items()
+    }
+    app_library = Path(args.app_library).absolute() if args.app_library else (args.fixture_root / "library").resolve()
     configure(
         args.base_url.rstrip("/"),
         args.app_inbox or str((args.fixture_root / "inbox").resolve()),
-        args.app_library or str((args.fixture_root / "library").resolve()),
+        str(app_library),
     )
     browser_result = run_browser(args.base_url.rstrip("/"), args.state_path, args.evidence_dir)
     after = {name: sha256(path) for name, path in tracks.items()}
     assert before["as_is"] == after["as_is"], "as-is direct import changed source audio bytes"
     assert all(track.exists() for track in tracks.values()), "direct import moved or removed a source file"
+    host_identity_after = {
+        name: {"path": str(path.resolve()), "device": path.stat().st_dev, "inode": path.stat().st_ino}
+        for name, path in tracks.items()
+    }
+    assert host_identity_after == host_identity_before, "direct import moved or replaced a host fixture file"
     items = request_json(f"{args.base_url.rstrip('/')}/api/items")
     assert len(items) == len(tracks)
     by_path = {Path(item["path"]).name: item for item in items}
     for name, path in tracks.items():
-        assert Path(by_path[path.name]["path"]).resolve() == path.resolve()
+        expected_app_path = app_library / TRACKS[name]
+        reported_path = Path(by_path[path.name]["path"])
+        assert reported_path.is_absolute()
+        assert reported_path.is_relative_to(app_library)
+        assert reported_path == expected_app_path
 
     sidecar_tags = MediaFile(str(tracks["sidecar"]))
     embed_tags = MediaFile(str(tracks["embed"]))
@@ -389,6 +403,9 @@ def main() -> None:
     result = {
         "fixture_sha256_before": before,
         "fixture_sha256_after": after,
+        "host_identity_before": host_identity_before,
+        "host_identity_after": host_identity_after,
+        "expected_app_library": str(app_library),
         "registered_paths": sorted(item["path"] for item in items),
         "provider_mock": {
             "kind": "persisted MusicBrainz/CAA evidence plus config-injected server JPEG and routed browser thumbnail",
