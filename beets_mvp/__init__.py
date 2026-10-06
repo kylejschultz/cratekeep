@@ -279,6 +279,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             abort(404)
         return jsonify(item)
 
+    @app.get("/api/library-import/albums/<int:album_review_id>")
+    def library_import_album_review(album_review_id: int):
+        item = next(iter(_album_review_payloads(app, [album_review_id])), None)
+        if item is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        return jsonify(_with_readiness(item))
+
     @app.post("/api/library-import/albums/<int:album_review_id>/rematch")
     def rematch_library_import_album(album_review_id: int):
         values = request.get_json(silent=True)
@@ -1075,18 +1082,17 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
         summary.get("folder") for row in scan_rows
         for summary in [json.loads(row["summary_json"])] if summary.get("folder")
     }
-    pending_ids = sorted({row["album_id"] for row in inventory
-                          if row["album_id"] is not None and row["execution_status"] not in {"complete", "failed"}
-                          and row["candidate_status"] == "complete" and not row["candidate_error"]
-                          and row["state"] not in {"rejected", "skipped"}
-                          and row["selected_confidence"] == 1.0})
-    ready_ids = {
-        album["id"] for album in map(_with_readiness, _album_review_payloads(app, pending_ids)) if album["ready"]
-    }
+    # Inventory rows already belong to exactly one literal top-level scope. Group
+    # them once instead of rescanning the complete inventory for every folder.
+    rows_by_scope = {scope: [] for scope in scopes}
+    for row in inventory:
+        if row["present"]:
+            rows_by_scope.setdefault(_scope_for_relative_path(row["relative_path"]), []).append(row)
+
     records = []
     needle = query.casefold()
     for scope in scopes:
-        rows = [row for row in inventory if _relative_in_scope(row["relative_path"], scope) and row["present"]]
+        rows = rows_by_scope.get(scope, [])
         album_ids = {row["album_id"] for row in rows if row["album_id"] is not None}
         pending = {row["album_id"] for row in rows if row["album_id"] is not None
                    and row["execution_status"] != "complete"}
@@ -1094,36 +1100,73 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
                     and row["execution_status"] == "complete"}
         errors = {row["album_id"] for row in rows if row["album_id"] is not None
                   and (row["execution_status"] == "failed" or row["candidate_status"] == "error")}
-        ready = pending & ready_ids
         if not rows and scope not in scanned_scopes:
-            folder_status = "not-scanned"
+            fixed_status = "not-scanned"
         elif errors:
-            folder_status = "error"
-        elif ready:
-            folder_status = "ready"
+            fixed_status = "error"
         elif album_ids and not pending and imported:
-            folder_status = "imported"
+            fixed_status = "imported"
         else:
-            folder_status = "needs-review"
+            fixed_status = None
         haystack = " ".join([
             scope, *(row["relative_path"] for row in rows),
             *(str(row["artist"] or "") for row in rows), *(str(row["album"] or "") for row in rows),
         ]).casefold()
         if needle and needle not in haystack:
             continue
-        if status != "all" and folder_status != status:
-            continue
         records.append({
             "path": scope, "name": "Library root" if scope == "." else scope,
-            "status": folder_status, "track_count": len(rows), "album_count": len(album_ids),
-            "available_album_count": len(pending), "ready_album_count": len(ready),
-            "exception_album_count": len(pending - ready), "imported_album_count": len(imported),
+            "status": fixed_status, "track_count": len(rows), "album_count": len(album_ids),
+            "available_album_count": len(pending), "imported_album_count": len(imported),
+            "_pending_ids": pending,
+            "_readiness_ids": {
+                row["album_id"] for row in rows
+                if row["album_id"] is not None and row["execution_status"] not in {"complete", "failed"}
+                and row["candidate_status"] == "complete" and not row["candidate_error"]
+                and row["state"] not in {"rejected", "skipped"}
+                and row["selected_confidence"] == 1.0
+            },
         })
+
+    # Status filters must classify every matching folder. The ordinary all-status
+    # path paginates first, so candidate construction, duplicate checks, and audio
+    # duration inspection are bounded to albums on the displayed 25-folder page.
+    if status != "all":
+        fixed_matches = [record for record in records if record["status"] == status]
+        unresolved = [record for record in records if record["status"] is None]
+        if status in {"ready", "needs-review"}:
+            readiness_ids = sorted({album_id for record in unresolved for album_id in record["_readiness_ids"]})
+            ready_ids = {
+                album["id"] for album in map(_with_readiness, _album_review_payloads(app, readiness_ids))
+                if album["ready"]
+            }
+            for record in unresolved:
+                record["status"] = "ready" if record["_pending_ids"] & ready_ids else "needs-review"
+            records = fixed_matches + [record for record in unresolved if record["status"] == status]
+        else:
+            records = fixed_matches
+
     total = len(records)
     page_count = max(1, math.ceil(total / FOLDER_PAGE_SIZE))
     page = min(page, page_count)
     start = (page - 1) * FOLDER_PAGE_SIZE
-    return {"folders": records[start:start + FOLDER_PAGE_SIZE], "page": page, "page_count": page_count,
+    page_records = records[start:start + FOLDER_PAGE_SIZE]
+    if status == "all":
+        unresolved = [record for record in page_records if record["status"] is None]
+        readiness_ids = sorted({album_id for record in unresolved for album_id in record["_readiness_ids"]})
+        ready_ids = {
+            album["id"] for album in map(_with_readiness, _album_review_payloads(app, readiness_ids))
+            if album["ready"]
+        }
+        for record in unresolved:
+            record["status"] = "ready" if record["_pending_ids"] & ready_ids else "needs-review"
+    for record in page_records:
+        ready = record["_pending_ids"] & (ready_ids if record["status"] in {"ready", "needs-review"} else set())
+        record["ready_album_count"] = len(ready)
+        record["exception_album_count"] = len(record["_pending_ids"] - ready)
+        record.pop("_pending_ids")
+        record.pop("_readiness_ids")
+    return {"folders": page_records, "page": page, "page_count": page_count,
             "total": total, "limit": FOLDER_PAGE_SIZE, "query": query, "status": status}
 
 

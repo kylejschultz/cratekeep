@@ -59,6 +59,8 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
             return [base, {**base, "provider_id": "queue-release-2"}]
         if query["album"] == "Lower Match":
             base["artist"] = f'{query["artist"]} Different'
+        if query["album"] in {"Sequential First", "Sequential Second"}:
+            base["artist"] = f'{query["artist"]} Different'
         return [base]
     assert limit == 1
     candidate = {

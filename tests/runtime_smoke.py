@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 import urllib.parse
 import urllib.request
 import wave
@@ -37,6 +38,8 @@ TRACKS = {
     "queue_lower": Path("Queue Lower") / "Lower Match" / "01 Lower.wav",
     "queue_error": Path("Queue Error") / "Provider Error" / "01 Error.wav",
     "queue_unselected": Path("Queue Unselected") / "Untouched" / "01 Untouched.wav",
+    "queue_sequence_first": Path("Queue Sequential") / "Sequential First" / "01 First.wav",
+    "queue_sequence_second": Path("Queue Sequential") / "Sequential Second" / "01 Second.wav",
 }
 GENRES = {"case": "Alternative Rock", "sidecar": "Rock", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient"}
 CASE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174099"
@@ -90,9 +93,8 @@ def make_fixture(root: Path) -> dict[str, Path]:
             tags.track = int(track.stem.split(" ", 1)[0])
             tags.disc = 1
             tags.save()
-    for number in range(30):
-        pagination = root / "library" / f"ZZ Pagination Folder {number:02d}" / f"Album {number:02d}" / "01 Track.wav"
-        write_wav(pagination)
+    for number in range(120):
+        (root / "library" / f"ZZ Pagination Folder {number:03d}").mkdir(parents=True)
     return tracks
 
 
@@ -236,6 +238,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     page_errors: list[str] = []
     console_errors: list[str] = []
     network: list[dict] = []
+    folder_page_timings_ms: dict[str, float] = {}
+    sequential_proof: list[dict] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page: Page = browser.new_page(viewport={"width": 1440, "height": 1000})
@@ -283,17 +287,29 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator("#settings-tab-library-import").click()
         page.locator(".review-folder").first.wait_for()
         assert page.locator(".review-folder").count() == 25
+        started = time.perf_counter()
+        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
+                                  and "page=1" in response.url):
+            page.locator("#library-import-page-input").fill("1")
+            page.locator("#library-import-page-input").press("Enter")
+        folder_page_timings_ms["page_1"] = round((time.perf_counter() - started) * 1000, 2)
         first_page_name = page.locator(".review-folder-path").first.inner_text()
         page.locator(".review-folder .review-select").first.check()
+        started = time.perf_counter()
         page.locator("#folder-page-next").click()
         page.wait_for_function("document.getElementById('library-import-page-input').value === '2'")
+        folder_page_timings_ms["page_2"] = round((time.perf_counter() - started) * 1000, 2)
         assert page.locator(".review-folder").count() >= 2
         second_page_name = page.locator(".review-folder-path").first.inner_text()
         page.locator(".review-folder .review-select").first.check()
         page.get_by_text("2 folders selected", exact=False).wait_for()
-        page.locator("#library-import-page-input").fill("1")
-        page.locator("#library-import-page-input").press("Enter")
+        started = time.perf_counter()
+        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
+                                  and "page=1" in response.url):
+            page.locator("#library-import-page-input").fill("1")
+            page.locator("#library-import-page-input").press("Enter")
         page.get_by_text(first_page_name, exact=True).wait_for()
+        folder_page_timings_ms["direct_jump_page_1"] = round((time.perf_counter() - started) * 1000, 2)
         assert page.locator(".review-folder .review-select").first.is_checked()
         page.screenshot(path=evidence / "pagination-1-desktop.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
@@ -305,6 +321,16 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.set_viewport_size({"width": 1440, "height": 1000})
         assert second_page_name
 
+        # Rapid navigation must leave the newest requested page rendered even if
+        # the earlier request is aborted or completes after it.
+        page.locator("#library-import-page-input").fill("2")
+        page.locator("#library-import-page-input").press("Enter")
+        page.locator("#library-import-page-input").fill("5")
+        page.locator("#library-import-page-input").press("Enter")
+        page.wait_for_function("document.getElementById('library-import-page-input').value === '5'")
+        page.wait_for_timeout(250)
+        assert page.locator("#library-import-page-input").input_value() == "5"
+
         # Select folders across filtered views and exercise scoped scan, safe
         # bulk import confirmation, and exception sequencing.
         page.evaluate("sessionStorage.removeItem(Object.keys(sessionStorage).find(key => key.startsWith('cratekeep-folder-selection:')))" )
@@ -312,9 +338,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator("#settings-tab-library-import").click()
         queue_before = {name: (sha256(tracks[name]), str(tracks[name].resolve()), tracks[name].stat().st_ino)
                         for name in ("queue_safe", "queue_tied", "queue_lower", "queue_error", "queue_unselected")}
-        for folder_name in ("Queue Safe", "Queue Tied", "Queue Lower", "Queue Error"):
+        for folder_name in ("Queue Safe", "Queue Sequential", "Queue Error"):
             page.get_by_role("checkbox", name=f"Select folder {folder_name}", exact=True).check()
-        page.get_by_text("4 folders selected", exact=False).wait_for()
+        page.get_by_text("3 folders selected", exact=False).wait_for()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as scan_info:
             page.locator("#library-import-scan-selected").click()
         assert scan_info.value.status == 207
@@ -323,9 +349,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                    for name, before in queue_before.items()), "folder scan changed media bytes, path, or inode"
         assert page.locator("#library-import-ready").inner_text() == "Import ready (1)"
         assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (3)"
+        page.get_by_role("checkbox", name="Select folder Queue Error", exact=True).uncheck()
+        page.get_by_text("2 folders selected", exact=False).wait_for()
+        assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (2)"
         page.locator("#library-import-ready").click()
         page.locator("#library-import-confirm-modal:not([hidden])").wait_for()
-        assert "4 folders · 1 ready albums · 1 files/tracks · 3 excluded exceptions" in page.locator("#library-import-confirm-summary").inner_text()
+        assert "2 folders · 1 ready albums · 1 files/tracks · 2 excluded exceptions" in page.locator("#library-import-confirm-summary").inner_text()
         page.locator("#library-import-confirm-cancel").click()
         assert page.locator("#library-import-ready").evaluate("element => document.activeElement === element")
         page.locator("#library-import-ready").click()
@@ -335,12 +364,58 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert len(bulk_info.value.json()["imported"]) == 1
         page.get_by_text("1 albums imported", exact=False).wait_for()
         page.screenshot(path=evidence / "03-folder-bulk-import.png", full_page=True)
-        page.locator("#library-import-review-exceptions").click()
+        with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as first_album_info:
+            page.locator("#library-import-review-exceptions").click()
         page.locator("#library-import-modal:not([hidden])").wait_for()
+        first_payload = first_album_info.value.json()
         first_exception = page.locator("#library-import-modal-title").inner_text()
         page.get_by_role("button", name="Skip", exact=True).click()
         page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_exception)
+        second_exception = page.locator("#library-import-modal-title").inner_text()
+        assert second_exception != first_exception
         page.locator("#library-import-modal-close").click()
+        page.locator("#library-import-modal").wait_for(state="hidden")
+
+        # Reopening starts a fresh run. A failed first import stays on the same
+        # album; retry success advances to a freshly fetched second payload.
+        with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as reopened_info:
+            page.locator("#library-import-review-exceptions").click()
+        page.locator("#library-import-modal:not([hidden])").wait_for()
+        reopened_payload = reopened_info.value.json()
+        assert reopened_payload["id"] == first_payload["id"]
+        first_title = page.locator("#library-import-modal-title").inner_text()
+        execute_pattern = re.compile(r".*/api/library-import/albums/\d+/execute$")
+        expected_failure["kind"] = "execute"
+        page.route(execute_pattern, lambda route: route.fulfill(
+            status=502, content_type="application/json",
+            body=json.dumps({"error": "Deterministic sequential import failure", "code": "fixture_failure"}),
+        ), times=1)
+        with page.expect_response(lambda response: response.url.endswith("/execute")) as failed_sequence:
+            page.locator("#library-import-in-place").click()
+        assert failed_sequence.value.status == 502
+        expected_failure["kind"] = None
+        assert page.locator("#library-import-modal-title").inner_text() == first_title
+        assert page.locator("#library-import-in-place").inner_text() == "Import"
+
+        with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as next_album_info:
+            with page.expect_response(lambda response: response.url.endswith("/execute")) as first_execute:
+                page.locator("#library-import-in-place").click()
+        next_payload = next_album_info.value.json()
+        first_body = first_execute.value.request.post_data_json
+        sequential_proof.append({"album_id": reopened_payload["id"], "candidate_id": first_body["candidate_id"],
+                                 "owned_candidate_ids": [candidate["id"] for candidate in reopened_payload["candidates"]]})
+        assert first_body["candidate_id"] in sequential_proof[-1]["owned_candidate_ids"]
+        page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_title)
+        with page.expect_response(lambda response: response.url.endswith("/execute")) as second_execute:
+            page.locator("#library-import-in-place").click()
+        second_body = second_execute.value.request.post_data_json
+        sequential_proof.append({"album_id": next_payload["id"], "candidate_id": second_body["candidate_id"],
+                                 "owned_candidate_ids": [candidate["id"] for candidate in next_payload["candidates"]]})
+        assert second_body["candidate_id"] in sequential_proof[-1]["owned_candidate_ids"]
+        assert sequential_proof[0]["album_id"] != sequential_proof[1]["album_id"]
+        page.locator("#library-import-in-place", has_text="Close").wait_for()
+        page.screenshot(path=evidence / "03-sequential-exceptions-complete.png", full_page=True)
+        page.locator("#library-import-in-place").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
 
         # Populate the existing detailed-review smoke fixtures through the
@@ -350,7 +425,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         candidate_ids = install_provider_fixtures(state_path)
         page.reload(wait_until="networkidle")
         page.locator("#settings-tab-library-import").click()
-        page.get_by_text("4 folders selected", exact=False).wait_for()
+        page.get_by_text("2 folders selected", exact=False).wait_for()
         page.screenshot(path=evidence / "03-selection-restored.png", full_page=True)
         candidate_review = open_folder_album("Sidecar Artist")
         candidate_review.click(force=True)
@@ -642,6 +717,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         "page_errors": page_errors, "console_errors": unexpected_console,
         "expected_failure_console": [message for message in console_errors if message not in unexpected_console],
         "network": network,
+        "folder_page_timings_ms": folder_page_timings_ms,
+        "sequential_candidate_proof": sequential_proof,
     }
 
 

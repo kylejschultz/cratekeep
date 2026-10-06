@@ -94,6 +94,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `GET /api/library-import/reviews` — list persisted track groups and album review records, paginated by album (`limit`/`offset`, 25 albums by default)
 - `GET /api/library-import/folders` — list literal immediate-child library folders, 25 per page, with search and persisted-state status filtering
 - `GET /api/library-import/folders/albums?folder=…` — lazily load reviewable albums for one validated folder scope
+- `GET /api/library-import/albums/<id>` — fetch one current album-review payload before a sequential review transition
 - `POST /api/library-import/folders/scan` — inventory and MusicBrainz-match only the submitted folder scopes; never imports or writes media
 - `POST /api/library-import/bulk/preview` — summarize exact/current ready albums and excluded exceptions in selected folders
 - `POST /api/library-import/bulk/execute` — after explicit `confirmed: true`, revalidate and import only still-ready albums through the existing per-album dry-run/execute boundary

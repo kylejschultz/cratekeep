@@ -744,6 +744,7 @@
     let reviewOpeningState = '', reviewSucceeded = false;
     const selectedAlbumIds = new Set();
     let reviewSequence = [];
+    let reviewTransitionToken = 0;
     const reviewAlbumLimit = 25;
     let latestInventoryPreview = null, reviewHasMore = false, reviewOffset = 0, reviewTotalAlbums = 0, reviewPageAlbumCount = 0;
     let inventoryPreviewReady = false;
@@ -1346,13 +1347,42 @@
         || mbidSearchBusy();
     }
 
-    function closeReview(clearSequence = true) {
+    function resetAlbumReviewState() {
+      activeAlbum = null;
+      activeCandidateId = null;
+      reviewSucceeded = false;
+      reviewOpeningState = '';
+      reviewReturnFocus = null;
+      document.getElementById('library-import-duplicate-action').value = '';
+      const message = document.getElementById('library-import-modal-message');
+      message.dataset.busy = 'false'; message.textContent = '';
+      const result = document.getElementById('library-import-execution-result');
+      result.dataset.busy = 'false'; result.textContent = '';
+    }
+
+    function closeReview(clearSequence = true, invalidateTransition = true) {
       closeTrackComparison();
       closeMbidSearch({force:true, restoreFocus:false});
+      if (invalidateTransition) reviewTransitionToken += 1;
       reviewModal.hidden = true;
       document.body.classList.remove('modal-open');
       if (clearSequence) reviewSequence = [];
-      if (reviewReturnFocus) reviewReturnFocus.focus();
+      const returnFocus = reviewReturnFocus;
+      resetAlbumReviewState();
+      if (returnFocus) returnFocus.focus();
+    }
+
+    async function openNextQueuedReview(returnFocus) {
+      const nextId = reviewSequence[0];
+      if (!nextId) return false;
+      const transitionToken = ++reviewTransitionToken;
+      const response = await fetch(`/api/library-import/albums/${nextId}`);
+      const album = await readApiResponse(response, 'Unable to load the next album review');
+      if (transitionToken !== reviewTransitionToken || reviewSequence[0] !== nextId) return false;
+      reviewSequence.shift();
+      closeReview(false, false);
+      openReview(album, returnFocus);
+      return true;
     }
 
     function requestCloseReview(clearSequence = true) {
@@ -1477,14 +1507,9 @@
           });
           const data = await readApiResponse(response, 'Unable to save review decision');
           selectedAlbumIds.delete(activeAlbum.id);
-          const nextId = reviewSequence.shift();
           await loadReviewItems();
-          closeReview(false);
-          if (nextId) {
-            const nextAlbum = albumReviews.find(album => album.id === nextId);
-            const nextButton = reviewList.querySelector(`.review-album[data-album-id="${nextId}"]`) || document.getElementById('library-import-review-exceptions');
-            if (nextAlbum && nextButton) openReview(nextAlbum, nextButton);
-          }
+          if (reviewSequence.length) await openNextQueuedReview(document.getElementById('library-import-review-exceptions'));
+          else closeReview(false);
         } catch (error) {
           message.dataset.busy = 'false';
           message.textContent = error.message || 'Unable to save review decision.';
@@ -1520,11 +1545,8 @@
           result.textContent = `${data.files} files imported in place; no files were moved or copied.${artMessage}`;
           selectedAlbumIds.delete(activeAlbum.id);
           await loadReviewItems();
-          const nextId = reviewSequence.shift();
-          if (nextId) {
-            const nextAlbum = albumReviews.find(album => album.id === nextId);
-            closeReview(false);
-            if (nextAlbum) openReview(nextAlbum, document.getElementById('library-import-review-exceptions'));
+          if (reviewSequence.length) {
+            await openNextQueuedReview(document.getElementById('library-import-review-exceptions'));
             return;
           }
           reviewSucceeded = true;
@@ -1599,6 +1621,7 @@
     const folderSelectionKey = 'cratekeep-folder-selection:' + {{ build_sha|tojson }};
     const selectedFolders = new Set();
     let foldersOnPage = [], currentFolderPage = 1, totalFolderPages = 1, totalFolders = 0;
+    let folderRequestController = null, folderRequestSequence = 0;
     let selectedFolderSummary = {available_album_count:0, ready_album_count:0, exception_count:0};
     try { JSON.parse(sessionStorage.getItem(folderSelectionKey) || '[]').forEach(path => selectedFolders.add(path)); } catch (error) {}
 
@@ -1681,14 +1704,23 @@
     }
 
     async function loadFolderItems(page = currentFolderPage) {
+      const requestSequence = ++folderRequestSequence;
+      if (folderRequestController) folderRequestController.abort();
+      folderRequestController = new AbortController();
       reviewStatus.dataset.busy = 'true'; reviewStatus.textContent = 'Loading folders…';
       folderFirst.disabled = folderPrevious.disabled = folderNext.disabled = folderLast.disabled = true;
       try {
         const query = new URLSearchParams({page:String(page), q:folderSearch.value.trim(), status:folderFilter.value});
-        const response = await fetch(`/api/library-import/folders?${query}`);
+        const response = await fetch(`/api/library-import/folders?${query}`, {signal:folderRequestController.signal});
         const data = await readApiResponse(response, 'Unable to load folders');
+        if (requestSequence !== folderRequestSequence) return;
         foldersOnPage = data.folders; currentFolderPage = data.page; totalFolderPages = data.page_count; totalFolders = data.total; renderFolderQueue();
-      } catch (error) { reviewStatus.dataset.busy = 'false'; reviewStatus.textContent = error.message || 'Unable to load folders.'; }
+      } catch (error) {
+        if (error.name === 'AbortError' || requestSequence !== folderRequestSequence) return;
+        reviewStatus.dataset.busy = 'false'; reviewStatus.textContent = error.message || 'Unable to load folders.';
+      } finally {
+        if (requestSequence === folderRequestSequence) folderRequestController = null;
+      }
     }
     loadReviewItems = loadFolderItems;
 
@@ -1747,8 +1779,8 @@
       try {
         const response = await fetch('/api/library-import/bulk/exceptions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
         const data = await readApiResponse(response, 'Unable to load exceptions'); albumReviews = data.albums;
-        reviewSequence = albumReviews.map(album => album.id); const firstId = reviewSequence.shift();
-        const first = albumReviews.find(album => album.id === firstId); if (first) openReview(first, folderExceptions);
+        reviewSequence = albumReviews.map(album => album.id);
+        await openNextQueuedReview(folderExceptions);
       } catch (error) { reviewStatus.textContent = error.message; }
       finally { setOperationBusy(folderExceptions, reviewStatus, false); }
     });

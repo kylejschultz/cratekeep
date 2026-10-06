@@ -474,7 +474,7 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"/api/library-import/albums/${activeAlbum.id}/preview" not in modal
     assert b"if (event.key === 'Escape')" in modal
     assert b"event.key !== 'Tab'" in modal
-    assert b"reviewReturnFocus.focus()" in modal
+    assert b"returnFocus.focus()" in modal
     assert b'.candidate-option[open]' in html
 
 
@@ -2594,7 +2594,141 @@ def test_album_review_multi_select_keeps_sequential_single_album_flow(tmp_path):
     assert b'id="library-import-review-exceptions"' in html
     assert b"const selectedFolders = new Set();" in html
     assert b"reviewSequence = albumReviews.map(album => album.id)" in html
-    assert b"if (nextAlbum && nextButton) openReview(nextAlbum, nextButton)" in html
+    assert b"await fetch(`/api/library-import/albums/${nextId}`)" in html
+    assert b"if (transitionToken !== reviewTransitionToken" in html
+    assert b"reviewSequence.shift();" in html
+    assert b"folderRequestController.abort()" in html
+    assert b"requestSequence !== folderRequestSequence" in html
+
+
+def test_folder_queue_page_two_bounds_readiness_and_groups_inventory_once(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    root = Path(app.config["LIBRARY_PATH"])
+    folder_count = 1050
+    for number in range(folder_count):
+        (root / f"Folder {number:04d}").mkdir()
+    root_text = str(root.resolve())
+    now = "2026-10-06T00:00:00+00:00"
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('fixture', ?, 'complete', ?)",
+            (root_text, now),
+        ).lastrowid
+        for number in range(folder_count):
+            album_id = number + 1
+            inventory_id = db.execute(
+                """INSERT INTO library_inventory(root_path, relative_path, size_bytes, mtime_ns, device, inode,
+                          present, first_seen_job_id, last_seen_job_id) VALUES (?, ?, 1, 1, 1, ?, 1, ?, ?)""",
+                (root_text, f"Folder {number:04d}/01 Track.wav", album_id, job_id, job_id),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO album_reviews(id, root_path, artist_key, album_key, artist, album, state,
+                          candidate_status, candidate_error, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending',
+                          'complete', '', ?)""",
+                (album_id, root_text, f"artist-{number}", f"album-{number}", f"Artist {number}",
+                 f"Album {number}", now),
+            )
+            db.execute(
+                "INSERT INTO album_review_tracks(album_review_id, inventory_id) VALUES (?, ?)",
+                (album_id, inventory_id),
+            )
+            candidate_id = db.execute(
+                """INSERT INTO metadata_candidates(album_review_id, provider, provider_id, rank, confidence,
+                          artist, album, proposed_diff_json, provider_data_json, created_at)
+                   VALUES (?, 'fixture', ?, 1, 1.0, ?, ?, '{}', '{}', ?)""",
+                (album_id, f"candidate-{number}", f"Artist {number}", f"Album {number}", now),
+            ).lastrowid
+            db.execute("UPDATE album_reviews SET selected_candidate_id=? WHERE id=?", (candidate_id, album_id))
+
+    payload_calls = []
+    scope_calls = 0
+    import beets_mvp
+    original_scope = beets_mvp._scope_for_relative_path
+
+    def count_scope(relative_path):
+        nonlocal scope_calls
+        scope_calls += 1
+        return original_scope(relative_path)
+
+    def readiness_payloads(_app, album_ids=None):
+        payload_calls.append(list(album_ids or []))
+        return [{
+            "id": album_id, "execution_status": "not-run", "candidate_status": "complete",
+            "candidate_error": "", "decision": "pending", "selected_candidate_id": album_id,
+            "duplicate_preflight": {"status": "clear"}, "tracks": [{"id": album_id, "exception": None}],
+            "candidates": [{"id": album_id, "confidence": 1.0, "track_count_mismatch": False,
+                            "unmatched_track_count": 0, "hard_mismatches": [], "matched_track_count": 1,
+                            "track_details": [{"status": "matched", "local": "Track", "proposed": "Track"}]}],
+        } for album_id in (album_ids or [])]
+
+    monkeypatch.setattr(beets_mvp, "_scope_for_relative_path", count_scope)
+    monkeypatch.setattr(beets_mvp, "_album_review_payloads", readiness_payloads)
+    result = app.test_client().get("/api/library-import/folders?page=2").json
+
+    assert result["total"] == folder_count and result["page_count"] == 42
+    assert [folder["path"] for folder in result["folders"]] == [f"Folder {number:04d}" for number in range(25, 50)]
+    assert payload_calls == [list(range(26, 51))]
+    assert scope_calls == folder_count
+
+
+def test_folder_queue_search_and_every_status_remain_truthful(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    root = Path(app.config["LIBRARY_PATH"])
+    for folder in ("Error", "Imported", "Needs Review", "Not Scanned", "Ready"):
+        (root / folder).mkdir()
+    root_text = str(root.resolve())
+    now = "2026-10-06T00:00:00+00:00"
+    states = [
+        ("Error", "Needle Error", "failed", "error", "pending", .5),
+        ("Imported", "Needle Imported", "complete", "complete", "approved", 1.0),
+        ("Needs Review", "Needle Review", "not-run", "complete", "pending", .998),
+        ("Ready", "Needle Ready", "not-run", "complete", "pending", 1.0),
+    ]
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('fixture', ?, 'complete', ?)",
+            (root_text, now),
+        ).lastrowid
+        for album_id, (folder, artist, execution, candidate_status, state, confidence) in enumerate(states, 1):
+            inventory_id = db.execute(
+                """INSERT INTO library_inventory(root_path, relative_path, size_bytes, mtime_ns, device, inode,
+                          present, first_seen_job_id, last_seen_job_id) VALUES (?, ?, 1, 1, 1, ?, 1, ?, ?)""",
+                (root_text, f"{folder}/01 Track.wav", album_id, job_id, job_id),
+            ).lastrowid
+            db.execute(
+                """INSERT INTO album_reviews(id, root_path, artist_key, album_key, artist, album, state,
+                          candidate_status, candidate_error, execution_status, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (album_id, root_text, artist.casefold(), folder.casefold(), artist, folder, state,
+                 candidate_status, "fixture error" if candidate_status == "error" else "", execution, now),
+            )
+            db.execute("INSERT INTO album_review_tracks(album_review_id, inventory_id) VALUES (?, ?)",
+                       (album_id, inventory_id))
+            candidate_id = db.execute(
+                """INSERT INTO metadata_candidates(album_review_id, provider, provider_id, rank, confidence,
+                          artist, album, proposed_diff_json, provider_data_json, created_at)
+                   VALUES (?, 'fixture', ?, 1, ?, ?, ?, '{}', '{}', ?)""",
+                (album_id, f"candidate-{album_id}", confidence, artist, folder, now),
+            ).lastrowid
+            db.execute("UPDATE album_reviews SET selected_candidate_id=? WHERE id=?", (candidate_id, album_id))
+
+    import beets_mvp
+    monkeypatch.setattr(beets_mvp, "_album_review_payloads", lambda _app, album_ids=None: [{
+        "id": album_id, "execution_status": "not-run", "candidate_status": "complete", "candidate_error": "",
+        "decision": "pending", "selected_candidate_id": album_id, "duplicate_preflight": {"status": "clear"},
+        "tracks": [{"id": album_id, "exception": None}],
+        "candidates": [{"id": album_id, "confidence": 1.0, "track_count_mismatch": False,
+                        "unmatched_track_count": 0, "hard_mismatches": [], "matched_track_count": 1,
+                        "track_details": [{"status": "matched", "local": "Track", "proposed": "Track"}]}],
+    } for album_id in (album_ids or [])])
+    client = app.test_client()
+
+    assert client.get("/api/library-import/folders?q=Needle+Ready").json["folders"][0]["path"] == "Ready"
+    expected = {"not-scanned": "Not Scanned", "ready": "Ready", "needs-review": "Needs Review",
+                "error": "Error", "imported": "Imported"}
+    for status, folder in expected.items():
+        result = client.get("/api/library-import/folders", query_string={"status": status}).json
+        assert [record["path"] for record in result["folders"]] == [folder]
 
 
 def test_duplicate_warning_is_preflighted_and_gates_direct_import(tmp_path):
