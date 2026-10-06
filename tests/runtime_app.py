@@ -41,5 +41,46 @@ def deterministic_artwork_fetcher(candidate: dict) -> bytes:
     return ARTWORK_JPEG
 
 
+def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]:
+    """Resolve exact release IDs without external traffic for browser smoke tests."""
+    release_id = query.get("musicbrainz_id")
+    assert release_id and limit == 1
+    candidate = {
+        "provider_id": release_id,
+        "artist": query["artist"],
+        "album": f'{query["album"]} (MBID Edition)' if release_id.endswith("4077") else query["album"],
+        "date": "2024-03-02",
+        "year": "2024",
+        "release_type": "Album",
+        "country": "GB",
+        "track_count": len(query.get("tracks", [])),
+        "media": [{"position": 1, "format": "CD", "track_count": len(query.get("tracks", []))}],
+        "tracks": [
+            {"title": track.get("title"), "position": index, "medium_position": 1}
+            for index, track in enumerate(query.get("tracks", []), 1)
+        ],
+        "artwork": {
+            "available": True,
+            "source": "cover-art-archive",
+            "entity": "release",
+            "mbid": release_id,
+            "thumbnail_url": f"https://coverartarchive.org/release/{release_id}/front-250",
+        },
+        "retrieval": {"search_score": None, "source": "release-id"},
+    }
+    if release_id == "123e4567-e89b-42d3-a456-426614174002":
+        candidate["genre"] = "electronic"
+        candidate["genre_evidence"] = {
+            "source": "musicbrainz-release-group-genres",
+            "rule": "top positive canonical genre has at least 2 votes and strictly exceeds runner-up",
+            "counts": [{"name": "electronic", "count": 4}, {"name": "rock", "count": 1}],
+            "selected": "electronic",
+        }
+    return [candidate]
+
+
 def create_app():
-    return create_cratekeep_app({"ARTWORK_FETCHER": deterministic_artwork_fetcher})
+    return create_cratekeep_app({
+        "ARTWORK_FETCHER": deterministic_artwork_fetcher,
+        "MUSICBRAINZ_PROVIDER": deterministic_musicbrainz_provider,
+    })

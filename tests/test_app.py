@@ -398,8 +398,11 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'aria-labelledby="library-import-modal-title"' in modal
     assert b'aria-describedby="library-import-modal-description"' in modal
     assert b'Import validates the current files, then applies the selected metadata in place.' in modal
-    assert b'class="album-modal-section alternatives-section"' in modal
+    assert b'class="candidate-picker"' in modal
+    assert b'class="album-modal-section alternatives-section"' not in modal
     assert b'>Choose album metadata<' in modal
+    assert b'id="library-import-open-mbid-search"' in modal
+    assert b'>Search by MBID<' in modal
     assert b'role="radiogroup" aria-label="Album metadata candidates"' in modal
     assert b"detail.className = 'candidate-option'" in modal
     assert b"const asIs = {...current, id:'as-is', is_as_is:true" in modal
@@ -443,7 +446,22 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"label:'Local tracks found online'" in modal
     assert b"label:'Online tracks present locally'" in modal
     assert b'id="library-import-modal-tracks"' not in modal
-    assert b'Rematch with MusicBrainz release ID' in modal
+    assert b'class="override-form"' not in modal
+    assert b'id="library-import-rematch-form"' not in modal
+    assert b'A genre changes only when' not in modal
+    assert b'id="library-import-mbid-modal" class="browser track-modal" hidden' in modal
+    assert b'aria-labelledby="library-import-mbid-title"' in modal
+    assert b'aria-describedby="library-import-mbid-description library-import-mbid-status"' in modal
+    assert b'>Search by MusicBrainz release ID<' in modal
+    assert b'id="library-import-mbid-form" class="mbid-search-form" novalidate' in modal
+    assert b'id="library-import-mbid-cancel">Cancel<' in modal
+    assert b'id="library-import-mbid-search">Search<' in modal
+    assert b"reviewDialog.inert = true" in modal
+    assert b"openMbidSearch(openButton)" in modal
+    assert b"event.stopPropagation(); closeMbidSearch()" in modal
+    assert b"if (!force && mbidSearchBusy()) return false" in modal
+    assert b"mbidSearchReturnFocus.focus()" in modal
+    assert b"MusicBrainz release added and selected. No files were changed." in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'data-review-decision="rejected"' not in modal
     assert b'id="library-import-in-place" class="approve-button">Import' in modal
@@ -2529,7 +2547,10 @@ def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     assert b"Not applicable \xe2\x80\x94 As Is" in html
     assert b"Math.round(candidate.confidence" not in html
     assert b"candidates.querySelector('[aria-checked=\"true\"]')?.focus()" in html
-    assert b'id="library-import-rematch-form"' in html
+    assert b'id="library-import-open-mbid-search"' in html
+    assert b'id="library-import-mbid-modal"' in html
+    assert b'id="library-import-rematch-form"' not in html
+    assert b'.override-form' not in html
     assert b'aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1"' in html
     assert b"if (event.key === 'Escape')" in html
     assert b"input:not(:disabled)" in html
@@ -2631,7 +2652,7 @@ def test_library_import_operations_expose_visible_live_progress(tmp_path):
     assert b'.operation-status[data-busy="true"]::before' in html
     assert b"Scanning source folders, file names, and stats" in html
     assert b"Requesting bounded MusicBrainz matches" in html
-    assert b"Rematching through the configured MusicBrainz provider" in html
+    assert b"Searching MusicBrainz for this release" in html
     assert b"Validating files, registering them, and applying approved metadata in place" in html
     assert b"setAttribute('aria-busy', String(busy))" in html
 

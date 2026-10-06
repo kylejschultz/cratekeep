@@ -175,7 +175,11 @@
     .album-modal-dialog .browser-body { padding:.8rem 1rem; }
     .album-modal-section { margin-bottom:.7rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .album-modal-section h3 { margin:0 0 .45rem; font-size:.88rem; }
-    .alternatives-section { background:var(--modal-subtle); }
+    .candidate-picker { margin-bottom:.7rem; }
+    .candidate-picker-header { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.45rem; }
+    .candidate-picker-header h3 { margin:0; font-size:.82rem; }
+    .candidate-picker-header button { flex:0 0 auto; margin:0; padding:.38rem .62rem; border-color:var(--modal-border); background:var(--modal-panel); color:var(--text); font-size:.76rem; }
+    .candidate-picker-header button:hover { background:var(--modal-subtle); color:var(--text); }
     .candidate-list { display:grid; gap:.3rem; }
     .candidate-option { overflow:hidden; border:1px solid var(--modal-border); border-radius:.35rem; background:var(--modal-panel); }
     .candidate-option[open] { border-color:var(--modal-accent); }
@@ -214,6 +218,10 @@
     .track-change-button:focus-visible { outline:2px solid var(--modal-accent); outline-offset:3px; }
     .track-modal { z-index:12; padding:clamp(.4rem,2vw,1rem); background:rgb(8 19 26 / 50%); }
     .track-modal-dialog { width:min(800px,100%); max-height:min(620px,calc(100vh - 2rem)); }
+    .mbid-modal-dialog { width:min(460px,100%); }
+    .mbid-search-form label { margin:0; }
+    .mbid-search-form input { margin:0; }
+    .mbid-search-form .browser-status { margin-bottom:0; }
     .track-table-wrap { overflow:auto; }
     .track-comparison-table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:.76rem; }
     .track-comparison-table th:first-child { width:10%; }
@@ -232,10 +240,6 @@
     .track-missing { color:var(--muted); font-style:italic; }
     .track-unmatched-label { display:block; margin-top:.15rem; color:#b54708; font-size:.65rem; font-weight:750; text-transform:uppercase; }
     body.dark-mode .track-unmatched-label { color:#fdb022; }
-    .override-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:.5rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
-    .override-form label { margin:0; font-size:.86rem; }
-    .override-form input { margin-top:.25rem; }
-    .override-form small { grid-column:1 / -1; margin:0; }
     .review-footer { position:sticky; bottom:0; justify-content:space-between; flex-wrap:nowrap; padding:.7rem 1rem; }
     .review-footer-group { display:flex; flex-wrap:wrap; gap:.5rem; }
     .review-footer button { margin:0; padding:.55rem .8rem; }
@@ -414,18 +418,13 @@
           <p id="library-import-duplicate-message"></p>
           <ul id="library-import-duplicate-files"></ul>
         </section>
-        <section class="album-modal-section alternatives-section" aria-labelledby="candidate-alternatives-title">
-          <h3 id="candidate-alternatives-title">Choose album metadata</h3>
-          <p class="section-note">A genre changes only when the top canonical MusicBrainz release-group genre has at least 2 positive votes and strictly exceeds the runner-up. Weak, tied, or missing evidence preserves the current genre.</p>
+        <section class="candidate-picker" aria-labelledby="candidate-alternatives-title">
+          <div class="candidate-picker-header">
+            <h3 id="candidate-alternatives-title">Choose album metadata</h3>
+            <button id="library-import-open-mbid-search" type="button" aria-haspopup="dialog" aria-controls="library-import-mbid-modal">Search by MBID</button>
+          </div>
           <div id="library-import-modal-candidates" class="candidate-list" role="radiogroup" aria-label="Album metadata candidates"></div>
         </section>
-        <form id="library-import-rematch-form" class="override-form">
-          <label for="library-import-mbid">Rematch with MusicBrainz release ID
-            <input id="library-import-mbid" name="musicbrainz_id" required autocomplete="off" spellcheck="false" inputmode="text" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" aria-describedby="library-import-mbid-help">
-          </label>
-          <button id="library-import-rematch" type="submit">Rematch</button>
-          <small id="library-import-mbid-help">Paste a canonical release UUID to replace the suggested candidates.</small>
-        </form>
         <section id="library-import-duplicate-policy" class="album-modal-section" aria-labelledby="duplicate-action-title" hidden>
           <h3 id="duplicate-action-title">If a managed track has the same MusicBrainz recording ID</h3>
           <label for="library-import-duplicate-action">Duplicate decision
@@ -473,6 +472,25 @@
       <footer class="browser-actions">
         <button type="button" id="track-comparison-close">Close</button>
       </footer>
+    </section>
+  </div>
+  <div id="library-import-mbid-modal" class="browser track-modal" hidden>
+    <section class="browser-dialog mbid-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-mbid-title" aria-describedby="library-import-mbid-description library-import-mbid-status">
+      <header class="browser-header">
+        <h2 id="library-import-mbid-title">Search by MusicBrainz release ID</h2>
+      </header>
+      <form id="library-import-mbid-form" class="mbid-search-form" novalidate>
+        <div class="browser-body">
+          <p id="library-import-mbid-description" class="visually-hidden">Enter one canonical MusicBrainz release UUID.</p>
+          <label class="visually-hidden" for="library-import-mbid">MusicBrainz release UUID</label>
+          <input id="library-import-mbid" name="musicbrainz_id" type="text" required autocomplete="off" spellcheck="false" inputmode="text" placeholder="123e4567-e89b-42d3-a456-426614174000" aria-describedby="library-import-mbid-description library-import-mbid-status">
+          <p id="library-import-mbid-status" class="browser-status operation-status" role="status" aria-live="polite"></p>
+        </div>
+        <footer class="browser-actions">
+          <button type="button" class="secondary" id="library-import-mbid-cancel">Cancel</button>
+          <button type="submit" id="library-import-mbid-search">Search</button>
+        </footer>
+      </form>
     </section>
   </div>
   {% endif %}
@@ -692,10 +710,11 @@
     const reviewSelectedButton = document.getElementById('library-import-review-selected');
     const reviewModal = document.getElementById('library-import-modal');
     const trackComparisonModal = document.getElementById('track-comparison-modal');
+    const mbidSearchModal = document.getElementById('library-import-mbid-modal');
     const inventoryStatus = document.getElementById('inventory-status');
     const inventorySummary = document.getElementById('inventory-summary');
     const inventoryStorageKey = 'cratekeep-inventory-preview:' + {{ build_sha|tojson }};
-    let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null, trackComparisonReturnFocus = null;
+    let reviewItems = [], reviewGroups = [], albumReviews = [], activeAlbum = null, activeCandidateId = null, reviewReturnFocus = null, trackComparisonReturnFocus = null, mbidSearchReturnFocus = null;
     let reviewOpeningState = '', reviewSucceeded = false;
     const selectedAlbumIds = new Set();
     let reviewSequence = [];
@@ -1002,6 +1021,39 @@
       reviewDialog.inert = true; reviewDialog.setAttribute('aria-hidden', 'true');
     }
 
+    function mbidSearchBusy() {
+      return mbidSearchModal && mbidSearchModal.querySelector('[aria-busy="true"]') !== null;
+    }
+
+    function closeMbidSearch({force = false, restoreFocus = true} = {}) {
+      if (!mbidSearchModal || mbidSearchModal.hidden) return true;
+      if (!force && mbidSearchBusy()) return false;
+      const input = document.getElementById('library-import-mbid');
+      const status = document.getElementById('library-import-mbid-status');
+      const searchButton = document.getElementById('library-import-mbid-search');
+      mbidSearchModal.hidden = true;
+      input.value = ''; input.disabled = false;
+      status.textContent = ''; status.dataset.busy = 'false'; status.classList.remove('error-text');
+      searchButton.disabled = false; searchButton.setAttribute('aria-busy', 'false');
+      const reviewDialog = reviewModal.querySelector('.browser-dialog');
+      reviewDialog.inert = false; reviewDialog.removeAttribute('aria-hidden');
+      if (restoreFocus && mbidSearchReturnFocus) mbidSearchReturnFocus.focus();
+      mbidSearchReturnFocus = null;
+      return true;
+    }
+
+    function openMbidSearch(button) {
+      mbidSearchReturnFocus = button;
+      const input = document.getElementById('library-import-mbid');
+      const status = document.getElementById('library-import-mbid-status');
+      input.value = ''; input.disabled = false;
+      status.textContent = ''; status.dataset.busy = 'false'; status.classList.remove('error-text');
+      mbidSearchModal.hidden = false;
+      const reviewDialog = reviewModal.querySelector('.browser-dialog');
+      reviewDialog.inert = true; reviewDialog.setAttribute('aria-hidden', 'true');
+      input.focus();
+    }
+
     function resetImportAction() {
       const importButton = document.getElementById('library-import-in-place');
       importButton.textContent = 'Import'; importButton.disabled = false;
@@ -1242,6 +1294,7 @@
     }
 
     function openReview(album, button) {
+      closeMbidSearch({force:true, restoreFocus:false});
       activeAlbum = album;
       activeCandidateId = album.selection_mode === 'as-is' ? 'as-is' : (album.selected_candidate_id || album.proposed_match?.id || 'as-is');
       reviewReturnFocus = button;
@@ -1255,7 +1308,6 @@
       executionResult.textContent = album.execution_status === 'complete'
         ? 'This album has already been imported.'
         : 'Choose metadata, then import in place. The server validates every file before writing.';
-      document.getElementById('library-import-mbid').value = '';
       document.getElementById('library-import-duplicate-action').value = album.duplicate_action || '';
       document.getElementById('library-import-modal-close').hidden = false;
       renderAlbumMatch();
@@ -1267,17 +1319,18 @@
 
     function reviewState() {
       return JSON.stringify({candidate:activeCandidateId,
-        duplicate:document.getElementById('library-import-duplicate-action').value,
-        rematch:document.getElementById('library-import-mbid').value});
+        duplicate:document.getElementById('library-import-duplicate-action').value});
     }
 
     function reviewBusy() {
       return reviewModal.querySelector('[aria-busy="true"]') !== null
-        || reviewModal.querySelector('[data-busy="true"]') !== null;
+        || reviewModal.querySelector('[data-busy="true"]') !== null
+        || mbidSearchBusy();
     }
 
     function closeReview(clearSequence = true) {
       closeTrackComparison();
+      closeMbidSearch({force:true, restoreFocus:false});
       reviewModal.hidden = true;
       document.body.classList.remove('modal-open');
       if (clearSequence) reviewSequence = [];
@@ -1302,6 +1355,79 @@
         const first = focusable[0], last = focusable[focusable.length - 1];
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      });
+    }
+
+    if (mbidSearchModal) {
+      const openButton = document.getElementById('library-import-open-mbid-search');
+      const input = document.getElementById('library-import-mbid');
+      const status = document.getElementById('library-import-mbid-status');
+      const searchButton = document.getElementById('library-import-mbid-search');
+      openButton.addEventListener('click', () => openMbidSearch(openButton));
+      document.getElementById('library-import-mbid-cancel').addEventListener('click', () => closeMbidSearch());
+      mbidSearchModal.addEventListener('mousedown', event => {
+        if (event.target === mbidSearchModal) closeMbidSearch();
+      });
+      mbidSearchModal.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+          event.preventDefault(); event.stopPropagation(); closeMbidSearch(); return;
+        }
+        if (event.key !== 'Tab') return;
+        const focusable = [...mbidSearchModal.querySelectorAll('button:not(:disabled), input:not(:disabled)')];
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      });
+      document.getElementById('library-import-mbid-form').addEventListener('submit', async event => {
+        event.preventDefault();
+        if (mbidSearchBusy()) return;
+        const musicbrainzId = input.value.trim();
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(musicbrainzId)) {
+          status.classList.add('error-text');
+          status.textContent = 'Enter a canonical MusicBrainz release UUID.';
+          input.focus();
+          return;
+        }
+        status.classList.remove('error-text');
+        setOperationBusy(searchButton, status, true, 'Searching MusicBrainz for this release…');
+        input.disabled = true;
+        try {
+          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/rematch`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({musicbrainz_id: musicbrainzId}),
+          });
+          const data = await readApiResponse(response, 'Unable to search for this release', {deferHttpError: true});
+          if (!response.ok) {
+            const fallback = {
+              invalid_musicbrainz_id: 'Enter a canonical MusicBrainz release UUID.',
+              release_not_found: 'No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.',
+              album_review_not_found: 'This album review no longer exists. Refresh the review list.',
+              provider_http_error: data.retryable
+                ? 'MusicBrainz is temporarily unavailable. Try this release ID again later.'
+                : 'MusicBrainz rejected the lookup. Verify the release ID or try again later.',
+              provider_unavailable: 'MusicBrainz could not be reached. Try again later.',
+              provider_invalid_response: 'MusicBrainz returned an unusable response. Try again later.',
+            }[data.code];
+            throw new Error(fallback || data.error || `Unable to search for this release (HTTP ${response.status}).`);
+          }
+          activeAlbum = data; activeCandidateId = data.selected_candidate_id;
+          resetImportAction();
+          const index = albumReviews.findIndex(album => album.id === data.id);
+          if (index >= 0) albumReviews[index] = data;
+          renderAlbumMatch();
+          closeMbidSearch({force:true});
+          const message = document.getElementById('library-import-modal-message');
+          message.textContent = 'MusicBrainz release added and selected. No files were changed.';
+        } catch (error) {
+          status.classList.add('error-text');
+          status.textContent = error.message || 'Unable to search for this release.';
+        } finally {
+          if (!mbidSearchModal.hidden) {
+            input.disabled = false;
+            setOperationBusy(searchButton, status, false);
+            input.focus();
+          }
+        }
       });
     }
 
@@ -1391,46 +1517,6 @@
         else importSelectedAlbum(event.currentTarget);
       });
       document.getElementById('library-import-duplicate-action').addEventListener('change', resetImportAction);
-      document.getElementById('library-import-mbid').addEventListener('input', resetImportAction);
-      document.getElementById('library-import-rematch-form').addEventListener('submit', async event => {
-        event.preventDefault();
-        const input = document.getElementById('library-import-mbid');
-        const message = document.getElementById('library-import-modal-message');
-        const rematchButton = document.getElementById('library-import-rematch');
-        if (!input.reportValidity()) return;
-        setOperationBusy(rematchButton, message, true, 'Rematching through the configured MusicBrainz provider…');
-        input.disabled = true;
-        try {
-          const response = await fetch(`/api/library-import/albums/${activeAlbum.id}/rematch`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({musicbrainz_id: input.value}),
-          });
-          const data = await readApiResponse(response, 'Unable to rematch this album', {deferHttpError: true});
-          if (!response.ok) {
-            const fallback = {
-              invalid_musicbrainz_id: 'Enter a canonical MusicBrainz release UUID.',
-              release_not_found: 'No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.',
-              album_review_not_found: 'This album review no longer exists. Refresh the review list.',
-              provider_http_error: data.retryable
-                ? 'MusicBrainz is temporarily unavailable. Try this release ID again later.'
-                : 'MusicBrainz rejected the lookup. Verify the release ID or try again later.',
-              provider_unavailable: 'MusicBrainz could not be reached. Try again later.',
-              provider_invalid_response: 'MusicBrainz returned an unusable response. Try again later.',
-            }[data.code];
-            throw new Error(fallback || data.error || `Unable to rematch this album (HTTP ${response.status}).`);
-          }
-          activeAlbum = data; activeCandidateId = data.selected_candidate_id; input.value = '';
-          resetImportAction();
-          const index = albumReviews.findIndex(album => album.id === data.id);
-          if (index >= 0) albumReviews[index] = data;
-          renderAlbumMatch(); message.textContent = 'MusicBrainz release selected by ID. Confidence remains based on metadata evidence. No files were changed.';
-        } catch (error) {
-          message.textContent = error.message || 'Unable to rematch this album.';
-        } finally {
-          input.disabled = false;
-          setOperationBusy(rematchButton, message, false);
-        }
-      });
       if (restoreInventoryPreview()) loadReviewItems();
     }
 

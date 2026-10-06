@@ -35,6 +35,8 @@ TRACKS = {
 }
 GENRES = {"case": "Alternative Rock", "sidecar": "Rock", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient"}
 CASE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174099"
+SEARCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174077"
+EXISTING_SIDECAR_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174002"
 
 
 def request_json(url: str):
@@ -196,8 +198,12 @@ def sha256(path: Path) -> str:
 
 def assert_no_browser_errors(page_errors: list[str], console_errors: list[str], network: list[dict]) -> list[str]:
     failed_responses = [event for event in network if event.get("status", 0) >= 400 and not event.get("expected")]
-    if any(event.get("expected") and event.get("status") == 502 for event in network):
-        console_errors = [message for message in console_errors if "status of 502" not in message]
+    expected_statuses = {event["status"] for event in network if event.get("expected")}
+    if expected_statuses:
+        console_errors = [
+            message for message in console_errors
+            if not any(f"status of {status}" in message for status in expected_statuses)
+        ]
     assert not page_errors, f"browser page errors: {page_errors}"
     assert not console_errors, f"browser console errors: {console_errors}"
     assert not failed_responses, f"failed API responses: {failed_responses}"
@@ -221,21 +227,23 @@ def set_artwork_settings(page: Page, base_url: str, *, sidecar: bool, embed: boo
     assert page.locator('input[name="art_replace"]').is_checked() is replace
 
 
-def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
+def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[str, Path]) -> dict:
     page_errors: list[str] = []
     console_errors: list[str] = []
     network: list[dict] = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page: Page = browser.new_page(viewport={"width": 1440, "height": 1000})
-        expected_execute_failure = {"pending": False}
+        expected_failure = {"kind": None}
         page.on("pageerror", lambda error: page_errors.append(str(error)))
         page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
         page.on(
             "response",
             lambda response: network.append({"method": response.request.method, "status": response.status, "url": response.url,
-                                              "expected": response.status == 502 and (
-                                                  expected_execute_failure["pending"]
+                                              "expected": (
+                                                  expected_failure["kind"] == "execute" and response.status == 502
+                                              ) or (
+                                                  expected_failure["kind"] == "rematch" and response.status == 503
                                               )})
             if "/api/" in response.url
             else None,
@@ -316,7 +324,138 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
         assert candidate_ids["sidecar"] > 0
         assert page.locator(".candidate-artwork").count() == 1
 
-        # Candidate, duplicate, rematch, and preview state share one guarded close path.
+        # MBID lookup is a compact nested, metadata-only flow independent of Import.
+        picker = page.locator(".candidate-picker")
+        assert picker.count() == 1
+        assert "top canonical MusicBrainz release-group genre" not in picker.inner_text()
+        assert picker.evaluate("element => getComputedStyle(element).borderTopStyle") == "none"
+        page.screenshot(path=evidence / "04-mbid-picker-desktop-dark.png")
+        search_open = page.locator("#library-import-open-mbid-search")
+        search_open.click()
+        mbid_modal = page.locator("#library-import-mbid-modal")
+        mbid_input = page.locator("#library-import-mbid")
+        mbid_modal.wait_for(state="visible")
+        assert mbid_input.evaluate("element => document.activeElement === element")
+        assert page.locator(".album-modal-dialog").evaluate("element => element.inert")
+        page.screenshot(path=evidence / "04-mbid-search-modal-desktop-dark.png")
+
+        # Transient typing and Cancel do not dirty the parent review.
+        mbid_input.fill("transient text")
+        page.locator("#library-import-mbid-cancel").click()
+        assert search_open.evaluate("element => document.activeElement === element")
+        dialogs = []
+        def record_dialog(dialog):
+            dialogs.append(dialog.message)
+            dialog.dismiss()
+        page.on("dialog", record_dialog)
+        page.locator("#library-import-modal-close").click()
+        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.remove_listener("dialog", record_dialog)
+        assert dialogs == [], "cancelled MBID typing must not trigger the parent dirty-state prompt"
+        candidate_review.click()
+        page.locator("#library-import-modal:not([hidden])").wait_for()
+        search_open.click(); mbid_modal.wait_for(state="visible")
+        page.keyboard.press("Escape")
+        mbid_modal.wait_for(state="hidden")
+        assert search_open.evaluate("element => document.activeElement === element")
+        search_open.click(); mbid_modal.wait_for(state="visible")
+        mbid_modal.click(position={"x": 2, "y": 2})
+        mbid_modal.wait_for(state="hidden")
+
+        # Focus wraps within the nested dialog, and active requests block every close path.
+        search_open.click(); mbid_modal.wait_for(state="visible")
+        page.keyboard.press("Shift+Tab")
+        assert page.locator("#library-import-mbid-search").evaluate("element => document.activeElement === element")
+        page.keyboard.press("Tab")
+        assert mbid_input.evaluate("element => document.activeElement === element")
+        page.evaluate("document.getElementById('library-import-mbid-search').setAttribute('aria-busy', 'true')")
+        page.locator("#library-import-mbid-cancel").click()
+        page.keyboard.press("Escape")
+        mbid_modal.click(position={"x": 2, "y": 2})
+        assert mbid_modal.is_visible(), "busy MBID search must block Cancel, Escape, and backdrop close"
+        page.evaluate("document.getElementById('library-import-mbid-search').setAttribute('aria-busy', 'false')")
+
+        request_network_start = len(network)
+        item_rows_before = request_json(f"{base_url}/api/items")
+        file_before = {
+            "sha256": sha256(tracks["sidecar"]),
+            "stat": (tracks["sidecar"].stat().st_size, tracks["sidecar"].stat().st_mtime_ns,
+                     tracks["sidecar"].stat().st_dev, tracks["sidecar"].stat().st_ino),
+            "path": str(tracks["sidecar"].resolve()),
+        }
+        mbid_input.fill("not-a-uuid")
+        page.locator("#library-import-mbid-search").click()
+        assert "canonical MusicBrainz release UUID" in page.locator("#library-import-mbid-status").inner_text()
+        assert len(network) == request_network_start, "invalid UUID must remain local"
+
+        rematch_pattern = re.compile(r".*/api/library-import/albums/\d+/rematch$")
+        page.route(rematch_pattern, lambda route: route.fulfill(
+            status=503, content_type="application/json",
+            body=json.dumps({"error": "fixture unavailable", "code": "provider_unavailable", "retryable": True}),
+        ), times=1)
+        mbid_input.fill(SEARCH_RELEASE_ID)
+        expected_failure["kind"] = "rematch"
+        with page.expect_response(lambda response: response.url.endswith("/rematch")) as failed_rematch:
+            page.locator("#library-import-mbid-search").click()
+        assert failed_rematch.value.status == 503
+        expected_failure["kind"] = None
+        assert mbid_modal.is_visible()
+        assert mbid_input.is_enabled() and mbid_input.input_value() == SEARCH_RELEASE_ID
+        assert "could not be reached" in page.locator("#library-import-mbid-status").inner_text()
+
+        candidate_options = page.locator("#library-import-modal-candidates [role='radio']")
+        initial_option_count = candidate_options.count()
+        with page.expect_response(lambda response: response.url.endswith("/rematch")) as new_rematch:
+            page.locator("#library-import-mbid-search").click()
+        assert new_rematch.value.status == 200
+        new_payload = new_rematch.value.json()
+        mbid_modal.wait_for(state="hidden")
+        assert page.locator("#library-import-modal").is_visible()
+        assert "added and selected" in page.locator("#library-import-modal-message").inner_text()
+        assert candidate_options.count() == initial_option_count + 1
+        selected_candidate = page.get_by_role("radio", checked=True)
+        assert selected_candidate.evaluate("element => element.parentElement.open")
+        assert new_payload["selected_candidate_id"] == new_payload["proposed_match"]["id"]
+        assert sum(candidate["provider_id"] == SEARCH_RELEASE_ID for candidate in new_payload["candidates"]) == 1
+        assert page.locator("#library-import-in-place").inner_text() == "Import"
+
+        # Looking up an existing release moves/selects its row without duplication.
+        search_open.click(); mbid_input.fill(EXISTING_SIDECAR_RELEASE_ID)
+        with page.expect_response(lambda response: response.url.endswith("/rematch")) as existing_rematch:
+            page.locator("#library-import-mbid-search").click()
+        assert existing_rematch.value.status == 200
+        existing_payload = existing_rematch.value.json()
+        assert candidate_options.count() == initial_option_count + 1
+        assert sum(candidate["provider_id"] == EXISTING_SIDECAR_RELEASE_ID for candidate in existing_payload["candidates"]) == 1
+        assert existing_payload["candidates"][0]["provider_id"] == EXISTING_SIDECAR_RELEASE_ID
+        assert existing_payload["selected_candidate_id"] == existing_payload["candidates"][0]["id"]
+        assert page.get_by_role("radio", checked=True).evaluate("element => element.parentElement.open")
+
+        search_requests = network[request_network_start:]
+        assert not any(event["url"].endswith(("/preview", "/execute")) for event in search_requests)
+        assert sum(event["url"].endswith("/rematch") for event in search_requests) == 3
+        file_after = {
+            "sha256": sha256(tracks["sidecar"]),
+            "stat": (tracks["sidecar"].stat().st_size, tracks["sidecar"].stat().st_mtime_ns,
+                     tracks["sidecar"].stat().st_dev, tracks["sidecar"].stat().st_ino),
+            "path": str(tracks["sidecar"].resolve()),
+        }
+        assert file_after == file_before
+        assert request_json(f"{base_url}/api/items") == item_rows_before
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.screenshot(path=evidence / "05-mbid-picker-narrow-dark.png")
+        assert page.locator(".album-modal-dialog").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        ), "narrow album review must not overflow after MBID search"
+        search_open.click(); mbid_modal.wait_for(state="visible")
+        page.screenshot(path=evidence / "06-mbid-search-modal-narrow-dark.png")
+        assert page.locator(".mbid-modal-dialog").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        ), "narrow MBID search must not overflow its dialog"
+        page.locator("#library-import-mbid-cancel").click()
+        page.set_viewport_size({"width": 1440, "height": 1000})
+
+        # Candidate and duplicate state share one guarded close path.
         page.get_by_role("radio", name=re.compile("As Is")).click()
         page.once("dialog", lambda dialog: dialog.dismiss())
         page.locator("#library-import-modal").click(position={"x": 2, "y": 2})
@@ -346,7 +485,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
             if candidate.get_attribute("aria-checked") != "true":
                 candidate.click()
             if has_art:
-                assert page.locator(".candidate-artwork").count() == 1
+                assert candidate.locator("xpath=..").locator(".candidate-artwork").count() == 1
             else:
                 missing_text = " ".join(page.locator(".candidate-artwork-missing").all_text_contents())
                 assert "No candidate artwork available" in missing_text
@@ -387,7 +526,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
             request_network_start = len(network)
             if mock_failure:
                 execute_pattern = re.compile(r".*/api/library-import/albums/\d+/execute$")
-                expected_execute_failure["pending"] = True
+                expected_failure["kind"] = "execute"
                 page.route(execute_pattern, lambda route: route.fulfill(
                     status=502, content_type="application/json",
                     body=json.dumps({"error": "Deterministic mocked artwork failure; retry is available.",
@@ -399,7 +538,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
                 assert "retry is available" in page.locator("#library-import-execution-result").inner_text()
                 assert page.locator("#library-import-in-place").inner_text() == "Import"
                 assert page.locator("#library-import-modal").is_visible()
-                expected_execute_failure["pending"] = False
+                expected_failure["kind"] = None
             with page.expect_response(lambda response: response.url.endswith("/execute")) as execute_info:
                 page.locator("#library-import-in-place").click()
             assert execute_info.value.status in {200, 201}
@@ -495,7 +634,7 @@ def main() -> None:
         args.app_inbox or str((args.fixture_root / "inbox").resolve()),
         str(app_library),
     )
-    browser_result = run_browser(args.base_url.rstrip("/"), args.state_path, args.evidence_dir)
+    browser_result = run_browser(args.base_url.rstrip("/"), args.state_path, args.evidence_dir, tracks)
     after = {name: sha256(path) for name, path in tracks.items()}
     assert before["as_is"] == after["as_is"], "as-is direct import changed source audio bytes"
     assert all(track.exists() for track in tracks.values()), "direct import moved or removed a source file"
