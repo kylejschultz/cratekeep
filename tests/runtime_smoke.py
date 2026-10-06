@@ -161,7 +161,8 @@ def install_provider_fixtures(state_path: Path) -> dict[str, int]:
             "track_count": 4, "media": [{"position": 1, "format": "CD", "track_count": 4}],
             "tracks": [
                 {"title": "Used 2", "position": 1, "medium_position": 1, "length_ms": 1000},
-                {"title": "Extra", "position": 8, "medium_position": 1, "length_ms": 287000},
+                {"title": "Extra", "position": 8, "medium_position": 1, "length_ms": 287000,
+                 "track_artist": "2 Chainz feat. Rich Homie Quan", "artist_credit_source": "track"},
                 {"title": "U Da Realest", "position": 9, "medium_position": 1, "length_ms": 1000},
                 {"title": "Mainstream Ratchet", "position": 10, "medium_position": 1, "length_ms": 1000},
             ],
@@ -357,8 +358,17 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
                 change_button.click()
                 rows = page.locator("#track-comparison-rows tr:not(.track-explanation-row)")
                 assert rows.count() == 1
+                cells = rows.locator("td")
+                assert cells.count() == 5
                 row_text = rows.inner_text()
                 assert "Extra feat. Rich Homie Quan" in row_text and "Extra" in row_text
+                assert "2 Chainz feat. Rich Homie Quan" in row_text
+                assert cells.nth(1).locator(".track-metadata-title").inner_text() == "Extra feat. Rich Homie Quan"
+                assert cells.nth(1).locator(".track-metadata-artist").inner_text() == "Artist: 2 Chainz"
+                assert cells.nth(2).locator(".track-metadata-title").inner_text() == "Extra"
+                assert cells.nth(2).locator(".track-metadata-artist").inner_text() == "Artist: 2 Chainz feat. Rich Homie Quan"
+                assert "Title: Extra feat. Rich Homie Quan (changed)" in cells.nth(1).get_attribute("aria-label")
+                assert "Artist: 2 Chainz (changed)" in cells.nth(1).get_attribute("aria-label")
                 assert "UNMATCHED" not in row_text
                 assert all(title not in row_text for title in ("Used 2", "U Da Realest", "Mainstream Ratchet"))
                 page.screenshot(path=evidence / screenshot)
@@ -367,6 +377,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
                 assert page.locator(".track-modal-dialog").evaluate(
                     "element => element.scrollWidth <= element.clientWidth"
                 ), "narrow track changes must not overflow its dialog"
+                assert page.locator(".track-table-wrap").evaluate(
+                    "element => element.scrollWidth <= element.clientWidth"
+                ), "compact narrow track table should not require horizontal scrolling"
                 page.set_viewport_size({"width": 1440, "height": 1000})
                 page.locator("#track-comparison-close").click()
             else:
@@ -432,6 +445,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path) -> dict:
         )
         extra_item = next(item for item in feature_result["items"] if item["changes"].get("title"))
         assert extra_item["changes"]["title"] == {"from": "Extra feat. Rich Homie Quan", "to": "Extra"}
+        assert extra_item["changes"]["artist"] == {"from": "2 Chainz", "to": "2 Chainz feat. Rich Homie Quan"}
+        assert "albumartist" not in extra_item["changes"]
 
         as_is_review = page.get_by_role("button", name=re.compile("As Is Artist"))
         as_is_review.wait_for()
@@ -520,6 +535,14 @@ def main() -> None:
     assert {name: by_path[path.name]["genre"] for name, path in tracks.items() if name in GENRES} == expected_genres
     file_genres = {name: MediaFile(str(tracks[name])).genre for name in GENRES}
     assert file_genres == expected_genres
+    feature_db = by_path[tracks["feature_extra"].name]
+    assert (feature_db["title"], feature_db["artist"], feature_db["albumartist"]) == (
+        "Extra", "2 Chainz feat. Rich Homie Quan", "2 Chainz",
+    )
+    feature_tags = MediaFile(str(tracks["feature_extra"]))
+    assert (feature_tags.title, feature_tags.artist, feature_tags.albumartist) == (
+        "Extra", "2 Chainz feat. Rich Homie Quan", "2 Chainz",
+    )
     result = {
         "fixture_sha256_before": before,
         "fixture_sha256_after": after,
@@ -537,6 +560,10 @@ def main() -> None:
         },
         "genre_results": {name: by_path[path.name]["genre"] for name, path in tracks.items() if name in GENRES},
         "file_genre_results": file_genres,
+        "feature_credit_result": {
+            "database": {key: feature_db[key] for key in ("title", "artist", "albumartist")},
+            "file": {"title": feature_tags.title, "artist": feature_tags.artist, "albumartist": feature_tags.albumartist},
+        },
         **browser_result,
     }
     results_path = args.evidence_dir / "runtime-results.json"

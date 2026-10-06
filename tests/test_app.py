@@ -9,6 +9,7 @@ import wave
 from pathlib import Path
 
 import pytest
+from beets.dbcore import types as beets_types
 from beets.library import Item, Library
 from mediafile import Image as MediaImage, ImageType, MediaFile
 from PIL import Image as PillowImage
@@ -16,9 +17,12 @@ from PIL import Image as PillowImage
 from beets_mvp import (
     LibraryImportExecutionError, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
     _format_genre, _genre_presentation_key, _group_library_import_review_items, _init_db,
-    _item_genre, _SafeArtworkRedirect, create_app,
+    _item_genre, _set_item_value, _SafeArtworkRedirect, create_app,
 )
-from beets_mvp.musicbrainz import ProviderError, _cover_art_evidence, _genre_evidence, search_releases
+from beets_mvp.musicbrainz import (
+    ProviderError, _artist_credit_text, _cover_art_evidence, _genre_evidence,
+    _normalize_release, search_releases,
+)
 from beets_mvp.matching import score_release
 
 def make_app(tmp_path: Path):
@@ -416,12 +420,18 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b'aria-labelledby="track-comparison-title"' in modal
     assert b'aria-describedby="track-comparison-description"' in modal
     assert b'<th scope="col">Position</th>' in modal
-    assert b'<th scope="col">Local title</th>' in modal
-    assert b'<th scope="col">MusicBrainz title</th>' in modal
+    assert b'<th scope="col">Local metadata</th>' in modal
+    assert b'<th scope="col">MusicBrainz metadata</th>' in modal
     assert b'<th scope="col">Local duration</th>' in modal
     assert b'<th scope="col">Proposed duration</th>' in modal
     assert b"row.className = 'track-row-unmatched'" in modal
     assert b"cell.classList.add('track-cell-changed')" in modal
+    assert b"function appendTrackMetadataCell(row, track, side)" in modal
+    assert b"titleLine.classList.add('track-field-changed')" in modal
+    assert b"artistLine.classList.add('track-field-changed')" in modal
+    assert b"cell.setAttribute('aria-label', `${sourceLabel} metadata. Title:" in modal
+    assert b".track-modal-dialog { width:min(800px,100%);" in html
+    assert b"min-width:860px" not in html
     assert b"explanationRow.className = 'track-explanation-row'" in modal
     assert b"const explanations = track.explanations || []" in modal
     assert b"reviewDialog.inert = true" in modal
@@ -534,8 +544,11 @@ const result = {
     {local:'He Said "Go"', proposed:'He Said “Go”', current_position:[1,4], proposed_position:[1,4], local_duration:180, proposed_duration:180, status:'matched'},
     {local:"Don't Stop", proposed:'Doesn’t Stop', current_position:[1,5], proposed_position:[1,5], local_duration:180, proposed_duration:180, status:'title-mismatch'},
     {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
+    {local:'Artist only', proposed:'Artist only', local_artist:'Lead', proposed_artist:'Lead feat. Guest', current_position:[1,6], proposed_position:[1,6], local_duration:180, proposed_duration:180, status:'matched'},
+    {local:'Old both', proposed:'New both', local_artist:'Lead', proposed_artist:'Lead feat. Guest', current_position:[1,7], proposed_position:[1,7], local_duration:180, proposed_duration:180, status:'matched'},
     {local:null, proposed:'Bonus', current_position:null, proposed_position:[2,1], local_duration:null, proposed_duration:90, status:'extra'},
   ]).map(track => ({local:track.local, proposed:track.proposed, localPosition:track.localPosition,
+    local_artist:track.local_artist ?? null, proposed_artist:track.proposed_artist ?? null, artistChanged:track.artistChanged,
     proposedPosition:track.proposedPosition, durationDelta:track.durationDelta, explanations:track.explanations})),
   compact: trackEvidence([
     {local:'Same', proposed:'Same', current_position:[1,1], proposed_position:[1,1], local_duration:180, proposed_duration:null, status:'matched'},
@@ -553,15 +566,22 @@ console.log(JSON.stringify(result));
             {"localYear": "", "proposedYear": "2024", "changed": True, "value": "Not provided → 2024"},
         ],
         "changes": [
-            {"local": "Old title", "proposed": "New title", "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10,
+            {"local": "Old title", "proposed": "New title", "local_artist": None, "proposed_artist": None, "artistChanged": False,
+             "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10,
              "explanations": ["Title differs: local “Old title” → MusicBrainz “New title”.",
                               "Position differs: local 1.01 → MusicBrainz 1.02.",
                               "Duration differs: local 2:00 → MusicBrainz 2:10 (10 seconds longer)."]},
-            {"local": "Part 1: Intro", "proposed": "Part 1 — Intro", "localPosition": "1.02", "proposedPosition": "1.02", "durationDelta": 0,
+            {"local": "Part 1: Intro", "proposed": "Part 1 — Intro", "local_artist": None, "proposed_artist": None, "artistChanged": False, "localPosition": "1.02", "proposedPosition": "1.02", "durationDelta": 0,
              "explanations": ["Title punctuation or formatting differs: local “Part 1: Intro” → MusicBrainz “Part 1 — Intro”."]},
-            {"local": "Don't Stop", "proposed": "Doesn’t Stop", "localPosition": "1.05", "proposedPosition": "1.05", "durationDelta": 0,
+            {"local": "Don't Stop", "proposed": "Doesn’t Stop", "local_artist": None, "proposed_artist": None, "artistChanged": False, "localPosition": "1.05", "proposedPosition": "1.05", "durationDelta": 0,
              "explanations": ["Title differs: local “Don't Stop” → MusicBrainz “Doesn’t Stop”."]},
-            {"local": None, "proposed": "Bonus", "localPosition": "", "proposedPosition": "2.01", "durationDelta": None,
+            {"local": "Artist only", "proposed": "Artist only", "local_artist": "Lead", "proposed_artist": "Lead feat. Guest", "artistChanged": True,
+             "localPosition": "1.06", "proposedPosition": "1.06", "durationDelta": 0,
+             "explanations": ["Artist differs: local “Lead” → proposed “Lead feat. Guest”."]},
+            {"local": "Old both", "proposed": "New both", "local_artist": "Lead", "proposed_artist": "Lead feat. Guest", "artistChanged": True,
+             "localPosition": "1.07", "proposedPosition": "1.07", "durationDelta": 0,
+             "explanations": ["Title differs: local “Old both” → MusicBrainz “New both”.", "Artist differs: local “Lead” → proposed “Lead feat. Guest”."]},
+            {"local": None, "proposed": "Bonus", "local_artist": None, "proposed_artist": None, "artistChanged": False, "localPosition": "", "proposedPosition": "2.01", "durationDelta": None,
              "explanations": ["MusicBrainz track is not present locally.", "Local duration unavailable."]},
         ],
         "compact": [],
@@ -923,6 +943,29 @@ def test_reliable_genre_preview_and_write_preserve_equivalent_or_apply_display_f
     assert MediaFile(str(path)).genre == expected_genre
     if expected_change is None:
         assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_genre_write_skips_undeclared_flex_alias_and_keeps_scalar():
+    item = Item()
+
+    _set_item_value(item, "genre", "Alternative Rock")
+
+    assert item.genre == "Alternative Rock"
+    assert item.get("genres") is None
+
+
+def test_genre_write_mirrors_declared_list_field(tmp_path, monkeypatch):
+    monkeypatch.setitem(Item._fields, "genres", beets_types.DelimitedString("; "))
+    library = Library(str(tmp_path / "declared-genres.db"), directory=str(tmp_path))
+    item = Item(title="Song", path=str(tmp_path / "song.wav"))
+
+    _set_item_value(item, "genre", "Alternative Rock")
+    library.add(item)
+    item.store()
+
+    stored = library.get_item(item.id)
+    assert stored.genre == "Alternative Rock"
+    assert stored.genres == ["Alternative Rock"]
 
 
 @pytest.mark.parametrize("evidence", [
@@ -1599,6 +1642,62 @@ def test_approved_candidate_execution_preserves_query_position_and_file_paths(tm
     assert item.get("mb_trackid") == "recording-2"
 
 
+def test_two_chainz_feature_credit_is_reviewed_planned_and_written_to_db_and_file(tmp_path):
+    app = make_app(tmp_path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174088",
+        "artist": "2 Chainz", "album": "B.O.A.T.S. II #METIME", "track_count": 1,
+        "media": [{"position": 1, "format": "CD", "track_count": 1}],
+        "tracks": [{
+            "title": "Extra", "position": 8, "medium_position": 1, "length_ms": 287000,
+            "recording_id": "recording-extra", "track_artist": "2 Chainz feat. Rich Homie Quan",
+            "artist_credit_source": "track",
+        }],
+    }]
+    path = tmp_path / "library" / "2 Chainz" / "B.O.A.T.S. II #METIME" / "08 Extra feat. Rich Homie Quan.wav"
+    write_wav(path, seconds=288)
+    media = MediaFile(str(path))
+    media.title = "Extra feat. Rich Homie Quan"
+    media.artist = "2 Chainz"
+    media.albumartist = "2 Chainz"
+    media.album = "B.O.A.T.S. II #METIME"
+    media.track = 8
+    media.disc = 1
+    media.save()
+    client = app.test_client()
+
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate = album["candidates"][0]
+    detail = candidate["track_details"][0]
+    assert {key: detail[key] for key in ("local", "proposed", "local_artist", "proposed_artist", "artist_credit_source")} == {
+        "local": "Extra feat. Rich Homie Quan", "proposed": "Extra", "local_artist": "2 Chainz",
+        "proposed_artist": "2 Chainz feat. Rich Homie Quan", "artist_credit_source": "track",
+    }
+    assert detail["status"] == "matched"
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": candidate["id"],
+    }).status_code == 200
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    changes = preview.json["items"][0]["changes"]
+    assert changes["title"] == {"from": "Extra feat. Rich Homie Quan", "to": "Extra"}
+    assert changes["artist"] == {"from": "2 Chainz", "to": "2 Chainz feat. Rich Homie Quan"}
+    assert "albumartist" not in changes
+
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    assert (item.title, item.artist, item.albumartist) == (
+        "Extra", "2 Chainz feat. Rich Homie Quan", "2 Chainz",
+    )
+    file_tags = MediaFile(str(path))
+    assert (file_tags.title, file_tags.artist, file_tags.albumartist) == (
+        "Extra", "2 Chainz feat. Rich Homie Quan", "2 Chainz",
+    )
+
+
 @pytest.mark.parametrize("duplicate_action", [None, "skip", "keep-both", "merge", "replace"])
 def test_duplicate_decision_is_persisted_previewed_and_enforced(tmp_path, duplicate_action):
     app = make_app(tmp_path)
@@ -2120,7 +2219,8 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
     assert result[0]["release_group_id"] == "group-1"
     assert result[0]["release_type"] == "Album"
     assert result[0]["country"] == "GB"
-    assert result[0]["tracks"][0] == {"medium_position": 1, "position": 1, "number": "1", "title": "Song", "recording_id": "recording-1", "length_ms": 123000}
+    assert result[0]["tracks"][0] == {"medium_position": 1, "position": 1, "number": "1", "title": "Song", "recording_id": "recording-1", "length_ms": 123000,
+                                        "track_artist": "Artist", "artist_credit_source": "release"}
     assert result[0]["retrieval"] == {"search_score": 99, "source": "musicbrainz-search"}
     assert result[0]["genre"] == "Rock"
     assert result[0]["genre_evidence"]["counts"] == [{"name": "Rock", "count": 4}, {"name": "Pop", "count": 2}]
@@ -2139,6 +2239,34 @@ def test_musicbrainz_http_seam_bounds_limit_and_maps_rate_limit(monkeypatch):
         assert "rate limit" in str(exc)
     else:
         raise AssertionError("expected ProviderError")
+
+
+def test_musicbrainz_track_artist_credit_precedence_joinphrases_and_fallbacks():
+    release = _normalize_release({
+        "id": "release", "title": "Album", "artist-credit": [{"name": "Release Artist"}],
+        "media": [{"tracks": [
+            {"title": "Track credit", "artist-credit": [
+                {"name": "Lead", "joinphrase": " feat. "},
+                {"artist": {"name": "Guest"}, "joinphrase": " & "}, {"name": "Other"},
+            ], "recording": {"title": "Track credit", "artist-credit": [{"name": "Ignored"}]}},
+            {"title": "Recording credit", "artist-credit": [], "recording": {
+                "title": "Recording credit", "artist-credit": [{"name": "Recorder", "joinphrase": " with "}, {"name": "Guest"}],
+            }},
+            {"title": "Malformed", "artist-credit": [{"joinphrase": " feat. "}, None],
+             "recording": {"title": "Malformed", "artist-credit": "not-a-list"}},
+            {"title": "Release fallback", "recording": {"title": "Release fallback"}},
+        ]}],
+    }, exact=True)
+
+    assert [(track["track_artist"], track["artist_credit_source"]) for track in release["tracks"]] == [
+        ("Lead feat. Guest & Other", "track"),
+        ("Recorder with Guest", "recording"),
+        ("Release Artist", "release"),
+        ("Release Artist", "release"),
+    ]
+    assert _artist_credit_text([{"artist": {"name": "Fallback Name"}}]) == "Fallback Name"
+    assert _artist_credit_text([None, "bad", {"name": ""}]) == ""
+    assert _artist_credit_text([{"name": "Partial", "joinphrase": " feat. "}, None]) == ""
 
 
 def test_musicbrainz_http_404_is_a_release_not_found_error(monkeypatch):
@@ -2212,6 +2340,43 @@ def test_matching_pairs_trailing_feature_credits_without_hiding_title_changes(lo
     assert _candidate_diff(query, candidate)["tracks"] == {
         "from": [local_title], "to": ["Extra"],
     }
+
+
+@pytest.mark.parametrize("local_title, local_artist, expected, source", [
+    ("Extra feat. Rich Homie Quan", "2 Chainz", "2 Chainz feat. Rich Homie Quan", "local-title-fallback"),
+    ("Extra ft. Rich Homie Quan", "2 Chainz feat. Rich Homie Quan", "2 Chainz feat. Rich Homie Quan", "local-title-fallback"),
+    ("Extra featuring Rich Homie Quan", "2 Chainz & Rich Homie Quan", "2 Chainz & Rich Homie Quan", "local-title-fallback"),
+    ("Extra", "2 Chainz", "2 Chainz", "release"),
+    ("Extra feat. 2 Chainz", "2 Chainz", "2 Chainz", "local-title-fallback"),
+    ("Extra feat. X", "2 Chainz", "2 Chainz feat. X", "local-title-fallback"),
+    ("Extra feat. Rich Homie Quan (Live)", "2 Chainz", "2 Chainz", "release"),
+    ("Extra feat. Rich Homie Quan [Remix]", "2 Chainz", "2 Chainz", "release"),
+    ("Extra (feat. Rich Homie Quan]", "2 Chainz", "2 Chainz", "release"),
+])
+def test_track_artist_conservative_local_feature_fallback(local_title, local_artist, expected, source):
+    result = score_release(
+        {"artist": "2 Chainz", "album": "Album", "tracks": [{"title": local_title, "artist": local_artist}]},
+        {"artist": "2 Chainz", "album": "Album", "tracks": [{
+            "title": "Extra", "track_artist": "2 Chainz", "artist_credit_source": "release",
+        }]},
+    )
+    detail = result["track_details"][0]
+    assert detail["proposed_artist"] == expected
+    assert detail["artist_credit_source"] == source
+
+
+def test_explicit_musicbrainz_track_credit_overrides_local_feature_fallback():
+    detail = score_release(
+        {"artist": "2 Chainz", "album": "Album", "tracks": [{
+            "title": "Extra feat. Wrong Guest", "artist": "2 Chainz feat. Wrong Guest",
+        }]},
+        {"artist": "2 Chainz", "album": "Album", "tracks": [{
+            "title": "Extra", "track_artist": "2 Chainz feat. Rich Homie Quan",
+            "artist_credit_source": "recording",
+        }]},
+    )["track_details"][0]
+    assert detail["proposed_artist"] == "2 Chainz feat. Rich Homie Quan"
+    assert detail["artist_credit_source"] == "recording"
 
 
 @pytest.mark.parametrize("local_title, canonical_title", [
@@ -2553,7 +2718,7 @@ def test_legacy_candidates_are_marked_stale_then_refreshed_without_losing_decisi
     assert refreshed["selected_candidate_id"] == refreshed["candidates"][0]["id"]
     assert refreshed["candidate_status"] == "complete"
     with sqlite3.connect(app.config["APP_DB"]) as db:
-        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 3
+        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 4
 
     restarted.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
         "provider_id": "different-release", "artist": query["artist"], "album": query["album"],
@@ -2565,6 +2730,63 @@ def test_legacy_candidates_are_marked_stale_then_refreshed_without_losing_decisi
     assert preserved["selected_candidate_id"] == selected_id
     assert preserved["candidates"][0]["provider_id"] == "release-1"
     assert preserved["candidate_status"] == "stale"
+
+
+def test_schema_v4_restart_does_not_reopen_or_rewrite_completed_import(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = "Song"
+    media.artist = media.albumartist = "Artist"
+    media.album = "Album"
+    media.save()
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": "Artist", "album": "Album", "track_count": 1,
+        "tracks": [{"title": "Song", "position": 1, "recording_id": "recording-1",
+                    "track_artist": "Artist", "artist_credit_source": "track"}],
+    }]
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": album["candidates"][0]["id"],
+    }).status_code == 200
+    assert client.post(f'/api/library-import/albums/{album["id"]}/execute', json={}).status_code == 201
+    before_bytes = path.read_bytes()
+    before_tags = MediaFile(str(path))
+    before_file_metadata = (before_tags.title, before_tags.artist, before_tags.albumartist)
+    before_item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    before_db_metadata = (before_item.title, before_item.artist, before_item.albumartist, before_item.mb_trackid)
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        db.execute("UPDATE metadata_candidates SET schema_version = 3 WHERE album_review_id = ?", (album["id"],))
+
+    def provider_must_not_run(query, *, limit):
+        raise AssertionError("startup must not refresh completed candidate evidence")
+
+    restarted = create_app({
+        "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": app.config["STATE_PATH"],
+        "BROWSE_ROOTS": [str(tmp_path)], "MUSICBRAINZ_PROVIDER": provider_must_not_run,
+    })
+    restarted_client = restarted.test_client()
+    pending = restarted_client.get("/api/library-import/reviews").json
+    assert pending["albums"] == []
+    assert pending["items"] == []
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        review = db.execute(
+            "SELECT candidate_status, execution_status FROM album_reviews WHERE id = ?", (album["id"],)
+        ).fetchone()
+        schema_version = db.execute(
+            "SELECT schema_version FROM metadata_candidates WHERE album_review_id = ?", (album["id"],)
+        ).fetchone()[0]
+    assert review == ("complete", "complete")
+    assert schema_version == 3
+    assert path.read_bytes() == before_bytes
+    after_tags = MediaFile(str(path))
+    assert (after_tags.title, after_tags.artist, after_tags.albumartist) == before_file_metadata
+    after_item = next(iter(Library(restarted.config["BEETS_DB"], directory=restarted.config["LIBRARY_PATH"]).items()))
+    assert (after_item.title, after_item.artist, after_item.albumartist, after_item.mb_trackid) == before_db_metadata
 
 
 def test_candidate_schema_defaults_distinguish_fresh_and_upgraded_databases(tmp_path):

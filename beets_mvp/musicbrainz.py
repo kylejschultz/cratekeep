@@ -149,9 +149,7 @@ def _request_json(url: str, timeout: int) -> dict:
 
 
 def _normalize_release(release: dict, *, exact: bool) -> dict:
-    artist_credit = release.get("artist-credit") or []
-    artist = "".join((part.get("name", "") + part.get("joinphrase", ""))
-                     if isinstance(part, dict) else str(part) for part in artist_credit)
+    artist = _artist_credit_text(release.get("artist-credit"))
     media = []
     flattened = []
     for medium_index, source_medium in enumerate(release.get("media") or [], 1):
@@ -159,12 +157,24 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
         tracks = []
         for track_index, source_track in enumerate(source_medium.get("tracks") or [], 1):
             recording = source_track.get("recording") or {}
+            track_artist = _artist_credit_text(source_track.get("artist-credit"))
+            recording_artist = _artist_credit_text(recording.get("artist-credit"))
+            if track_artist:
+                artist_credit_source = "track"
+            elif recording_artist:
+                track_artist = recording_artist
+                artist_credit_source = "recording"
+            else:
+                track_artist = artist
+                artist_credit_source = "release"
             normalized = {
                 "position": source_track.get("position") or track_index,
                 "number": source_track.get("number"),
                 "title": recording.get("title") or source_track.get("title", ""),
                 "recording_id": recording.get("id"),
                 "length_ms": source_track.get("length") if source_track.get("length") is not None else recording.get("length"),
+                "track_artist": track_artist,
+                "artist_credit_source": artist_credit_source,
             }
             tracks.append(normalized)
             flattened.append({"medium_position": medium_position, **normalized})
@@ -185,6 +195,25 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
         "media": media, "tracks": flattened,
         "retrieval": {"search_score": search_score, "source": "musicbrainz-search" if not exact else "release-id"},
     }
+
+
+def _artist_credit_text(credit: object) -> str:
+    """Join a MusicBrainz artist-credit without inventing malformed parts."""
+    if not isinstance(credit, list):
+        return ""
+    pieces = []
+    for part in credit:
+        if not isinstance(part, dict):
+            return ""
+        name = part.get("name")
+        if not isinstance(name, str) or not name.strip():
+            artist = part.get("artist")
+            name = artist.get("name") if isinstance(artist, dict) else ""
+        if not isinstance(name, str) or not name.strip():
+            return ""
+        joinphrase = part.get("joinphrase")
+        pieces.append(name.strip() + (joinphrase if isinstance(joinphrase, str) else ""))
+    return "".join(pieces).strip()
 
 
 def _genre_evidence(genres: object) -> dict:

@@ -52,6 +52,43 @@ def _track_title_key(track: object) -> str:
     }))
 
 
+def _trailing_feature_guest(title: object) -> str:
+    match = TRAILING_FEATURE_CREDIT.search(_text(title))
+    if not match:
+        return ""
+    credit = match.group(0).strip().strip("()[]").strip()
+    marker = re.search(r"(?:feat(?:uring)?|ft)\.?\s+", credit, re.IGNORECASE)
+    return credit[marker.end():].strip().rstrip(".,;:").strip() if marker else ""
+
+
+def _contains_credit(artist: object, guest: object) -> bool:
+    tokens = lambda value: re.findall(r"\w+", _key(value), re.UNICODE)
+    artist_tokens, guest_tokens = tokens(artist), tokens(guest)
+    return bool(guest_tokens) and any(
+        artist_tokens[index:index + len(guest_tokens)] == guest_tokens
+        for index in range(len(artist_tokens) - len(guest_tokens) + 1)
+    )
+
+
+def _track_artist(local: object, canonical: object, release_artist: object) -> tuple[str, str]:
+    canonical = canonical if isinstance(canonical, dict) else {}
+    release = _text(release_artist)
+    proposed = _text(canonical.get("track_artist"))
+    source = canonical.get("artist_credit_source")
+    if proposed and source in {"track", "recording"}:
+        return proposed, source
+    guest = _trailing_feature_guest(_track_title(local))
+    local_artist = _text(local.get("artist")) if isinstance(local, dict) else ""
+    if guest:
+        if local_artist and _contains_credit(local_artist, guest):
+            return local_artist, "local-title-fallback"
+        if _contains_credit(release, guest):
+            return release, "local-title-fallback"
+        if release:
+            return f"{release} feat. {guest}", "local-title-fallback"
+    return release, "release"
+
+
 def _duration(track: object) -> float | None:
     if not isinstance(track, dict):
         return None
@@ -111,7 +148,7 @@ def _pair_metrics(local: object, canonical: object, local_index: int, canonical_
             "status": status, "issues": issues}
 
 
-def _assign_tracks(local_tracks: list, canonical_tracks: list) -> tuple[list[dict], float]:
+def _assign_tracks(local_tracks: list, canonical_tracks: list, release_artist: object = "") -> tuple[list[dict], float]:
     edges = []
     for local_index, local in enumerate(local_tracks):
         for canonical_index, canonical in enumerate(canonical_tracks):
@@ -147,8 +184,11 @@ def _assign_tracks(local_tracks: list, canonical_tracks: list) -> tuple[list[dic
     details = []
     for local_index, canonical_index, metrics in sorted(pairs):
         local, canonical = local_tracks[local_index], canonical_tracks[canonical_index]
+        proposed_artist, artist_credit_source = _track_artist(local, canonical, release_artist)
         details.append({
             "position": local_index + 1, "local": _track_title(local), "proposed": _track_title(canonical),
+            "local_artist": _text(local.get("artist")) if isinstance(local, dict) else "",
+            "proposed_artist": proposed_artist, "artist_credit_source": artist_credit_source,
             "local_duration": _duration(local), "proposed_duration": _duration(canonical),
             "current_position": list(metrics["local_position"]),
             "proposed_position": list(metrics["canonical_position"]),
@@ -158,12 +198,17 @@ def _assign_tracks(local_tracks: list, canonical_tracks: list) -> tuple[list[dic
     for index, track in enumerate(local_tracks):
         if index not in assigned_local:
             details.append({"position": index + 1, "local": _track_title(track), "proposed": None,
+                            "local_artist": _text(track.get("artist")) if isinstance(track, dict) else "",
+                            "proposed_artist": None, "artist_credit_source": None,
                             "local_duration": _duration(track), "proposed_duration": None,
                             "current_position": list(_position(track, index + 1)), "proposed_position": None,
                             "status": "missing", "issues": ["missing"], "distance": 1.0})
     for index, track in enumerate(canonical_tracks):
         if index not in assigned_canonical:
+            proposed_artist, artist_credit_source = _track_artist({}, track, release_artist)
             details.append({"position": index + 1, "local": None, "proposed": _track_title(track),
+                            "local_artist": None, "proposed_artist": proposed_artist,
+                            "artist_credit_source": artist_credit_source,
                             "local_duration": None, "proposed_duration": _duration(track),
                             "current_position": None, "proposed_position": list(_position(track, index + 1)),
                             "recording_id": track.get("recording_id") if isinstance(track, dict) else None,
@@ -179,7 +224,7 @@ def score_release(query: dict, candidate: dict, *, exact_mbid: bool = False) -> 
     """Return bounded confidence, beets-style recommendation, and explainable penalties."""
     local_tracks = query.get("tracks") if isinstance(query.get("tracks"), list) else []
     canonical_tracks = _candidate_tracks(candidate)
-    track_details, track_distance = _assign_tracks(local_tracks, canonical_tracks)
+    track_details, track_distance = _assign_tracks(local_tracks, canonical_tracks, candidate.get("artist"))
     artist_distance = 1 - _similarity(query.get("artist"), candidate.get("artist"))
     album_distance = 1 - _similarity(query.get("album"), candidate.get("album"))
     try:

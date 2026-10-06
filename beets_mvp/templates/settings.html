@@ -215,11 +215,17 @@
     .track-modal { z-index:12; padding:clamp(.4rem,2vw,1rem); background:rgb(8 19 26 / 50%); }
     .track-modal-dialog { width:min(800px,100%); max-height:min(620px,calc(100vh - 2rem)); }
     .track-table-wrap { overflow:auto; }
-    .track-comparison-table { width:100%; border-collapse:collapse; font-size:.76rem; }
+    .track-comparison-table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:.76rem; }
+    .track-comparison-table th:first-child { width:10%; }
+    .track-comparison-table th:nth-child(2),.track-comparison-table th:nth-child(3) { width:28%; }
+    .track-comparison-table th:nth-last-child(-n+2) { width:17%; }
     .track-comparison-table th,.track-comparison-table td { padding:.45rem .5rem; border-bottom:1px solid var(--modal-border); text-align:left; vertical-align:top; }
-    .track-comparison-table th { position:sticky; z-index:1; top:0; background:var(--modal-surface); color:var(--muted); font-size:.66rem; letter-spacing:.03em; text-transform:uppercase; }
-    .track-comparison-table td:first-child,.track-comparison-table td:nth-last-child(-n+2) { white-space:nowrap; }
+    .track-comparison-table th { position:sticky; z-index:1; top:0; overflow-wrap:anywhere; background:var(--modal-surface); color:var(--muted); font-size:.66rem; letter-spacing:.03em; text-transform:uppercase; }
+    .track-comparison-table tr:not(.track-explanation-row) td:first-child,.track-comparison-table tr:not(.track-explanation-row) td:nth-last-child(-n+2) { white-space:nowrap; }
     .track-cell-changed { background:color-mix(in srgb,#fdb022 16%,var(--modal-panel)); font-weight:650; }
+    .track-metadata-title { font-weight:700; overflow-wrap:anywhere; }
+    .track-metadata-artist { display:block; margin-top:.2rem; color:var(--muted); font-size:.68rem; overflow-wrap:anywhere; }
+    .track-field-changed { padding:.08rem .18rem; border-radius:.18rem; background:color-mix(in srgb,#fdb022 16%,var(--modal-panel)); color:var(--text); font-weight:700; }
     .track-row-unmatched { box-shadow:inset 3px 0 #b54708; }
     .track-explanation-row td { padding:.25rem .5rem .45rem; color:var(--muted); background:var(--modal-subtle); font-size:.69rem; }
     .track-change-explanation { margin:0; }
@@ -263,7 +269,9 @@
       .candidate-toggle { grid-column:4; grid-row:1 / span 2; }
       .candidate-detail { grid-template-columns:minmax(0,1fr); padding-left:.75rem; }
       .candidate-facts,.candidate-detail > .candidate-facts:first-child { grid-column:1; grid-template-columns:minmax(0,1fr); }
-      .track-comparison-table { min-width:640px; }
+      .track-comparison-table { font-size:.68rem; }
+      .track-comparison-table th { padding:.35rem .12rem; font-size:.56rem; letter-spacing:0; }
+      .track-comparison-table td { padding:.35rem .22rem; }
       .review-footer { align-items:stretch; flex-direction:column-reverse; }
       .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
       .review-footer button { width:100%; }
@@ -457,7 +465,7 @@
         <p id="track-comparison-description">Only changed or unpaired tracks are shown, with local metadata compared with the proposed MusicBrainz release.</p>
         <div class="track-table-wrap">
           <table class="track-comparison-table">
-            <thead><tr><th scope="col">Position</th><th scope="col">Local title</th><th scope="col">MusicBrainz title</th><th scope="col">Local duration</th><th scope="col">Proposed duration</th></tr></thead>
+            <thead><tr><th scope="col">Position</th><th scope="col">Local metadata</th><th scope="col">MusicBrainz metadata</th><th scope="col">Local duration</th><th scope="col">Proposed duration</th></tr></thead>
             <tbody id="track-comparison-rows"></tbody>
           </table>
         </div>
@@ -925,6 +933,33 @@
       row.append(cell);
     }
 
+    function appendTrackMetadataCell(row, track, side) {
+      const local = side === 'local';
+      const title = local ? track.local : track.proposed;
+      const artist = local ? track.local_artist : track.proposed_artist;
+      const sourceLabel = local ? 'Local' : 'MusicBrainz';
+      const cell = document.createElement('td'); cell.className = 'track-metadata-cell';
+      cell.setAttribute('aria-label', `${sourceLabel} metadata. Title: ${title || 'Not provided'}${track.titleChanged ? ' (changed)' : ''}. Artist: ${artist || 'Not provided'}${track.artistChanged ? ' (changed)' : ''}.`);
+      const titleLine = document.createElement('div'); titleLine.className = 'track-metadata-title';
+      titleLine.textContent = title || '—';
+      if (track.titleChanged && title != null) titleLine.classList.add('track-field-changed');
+      if (title == null) titleLine.classList.add('track-missing');
+      const artistLine = document.createElement('span'); artistLine.className = 'track-metadata-artist';
+      artistLine.textContent = `Artist: ${artist || 'Not provided'}`;
+      if (track.artistChanged && artist != null) artistLine.classList.add('track-field-changed');
+      if (artist == null) artistLine.classList.add('track-missing');
+      cell.append(titleLine, artistLine);
+      const label = title == null ? (local ? 'Not present locally' : 'Not present online')
+        : track.status === 'missing' ? 'Not found online'
+        : track.status === 'extra' ? 'Extra online'
+        : track.status === 'unmatched' ? 'Unmatched' : '';
+      if (label) {
+        const status = document.createElement('span'); status.className = 'track-unmatched-label';
+        status.textContent = label; cell.append(status);
+      }
+      row.append(cell);
+    }
+
     function closeTrackComparison() {
       if (!trackComparisonModal || trackComparisonModal.hidden) return;
       trackComparisonModal.hidden = true;
@@ -945,10 +980,8 @@
           ? (track.localPosition || track.proposedPosition || '—')
           : `${track.localPosition || '—'} → ${track.proposedPosition || '—'}`;
         appendTrackCell(row, position, {changed:track.positionChanged});
-        appendTrackCell(row, track.local, {changed:track.titleChanged && track.local != null,
-          missing:track.local == null, label:track.local == null ? 'Not present locally' : (track.status === 'missing' ? 'Not found online' : track.status === 'unmatched' ? 'Unmatched' : '')});
-        appendTrackCell(row, track.proposed, {changed:track.titleChanged && track.proposed != null,
-          missing:track.proposed == null, label:track.proposed == null ? 'Not present online' : (track.status === 'extra' ? 'Extra online' : track.status === 'unmatched' ? 'Unmatched' : '')});
+        appendTrackMetadataCell(row, track, 'local');
+        appendTrackMetadataCell(row, track, 'proposed');
         appendTrackCell(row, track.localDuration, {changed:track.durationChanged && track.localDuration !== '', missing:track.localDuration === ''});
         appendTrackCell(row, track.proposedDuration, {changed:track.durationChanged && track.proposedDuration !== '', missing:track.proposedDuration === ''});
         const explanations = track.explanations || [];
@@ -1061,6 +1094,7 @@
           const localDuration = trackDuration(track.local_duration);
           const proposedDuration = trackDuration(track.proposed_duration);
           const titleChanged = trackTitleKey(track.local) !== trackTitleKey(track.proposed);
+          const artistChanged = metadataChanged(track.local_artist, track.proposed_artist);
           const positionChanged = localPosition !== proposedPosition;
           const rawDurationDelta = track.local_duration != null && track.proposed_duration != null
             && Number.isFinite(Number(track.local_duration)) && Number.isFinite(Number(track.proposed_duration))
@@ -1068,12 +1102,13 @@
           const durationDelta = rawDurationDelta === null ? null : Math.round(rawDurationDelta);
           const durationChanged = rawDurationDelta !== null && Math.abs(rawDurationDelta) > 3;
           const unpaired = ['missing', 'extra', 'unmatched'].includes(track.status);
-          const changed = titleChanged || positionChanged || durationChanged || unpaired;
+          const changed = titleChanged || artistChanged || positionChanged || durationChanged || unpaired;
           const explanations = [];
           if (track.status === 'missing') explanations.push('Local track was not found on the MusicBrainz release.');
           else if (track.status === 'extra') explanations.push('MusicBrainz track is not present locally.');
           else if (track.status === 'unmatched') explanations.push('Local and MusicBrainz tracks could not be confidently matched.');
           if (titleChanged && !unpaired) explanations.push(trackTitleExplanation(track.local, track.proposed));
+          if (artistChanged && !unpaired) explanations.push(`Artist differs: local “${track.local_artist || 'Not provided'}” → proposed “${track.proposed_artist || 'Not provided'}”.`);
           if (positionChanged && !unpaired) explanations.push(`Position differs: local ${localPosition || 'not provided'} → MusicBrainz ${proposedPosition || 'not provided'}.`);
           if (changed && localDuration === '' && proposedDuration !== '') explanations.push('Local duration unavailable.');
           if (changed && proposedDuration === '' && localDuration !== '') explanations.push('MusicBrainz duration unavailable.');
@@ -1083,11 +1118,11 @@
             explanations.push(`Duration differs: local ${localDuration} → MusicBrainz ${proposedDuration} (${seconds} second${seconds === 1 ? '' : 's'} ${direction}).`);
           }
           return {...track, localPosition, proposedPosition, localDuration, proposedDuration,
-            durationDelta, titleChanged, positionChanged, durationChanged, unpaired, explanations};
+            durationDelta, titleChanged, artistChanged, positionChanged, durationChanged, unpaired, explanations};
         });
       }
       function changedTrackEvidence(details) {
-        return trackEvidence(details).filter(track => track.titleChanged || track.positionChanged || track.durationChanged || track.unpaired);
+        return trackEvidence(details).filter(track => track.titleChanged || track.artistChanged || track.positionChanged || track.durationChanged || track.unpaired);
       }
       function renderTrackChangeFact(dd, fact, value) {
         if (fact.changeCount === 0) {
@@ -1104,7 +1139,7 @@
       function candidateFacts(value) {
         const details = value.is_as_is || !Array.isArray(value.track_details) ? [] : value.track_details;
         const tracks = trackEvidence(details);
-        const trackChanges = tracks.filter(track => track.titleChanged || track.positionChanged || track.durationChanged || track.unpaired);
+        const trackChanges = tracks.filter(track => track.titleChanged || track.artistChanged || track.positionChanged || track.durationChanged || track.unpaired);
         const unmatchedLocal = details.filter(track => track.local != null && ['missing', 'unmatched'].includes(track.status)).length;
         const unmatchedOnline = details.filter(track => track.proposed != null && ['extra', 'unmatched'].includes(track.status)).length;
         const formats = [...new Set(Array.isArray(value.media)

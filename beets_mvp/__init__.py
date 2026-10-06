@@ -39,7 +39,7 @@ MAX_INVENTORY_SAMPLE = 50
 MAX_LIBRARY_IMPORT_ALBUMS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
-CANDIDATE_SCHEMA_VERSION = 3
+CANDIDATE_SCHEMA_VERSION = 4
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip"}
 MUSICBRAINZ_ID_PATTERN = re.compile(
@@ -1060,7 +1060,7 @@ def _item_genre(item: Item) -> str:
 
 def _set_item_value(item: Item, field: str, value: object) -> None:
     item[field] = value
-    if field == "genre":
+    if field == "genre" and "genres" in item._fields:
         normalized = _normalize_metadata(value)
         item["genres"] = [normalized] if normalized else []
 
@@ -1209,6 +1209,7 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
         if duration is not None:
             track["duration"] = duration
         if item:
+            track["artist"] = _normalize_metadata(item.get("artist"))
             for source, target in (("disc", "disc"), ("track", "track"),
                                    ("mb_trackid", "recording_id")):
                 if item.get(source) not in (None, "", 0):
@@ -1291,6 +1292,11 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
                         for track in query["tracks"]]
         if [_track_title_key(track) for track in normalized_tracks] != [_track_title_key(track) for track in local_tracks]:
             proposed["tracks"] = {"from": local_tracks, "to": normalized_tracks}
+        details = _candidate_track_details(query, candidate)
+        local_artists = [detail.get("local_artist") or "" for detail in details if detail.get("local") is not None]
+        proposed_artists = [detail.get("proposed_artist") or "" for detail in details if detail.get("local") is not None]
+        if [_metadata_key(value) for value in local_artists] != [_metadata_key(value) for value in proposed_artists]:
+            proposed["track_artists"] = {"from": local_artists, "to": proposed_artists}
     return proposed
 
 
@@ -1635,6 +1641,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                 "executed_at": row["executed_at"],
                 "tracks": [{"id": track["id"], "path": track["relative_path"],
                             "title": query["tracks"][index]["title"],
+                            "artist": query["tracks"][index].get("artist"),
                             "duration": query["tracks"][index].get("duration"),
                             "disc": query["tracks"][index].get("disc"),
                             "position": query["tracks"][index].get("track"),
@@ -1982,7 +1989,10 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
     artist = _normalize_metadata(candidate.get("artist"))
     album = _normalize_metadata(candidate.get("album"))
     if artist:
-        values.update(artist=artist, albumartist=artist)
+        values["albumartist"] = artist
+        values["artist"] = _normalize_metadata(detail.get("proposed_artist")) if detail else artist
+        if not values["artist"]:
+            values["artist"] = artist
     if album:
         values["album"] = album
     genre = _candidate_genre(candidate)
