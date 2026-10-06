@@ -131,7 +131,9 @@
     @keyframes operation-spin { to { transform:rotate(360deg); } }
     @media (prefers-reduced-motion:reduce) { .operation-status[data-busy="true"]::before { animation-duration:1.8s; } }
     .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
-    .review-bulk-actions { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; padding:.5rem .65rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
+    .folder-tools { display:grid; grid-template-columns:minmax(12rem,1fr) minmax(9rem,auto); gap:.55rem; margin-top:.75rem; }
+    .folder-tools input,.folder-tools select { margin:0; }
+    .review-bulk-actions { position:sticky; bottom:.5rem; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; padding:.5rem .65rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); box-shadow:0 2px 10px rgba(0,0,0,.12); }
     .review-bulk-actions label { display:flex; align-items:center; gap:.45rem; margin:0; font-size:.8rem; }
     .review-bulk-actions button { margin:0; }
     .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
@@ -139,13 +141,20 @@
     .review-folder { border-bottom:1px solid var(--border); background:transparent; }
     .review-folder:last-child { border-bottom:0; }
     .review-folder .review-folder { margin-left:1rem; border-left:1px solid var(--border); }
-    .review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.65rem; align-items:center; cursor:pointer; padding:.7rem .8rem; }
+    .review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto; gap:.55rem; align-items:center; padding:.4rem .6rem; }
     .review-folder-summary:hover { background:var(--active); }
     .review-folder-identity { min-width:0; }
     .review-folder-path { display:block; min-width:0; overflow-wrap:anywhere; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
-    .review-folder-path::before { content:"\1F4C1"; margin-right:.45rem; font-family:system-ui,sans-serif; }
+    .folder-expand { width:1.8rem; min-width:1.8rem; height:1.8rem; margin:0; padding:0; border:0; background:transparent; color:var(--accent); }
+    .folder-expand::before { content:'\25b8'; }
+    .folder-expand[aria-expanded="true"]::before { content:'\25be'; }
     .review-folder-count { color:var(--muted); font-size:.76rem; white-space:nowrap; }
     .review-folder-contents { border-top:1px solid var(--border); background:var(--page); }
+    .selection-summary { color:var(--muted); font-size:.8rem; }
+    .selection-actions { display:flex; flex-wrap:wrap; gap:.4rem; }
+    .selection-actions button { padding:.42rem .6rem; font-size:.78rem; }
+    .page-jump { display:flex; align-items:center; gap:.35rem; }
+    .page-jump input { width:4.5rem; margin:0; padding:.38rem; }
     .review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto auto; gap:.55rem; align-items:center; padding:.42rem .6rem; border-bottom:1px solid var(--border); }
     .review-album-row:last-child { border-bottom:0; }
     .review-select { width:1rem; height:1rem; margin:0; }
@@ -163,9 +172,13 @@
     .status-pill { color:#20252b; background:#f4f5f6; }
     .status-pill[data-status="Matched"],.status-pill[data-status="Queued"],.status-pill[data-status="Imported"] { border-color:#397052; color:#163d29; background:#d9eee1; }
     .status-pill[data-status="Needs attention"] { border-color:#9f3b45; color:#6d1620; background:#f9dadd; }
+    .status-pill[data-status="ready"],.status-pill[data-status="imported"],.status-pill[data-status="Ready"] { border-color:#397052; color:#163d29; background:#d9eee1; }
+    .status-pill[data-status="error"],.status-pill[data-status="needs-review"] { border-color:#9f3b45; color:#6d1620; background:#f9dadd; }
     body.dark-mode .status-pill { color:#edf1f4; background:#3e4852; }
     body.dark-mode .status-pill[data-status="Matched"],body.dark-mode .status-pill[data-status="Queued"],body.dark-mode .status-pill[data-status="Imported"] { border-color:#78a68a; color:#e9fff0; background:#294337; }
     body.dark-mode .status-pill[data-status="Needs attention"] { border-color:#d78089; color:#fff0f1; background:#5a3034; }
+    body.dark-mode .status-pill[data-status="ready"],body.dark-mode .status-pill[data-status="imported"],body.dark-mode .status-pill[data-status="Ready"] { border-color:#78a68a; color:#e9fff0; background:#294337; }
+    body.dark-mode .status-pill[data-status="error"],body.dark-mode .status-pill[data-status="needs-review"] { border-color:#d78089; color:#fff0f1; background:#5a3034; }
     .score-pill[data-band="low"] { border-color:#8f1d14; color:#fff; background:#b42318; }
     .score-pill[data-band="medium"] { border-color:#b54708; color:#342100; background:#fdb022; }
     .score-pill[data-band="high"] { border-color:#085d3a; color:#fff; background:#067647; }
@@ -256,6 +269,10 @@
       .candidate-facts { grid-template-columns:repeat(2,minmax(0,1fr)); }
     }
     @media (max-width: 520px) {
+      .folder-tools { grid-template-columns:1fr; }
+      .review-bulk-actions { align-items:stretch; flex-direction:column; }
+      .selection-actions { display:grid; grid-template-columns:1fr 1fr; width:100%; }
+      .review-pagination { flex-wrap:wrap; justify-content:center; }
       body { margin: 0; padding: .75rem; }
       body:not(.setup-mode) { padding:0; } .content main { padding:1rem; }
       .path-picker { align-items: stretch; flex-direction: column; }
@@ -263,7 +280,9 @@
       .browser-dialog { max-height: calc(100vh - .8rem); }
       .browser-path-form { align-items: stretch; flex-direction: column; }
       .directory-list { min-height: 11rem; }
-      .review-folder-summary,.review-album-row { grid-template-columns:auto minmax(0,1fr) auto auto; padding-left:.6rem; }
+      .review-folder-summary { grid-template-columns:auto auto minmax(0,1fr) auto; padding-left:.4rem; }
+      .review-folder-summary .review-folder-count:last-of-type { display:none; }
+      .review-album-row { grid-template-columns:minmax(0,1fr) auto auto auto; padding-left:.6rem; }
       .review-folder-summary .score-pill,.review-album-row .score-pill { display:none; }
       .review-album-row .status-pill,.duplicate-row-warning { display:none; }
       .review-album { width:100%; }
@@ -352,27 +371,26 @@
     </div>
     <div class="settings-panel" id="settings-panel-library-import" role="tabpanel" aria-labelledby="settings-tab-library-import" data-settings-panel="library-import" hidden>
     <section class="settings-section" aria-labelledby="library-import-title">
-      <h2 id="library-import-title">Library import preview</h2>
-      <p>Inventory audio file paths and file stats, then compare them with the canonical beets library. This preview never changes music files or runs beets import.</p>
-      <div class="import-actions">
-        <button id="inventory-preview" type="button">Run inventory preview</button>
-        <button id="candidate-generate" type="button" aria-describedby="candidate-generate-help" disabled>Find MusicBrainz candidates</button>
+      <h2 id="library-import-title">Folder import queue</h2>
+      <p>Select literal folders beneath the configured library root. Scanning only inventories and matches selected scopes; it never imports or changes media.</p>
+      <div class="folder-tools">
+        <label for="library-import-search" class="visually-hidden">Search folders and album metadata</label>
+        <input id="library-import-search" type="search" placeholder="Search folders, paths, albums, or artists">
+        <label for="library-import-filter" class="visually-hidden">Filter folder status</label>
+        <select id="library-import-filter"><option value="all">All statuses</option><option value="not-scanned">Not scanned</option><option value="ready">Ready</option><option value="needs-review">Needs review</option><option value="error">Error</option><option value="imported">Imported</option></select>
       </div>
-      <small id="candidate-generate-help">Run inventory preview in this browser session before finding candidates.</small>
-      <p id="inventory-status" class="operation-status" role="status" aria-live="polite">No preview run in this browser session.</p>
-      <div id="inventory-summary" class="inventory-summary" hidden></div>
-      <h3>Review inventory items</h3>
-      <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite">Run an inventory preview to create review items.</p>
-      <div class="review-bulk-actions" aria-label="Album selection actions">
-        <label for="library-import-select-all"><input id="library-import-select-all" type="checkbox"> Select all albums on this page</label>
-        <button id="library-import-review-selected" class="secondary" type="button" disabled>Review selected (0)</button>
-      </div>
+      <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite">Loading folders…</p>
+      <label for="folder-select-page"><input id="folder-select-page" type="checkbox"> Select this page</label>
       <div id="library-import-review-list" class="review-list"></div>
-      <nav class="review-pagination" aria-label="Library import review pages">
-        <button id="library-import-review-previous" class="secondary" type="button" disabled>Previous albums</button>
-        <span id="library-import-review-page" aria-live="polite"></span>
-        <button id="library-import-review-next" class="secondary" type="button" disabled>Next albums</button>
+      <nav class="review-pagination" aria-label="Library folder pages">
+        <button id="library-import-review-first" class="secondary" type="button" disabled>First</button>
+        <button id="folder-page-previous" class="secondary" type="button" disabled>Previous</button>
+        <label class="page-jump">Page <input id="library-import-page-input" type="number" min="1" value="1"> <span id="folder-page-total" aria-live="polite">of 1</span></label>
+        <button id="folder-page-next" class="secondary" type="button" disabled>Next</button>
+        <button id="library-import-review-last" class="secondary" type="button" disabled>Last</button>
       </nav>
+      <div class="review-bulk-actions" aria-label="Selected folder actions"><span id="library-import-selection-summary" class="selection-summary">0 folders selected · 0 albums available</span><div class="selection-actions"><button id="library-import-scan-selected" type="button" disabled>Scan selected</button><button id="library-import-ready" type="button" disabled>Import ready (0)</button><button id="library-import-review-exceptions" class="secondary" type="button" disabled>Review exceptions (0)</button></div></div>
+      <div hidden aria-hidden="true"><button id="inventory-preview" type="button"></button><button id="candidate-generate" type="button"></button><small id="candidate-generate-help"></small><p id="inventory-status"></p><div id="inventory-summary"></div><input id="library-import-select-all" type="checkbox"><button id="library-import-review-selected" type="button"></button><button id="library-import-review-previous" type="button"></button><span id="library-import-review-page"></span><button id="library-import-review-next" type="button"></button></div>
     </section>
     </div>
     {% endif %}
@@ -405,6 +423,13 @@
     </section>
   </div>
   {% if not first_run %}
+  <div id="library-import-confirm-modal" class="browser" hidden>
+    <section class="browser-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-confirm-title" aria-describedby="library-import-confirm-summary" tabindex="-1">
+      <header class="browser-header"><h2 id="library-import-confirm-title">Import ready albums?</h2></header>
+      <div class="browser-body"><p id="library-import-confirm-summary"></p><p>Only albums that still pass exact-match and file-safety checks will be imported. Exceptions remain for review.</p></div>
+      <footer class="browser-actions"><button id="library-import-confirm-cancel" class="secondary" type="button">Cancel</button><button id="library-import-confirm" type="button">Confirm import</button></footer>
+    </section>
+  </div>
   <div id="library-import-modal" class="browser" hidden>
     <section class="browser-dialog album-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-modal-title" tabindex="-1" aria-describedby="library-import-modal-description">
       <header class="browser-header">
@@ -447,6 +472,7 @@
       <footer class="browser-actions review-footer">
         <div class="review-footer-group">
           <button type="button" class="secondary" id="library-import-modal-close">Cancel</button>
+          <button type="button" class="secondary" data-review-decision="skipped">Skip</button>
         </div>
         <div class="review-footer-group">
           <button type="button" id="library-import-in-place" class="approve-button">Import</button>
@@ -833,8 +859,7 @@
         const selectedOnPage = pageIds.filter(id => selectedAlbumIds.has(id)).length;
         reviewSelectAll.checked = pageIds.length > 0 && selectedOnPage === pageIds.length;
         reviewSelectAll.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
-        reviewSelectedButton.disabled = selectedAlbumIds.size === 0;
-        reviewSelectedButton.textContent = `Review selected (${selectedAlbumIds.size})`;
+        reviewSelectedButton.disabled = true;
       };
       function albumRowParts(albumReview, folderPath, songs) {
           const statusValue = albumInventoryStatus(albumReview, songs);
@@ -903,13 +928,6 @@
     reviewSelectAll.addEventListener('change', () => {
       albumReviews.forEach(album => reviewSelectAll.checked ? selectedAlbumIds.add(album.id) : selectedAlbumIds.delete(album.id));
       renderReviewItems();
-    });
-    reviewSelectedButton.addEventListener('click', () => {
-      reviewSequence = albumReviews.filter(album => selectedAlbumIds.has(album.id)).map(album => album.id);
-      const first = reviewSequence.shift();
-      const album = albumReviews.find(value => value.id === first);
-      const button = reviewList.querySelector(`.review-album[data-album-id="${first}"]`);
-      if (album && button) openReview(album, button);
     });
 
     async function loadReviewItems(offset = reviewOffset) {
@@ -1464,7 +1482,7 @@
           closeReview(false);
           if (nextId) {
             const nextAlbum = albumReviews.find(album => album.id === nextId);
-            const nextButton = reviewList.querySelector(`.review-album[data-album-id="${nextId}"]`);
+            const nextButton = reviewList.querySelector(`.review-album[data-album-id="${nextId}"]`) || document.getElementById('library-import-review-exceptions');
             if (nextAlbum && nextButton) openReview(nextAlbum, nextButton);
           }
         } catch (error) {
@@ -1502,6 +1520,13 @@
           result.textContent = `${data.files} files imported in place; no files were moved or copied.${artMessage}`;
           selectedAlbumIds.delete(activeAlbum.id);
           await loadReviewItems();
+          const nextId = reviewSequence.shift();
+          if (nextId) {
+            const nextAlbum = albumReviews.find(album => album.id === nextId);
+            closeReview(false);
+            if (nextAlbum) openReview(nextAlbum, document.getElementById('library-import-review-exceptions'));
+            return;
+          }
           reviewSucceeded = true;
           document.getElementById('library-import-modal-close').hidden = true;
           button.textContent = 'Close'; button.disabled = false; button.focus();
@@ -1554,6 +1579,181 @@
         setCandidateAvailability(inventoryPreviewReady);
       }
     });
+
+    // Filesystem-first queue. The legacy album API remains compatible, while
+    // this surface pages literal immediate-child folders and expands on demand.
+    const folderSearch = document.getElementById('library-import-search');
+    const folderFilter = document.getElementById('library-import-filter');
+    const folderSelectPage = document.getElementById('folder-select-page');
+    const folderFirst = document.getElementById('library-import-review-first');
+    const folderPrevious = document.getElementById('folder-page-previous');
+    const folderNext = document.getElementById('folder-page-next');
+    const folderLast = document.getElementById('library-import-review-last');
+    const folderPageInput = document.getElementById('library-import-page-input');
+    const folderPageTotal = document.getElementById('folder-page-total');
+    const folderSelectionSummary = document.getElementById('library-import-selection-summary');
+    const folderScan = document.getElementById('library-import-scan-selected');
+    const folderImport = document.getElementById('library-import-ready');
+    const folderExceptions = document.getElementById('library-import-review-exceptions');
+    const folderConfirmModal = document.getElementById('library-import-confirm-modal');
+    const folderSelectionKey = 'cratekeep-folder-selection:' + {{ build_sha|tojson }};
+    const selectedFolders = new Set();
+    let foldersOnPage = [], currentFolderPage = 1, totalFolderPages = 1, totalFolders = 0;
+    let selectedFolderSummary = {available_album_count:0, ready_album_count:0, exception_count:0};
+    try { JSON.parse(sessionStorage.getItem(folderSelectionKey) || '[]').forEach(path => selectedFolders.add(path)); } catch (error) {}
+
+    function saveFolderSelection() {
+      try { sessionStorage.setItem(folderSelectionKey, JSON.stringify([...selectedFolders])); } catch (error) {}
+    }
+
+    async function refreshFolderSelectionSummary() {
+      const count = selectedFolders.size;
+      folderScan.disabled = count === 0;
+      if (count) {
+        try {
+          const response = await fetch('/api/library-import/bulk/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
+          selectedFolderSummary = await readApiResponse(response, 'Unable to summarize selected folders');
+        } catch (error) { reviewStatus.textContent = error.message; }
+      } else selectedFolderSummary = {available_album_count:0, ready_album_count:0, exception_count:0};
+      folderSelectionSummary.textContent = `${count} ${count === 1 ? 'folder' : 'folders'} selected · ${selectedFolderSummary.available_album_count} albums available`;
+      folderImport.textContent = `Import ready (${selectedFolderSummary.ready_album_count})`;
+      folderImport.disabled = selectedFolderSummary.ready_album_count === 0;
+      folderExceptions.textContent = `Review exceptions (${selectedFolderSummary.exception_count})`;
+      folderExceptions.disabled = selectedFolderSummary.exception_count === 0;
+    }
+
+    function folderAlbumRow(album, items) {
+      const row = document.createElement('article'); row.className = 'review-album-row';
+      const identity = document.createElement('span'); identity.className = 'review-folder-identity';
+      const name = document.createElement('span'); name.className = 'review-folder-path'; name.textContent = `${album.artist} — ${album.album}`; name.title = album.source_paths.join(' · '); identity.append(name);
+      const count = document.createElement('span'); count.className = 'review-track-count'; count.textContent = `${album.tracks.length} ${album.tracks.length === 1 ? 'track' : 'tracks'}`;
+      const state = document.createElement('span'); state.className = 'status-pill';
+      state.textContent = album.ready ? 'Ready' : albumInventoryStatus(album, items); state.dataset.status = state.textContent;
+      state.title = album.readiness_reason || '';
+      const score = document.createElement('span'); score.className = 'score-pill';
+      const presentation = matchScorePresentation(album.highest_confidence);
+      if (presentation) { score.textContent = presentation.label; score.dataset.band = presentation.band; }
+      else score.hidden = true;
+      const open = document.createElement('button'); open.type = 'button'; open.className = 'review-album'; open.textContent = '↗'; open.dataset.albumId = album.id; open.setAttribute('aria-label', `Review ${album.album} by ${album.artist}`);
+      open.addEventListener('click', () => openReview(album, open));
+      row.append(identity, count, state, score, open); return row;
+    }
+
+    async function expandFolder(folder, button, body) {
+      const open = button.getAttribute('aria-expanded') === 'true';
+      if (open) { button.setAttribute('aria-expanded', 'false'); body.hidden = true; return; }
+      button.setAttribute('aria-expanded', 'true'); body.hidden = false;
+      if (body.dataset.loaded === 'true') return;
+      body.textContent = 'Loading albums…';
+      try {
+        const response = await fetch(`/api/library-import/folders/albums?folder=${encodeURIComponent(folder.path)}`);
+        const data = await readApiResponse(response, 'Unable to load folder albums');
+        albumReviews = [...albumReviews.filter(existing => !data.albums.some(album => album.id === existing.id)), ...data.albums];
+        const children = data.albums.map(album => folderAlbumRow(album, data.items));
+        if (!children.length) { const empty = document.createElement('p'); empty.textContent = 'No reviewable albums in this folder.'; children.push(empty); }
+        body.replaceChildren(...children); body.dataset.loaded = 'true';
+      } catch (error) { body.textContent = error.message || 'Unable to load folder albums.'; }
+    }
+
+    function renderFolderQueue() {
+      const rows = foldersOnPage.map(folder => {
+        const article = document.createElement('article'); article.className = 'review-folder';
+        const summary = document.createElement('div'); summary.className = 'review-folder-summary';
+        const select = document.createElement('input'); select.type = 'checkbox'; select.className = 'review-select'; select.checked = selectedFolders.has(folder.path); select.setAttribute('aria-label', `Select folder ${folder.name}`);
+        select.addEventListener('change', () => { select.checked ? selectedFolders.add(folder.path) : selectedFolders.delete(folder.path); saveFolderSelection(); renderFolderQueue(); refreshFolderSelectionSummary(); });
+        const expand = document.createElement('button'); expand.type = 'button'; expand.className = 'folder-expand'; expand.setAttribute('aria-expanded', 'false'); expand.setAttribute('aria-label', `Expand ${folder.name}`);
+        const identity = document.createElement('span'); identity.className = 'review-folder-identity';
+        const path = document.createElement('span'); path.className = 'review-folder-path'; path.textContent = folder.name; path.title = folder.path; identity.append(path);
+        const counts = document.createElement('span'); counts.className = 'review-folder-count'; counts.textContent = `${folder.album_count} albums · ${folder.track_count} tracks`;
+        const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = folder.status; status.textContent = folder.status.replace('-', ' ');
+        const body = document.createElement('div'); body.className = 'review-folder-contents'; body.hidden = true;
+        expand.addEventListener('click', () => expandFolder(folder, expand, body));
+        summary.append(select, expand, identity, counts, status); article.append(summary, body); return article;
+      });
+      reviewList.replaceChildren(...rows);
+      reviewStatus.dataset.busy = 'false'; reviewStatus.textContent = totalFolders ? `${totalFolders} matching folders.` : 'No folders match this search and filter.';
+      const selectedHere = foldersOnPage.filter(folder => selectedFolders.has(folder.path)).length;
+      folderSelectPage.checked = foldersOnPage.length > 0 && selectedHere === foldersOnPage.length;
+      folderSelectPage.indeterminate = selectedHere > 0 && selectedHere < foldersOnPage.length;
+      folderPageInput.value = currentFolderPage; folderPageInput.max = totalFolderPages; folderPageTotal.textContent = `of ${totalFolderPages}`;
+      folderFirst.disabled = folderPrevious.disabled = currentFolderPage <= 1;
+      folderNext.disabled = folderLast.disabled = currentFolderPage >= totalFolderPages;
+    }
+
+    async function loadFolderItems(page = currentFolderPage) {
+      reviewStatus.dataset.busy = 'true'; reviewStatus.textContent = 'Loading folders…';
+      folderFirst.disabled = folderPrevious.disabled = folderNext.disabled = folderLast.disabled = true;
+      try {
+        const query = new URLSearchParams({page:String(page), q:folderSearch.value.trim(), status:folderFilter.value});
+        const response = await fetch(`/api/library-import/folders?${query}`);
+        const data = await readApiResponse(response, 'Unable to load folders');
+        foldersOnPage = data.folders; currentFolderPage = data.page; totalFolderPages = data.page_count; totalFolders = data.total; renderFolderQueue();
+      } catch (error) { reviewStatus.dataset.busy = 'false'; reviewStatus.textContent = error.message || 'Unable to load folders.'; }
+    }
+    loadReviewItems = loadFolderItems;
+
+    folderSelectPage.addEventListener('change', () => { foldersOnPage.forEach(folder => folderSelectPage.checked ? selectedFolders.add(folder.path) : selectedFolders.delete(folder.path)); saveFolderSelection(); renderFolderQueue(); refreshFolderSelectionSummary(); });
+    folderFirst.addEventListener('click', () => loadFolderItems(1));
+    folderPrevious.addEventListener('click', () => loadFolderItems(currentFolderPage - 1));
+    folderNext.addEventListener('click', () => loadFolderItems(currentFolderPage + 1));
+    folderLast.addEventListener('click', () => loadFolderItems(totalFolderPages));
+    function jumpToFolderPage() { loadFolderItems(Math.min(totalFolderPages, Math.max(1, Number.parseInt(folderPageInput.value, 10) || 1))); }
+    folderPageInput.addEventListener('change', jumpToFolderPage); folderPageInput.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); jumpToFolderPage(); } });
+    let folderSearchTimer; folderSearch.addEventListener('input', () => { clearTimeout(folderSearchTimer); folderSearchTimer = setTimeout(() => loadFolderItems(1), 250); });
+    folderFilter.addEventListener('change', () => loadFolderItems(1));
+
+    folderScan.addEventListener('click', async () => {
+      setOperationBusy(folderScan, reviewStatus, true, `Scanning ${selectedFolders.size} selected folders; no files will be changed…`);
+      try {
+        const response = await fetch('/api/library-import/folders/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
+        const data = await readApiResponse(response, 'Selected-folder scan failed', {acceptedStatuses:[207]});
+        await loadFolderItems(); await refreshFolderSelectionSummary();
+        reviewStatus.textContent = `${data.scanned_folder_count} folders scanned; ${data.albums.length} albums matched; ${data.errors.length} errors. No files were changed.`;
+      } catch (error) { reviewStatus.textContent = error.message || 'Selected-folder scan failed.'; }
+      finally { setOperationBusy(folderScan, reviewStatus, false); folderScan.disabled = selectedFolders.size === 0; }
+    });
+
+    folderImport.addEventListener('click', async () => {
+      try {
+        const response = await fetch('/api/library-import/bulk/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
+        selectedFolderSummary = await readApiResponse(response, 'Unable to preview ready imports');
+        document.getElementById('library-import-confirm-summary').textContent = `${selectedFolderSummary.selected_folder_count} folders · ${selectedFolderSummary.ready_album_count} ready albums · ${selectedFolderSummary.track_count} files/tracks · ${selectedFolderSummary.exception_count} excluded exceptions.`;
+        folderConfirmModal.hidden = false; document.body.classList.add('modal-open'); folderConfirmModal.querySelector('.browser-dialog').focus();
+      } catch (error) { reviewStatus.textContent = error.message; }
+    });
+    function closeFolderConfirm() { folderConfirmModal.hidden = true; document.body.classList.remove('modal-open'); folderImport.focus(); }
+    document.getElementById('library-import-confirm-cancel').addEventListener('click', closeFolderConfirm);
+    folderConfirmModal.addEventListener('mousedown', event => { if (event.target === folderConfirmModal) closeFolderConfirm(); });
+    folderConfirmModal.addEventListener('keydown', event => {
+      if (event.key === 'Escape') { event.preventDefault(); closeFolderConfirm(); }
+      if (event.key !== 'Tab') return;
+      const controls = [...folderConfirmModal.querySelectorAll('button:not(:disabled)')], first = controls[0], last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+    document.getElementById('library-import-confirm').addEventListener('click', async event => {
+      const button = event.currentTarget; setOperationBusy(button, reviewStatus, true, 'Revalidating and importing ready albums…');
+      try {
+        const response = await fetch('/api/library-import/bulk/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders], confirmed:true})});
+        const data = await readApiResponse(response, 'Ready import failed', {acceptedStatuses:[207]}); closeFolderConfirm();
+        await loadFolderItems(); await refreshFolderSelectionSummary();
+        reviewStatus.textContent = `${data.imported.length} albums imported; ${data.skipped.length} exceptions skipped; ${data.failed.length} failed.`;
+      } catch (error) { reviewStatus.textContent = error.message || 'Ready import failed.'; }
+      finally { setOperationBusy(button, reviewStatus, false); }
+    });
+
+    folderExceptions.addEventListener('click', async () => {
+      setOperationBusy(folderExceptions, reviewStatus, true, 'Loading selected exceptions…');
+      try {
+        const response = await fetch('/api/library-import/bulk/exceptions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
+        const data = await readApiResponse(response, 'Unable to load exceptions'); albumReviews = data.albums;
+        reviewSequence = albumReviews.map(album => album.id); const firstId = reviewSequence.shift();
+        const first = albumReviews.find(album => album.id === firstId); if (first) openReview(first, folderExceptions);
+      } catch (error) { reviewStatus.textContent = error.message; }
+      finally { setOperationBusy(folderExceptions, reviewStatus, false); }
+    });
+
+    loadFolderItems(1); refreshFolderSelectionSummary();
 
     {% if not first_run %}
     (() => {

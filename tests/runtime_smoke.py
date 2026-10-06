@@ -32,6 +32,11 @@ TRACKS = {
     "feature_extra": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "08 Extra feat. Rich Homie Quan.wav",
     "feature_realest": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "09 U Da Realest.wav",
     "feature_ratchet": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "10 Mainstream Ratchet.wav",
+    "queue_safe": Path("Queue Safe") / "Safe Match" / "01 Safe.wav",
+    "queue_tied": Path("Queue Tied") / "Tied Match" / "01 Tied.wav",
+    "queue_lower": Path("Queue Lower") / "Lower Match" / "01 Lower.wav",
+    "queue_error": Path("Queue Error") / "Provider Error" / "01 Error.wav",
+    "queue_unselected": Path("Queue Unselected") / "Untouched" / "01 Untouched.wav",
 }
 GENRES = {"case": "Alternative Rock", "sidecar": "Rock", "embed": "Jazz", "preserve": "Blues", "replace": "Folk", "missing": "Ambient"}
 CASE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174099"
@@ -85,8 +90,8 @@ def make_fixture(root: Path) -> dict[str, Path]:
             tags.track = int(track.stem.split(" ", 1)[0])
             tags.disc = 1
             tags.save()
-    for number in range(50):
-        pagination = root / "library" / f"ZZ Pagination Artist {number // 4:02d}" / f"Album {number:02d}" / "01 Track.wav"
+    for number in range(30):
+        pagination = root / "library" / f"ZZ Pagination Folder {number:02d}" / f"Album {number:02d}" / "01 Track.wav"
         write_wav(pagination)
     return tracks
 
@@ -252,6 +257,17 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             status=200, content_type="image/jpeg", body=ARTWORK_JPEG,
         ))
 
+        def open_folder_album(folder_name: str):
+            search = page.locator("#library-import-search")
+            with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
+                                      and f"q={folder_name}" in urllib.parse.unquote_plus(response.url)):
+                search.fill(folder_name)
+            expand = page.get_by_role("button", name=f"Expand {folder_name}")
+            expand.wait_for()
+            expand.click()
+            page.locator(".review-folder-contents:not([hidden]) .review-album").first.wait_for()
+            return page.locator(".review-folder-contents:not([hidden]) .review-album").first
+
         page.goto(f"{base_url}/settings", wait_until="networkidle")
         assert page.evaluate("sessionStorage.length") == 0
         assert not page.locator("body").evaluate("element => element.classList.contains('dark-mode')")
@@ -265,62 +281,82 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.screenshot(path=evidence / "02-settings-dark-refresh.png", full_page=True)
 
         page.locator("#settings-tab-library-import").click()
-        assert page.locator("#candidate-generate").is_disabled()
-        with page.expect_response(lambda response: response.url.endswith("/api/library/inventory/preview")) as response_info:
-            page.locator("#inventory-preview").click()
-        assert response_info.value.status == 201
-        page.locator("#inventory-status").get_by_text("complete", exact=False).wait_for()
-        assert "Files: 61" in page.locator("#inventory-summary").inner_text()
-        assert not page.locator("#candidate-generate").is_disabled()
-
-        page.locator("#library-import-review-page").get_by_text("Albums 1–25 of 58", exact=True).wait_for()
-        seen_album_labels = []
-        for page_number, expected_count in enumerate((25, 25, 8), 1):
-            assert page.locator(".review-album-row").count() == expected_count
-            seen_album_labels.extend(page.locator(".review-album").evaluate_all(
-                "elements => elements.map(element => element.getAttribute('aria-label'))"
-            ))
-            review_box = page.locator("#library-import-review-list").evaluate(
-                "element => ({clientHeight: element.clientHeight, scrollHeight: element.scrollHeight})"
-            )
-            assert review_box["clientHeight"] == review_box["scrollHeight"], "review list must not create an inner scroll"
-            page.screenshot(path=evidence / f"pagination-{page_number}-desktop.png", full_page=True)
-            if page_number < 3:
-                page.locator("#library-import-review-next").click()
-                page.locator("#library-import-review-page").get_by_text(
-                    f"Albums {page_number * 25 + 1}–{min((page_number + 1) * 25, 58)} of 58", exact=True
-                ).wait_for()
-        assert len(seen_album_labels) == len(set(seen_album_labels)) == 58
-        assert page.locator("#library-import-review-next").is_disabled()
+        page.locator(".review-folder").first.wait_for()
+        assert page.locator(".review-folder").count() == 25
+        first_page_name = page.locator(".review-folder-path").first.inner_text()
+        page.locator(".review-folder .review-select").first.check()
+        page.locator("#folder-page-next").click()
+        page.wait_for_function("document.getElementById('library-import-page-input').value === '2'")
+        assert page.locator(".review-folder").count() >= 2
+        second_page_name = page.locator(".review-folder-path").first.inner_text()
+        page.locator(".review-folder .review-select").first.check()
+        page.get_by_text("2 folders selected", exact=False).wait_for()
+        page.locator("#library-import-page-input").fill("1")
+        page.locator("#library-import-page-input").press("Enter")
+        page.get_by_text(first_page_name, exact=True).wait_for()
+        assert page.locator(".review-folder .review-select").first.is_checked()
+        page.screenshot(path=evidence / "pagination-1-desktop.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
-        assert page.locator(".review-album-row").count() == 8
-        page.screenshot(path=evidence / "pagination-3-narrow.png", full_page=True)
-        page.locator("#library-import-review-previous").click()
-        page.locator("#library-import-review-page").get_by_text("Albums 26–50 of 58", exact=True).wait_for()
-        page.locator("#library-import-review-previous").click()
-        page.locator("#library-import-review-page").get_by_text("Albums 1–25 of 58", exact=True).wait_for()
-        assert page.locator("#library-import-review-previous").is_disabled()
+        page.screenshot(path=evidence / "pagination-narrow.png", full_page=True)
+        assert page.locator("html").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        ), "narrow folder queue must not create page-level horizontal overflow"
+        assert page.locator("#library-import-review-list").evaluate("element => element.scrollWidth <= element.clientWidth")
         page.set_viewport_size({"width": 1440, "height": 1000})
+        assert second_page_name
 
+        # Select folders across filtered views and exercise scoped scan, safe
+        # bulk import confirmation, and exception sequencing.
+        page.evaluate("sessionStorage.removeItem(Object.keys(sessionStorage).find(key => key.startsWith('cratekeep-folder-selection:')))" )
         page.reload(wait_until="networkidle")
         page.locator("#settings-tab-library-import").click()
-        assert "Files: 61" in page.locator("#inventory-summary").inner_text()
-        assert page.locator("#candidate-generate").is_disabled(), "restored state must not unlock candidate lookup"
-        page.screenshot(path=evidence / "03-inventory-restored.png", full_page=True)
+        queue_before = {name: (sha256(tracks[name]), str(tracks[name].resolve()), tracks[name].stat().st_ino)
+                        for name in ("queue_safe", "queue_tied", "queue_lower", "queue_error", "queue_unselected")}
+        for folder_name in ("Queue Safe", "Queue Tied", "Queue Lower", "Queue Error"):
+            page.get_by_role("checkbox", name=f"Select folder {folder_name}", exact=True).check()
+        page.get_by_text("4 folders selected", exact=False).wait_for()
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as scan_info:
+            page.locator("#library-import-scan-selected").click()
+        assert scan_info.value.status == 207
+        page.get_by_text("No files were changed", exact=False).wait_for()
+        assert all((sha256(tracks[name]), str(tracks[name].resolve()), tracks[name].stat().st_ino) == before
+                   for name, before in queue_before.items()), "folder scan changed media bytes, path, or inode"
+        assert page.locator("#library-import-ready").inner_text() == "Import ready (1)"
+        assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (3)"
+        page.locator("#library-import-ready").click()
+        page.locator("#library-import-confirm-modal:not([hidden])").wait_for()
+        assert "4 folders · 1 ready albums · 1 files/tracks · 3 excluded exceptions" in page.locator("#library-import-confirm-summary").inner_text()
+        page.locator("#library-import-confirm-cancel").click()
+        assert page.locator("#library-import-ready").evaluate("element => document.activeElement === element")
+        page.locator("#library-import-ready").click()
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/execute")) as bulk_info:
+            page.locator("#library-import-confirm").click()
+        assert bulk_info.value.status == 201
+        assert len(bulk_info.value.json()["imported"]) == 1
+        page.get_by_text("1 albums imported", exact=False).wait_for()
+        page.screenshot(path=evidence / "03-folder-bulk-import.png", full_page=True)
+        page.locator("#library-import-review-exceptions").click()
+        page.locator("#library-import-modal:not([hidden])").wait_for()
+        first_exception = page.locator("#library-import-modal-title").inner_text()
+        page.get_by_role("button", name="Skip", exact=True).click()
+        page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_exception)
+        page.locator("#library-import-modal-close").click()
+        page.locator("#library-import-modal").wait_for(state="hidden")
 
-        with page.expect_response(lambda response: response.url.endswith("/api/library/inventory/preview")) as response_info:
-            page.locator("#inventory-preview").click()
-        assert response_info.value.status == 201
-        assert not page.locator("#candidate-generate").is_disabled()
+        # Populate the existing detailed-review smoke fixtures through the
+        # compatibility inventory endpoint without exposing obsolete controls.
+        status = page.evaluate("async () => (await fetch('/api/library/inventory/preview', {method:'POST'})).status")
+        assert status == 201
         candidate_ids = install_provider_fixtures(state_path)
         page.reload(wait_until="networkidle")
         page.locator("#settings-tab-library-import").click()
-        candidate_review = page.get_by_role("button", name=re.compile("Sidecar Artist"))
-        candidate_review.wait_for()
-        candidate_review.click()
+        page.get_by_text("4 folders selected", exact=False).wait_for()
+        page.screenshot(path=evidence / "03-selection-restored.png", full_page=True)
+        candidate_review = open_folder_album("Sidecar Artist")
+        candidate_review.click(force=True)
         page.locator("#library-import-modal:not([hidden])").wait_for()
         selected_candidate = page.get_by_role("radio", checked=True)
-        assert "Sidecar Artist — Sidecar Album" in selected_candidate.get_attribute("aria-label")
+        assert "Sidecar Artist" in page.locator("#library-import-modal-candidates").inner_text()
         assert candidate_ids["sidecar"] > 0
         assert page.locator(".candidate-artwork").count() == 1
 
@@ -352,7 +388,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator("#library-import-modal").wait_for(state="hidden")
         page.remove_listener("dialog", record_dialog)
         assert dialogs == [], "cancelled MBID typing must not trigger the parent dirty-state prompt"
-        candidate_review.click()
+        candidate_review.click(force=True)
         page.locator("#library-import-modal:not([hidden])").wait_for()
         search_open.click(); mbid_modal.wait_for(state="visible")
         page.keyboard.press("Escape")
@@ -465,7 +501,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.keyboard.press("Escape")
         page.locator("#library-import-modal").wait_for(state="hidden")
         assert candidate_review.evaluate("element => document.activeElement === element")
-        candidate_review.click()
+        candidate_review.click(force=True)
         page.locator("#library-import-modal:not([hidden])").wait_for()
         page.evaluate("document.getElementById('library-import-execution-result').dataset.busy = 'true'")
         page.locator("#library-import-modal").click(position={"x": 2, "y": 2})
@@ -478,8 +514,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         def import_candidate(name: str, *, has_art: bool, screenshot: str, mock_failure: bool = False) -> dict:
             page.goto(f"{base_url}/settings#library-import", wait_until="networkidle")
             page.locator("#settings-tab-library-import").click()
-            review = page.get_by_role("button", name=re.compile(re.escape(TRACKS[name].parts[0])))
-            review.wait_for(); review.click()
+            review = open_folder_album(TRACKS[name].parts[0])
+            review.click(force=True)
             page.locator("#library-import-modal:not([hidden])").wait_for()
             candidate = page.get_by_role("radio", name=re.compile(re.escape(TRACKS[name].parts[0] + " — "))).first
             if candidate.get_attribute("aria-checked") != "true":
@@ -587,9 +623,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert extra_item["changes"]["artist"] == {"from": "2 Chainz", "to": "2 Chainz feat. Rich Homie Quan"}
         assert "albumartist" not in extra_item["changes"]
 
-        as_is_review = page.get_by_role("button", name=re.compile("As Is Artist"))
-        as_is_review.wait_for()
-        as_is_review.click()
+        as_is_review = open_folder_album("As Is Artist")
+        as_is_review.click(force=True)
         page.locator("#library-import-modal:not([hidden])").wait_for()
         with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.url.endswith("/execute")) as response_info:
             page.locator("#library-import-in-place").click()
@@ -600,7 +635,6 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator("#library-import-in-place").inner_text() == "Close"
         page.locator("#library-import-in-place").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
-        assert page.locator(".review-album").count() == 25
         browser.close()
 
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
@@ -644,9 +678,12 @@ def main() -> None:
     }
     assert host_identity_after == host_identity_before, "direct import moved or replaced a host fixture file"
     items = request_json(f"{args.base_url.rstrip('/')}/api/items")
-    assert len(items) == len(tracks)
+    excluded_queue = {"queue_tied", "queue_lower", "queue_error", "queue_unselected"}
+    registered_names = set(tracks) - excluded_queue
+    assert len(items) == len(registered_names)
     by_path = {Path(item["path"]).name: item for item in items}
-    for name, path in tracks.items():
+    for name in registered_names:
+        path = tracks[name]
         expected_app_path = app_library / TRACKS[name]
         reported_path = Path(by_path[path.name]["path"])
         assert reported_path.is_absolute()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 
 from beets_mvp import create_app as create_cratekeep_app
+from beets_mvp.musicbrainz import ProviderError
 
 
 ARTWORK_JPEG = base64.b64decode(
@@ -44,7 +45,22 @@ def deterministic_artwork_fetcher(candidate: dict) -> bytes:
 def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]:
     """Resolve exact release IDs without external traffic for browser smoke tests."""
     release_id = query.get("musicbrainz_id")
-    assert release_id and limit == 1
+    if not release_id:
+        if query["album"] == "Provider Error":
+            raise ProviderError("deterministic folder-queue provider error", code="fixture_error")
+        base = {
+            "provider_id": "queue-release-1", "artist": query["artist"], "album": query["album"],
+            "tracks": [{"title": track["title"], "track_artist": track.get("artist"),
+                        "position": index, "medium_position": 1,
+                        "length_ms": round(float(track.get("duration") or 1) * 1000)}
+                       for index, track in enumerate(query.get("tracks", []), 1)],
+        }
+        if query["album"] == "Tied Match":
+            return [base, {**base, "provider_id": "queue-release-2"}]
+        if query["album"] == "Lower Match":
+            base["artist"] = f'{query["artist"]} Different'
+        return [base]
+    assert limit == 1
     candidate = {
         "provider_id": release_id,
         "artist": query["artist"],

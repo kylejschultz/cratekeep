@@ -1,5 +1,6 @@
 import hashlib
 import json
+import copy
 from io import BytesIO
 import shutil
 import sqlite3
@@ -15,7 +16,7 @@ from mediafile import Image as MediaImage, ImageType, MediaFile
 from PIL import Image as PillowImage
 
 from beets_mvp import (
-    LibraryImportExecutionError, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
+    LibraryImportExecutionError, _album_bulk_readiness, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
     _format_genre, _genre_presentation_key, _group_library_import_review_items, _init_db,
     _item_genre, _set_item_value, _SafeArtworkRedirect, create_app,
 )
@@ -338,7 +339,7 @@ def test_normal_settings_renders_in_app_page_and_beets_editor(tmp_path):
     assert b'name="fetch_art"' in page.data
     assert b'name="fetch_art" type="checkbox" value="1" checked' not in page.data
     assert b'id="inventory-preview"' in page.data
-    assert b'never changes music files or runs beets import' in page.data
+    assert b'never imports or changes media' in page.data
 
 
 def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
@@ -2525,7 +2526,7 @@ def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_pat
     html = make_app(tmp_path).test_client().get("/settings").data
 
     assert b".review-list { overflow:hidden;" in html
-    assert b".review-folder-summary { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in html
+    assert b".review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto;" in html
     assert b".review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto auto;" in html
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     assert b"document.createElement('article')" in html
@@ -2572,7 +2573,7 @@ def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html
     assert b"Albums ${pageStart}\xe2\x80\x93${pageEnd} of ${reviewTotalAlbums}" in html
-    assert b"Previous albums" in html and b"Next albums" in html
+    assert b">Previous<" in html and b">Next<" in html
 
 
 def test_album_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
@@ -2589,12 +2590,10 @@ def test_album_folder_line_carries_review_status_score_without_track_expansion(t
 def test_album_review_multi_select_keeps_sequential_single_album_flow(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
 
-    assert b'id="library-import-select-all" type="checkbox"' in html
-    assert b'id="library-import-review-selected" class="secondary" type="button" disabled>Review selected (0)' in html
-    assert b"select.setAttribute('aria-label', `Select ${folderPath === '.' ? 'library root' : folderPath} for sequential review`)" in html
-    assert b"const selectedAlbumIds = new Set();" in html
-    assert b"reviewSelectedButton.textContent = `Review selected (${selectedAlbumIds.size})`" in html
-    assert b"reviewSequence = albumReviews.filter(album => selectedAlbumIds.has(album.id)).map(album => album.id)" in html
+    assert b'id="folder-select-page" type="checkbox"' in html
+    assert b'id="library-import-review-exceptions"' in html
+    assert b"const selectedFolders = new Set();" in html
+    assert b"reviewSequence = albumReviews.map(album => album.id)" in html
     assert b"if (nextAlbum && nextButton) openReview(nextAlbum, nextButton)" in html
 
 
@@ -2879,7 +2878,7 @@ def test_album_modal_actions_remain_workflow_only(tmp_path):
     assert b"method: 'PATCH'" in html
     assert b"/api/library-import/albums/${activeAlbum.id}/preview" not in html
     assert b"/api/library-import/albums/${activeAlbum.id}/execute" in html
-    assert b"data-review-decision=\"skipped\"" not in html
+    assert b"data-review-decision=\"skipped\"" in html
     assert b"Skip for now" not in html
     assert b"data-review-decision=\"rejected\"" not in html
     assert b"data-review-decision=\"approved\"" not in html
@@ -2912,43 +2911,10 @@ def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
 def test_musicbrainz_candidates_require_successful_preview_in_current_page_session(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
 
-    assert 'id="candidate-generate" type="button" aria-describedby="candidate-generate-help" disabled' in html
-    assert "Run inventory preview in this browser session before finding candidates." in html
-    assert html.count("setCandidateAvailability(true);") == 1
-    preview_success = html.index("setCandidateAvailability(true);")
-    assert html.index("readApiResponse(response, 'Inventory preview failed'", html.index("/api/library/inventory/preview")) < preview_success
-    assert preview_success < html.index("await loadReviewItems(0);")
-
-    start = html.index("let inventoryPreviewReady = false;")
-    end = html.index("function setOperationBusy", start)
-    helper = html[start:end]
-    probe = f"""
-const attributes = {{}};
-const candidateButton = {{disabled: null, setAttribute(name, value) {{ attributes[name] = value; }}}};
-const candidateHelp = {{textContent: ''}};
-{helper}
-const before = {{disabled: candidateButton.disabled, ariaDisabled: attributes['aria-disabled'], help: candidateHelp.textContent}};
-setCandidateAvailability(true);
-const after = {{disabled: candidateButton.disabled, ariaDisabled: attributes['aria-disabled'], help: candidateHelp.textContent}};
-console.log(JSON.stringify({{before, after}}));
-"""
-    completed = subprocess.run(
-        [shutil.which("node"), "--input-type=module", "--eval", probe],
-        check=True, capture_output=True, text=True,
-    )
-
-    assert json.loads(completed.stdout) == {
-        "before": {
-            "disabled": True,
-            "ariaDisabled": "true",
-            "help": "Run inventory preview in this browser session before finding candidates.",
-        },
-        "after": {
-            "disabled": False,
-            "ariaDisabled": "false",
-            "help": "Inventory preview complete. Candidate lookup uses the current inventory.",
-        },
-    }
+    assert 'id="library-import-scan-selected" type="button" disabled' in html
+    assert "fetch('/api/library-import/folders/scan'" in html
+    assert "folders:[...selectedFolders]" in html
+    assert "No files were changed" in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
@@ -3088,3 +3054,207 @@ def test_setup_and_settings_routes_have_distinct_lifecycle_pages(tmp_path):
         "library_path": str(tmp_path / "library"),
     })
     assert client.get("/setup").headers["Location"].endswith("/settings")
+
+
+def tagged_wav(path: Path, *, artist: str, album: str, title: str = "Track") -> None:
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = title
+    media.artist = media.albumartist = artist
+    media.album = album
+    media.track = media.disc = 1
+    media.save()
+
+
+def exact_candidate(query: dict, provider_id: str = "release-1") -> dict:
+    return {
+        "provider_id": provider_id, "artist": query["artist"], "album": query["album"],
+        "tracks": [{
+            "title": track["title"], "track_artist": track.get("artist"),
+            "position": index, "medium_position": 1,
+            "length_ms": round(float(track.get("duration") or 1) * 1000),
+            "recording_id": f"recording-{provider_id}-{index}",
+        } for index, track in enumerate(query["tracks"], 1)],
+    }
+
+
+def test_folder_queue_is_literal_paginated_searchable_filterable_and_path_safe(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    for number in range(27):
+        (root / f"Literal Folder {number:02d}").mkdir()
+    tagged_wav(root / "Loose.wav", artist="Loose Artist", album="Loose Album")
+    client = app.test_client()
+
+    first = client.get("/api/library-import/folders").json
+    second = client.get("/api/library-import/folders?page=2").json
+    assert first["limit"] == 25 and len(first["folders"]) == 25
+    assert second["page"] == second["page_count"] == 2 and len(second["folders"]) == 3
+    assert first["folders"][0]["path"] == "."
+    assert first["folders"][1]["name"] == "Literal Folder 00"
+    searched = client.get("/api/library-import/folders?q=Folder+26").json
+    assert [folder["path"] for folder in searched["folders"]] == ["Literal Folder 26"]
+    assert client.get("/api/library-import/folders?status=not-scanned").json["total"] == 28
+    for unsafe in ("../outside", "/tmp", "Literal Folder 00/child"):
+        assert client.get("/api/library-import/folders/albums", query_string={"folder": unsafe}).status_code == 400
+
+
+def test_folder_expansion_and_selected_scan_are_scoped_and_non_mutating(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    selected = root / "Selected Literal" / "Album A" / "01 Song.wav"
+    sibling = root / "Sibling Literal" / "Album B" / "01 Other.wav"
+    tagged_wav(selected, artist="Shared Metadata Artist", album="Shared Album", title="Song")
+    tagged_wav(sibling, artist="Shared Metadata Artist", album="Shared Album", title="Other")
+    beets_library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    beets_library.add(Item(title="Song", artist="Shared Metadata Artist", albumartist="Shared Metadata Artist",
+                           album="Shared Album", path=str(selected)))
+    beets_library.add(Item(title="Other", artist="Shared Metadata Artist", albumartist="Shared Metadata Artist",
+                           album="Shared Album", path=str(sibling)))
+    before = {path: (path.read_bytes(), path.stat().st_ino) for path in (selected, sibling)}
+    queries = []
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: queries.append(query["album"]) or [exact_candidate(query)]
+    client = app.test_client()
+
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Sibling Literal"]}).status_code == 201
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        sibling_seen_job = db.execute(
+            "SELECT last_seen_job_id FROM library_inventory WHERE relative_path LIKE 'Sibling Literal/%'"
+        ).fetchone()[0]
+    queries.clear()
+    scanned = client.post("/api/library-import/folders/scan", json={"folders": ["Selected Literal"]})
+    assert scanned.status_code == 201
+    assert queries == ["Shared Album"]
+    sibling_expanded = client.get("/api/library-import/folders/albums", query_string={"folder": "Sibling Literal"}).json
+    assert [track["path"] for album in sibling_expanded["albums"] for track in album["tracks"]] == [
+        "Sibling Literal/Album B/01 Other.wav"
+    ]
+    expanded = client.get("/api/library-import/folders/albums", query_string={"folder": "Selected Literal"}).json
+    assert [track["path"] for album in expanded["albums"] for track in album["tracks"]] == [
+        "Selected Literal/Album A/01 Song.wav"
+    ]
+    assert all(path.read_bytes() == contents and path.stat().st_ino == inode
+               for path, (contents, inode) in before.items())
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute(
+            "SELECT last_seen_job_id FROM library_inventory WHERE relative_path LIKE 'Sibling Literal/%'"
+        ).fetchone()[0] == sibling_seen_job
+
+
+def test_folder_scan_upgrades_legacy_album_key_without_losing_review_identity(tmp_path):
+    app = make_app(tmp_path)
+    track = tmp_path / "library" / "Selected" / "Album" / "01 Song.wav"
+    tagged_wav(track, artist="Legacy Artist", album="Legacy Album", title="Song")
+    Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).add(
+        Item(title="Song", artist="Legacy Artist", albumartist="Legacy Artist",
+             album="Legacy Album", path=str(track))
+    )
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query)]
+    client = app.test_client()
+
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]}).status_code == 201
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        album_id, candidate_id = db.execute(
+            "SELECT id, selected_candidate_id FROM album_reviews WHERE artist = 'Legacy Artist'"
+        ).fetchone()
+        assert candidate_id is not None
+        db.execute(
+            "UPDATE album_reviews SET artist_key = ?, state = 'approved' WHERE id = ?",
+            ("legacy artist", album_id),
+        )
+
+    rescanned = client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]})
+    assert rescanned.status_code == 201
+    expanded = client.get(
+        "/api/library-import/folders/albums", query_string={"folder": "Selected"}
+    ).json["albums"]
+    assert len(expanded) == 1
+    assert expanded[0]["id"] == album_id
+    assert expanded[0]["decision"] == "approved"
+    assert expanded[0]["selected_candidate_id"] is not None
+
+
+def test_selected_scan_reports_partial_album_failure_without_losing_success(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    tagged_wav(root / "Selected" / "Good" / "01 Good.wav", artist="Artist", album="Good", title="Good")
+    tagged_wav(root / "Selected" / "Bad" / "01 Bad.wav", artist="Artist", album="Bad", title="Bad")
+
+    def provider(query, *, limit):
+        if query["album"] == "Bad":
+            raise ProviderError("deterministic provider failure", code="fixture_failure")
+        return [exact_candidate(query)]
+
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    response = app.test_client().post("/api/library-import/folders/scan", json={"folders": ["Selected"]})
+    assert response.status_code == 207
+    assert {album["status"] for album in response.json["albums"]} == {"ready", "error"}
+    assert any(error.get("album_review_id") for error in response.json["errors"])
+    summary = app.test_client().post("/api/library-import/bulk/preview", json={"folders": ["Selected"]}).json
+    assert summary["ready_album_count"] == summary["exception_count"] == 1
+
+
+def test_bulk_readiness_predicate_rejects_every_unsafe_condition():
+    base = {
+        "id": 1, "execution_status": "not-run", "candidate_status": "complete", "candidate_error": "",
+        "decision": "pending", "selected_candidate_id": 10, "duplicate_preflight": {"status": "clear"},
+        "tracks": [{"id": 1, "exception": None}],
+        "candidates": [{"id": 10, "confidence": 1.0, "track_count_mismatch": False,
+                        "unmatched_track_count": 0, "hard_mismatches": [], "matched_track_count": 1,
+                        "track_details": [{"status": "matched", "local": "Track", "proposed": "Track"}]}],
+    }
+    assert _album_bulk_readiness(base)[0]
+    changes = [
+        lambda album: album["candidates"].append({**album["candidates"][0], "id": 11}),
+        lambda album: album["candidates"][0].update(confidence=.999),
+        lambda album: album["candidates"][0].update(unmatched_track_count=1),
+        lambda album: album.update(candidate_status="stale"),
+        lambda album: album["duplicate_preflight"].update(status="possible"),
+        lambda album: album.update(candidate_status="error"),
+        lambda album: album.update(execution_status="complete"),
+    ]
+    for change in changes:
+        album = copy.deepcopy(base); change(album)
+        assert not _album_bulk_readiness(album)[0]
+
+
+def test_bulk_import_requires_confirmation_revalidates_and_isolates_failures(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    for album in ("First", "Second"):
+        tagged_wav(root / "Selected" / album / f"01 {album}.wav", artist="Artist", album=album, title=album)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query, query["album"])]
+    client = app.test_client()
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]}).status_code == 201
+    assert client.post("/api/library-import/bulk/execute", json={"folders": ["Selected"]}).status_code == 400
+
+    import beets_mvp
+    original = beets_mvp._execute_library_import_album
+    failed_once = False
+    def isolated(app_value, album_id, *, dry_run):
+        nonlocal failed_once
+        if not dry_run and not failed_once:
+            failed_once = True
+            raise LibraryImportExecutionError("fixture execution failure", code="fixture_failure", status=500)
+        return original(app_value, album_id, dry_run=dry_run)
+    monkeypatch.setattr(beets_mvp, "_execute_library_import_album", isolated)
+
+    result = client.post("/api/library-import/bulk/execute", json={"folders": ["Selected"], "confirmed": True})
+    assert result.status_code == 207
+    assert len(result.json["failed"]) == len(result.json["imported"]) == 1
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM album_reviews WHERE execution_status='complete'").fetchone()[0] == 1
+
+
+def test_folder_queue_ui_has_persistent_selection_lazy_expansion_and_accessible_confirmation(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    for control in ("library-import-search", "library-import-filter", "folder-select-page", "library-import-page-input",
+                    "library-import-scan-selected", "library-import-ready", "library-import-review-exceptions"):
+        assert f'id="{control}"' in html
+    assert "sessionStorage.setItem(folderSelectionKey" in html
+    assert "/api/library-import/folders/albums?folder=" in html
+    assert 'aria-modal="true" aria-labelledby="library-import-confirm-title"' in html
+    assert "folderConfirmModal.addEventListener('keydown'" in html
+    assert "reviewSequence = albumReviews.map" in html
+    assert "data-review-decision=\"skipped\"" in html
+    assert "@media (max-width: 520px)" in html

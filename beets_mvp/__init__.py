@@ -39,6 +39,7 @@ MAX_INVENTORY_SAMPLE = 50
 MAX_LIBRARY_IMPORT_ALBUMS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
+FOLDER_PAGE_SIZE = 25
 CANDIDATE_SCHEMA_VERSION = 4
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip"}
@@ -188,6 +189,72 @@ def create_app(test_config: dict | None = None) -> Flask:
                        albums=_album_review_payloads(app, album_ids), limit=limit, offset=offset,
                        album_count=len(album_ids), total_albums=total_albums, has_more=has_more,
                        next_offset=(offset + len(album_ids)) if has_more else None)
+
+    @app.get("/api/library-import/folders")
+    def library_import_folders():
+        try:
+            page = int(request.args.get("page", "1"))
+        except ValueError:
+            return jsonify(error="page must be an integer"), 400
+        if page < 1:
+            return jsonify(error="page must be one or greater"), 400
+        status = request.args.get("status", "all").strip().lower()
+        query = request.args.get("q", "").strip()
+        try:
+            result = _folder_queue_page(app, page=page, query=query, status=status)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(result)
+
+    @app.get("/api/library-import/folders/albums")
+    def library_import_folder_albums():
+        try:
+            scope = _validated_folder_scope(app, request.args.get("folder", ""))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        album_ids = _album_ids_for_scopes(app, [scope], include_complete=False)
+        items = _library_import_review_items(app, album_ids)
+        albums = _album_review_payloads(app, album_ids)
+        return jsonify(folder=scope, items=items, albums=[_with_readiness(album) for album in albums])
+
+    @app.post("/api/library-import/folders/scan")
+    def scan_library_import_folders():
+        try:
+            scopes = _request_folder_scopes(app)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        result = _scan_folder_scopes(app, scopes)
+        return jsonify(result), (207 if result["errors"] else 201)
+
+    @app.post("/api/library-import/bulk/preview")
+    def preview_ready_library_imports():
+        try:
+            scopes = _request_folder_scopes(app)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(_bulk_ready_summary(app, scopes))
+
+    @app.post("/api/library-import/bulk/exceptions")
+    def selected_library_import_exceptions():
+        try:
+            scopes = _request_folder_scopes(app)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        album_ids = _album_ids_for_scopes(app, scopes, include_complete=False)
+        albums = [_with_readiness(album) for album in _album_review_payloads(app, album_ids)]
+        return jsonify(albums=[album for album in albums if not album["ready"]])
+
+    @app.post("/api/library-import/bulk/execute")
+    def execute_ready_library_imports():
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or values.get("confirmed") is not True:
+            return jsonify(error="explicit confirmation is required", code="confirmation_required"), 400
+        try:
+            scopes = _request_folder_scopes(app, values)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        result = _execute_bulk_ready(app, scopes)
+        return jsonify(result), (207 if result["failed"] else 201)
 
     @app.post("/api/library-import/candidates")
     def generate_library_import_candidates():
@@ -858,6 +925,343 @@ def _library_page_data(
     }
 
 
+FOLDER_STATUSES = {"all", "not-scanned", "ready", "needs-review", "error", "imported"}
+
+
+def _validated_folder_scope(app: Flask, value: object) -> str:
+    """Return a literal immediate-child scope without permitting traversal."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("folder scope is required")
+    scope = value.strip()
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    if scope == ".":
+        return scope
+    candidate = Path(scope)
+    if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+        raise ValueError("folder scope must be an immediate child of the library root")
+    path = root / candidate.name
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("folder scope does not exist") from exc
+    if resolved.parent != root or path.is_symlink() or not resolved.is_dir():
+        raise ValueError("folder scope must resolve to a non-symlinked folder beneath the library root")
+    return candidate.name
+
+
+def _request_folder_scopes(app: Flask, values: dict | None = None) -> list[str]:
+    values = values if values is not None else request.get_json(silent=True)
+    if not isinstance(values, dict) or not isinstance(values.get("folders"), list):
+        raise ValueError("folders must be an array of folder scopes")
+    if not values["folders"]:
+        raise ValueError("select at least one folder")
+    if len(values["folders"]) > 1000:
+        raise ValueError("no more than 1000 folder scopes may be submitted at once")
+    scopes = []
+    for value in values["folders"]:
+        scope = _validated_folder_scope(app, value)
+        if scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _scope_for_relative_path(relative_path: str) -> str:
+    parts = Path(relative_path).parts
+    return parts[0] if len(parts) > 1 else "."
+
+
+def _relative_in_scope(relative_path: str, scope: str) -> bool:
+    return _scope_for_relative_path(relative_path) == scope
+
+
+def _literal_folder_scopes(root: Path) -> list[str]:
+    if not root.is_dir():
+        raise ValueError("configured library path is not a directory")
+    scopes = sorted(
+        (entry.name for entry in root.iterdir() if entry.is_dir() and not entry.is_symlink()),
+        key=lambda value: (value.casefold(), value),
+    )
+    if any(entry.is_file() and not entry.is_symlink() and entry.suffix.lower() in AUDIO_EXTENSIONS
+           for entry in root.iterdir()):
+        scopes.insert(0, ".")
+    return scopes
+
+
+def _album_bulk_readiness(album: dict) -> tuple[bool, str]:
+    """Central exact/current/safe predicate used by queue display and execution."""
+    if album.get("execution_status") == "complete":
+        return False, "already imported"
+    if album.get("execution_status") == "failed" or album.get("candidate_status") == "error":
+        return False, "album has an error"
+    if album.get("candidate_status") != "complete" or album.get("candidate_error"):
+        return False, "candidate evidence is not current"
+    if album.get("decision") in {"rejected", "skipped"}:
+        return False, "album was excluded during review"
+    selected_id = album.get("selected_candidate_id")
+    candidate = next((item for item in album.get("candidates", []) if item.get("id") == selected_id), None)
+    if candidate is None:
+        return False, "no candidate is selected"
+    if candidate.get("confidence") != 1.0:
+        return False, "selected candidate is not an exact 100% match"
+    alternatives = [item for item in album.get("candidates", []) if item.get("id") != selected_id]
+    if any(item.get("confidence") == candidate["confidence"] for item in alternatives):
+        return False, "best candidate is tied"
+    tracks = album.get("tracks", [])
+    details = candidate.get("track_details", [])
+    if (not tracks or len(details) != len(tracks)
+            or candidate.get("track_count_mismatch")
+            or candidate.get("unmatched_track_count")
+            or candidate.get("hard_mismatches")
+            or candidate.get("matched_track_count") != len(tracks)
+            or any(detail.get("status") != "matched" or detail.get("local") is None
+                   or detail.get("proposed") is None for detail in details)):
+        return False, "track pairing is incomplete or ambiguous"
+    if any(track.get("exception") is not None for track in tracks):
+        return False, "album has track exceptions"
+    if album.get("duplicate_preflight", {}).get("status") != "clear":
+        return False, "album has a duplicate conflict"
+    return True, "exact, current, conflict-free match"
+
+
+def _with_readiness(album: dict) -> dict:
+    ready, reason = _album_bulk_readiness(album)
+    return {**album, "ready": ready, "readiness_reason": reason}
+
+
+def _album_ids_for_scopes(app: Flask, scopes: list[str], *, include_complete: bool) -> list[int]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT albums.id, albums.execution_status, inventory.relative_path
+                 FROM album_reviews AS albums
+                 JOIN album_review_tracks AS tracks ON tracks.album_review_id = albums.id
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE albums.root_path = ? AND inventory.present = 1
+                ORDER BY albums.id""",
+            (root,),
+        ).fetchall()
+    wanted = set(scopes)
+    return list(dict.fromkeys(
+        row["id"] for row in rows
+        if _scope_for_relative_path(row["relative_path"]) in wanted
+        and (include_complete or row["execution_status"] != "complete")
+    ))
+
+
+def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dict:
+    if status not in FOLDER_STATUSES:
+        raise ValueError("status must be all, not-scanned, ready, needs-review, error, or imported")
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    scopes = _literal_folder_scopes(root)
+    root_text = str(root)
+    with _connect(app.config["APP_DB"]) as db:
+        inventory = db.execute(
+            """SELECT inventory.relative_path, inventory.beets_item_id, inventory.present,
+                      albums.id AS album_id, albums.artist, albums.album, albums.execution_status,
+                      albums.candidate_status, albums.candidate_error, albums.state,
+                      selected.confidence AS selected_confidence
+                 FROM library_inventory AS inventory
+                 LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id = inventory.id
+                 LEFT JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                 LEFT JOIN metadata_candidates AS selected ON selected.id = albums.selected_candidate_id
+                WHERE inventory.root_path = ?""",
+            (root_text,),
+        ).fetchall()
+        scan_rows = db.execute(
+            "SELECT summary_json FROM adoption_jobs WHERE root_path=? AND kind='folder_inventory' AND status='complete'",
+            (root_text,),
+        ).fetchall()
+    scanned_scopes = {
+        summary.get("folder") for row in scan_rows
+        for summary in [json.loads(row["summary_json"])] if summary.get("folder")
+    }
+    pending_ids = sorted({row["album_id"] for row in inventory
+                          if row["album_id"] is not None and row["execution_status"] not in {"complete", "failed"}
+                          and row["candidate_status"] == "complete" and not row["candidate_error"]
+                          and row["state"] not in {"rejected", "skipped"}
+                          and row["selected_confidence"] == 1.0})
+    ready_ids = {
+        album["id"] for album in map(_with_readiness, _album_review_payloads(app, pending_ids)) if album["ready"]
+    }
+    records = []
+    needle = query.casefold()
+    for scope in scopes:
+        rows = [row for row in inventory if _relative_in_scope(row["relative_path"], scope) and row["present"]]
+        album_ids = {row["album_id"] for row in rows if row["album_id"] is not None}
+        pending = {row["album_id"] for row in rows if row["album_id"] is not None
+                   and row["execution_status"] != "complete"}
+        imported = {row["album_id"] for row in rows if row["album_id"] is not None
+                    and row["execution_status"] == "complete"}
+        errors = {row["album_id"] for row in rows if row["album_id"] is not None
+                  and (row["execution_status"] == "failed" or row["candidate_status"] == "error")}
+        ready = pending & ready_ids
+        if not rows and scope not in scanned_scopes:
+            folder_status = "not-scanned"
+        elif errors:
+            folder_status = "error"
+        elif ready:
+            folder_status = "ready"
+        elif album_ids and not pending and imported:
+            folder_status = "imported"
+        else:
+            folder_status = "needs-review"
+        haystack = " ".join([
+            scope, *(row["relative_path"] for row in rows),
+            *(str(row["artist"] or "") for row in rows), *(str(row["album"] or "") for row in rows),
+        ]).casefold()
+        if needle and needle not in haystack:
+            continue
+        if status != "all" and folder_status != status:
+            continue
+        records.append({
+            "path": scope, "name": "Library root" if scope == "." else scope,
+            "status": folder_status, "track_count": len(rows), "album_count": len(album_ids),
+            "available_album_count": len(pending), "ready_album_count": len(ready),
+            "exception_album_count": len(pending - ready), "imported_album_count": len(imported),
+        })
+    total = len(records)
+    page_count = max(1, math.ceil(total / FOLDER_PAGE_SIZE))
+    page = min(page, page_count)
+    start = (page - 1) * FOLDER_PAGE_SIZE
+    return {"folders": records[start:start + FOLDER_PAGE_SIZE], "page": page, "page_count": page_count,
+            "total": total, "limit": FOLDER_PAGE_SIZE, "query": query, "status": status}
+
+
+def _scope_audio_stats(root: Path, scope: str) -> list[tuple[Path, os.stat_result]]:
+    if scope != ".":
+        return _library_audio_stats(root / scope)
+    files = []
+    for path in sorted(root.iterdir(), key=lambda item: (item.name.casefold(), item.name)):
+        if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS:
+            files.append((path.resolve(), path.stat()))
+    return files
+
+
+def _preview_folder_inventory(app: Flask, scope: str) -> dict:
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    created_at = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('folder_inventory', ?, 'running', ?)",
+            (str(root), created_at),
+        ).lastrowid
+    try:
+        discovered = _scope_audio_stats(root, scope)
+        beets_paths = {str(Path(os.fsdecode(item.path)).resolve()): item.id for item in _library(app).items() if item.path}
+        with _connect(app.config["APP_DB"]) as db:
+            existing = db.execute(
+                "SELECT id, relative_path FROM library_inventory WHERE root_path = ?", (str(root),)
+            ).fetchall()
+            scoped_ids = [(row["id"],) for row in existing if _relative_in_scope(row["relative_path"], scope)]
+            if scoped_ids:
+                db.executemany("UPDATE library_inventory SET present = 0, beets_item_id = NULL WHERE id = ?", scoped_ids)
+            tracked = 0
+            for path, stat in discovered:
+                relative = path.relative_to(root).as_posix()
+                item_id = beets_paths.get(str(path)); tracked += item_id is not None
+                db.execute(
+                    """INSERT INTO library_inventory(root_path, relative_path, size_bytes, mtime_ns, device, inode,
+                              beets_item_id, present, first_seen_job_id, last_seen_job_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                       ON CONFLICT(root_path, relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,
+                         mtime_ns=excluded.mtime_ns, device=excluded.device, inode=excluded.inode,
+                         beets_item_id=excluded.beets_item_id, present=1, last_seen_job_id=excluded.last_seen_job_id""",
+                    (str(root), relative, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino,
+                     item_id, job_id, job_id),
+                )
+                inventory_id = db.execute(
+                    "SELECT id FROM library_inventory WHERE root_path = ? AND relative_path = ?", (str(root), relative)
+                ).fetchone()["id"]
+                db.execute("INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
+                           (inventory_id, created_at))
+                candidates = ([{"kind": "beets-item", "beets_item_id": item_id}] if item_id is not None
+                              else [{"kind": "needs-review", "match": None}])
+                db.execute("UPDATE adoption_reviews SET candidates_json = ?, updated_at = ? WHERE inventory_id = ?",
+                           (json.dumps(candidates), created_at, inventory_id))
+            summary = {"id": job_id, "folder": scope, "status": "complete", "files": len(discovered),
+                       "tracked": tracked, "untracked": len(discovered) - tracked, "finished_at": _now()}
+            db.execute("UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
+                       (json.dumps(summary), summary["finished_at"], job_id))
+        return summary
+    except Exception as exc:
+        message = f"folder inventory failed for {scope}: {exc}"
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute("UPDATE adoption_jobs SET status='failed', error=?, finished_at=? WHERE id=?",
+                       (message[:1000], _now(), job_id))
+        raise ValueError(message) from exc
+
+
+def _scan_folder_scopes(app: Flask, scopes: list[str]) -> dict:
+    folders, errors = [], []
+    successful = []
+    for scope in scopes:
+        try:
+            folders.append(_preview_folder_inventory(app, scope)); successful.append(scope)
+        except ValueError as exc:
+            errors.append({"folder": scope, "error": str(exc)})
+    albums = []
+    if successful:
+        _sync_album_reviews(app)
+        album_ids = _album_ids_for_scopes(app, successful, include_complete=False)
+        if album_ids:
+            with _connect(app.config["APP_DB"]) as db:
+                db.executemany(
+                    """UPDATE album_reviews SET candidate_status='stale',
+                              candidate_error='Inventory refreshed; candidate evidence requires refresh.'
+                         WHERE id=? AND execution_status!='complete'""", [(album_id,) for album_id in album_ids]
+                )
+            generated = _generate_musicbrainz_candidates(app, len(album_ids), album_ids=album_ids)
+            error_by_id = {item["album_review_id"]: item for item in generated["errors"]}
+            for album in map(_with_readiness, _album_review_payloads(app, album_ids)):
+                albums.append({"album_review_id": album["id"], "artist": album["artist"], "album": album["album"],
+                               "status": "error" if album["id"] in error_by_id else "ready" if album["ready"] else "needs-review",
+                               "ready": album["ready"], "error": error_by_id.get(album["id"], {}).get("error", "")})
+            errors.extend({"album_review_id": item["album_review_id"], "error": item["error"]}
+                          for item in generated["errors"])
+        by_id = {album["album_review_id"]: album for album in albums}
+        for folder in folders:
+            folder_ids = _album_ids_for_scopes(app, [folder["folder"]], include_complete=False)
+            folder["albums"] = [by_id[album_id] for album_id in folder_ids if album_id in by_id]
+            folder["errors"] = [album for album in folder["albums"] if album["status"] == "error"]
+    return {"folders": folders, "albums": albums, "errors": errors,
+            "selected_folder_count": len(scopes), "scanned_folder_count": len(successful)}
+
+
+def _bulk_ready_summary(app: Flask, scopes: list[str]) -> dict:
+    album_ids = _album_ids_for_scopes(app, scopes, include_complete=False)
+    albums = [_with_readiness(album) for album in _album_review_payloads(app, album_ids)]
+    ready = [album for album in albums if album["ready"]]
+    excluded = [album for album in albums if not album["ready"]]
+    return {"selected_folder_count": len(scopes), "available_album_count": len(albums),
+            "ready_album_count": len(ready), "track_count": sum(len(album["tracks"]) for album in ready),
+            "exception_count": len(excluded),
+            "ready_albums": [{"id": album["id"], "artist": album["artist"], "album": album["album"],
+                              "tracks": len(album["tracks"])} for album in ready],
+            "exceptions": [{"id": album["id"], "artist": album["artist"], "album": album["album"],
+                            "reason": album["readiness_reason"]} for album in excluded]}
+
+
+def _execute_bulk_ready(app: Flask, scopes: list[str]) -> dict:
+    summary = _bulk_ready_summary(app, scopes)
+    imported, failed = [], []
+    for album in summary["ready_albums"]:
+        try:
+            current = next(iter(_album_review_payloads(app, [album["id"]])), None)
+            ready, reason = _album_bulk_readiness(current or {})
+            if not ready:
+                raise LibraryImportExecutionError(f"Album is no longer ready: {reason}", code="not_ready")
+            _update_album_review(app, album["id"], {"decision": "approved"})
+            _execute_library_import_album(app, album["id"], dry_run=True)
+            result = _execute_library_import_album(app, album["id"], dry_run=False)
+            imported.append({"album_review_id": album["id"], "files": result["files"],
+                             "artist": album["artist"], "album": album["album"]})
+        except Exception as exc:
+            failed.append({"album_review_id": album["id"], "artist": album["artist"],
+                           "album": album["album"], "error": str(exc)})
+    return {"selected_folder_count": len(scopes), "imported": imported,
+            "skipped": summary["exceptions"], "failed": failed}
+
+
 def _preview_library_inventory(app: Flask) -> dict:
     root = Path(app.config["LIBRARY_PATH"]).resolve()
     created_at = _now()
@@ -1115,14 +1519,23 @@ def _all_library_import_review_items(app: Flask) -> list[dict]:
 def _sync_album_reviews(app: Flask) -> None:
     """Persist stable album groups without touching media or the beets database."""
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
-    groups: dict[tuple[str, str], dict] = {}
+    groups: dict[tuple[str, str, str], dict] = {}
     for item in _all_library_import_review_items(app):
         artist = _normalize_metadata(item["artist"]) or "Unknown artist"
         album = _normalize_metadata(item["album"]) or "Unknown album"
-        group = groups.setdefault((_metadata_key(artist), _metadata_key(album)), {"artist": artist, "album": album, "items": []})
+        # Folder scope is part of workflow identity. Identical tags in sibling
+        # top-level folders must never make selecting one folder operate on the
+        # other's files. Multi-disc subfolders inside one top-level scope still
+        # remain one matching/import unit.
+        scope_key = _scope_for_relative_path(item["path"])
+        group = groups.setdefault(
+            (scope_key, _metadata_key(artist), _metadata_key(album)),
+            {"artist": artist, "album": album, "items": []},
+        )
         group["items"].append(item)
     now = _now()
     with _connect(app.config["APP_DB"]) as db:
+        _migrate_legacy_album_scope_keys(db, root, now)
         exceptions = {
             row["inventory_id"]: row["exception_state"]
             for row in db.execute(
@@ -1139,7 +1552,8 @@ def _sync_album_reviews(app: Flask) -> None:
                  )""",
             (root,),
         )
-        for (artist_key, album_key), group in groups.items():
+        for (scope_key, metadata_artist_key, album_key), group in groups.items():
+            artist_key = f"{scope_key.casefold()}\x1f{metadata_artist_key}"
             db.execute(
                 """INSERT INTO album_reviews(root_path, artist_key, album_key, artist, album, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)
@@ -1157,8 +1571,77 @@ def _sync_album_reviews(app: Flask) -> None:
             )
 
 
-def _candidate_album_rows(app: Flask, limit: int) -> list[sqlite3.Row]:
+def _migrate_legacy_album_scope_keys(db: sqlite3.Connection, root: str, now: str) -> None:
+    """Keep pre-folder-workflow review IDs and choices when adding scope identity.
+
+    Earlier databases keyed an album only by normalized artist and album. Most
+    such rows belong to one top-level folder and can be upgraded in place. If a
+    legacy row spans sibling folders, retain it for the first deterministic
+    scope but mark its merged candidate evidence stale; subsequent scopes get
+    new review rows during the normal sync.
+    """
+    legacy_rows = db.execute(
+        """SELECT id, artist, artist_key, album_key
+             FROM album_reviews
+            WHERE root_path = ? AND execution_status != 'complete'
+              AND instr(artist_key, char(31)) = 0
+            ORDER BY id""",
+        (root,),
+    ).fetchall()
+    for album in legacy_rows:
+        paths = db.execute(
+            """SELECT inventory.relative_path
+                 FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE tracks.album_review_id = ? AND inventory.present = 1
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (album["id"],),
+        ).fetchall()
+        scopes = sorted({_scope_for_relative_path(row["relative_path"]) for row in paths}, key=str.casefold)
+        if not scopes:
+            continue
+        scoped_artist_key = f"{scopes[0].casefold()}\x1f{_metadata_key(album['artist'])}"
+        conflict = db.execute(
+            """SELECT id FROM album_reviews
+                WHERE root_path = ? AND artist_key = ? AND album_key = ? AND id != ?""",
+            (root, scoped_artist_key, album["album_key"], album["id"]),
+        ).fetchone()
+        if conflict is not None:
+            # A prior folder-first sync may already have created an empty
+            # replacement row. Prefer the legacy row when it carries the only
+            # candidate history, so upgrades are idempotent across restarts.
+            legacy_candidates = db.execute(
+                "SELECT COUNT(*) AS count FROM metadata_candidates WHERE album_review_id = ?", (album["id"],)
+            ).fetchone()["count"]
+            conflict_candidates = db.execute(
+                "SELECT COUNT(*) AS count FROM metadata_candidates WHERE album_review_id = ?", (conflict["id"],)
+            ).fetchone()["count"]
+            if legacy_candidates and not conflict_candidates:
+                db.execute("DELETE FROM album_review_tracks WHERE album_review_id = ?", (conflict["id"],))
+                db.execute("DELETE FROM album_reviews WHERE id = ?", (conflict["id"],))
+            else:
+                continue
+        assignments = ["artist_key = ?", "updated_at = ?"]
+        values: list[object] = [scoped_artist_key, now]
+        if len(scopes) > 1:
+            assignments.extend(["candidate_status = 'stale'", "candidate_error = ?"])
+            values.append("Album was split by top-level folder; refresh candidate evidence.")
+        db.execute(
+            f"UPDATE album_reviews SET {', '.join(assignments)} WHERE id = ?",
+            (*values, album["id"]),
+        )
+
+
+def _candidate_album_rows(app: Flask, limit: int, album_ids: list[int] | None = None) -> list[sqlite3.Row]:
     root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    album_filter = ""
+    parameters: list[object] = [root]
+    if album_ids is not None:
+        if not album_ids:
+            return []
+        album_filter = f" AND albums.id IN ({', '.join('?' for _ in album_ids)})"
+        parameters.extend(album_ids)
+    parameters.append(limit)
     with _connect(app.config["APP_DB"]) as db:
         return db.execute(
             """SELECT albums.id, albums.artist, albums.album
@@ -1166,11 +1649,12 @@ def _candidate_album_rows(app: Flask, limit: int) -> list[sqlite3.Row]:
                 WHERE albums.root_path = ?
                   AND albums.execution_status != 'complete'
                   AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                  {album_filter}
                 ORDER BY CASE albums.candidate_status
                            WHEN 'stale' THEN 0 WHEN 'not-run' THEN 1 WHEN 'error' THEN 2 ELSE 3
                          END,
-                         albums.artist_key, albums.album_key, albums.id LIMIT ?""",
-            (root, limit),
+                         albums.artist_key, albums.album_key, albums.id LIMIT ?""".format(album_filter=album_filter),
+            tuple(parameters),
         ).fetchall()
 
 
@@ -1380,9 +1864,9 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
     return next(iter(_album_review_payloads(app, [album_review_id])), None)
 
 
-def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
+def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[int] | None = None) -> dict:
     provider = app.config["MUSICBRAINZ_PROVIDER"]
-    albums = _candidate_album_rows(app, limit)
+    albums = _candidate_album_rows(app, limit, album_ids)
     errors = []
     generated = 0
     with _connect(app.config["APP_DB"]) as db:
@@ -1443,6 +1927,21 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int) -> dict:
                         (album["id"], selected["provider"], selected["provider_id"]),
                     ).fetchone()
                     selected_id = refreshed["id"] if refreshed else None
+                elif candidates:
+                    matches = [_candidate_match(query, candidate) for candidate in candidates]
+                    best = matches[0]
+                    tied = len(matches) > 1 and matches[1]["confidence"] == best["confidence"]
+                    exact_tracks = (
+                        best["confidence"] == 1.0 and not tied and not best["track_count_mismatch"]
+                        and not best["unmatched_track_count"] and not best["hard_mismatches"]
+                        and best["matched_track_count"] == len(query["tracks"])
+                        and all(detail.get("status") == "matched" for detail in best["track_details"])
+                    )
+                    if exact_tracks:
+                        selected_id = db.execute(
+                            "SELECT id FROM metadata_candidates WHERE album_review_id=? ORDER BY rank, id LIMIT 1",
+                            (album["id"],),
+                        ).fetchone()["id"]
                 db.execute(
                     """UPDATE album_reviews SET selected_candidate_id = ?, candidate_status = 'complete',
                               candidate_error = '', updated_at = ? WHERE id = ?""",
