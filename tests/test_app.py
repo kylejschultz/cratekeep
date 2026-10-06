@@ -945,7 +945,8 @@ def test_reliable_genre_preview_and_write_preserve_equivalent_or_apply_display_f
         assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
-def test_genre_write_skips_undeclared_flex_alias_and_keeps_scalar():
+def test_genre_write_skips_undeclared_flex_alias_and_keeps_scalar(monkeypatch):
+    monkeypatch.delitem(Item._fields, "genres", raising=False)
     item = Item()
 
     _set_item_value(item, "genre", "Alternative Rock")
