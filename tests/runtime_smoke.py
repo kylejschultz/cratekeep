@@ -72,6 +72,7 @@ def write_wav(path: Path, seconds: int = 1) -> None:
 
 def make_fixture(root: Path) -> dict[str, Path]:
     (root / "inbox").mkdir(parents=True, exist_ok=True)
+    write_wav(root / "inbox" / "Rollback Retained" / "01 Inbox.wav")
     tracks = {name: root / "library" / relative for name, relative in TRACKS.items()}
     for name, track in tracks.items():
         write_wav(track, 288 if name == "feature_extra" else 1)
@@ -93,7 +94,9 @@ def make_fixture(root: Path) -> dict[str, Path]:
             tags.track = int(track.stem.split(" ", 1)[0])
             tags.disc = 1
             tags.save()
-    for number in range(120):
+    # Fourteen real top-level scopes plus these 112 empty scopes make exactly
+    # 126 active rows, so removing one ready folder exercises a 6 -> 5 clamp.
+    for number in range(112):
         (root / "library" / f"ZZ Pagination Folder {number:03d}").mkdir(parents=True)
     return tracks
 
@@ -240,6 +243,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     network: list[dict] = []
     folder_page_timings_ms: dict[str, float] = {}
     sequential_proof: list[dict] = []
+    inline_scan_state_proof: dict[str, dict[str, str]] = {}
+    inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page: Page = browser.new_page(viewport={"width": 1440, "height": 1000})
@@ -323,10 +328,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
 
         # Rapid navigation must leave the newest requested page rendered even if
         # the earlier request is aborted or completes after it.
-        page.locator("#library-import-page-input").fill("2")
-        page.locator("#library-import-page-input").press("Enter")
-        page.locator("#library-import-page-input").fill("5")
-        page.locator("#library-import-page-input").press("Enter")
+        page.evaluate("() => { loadFolderItems(2); loadFolderItems(5); }")
         page.wait_for_function("document.getElementById('library-import-page-input').value === '5'")
         page.wait_for_timeout(250)
         assert page.locator("#library-import-page-input").input_value() == "5"
@@ -341,10 +343,49 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         for folder_name in ("Queue Safe", "Queue Sequential", "Queue Error"):
             page.get_by_role("checkbox", name=f"Select folder {folder_name}", exact=True).check()
         page.get_by_text("3 folders selected", exact=False).wait_for()
+        review_status_before_scan = page.locator("#library-import-review-status").inner_text()
+        safe_status = page.locator('.review-folder[data-folder-path="Queue Safe"] .status-pill')
+        sequential_status = page.locator('.review-folder[data-folder-path="Queue Sequential"] .status-pill')
+        unselected_status = page.locator('.review-folder[data-folder-path="Queue Unselected"] .status-pill')
+        unselected_status_before = unselected_status.inner_text()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as scan_info:
             page.locator("#library-import-scan-selected").click()
+            queued = {
+                "safe": safe_status.inner_text(),
+                "sequential": sequential_status.inner_text(),
+                "unselected": unselected_status.inner_text(),
+            }
+            assert queued == {"safe": "Queued", "sequential": "Queued", "unselected": unselected_status_before}
+            inline_scan_state_proof["queued"] = queued
+            page.wait_for_function("""() => {
+              const selected = ['Queue Safe', 'Queue Sequential'];
+              return selected.every(path => document.querySelector(`.review-folder[data-folder-path="${path}"] .status-pill`)?.textContent === 'Scanning…');
+            }""")
+            assert safe_status.inner_text() == sequential_status.inner_text() == "Scanning…"
+            assert unselected_status.inner_text() == unselected_status_before
+            inline_scan_state_proof["scanning"] = {
+                "safe": safe_status.inner_text(),
+                "sequential": sequential_status.inner_text(),
+                "unselected": unselected_status.inner_text(),
+            }
+            assert page.locator("#library-import-review-status").inner_text() == review_status_before_scan
+            assert page.locator("#library-import-scan-selected").get_attribute("aria-busy") == "true"
+            page.screenshot(path=evidence / "03-folder-inline-scanning.png", full_page=True)
         assert scan_info.value.status == 207
-        page.get_by_text("No files were changed", exact=False).wait_for()
+        page.wait_for_function("""() =>
+          document.querySelector('.review-folder[data-folder-path="Queue Safe"] .status-pill')?.textContent === 'ready'
+          && document.querySelector('.review-folder[data-folder-path="Queue Sequential"] .status-pill')?.textContent === 'needs review'
+          && document.querySelector('.review-folder[data-folder-path="Queue Error"] .status-pill')?.textContent === 'error'
+        """)
+        assert page.locator('.review-folder[data-folder-path="Queue Error"] .status-pill').get_attribute("title")
+        assert page.locator("#library-import-review-status").inner_text() == review_status_before_scan
+        inline_scan_state_proof["settled"] = {
+            "safe": safe_status.inner_text(),
+            "sequential": sequential_status.inner_text(),
+            "error": page.locator('.review-folder[data-folder-path="Queue Error"] .status-pill').inner_text(),
+            "unselected": unselected_status.inner_text(),
+        }
+        page.screenshot(path=evidence / "03-folder-inline-settled.png", full_page=True)
         assert all((sha256(tracks[name]), str(tracks[name].resolve()), tracks[name].stat().st_ino) == before
                    for name, before in queue_before.items()), "folder scan changed media bytes, path, or inode"
         assert page.locator("#library-import-ready").inner_text() == "Import ready (1)"
@@ -352,6 +393,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.get_by_role("checkbox", name="Select folder Queue Error", exact=True).uncheck()
         page.get_by_text("2 folders selected", exact=False).wait_for()
         assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (2)"
+        page.locator("#library-import-review-last").click()
+        page.wait_for_function("document.getElementById('library-import-page-input').value === '6'")
         page.locator("#library-import-ready").click()
         page.locator("#library-import-confirm-modal:not([hidden])").wait_for()
         assert "2 folders · 1 ready albums · 1 files/tracks · 2 excluded exceptions" in page.locator("#library-import-confirm-summary").inner_text()
@@ -363,6 +406,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert bulk_info.value.status == 201
         assert len(bulk_info.value.json()["imported"]) == 1
         page.get_by_text("1 albums imported", exact=False).wait_for()
+        page.wait_for_function("document.getElementById('library-import-page-input').value === '5'")
+        active_after_bulk = request_json(f"{base_url}/api/library-import/folders")
+        active_by_path = {folder["path"]: folder for folder in active_after_bulk["folders"]}
+        assert "Queue Safe" not in active_by_path
+        assert active_by_path["Queue Sequential"]["album_count"] == 2
+        assert active_by_path["Queue Sequential"]["track_count"] == 2
         page.screenshot(path=evidence / "03-folder-bulk-import.png", full_page=True)
         with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as first_album_info:
             page.locator("#library-import-review-exceptions").click()
@@ -405,6 +454,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         sequential_proof.append({"album_id": reopened_payload["id"], "candidate_id": first_body["candidate_id"],
                                  "owned_candidate_ids": [candidate["id"] for candidate in reopened_payload["candidates"]]})
         assert first_body["candidate_id"] in sequential_proof[-1]["owned_candidate_ids"]
+        sequential_pending = request_json(
+            f"{base_url}/api/library-import/folders/albums?folder=Queue%20Sequential"
+        )
+        assert len(sequential_pending["albums"]) == 1
+        assert sequential_pending["albums"][0]["id"] == next_payload["id"]
+        assert len(sequential_pending["albums"][0]["tracks"]) == 1
         page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_title)
         with page.expect_response(lambda response: response.url.endswith("/execute")) as second_execute:
             page.locator("#library-import-in-place").click()
@@ -413,6 +468,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                                  "owned_candidate_ids": [candidate["id"] for candidate in next_payload["candidates"]]})
         assert second_body["candidate_id"] in sequential_proof[-1]["owned_candidate_ids"]
         assert sequential_proof[0]["album_id"] != sequential_proof[1]["album_id"]
+        assert not any(
+            folder["path"] == "Queue Sequential"
+            for folder in request_json(f"{base_url}/api/library-import/folders")["folders"]
+        )
         page.locator("#library-import-in-place", has_text="Close").wait_for()
         page.screenshot(path=evidence / "03-sequential-exceptions-complete.png", full_page=True)
         page.locator("#library-import-in-place").click()
@@ -713,12 +772,16 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         browser.close()
 
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
+    inbox_after = request_json(f"{base_url}/api/inbox")
+    assert inbox_after == inbox_before and inbox_after, "full-library imports must not alter Inbox retention"
     return {
         "page_errors": page_errors, "console_errors": unexpected_console,
         "expected_failure_console": [message for message in console_errors if message not in unexpected_console],
         "network": network,
         "folder_page_timings_ms": folder_page_timings_ms,
+        "inline_scan_state_proof": inline_scan_state_proof,
         "sequential_candidate_proof": sequential_proof,
+        "inbox_retention": {"before": inbox_before, "after": inbox_after},
     }
 
 

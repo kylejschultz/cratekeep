@@ -3328,6 +3328,87 @@ def test_selected_scan_reports_partial_album_failure_without_losing_success(tmp_
     assert summary["ready_album_count"] == summary["exception_count"] == 1
 
 
+def test_library_import_active_queue_removes_completed_albums_but_retains_history_and_inbox(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    tagged_wav(root / "Partial" / "First" / "01 First.wav", artist="Artist", album="First", title="First")
+    tagged_wav(root / "Partial" / "Second" / "01 Second.wav", artist="Artist", album="Second", title="Second")
+    inbox_track = tmp_path / "inbox" / "Rollback Album" / "01 Inbox.mp3"
+    inbox_track.parent.mkdir(parents=True)
+    inbox_track.write_bytes(b"synthetic inbox fixture")
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query, query["album"])]
+    client = app.test_client()
+    inbox_before = client.get("/api/inbox").json
+
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Partial"]}).status_code == 201
+    albums = client.get("/api/library-import/folders/albums", query_string={"folder": "Partial"}).json["albums"]
+    first, second = sorted(albums, key=lambda album: album["album"])
+    imported = client.post(
+        f'/api/library-import/albums/{first["id"]}/execute',
+        json={"candidate_id": first["selected_candidate_id"]},
+    )
+    assert imported.status_code == 201
+
+    active = client.get("/api/library-import/folders").json
+    assert [(folder["path"], folder["album_count"], folder["track_count"])
+            for folder in active["folders"]] == [("Partial", 1, 1)]
+    expanded = client.get("/api/library-import/folders/albums", query_string={"folder": "Partial"}).json
+    assert [album["id"] for album in expanded["albums"]] == [second["id"]]
+
+    completed = client.post(
+        f'/api/library-import/albums/{second["id"]}/execute',
+        json={"candidate_id": second["selected_candidate_id"]},
+    )
+    assert completed.status_code == 201
+    assert client.get("/api/library-import/folders").json["folders"] == []
+    archived = client.get("/api/library-import/folders?status=imported").json["folders"]
+    assert [(folder["path"], folder["album_count"], folder["track_count"])
+            for folder in archived] == [("Partial", 2, 2)]
+    assert client.get("/api/inbox").json == inbox_before
+    assert inbox_track.read_bytes() == b"synthetic inbox fixture"
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM album_reviews WHERE execution_status='complete'").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM adoption_reviews WHERE imported_at IS NOT NULL").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM adoption_jobs WHERE kind='library_import_execute'").fetchone()[0] == 2
+
+
+def test_bulk_import_removes_completed_last_page_and_clamps_to_remaining_active_queue(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    for number in range(25):
+        (root / f"Active {number:02d}").mkdir()
+    tagged_wav(root / "Z Ready" / "Album" / "01 Track.wav", artist="Artist", album="Album")
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query)]
+    client = app.test_client()
+
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Z Ready"]}).status_code == 201
+    last_page = client.get("/api/library-import/folders?page=2").json
+    assert last_page["page"] == 2 and [folder["path"] for folder in last_page["folders"]] == ["Z Ready"]
+    result = client.post(
+        "/api/library-import/bulk/execute", json={"folders": ["Z Ready"], "confirmed": True}
+    )
+    assert result.status_code == 201 and len(result.json["imported"]) == 1
+
+    clamped = client.get("/api/library-import/folders?page=2").json
+    assert clamped["page"] == clamped["page_count"] == 1
+    assert clamped["total"] == 25 and all(folder["path"] != "Z Ready" for folder in clamped["folders"])
+    assert client.get("/api/library-import/folders?status=imported").json["folders"][0]["path"] == "Z Ready"
+
+
+def test_selected_scan_progress_is_bounded_to_visible_selected_folder_rows(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    scan_handler = html[html.index("folderScan.addEventListener"):html.index("folderImport.addEventListener")]
+
+    assert "foldersOnPage.filter(folder => selectedFolders.has(folder.path))" in scan_handler
+    assert "{status:'Queued', label:'Queued'}" in scan_handler
+    assert "{status:'Scanning', label:'Scanning…'}" in scan_handler
+    assert "setOperationBusy(folderScan, null, true)" in scan_handler
+    assert "loadFolderItems(currentFolderPage, {announce:false})" in scan_handler
+    assert "No files were changed" not in scan_handler
+    assert "status.setAttribute('aria-live', 'polite')" in html
+    assert "folderInlineStates.get(folder.path)" in html
+
+
 def test_bulk_readiness_predicate_rejects_every_unsafe_condition():
     base = {
         "id": 1, "execution_status": "not-run", "candidate_status": "complete", "candidate_error": "",

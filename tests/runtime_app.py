@@ -8,6 +8,7 @@ activate it, so the seam cannot turn provider URLs into an SSRF path.
 from __future__ import annotations
 
 import base64
+import time
 
 from beets_mvp import create_app as create_cratekeep_app
 from beets_mvp.musicbrainz import ProviderError
@@ -46,6 +47,8 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
     """Resolve exact release IDs without external traffic for browser smoke tests."""
     release_id = query.get("musicbrainz_id")
     if not release_id:
+        if query["album"] in {"Safe Match", "Sequential First", "Sequential Second", "Provider Error"}:
+            time.sleep(0.15)  # Keep inline scan state observable in the real-browser smoke.
         if query["album"] == "Provider Error":
             raise ProviderError("deterministic folder-queue provider error", code="fixture_error")
         base = {

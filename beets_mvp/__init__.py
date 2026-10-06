@@ -1065,7 +1065,7 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
         inventory = db.execute(
             """SELECT inventory.relative_path, inventory.beets_item_id, inventory.present,
                       albums.id AS album_id, albums.artist, albums.album, albums.execution_status,
-                      albums.candidate_status, albums.candidate_error, albums.state,
+                      albums.execution_error, albums.candidate_status, albums.candidate_error, albums.state,
                       selected.confidence AS selected_confidence
                  FROM library_inventory AS inventory
                  LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id = inventory.id
@@ -1099,24 +1099,40 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
         imported = {row["album_id"] for row in rows if row["album_id"] is not None
                     and row["execution_status"] == "complete"}
         errors = {row["album_id"] for row in rows if row["album_id"] is not None
+                  and row["execution_status"] != "complete"
                   and (row["execution_status"] == "failed" or row["candidate_status"] == "error")}
+        error_message = next((row["execution_error"] or row["candidate_error"] for row in rows
+                              if row["album_id"] in errors
+                              and (row["execution_error"] or row["candidate_error"])), "")
         if not rows and scope not in scanned_scopes:
             fixed_status = "not-scanned"
         elif errors:
             fixed_status = "error"
-        elif album_ids and not pending and imported:
+        elif pending:
+            fixed_status = None
+        elif imported:
             fixed_status = "imported"
         else:
-            fixed_status = None
+            # A scanned empty scope, or one containing only already-managed
+            # tracks with no active review album, has no queue work to show.
+            continue
+        if fixed_status == "imported" and status == "all":
+            continue
+        if fixed_status != "imported" and status == "imported":
+            continue
+        visible_ids = imported if fixed_status == "imported" else pending
+        visible_rows = [row for row in rows if row["album_id"] in visible_ids]
         haystack = " ".join([
-            scope, *(row["relative_path"] for row in rows),
-            *(str(row["artist"] or "") for row in rows), *(str(row["album"] or "") for row in rows),
+            scope, *(row["relative_path"] for row in visible_rows),
+            *(str(row["artist"] or "") for row in visible_rows),
+            *(str(row["album"] or "") for row in visible_rows),
         ]).casefold()
         if needle and needle not in haystack:
             continue
         records.append({
             "path": scope, "name": "Library root" if scope == "." else scope,
-            "status": fixed_status, "track_count": len(rows), "album_count": len(album_ids),
+            "status": fixed_status, "track_count": len(visible_rows), "album_count": len(visible_ids),
+            "error": error_message,
             "available_album_count": len(pending), "imported_album_count": len(imported),
             "_pending_ids": pending,
             "_readiness_ids": {

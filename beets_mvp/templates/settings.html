@@ -171,11 +171,13 @@
     .status-pill,.score-pill,.identity-pill { display:inline-flex; align-items:center; padding:.14rem .42rem; border:1px solid var(--border); border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
     .status-pill { color:#20252b; background:#f4f5f6; }
     .status-pill[data-status="Matched"],.status-pill[data-status="Queued"],.status-pill[data-status="Imported"] { border-color:#397052; color:#163d29; background:#d9eee1; }
+    .status-pill[data-status="Scanning"] { border-color:#28659a; color:#143f64; background:#dceefd; }
     .status-pill[data-status="Needs attention"] { border-color:#9f3b45; color:#6d1620; background:#f9dadd; }
     .status-pill[data-status="ready"],.status-pill[data-status="imported"],.status-pill[data-status="Ready"] { border-color:#397052; color:#163d29; background:#d9eee1; }
     .status-pill[data-status="error"],.status-pill[data-status="needs-review"] { border-color:#9f3b45; color:#6d1620; background:#f9dadd; }
     body.dark-mode .status-pill { color:#edf1f4; background:#3e4852; }
     body.dark-mode .status-pill[data-status="Matched"],body.dark-mode .status-pill[data-status="Queued"],body.dark-mode .status-pill[data-status="Imported"] { border-color:#78a68a; color:#e9fff0; background:#294337; }
+    body.dark-mode .status-pill[data-status="Scanning"] { border-color:#79aee0; color:#edf7ff; background:#294760; }
     body.dark-mode .status-pill[data-status="Needs attention"] { border-color:#d78089; color:#fff0f1; background:#5a3034; }
     body.dark-mode .status-pill[data-status="ready"],body.dark-mode .status-pill[data-status="imported"],body.dark-mode .status-pill[data-status="Ready"] { border-color:#78a68a; color:#e9fff0; background:#294337; }
     body.dark-mode .status-pill[data-status="error"],body.dark-mode .status-pill[data-status="needs-review"] { border-color:#d78089; color:#fff0f1; background:#5a3034; }
@@ -377,7 +379,7 @@
         <label for="library-import-search" class="visually-hidden">Search folders and album metadata</label>
         <input id="library-import-search" type="search" placeholder="Search folders, paths, albums, or artists">
         <label for="library-import-filter" class="visually-hidden">Filter folder status</label>
-        <select id="library-import-filter"><option value="all">All statuses</option><option value="not-scanned">Not scanned</option><option value="ready">Ready</option><option value="needs-review">Needs review</option><option value="error">Error</option><option value="imported">Imported</option></select>
+        <select id="library-import-filter"><option value="all">Active queue</option><option value="not-scanned">Not scanned</option><option value="ready">Ready</option><option value="needs-review">Needs review</option><option value="error">Error</option></select>
       </div>
       <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite">Loading folders…</p>
       <label for="folder-select-page"><input id="folder-select-page" type="checkbox"> Select this page</label>
@@ -1622,6 +1624,8 @@
     const selectedFolders = new Set();
     let foldersOnPage = [], currentFolderPage = 1, totalFolderPages = 1, totalFolders = 0;
     let folderRequestController = null, folderRequestSequence = 0;
+    let folderSummarySequence = 0;
+    const folderInlineStates = new Map();
     let selectedFolderSummary = {available_album_count:0, ready_album_count:0, exception_count:0};
     try { JSON.parse(sessionStorage.getItem(folderSelectionKey) || '[]').forEach(path => selectedFolders.add(path)); } catch (error) {}
 
@@ -1630,14 +1634,22 @@
     }
 
     async function refreshFolderSelectionSummary() {
+      const requestSequence = ++folderSummarySequence;
+      const scopes = [...selectedFolders];
       const count = selectedFolders.size;
       folderScan.disabled = count === 0;
       if (count) {
         try {
-          const response = await fetch('/api/library-import/bulk/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
-          selectedFolderSummary = await readApiResponse(response, 'Unable to summarize selected folders');
-        } catch (error) { reviewStatus.textContent = error.message; }
+          const response = await fetch('/api/library-import/bulk/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:scopes})});
+          const summary = await readApiResponse(response, 'Unable to summarize selected folders');
+          if (requestSequence !== folderSummarySequence || scopes.length !== selectedFolders.size
+              || scopes.some(scope => !selectedFolders.has(scope))) return;
+          selectedFolderSummary = summary;
+        } catch (error) {
+          if (requestSequence === folderSummarySequence) reviewStatus.textContent = error.message;
+        }
       } else selectedFolderSummary = {available_album_count:0, ready_album_count:0, exception_count:0};
+      if (requestSequence !== folderSummarySequence) return;
       folderSelectionSummary.textContent = `${count} ${count === 1 ? 'folder' : 'folders'} selected · ${selectedFolderSummary.available_album_count} albums available`;
       folderImport.textContent = `Import ready (${selectedFolderSummary.ready_album_count})`;
       folderImport.disabled = selectedFolderSummary.ready_album_count === 0;
@@ -1678,9 +1690,9 @@
       } catch (error) { body.textContent = error.message || 'Unable to load folder albums.'; }
     }
 
-    function renderFolderQueue() {
+    function renderFolderQueue({announce = true} = {}) {
       const rows = foldersOnPage.map(folder => {
-        const article = document.createElement('article'); article.className = 'review-folder';
+        const article = document.createElement('article'); article.className = 'review-folder'; article.dataset.folderPath = folder.path;
         const summary = document.createElement('div'); summary.className = 'review-folder-summary';
         const select = document.createElement('input'); select.type = 'checkbox'; select.className = 'review-select'; select.checked = selectedFolders.has(folder.path); select.setAttribute('aria-label', `Select folder ${folder.name}`);
         select.addEventListener('change', () => { select.checked ? selectedFolders.add(folder.path) : selectedFolders.delete(folder.path); saveFolderSelection(); renderFolderQueue(); refreshFolderSelectionSummary(); });
@@ -1688,13 +1700,21 @@
         const identity = document.createElement('span'); identity.className = 'review-folder-identity';
         const path = document.createElement('span'); path.className = 'review-folder-path'; path.textContent = folder.name; path.title = folder.path; identity.append(path);
         const counts = document.createElement('span'); counts.className = 'review-folder-count'; counts.textContent = `${folder.album_count} albums · ${folder.track_count} tracks`;
-        const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = folder.status; status.textContent = folder.status.replace('-', ' ');
+        const inlineState = folderInlineStates.get(folder.path);
+        const statusValue = inlineState?.status || folder.status;
+        const status = document.createElement('span'); status.className = 'status-pill'; status.dataset.status = statusValue;
+        status.textContent = inlineState?.label || statusValue.replace('-', ' ');
+        status.setAttribute('aria-live', 'polite'); status.setAttribute('aria-atomic', 'true');
+        if (inlineState?.title || folder.error) status.title = inlineState?.title || folder.error;
         const body = document.createElement('div'); body.className = 'review-folder-contents'; body.hidden = true;
         expand.addEventListener('click', () => expandFolder(folder, expand, body));
         summary.append(select, expand, identity, counts, status); article.append(summary, body); return article;
       });
       reviewList.replaceChildren(...rows);
-      reviewStatus.dataset.busy = 'false'; reviewStatus.textContent = totalFolders ? `${totalFolders} matching folders.` : 'No folders match this search and filter.';
+      if (announce) {
+        reviewStatus.dataset.busy = 'false';
+        reviewStatus.textContent = totalFolders ? `${totalFolders} matching folders.` : 'No folders match this search and filter.';
+      }
       const selectedHere = foldersOnPage.filter(folder => selectedFolders.has(folder.path)).length;
       folderSelectPage.checked = foldersOnPage.length > 0 && selectedHere === foldersOnPage.length;
       folderSelectPage.indeterminate = selectedHere > 0 && selectedHere < foldersOnPage.length;
@@ -1703,18 +1723,18 @@
       folderNext.disabled = folderLast.disabled = currentFolderPage >= totalFolderPages;
     }
 
-    async function loadFolderItems(page = currentFolderPage) {
+    async function loadFolderItems(page = currentFolderPage, {announce = true} = {}) {
       const requestSequence = ++folderRequestSequence;
       if (folderRequestController) folderRequestController.abort();
       folderRequestController = new AbortController();
-      reviewStatus.dataset.busy = 'true'; reviewStatus.textContent = 'Loading folders…';
+      if (announce) { reviewStatus.dataset.busy = 'true'; reviewStatus.textContent = 'Loading folders…'; }
       folderFirst.disabled = folderPrevious.disabled = folderNext.disabled = folderLast.disabled = true;
       try {
         const query = new URLSearchParams({page:String(page), q:folderSearch.value.trim(), status:folderFilter.value});
         const response = await fetch(`/api/library-import/folders?${query}`, {signal:folderRequestController.signal});
         const data = await readApiResponse(response, 'Unable to load folders');
         if (requestSequence !== folderRequestSequence) return;
-        foldersOnPage = data.folders; currentFolderPage = data.page; totalFolderPages = data.page_count; totalFolders = data.total; renderFolderQueue();
+        foldersOnPage = data.folders; currentFolderPage = data.page; totalFolderPages = data.page_count; totalFolders = data.total; renderFolderQueue({announce});
       } catch (error) {
         if (error.name === 'AbortError' || requestSequence !== folderRequestSequence) return;
         reviewStatus.dataset.busy = 'false'; reviewStatus.textContent = error.message || 'Unable to load folders.';
@@ -1735,14 +1755,33 @@
     folderFilter.addEventListener('change', () => loadFolderItems(1));
 
     folderScan.addEventListener('click', async () => {
-      setOperationBusy(folderScan, reviewStatus, true, `Scanning ${selectedFolders.size} selected folders; no files will be changed…`);
+      if (folderScan.getAttribute('aria-busy') === 'true') return;
+      const scopes = [...selectedFolders];
+      const visibleSelected = foldersOnPage.filter(folder => selectedFolders.has(folder.path)).map(folder => folder.path);
+      visibleSelected.forEach(scope => folderInlineStates.set(scope, {status:'Queued', label:'Queued'}));
+      renderFolderQueue({announce:false});
+      setOperationBusy(folderScan, null, true);
       try {
-        const response = await fetch('/api/library-import/folders/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        visibleSelected.forEach(scope => folderInlineStates.set(scope, {status:'Scanning', label:'Scanning…'}));
+        renderFolderQueue({announce:false});
+        const response = await fetch('/api/library-import/folders/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:scopes})});
         const data = await readApiResponse(response, 'Selected-folder scan failed', {acceptedStatuses:[207]});
-        await loadFolderItems(); await refreshFolderSelectionSummary();
-        reviewStatus.textContent = `${data.scanned_folder_count} folders scanned; ${data.albums.length} albums matched; ${data.errors.length} errors. No files were changed.`;
-      } catch (error) { reviewStatus.textContent = error.message || 'Selected-folder scan failed.'; }
-      finally { setOperationBusy(folderScan, reviewStatus, false); folderScan.disabled = selectedFolders.size === 0; }
+        visibleSelected.forEach(scope => folderInlineStates.delete(scope));
+        for (const error of data.errors || []) {
+          if (error.folder && visibleSelected.includes(error.folder)) {
+            folderInlineStates.set(error.folder, {status:'error', label:'Error', title:error.error || 'Folder scan failed.'});
+          }
+        }
+        await loadFolderItems(currentFolderPage, {announce:false}); await refreshFolderSelectionSummary();
+      } catch (error) {
+        visibleSelected.forEach(scope => folderInlineStates.set(scope, {
+          status:'error', label:'Error', title:error.message || 'Selected-folder scan failed.',
+        }));
+        renderFolderQueue({announce:false});
+        reviewStatus.textContent = error.message || 'Selected-folder scan failed.';
+      }
+      finally { setOperationBusy(folderScan, null, false); folderScan.disabled = selectedFolders.size === 0; }
     });
 
     folderImport.addEventListener('click', async () => {
