@@ -10,6 +10,7 @@ import wave
 from pathlib import Path
 
 import pytest
+import yaml
 from beets.dbcore import types as beets_types
 from beets.library import Item, Library
 from mediafile import Image as MediaImage, ImageType, MediaFile
@@ -18,7 +19,7 @@ from PIL import Image as PillowImage
 from beets_mvp import (
     LibraryImportExecutionError, _album_bulk_readiness, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
     _format_genre, _genre_presentation_key, _group_library_import_review_items, _init_db,
-    _item_genre, _set_item_value, _SafeArtworkRedirect, create_app,
+    _effective_candidate, _item_genre, _set_item_value, _SafeArtworkRedirect, create_app,
 )
 from beets_mvp.musicbrainz import (
     ProviderError, _artist_credit_text, _cover_art_evidence, _genre_evidence,
@@ -291,6 +292,12 @@ def test_review_then_import(tmp_path, monkeypatch):
     album.mkdir()
     (album / "song.mp3").write_bytes(b"not-real-audio")
     client = app.test_client()
+    config_path = Path(app.config["BEETS_CONFIG"])
+    assert client.post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "feat. {0}",
+        "beets_config": config_path.read_text(),
+    }).status_code == 302
 
     preview = client.post("/api/imports/preview", json={"path": "album"})
     assert preview.status_code == 201
@@ -311,7 +318,9 @@ def test_review_then_import(tmp_path, monkeypatch):
     executed = client.post(f"/api/imports/{preview.json['id']}/execute")
     assert executed.status_code == 200
     assert executed.json["status"] == "complete"
+    assert seen["command"][:3] == ["beet", "-c", str(config_path)]
     assert seen["command"][-2:] == ["--move", str(album)]
+    assert "ftintitle" in yaml.safe_load(config_path.read_text())["plugins"]
 
 def test_rejects_path_escape(tmp_path):
     client = make_app(tmp_path).test_client()
@@ -1718,6 +1727,148 @@ def test_two_chainz_feature_credit_is_reviewed_planned_and_written_to_db_and_fil
     )
 
 
+@pytest.mark.parametrize("keep_in_artist", [False, True])
+def test_enabled_ftintitle_projection_equals_preview_database_and_file_tags(tmp_path, keep_in_artist):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    config_path = Path(app.config["BEETS_CONFIG"])
+    settings = {
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "feat. {0}",
+        "beets_config": config_path.read_text(),
+    }
+    if keep_in_artist:
+        settings["ftintitle_keep_in_artist"] = "1"
+    assert client.post("/settings", data=settings).status_code == 302
+    configured = yaml.safe_load(config_path.read_text())
+    assert "ftintitle" in configured["plugins"]
+    assert configured["ftintitle"]["keep_in_artist"] is keep_in_artist
+
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174099",
+        "artist": "Lead", "album": "Featured Album", "track_count": 1,
+        "media": [{"position": 1, "format": "CD", "track_count": 1}],
+        "tracks": [{
+            "title": "Song", "position": 1, "medium_position": 1, "length_ms": 1000,
+            "recording_id": "recording-featured", "track_artist": "Lead feat. Guest",
+            "artist_credit_source": "track",
+        }],
+    }]
+    path = tmp_path / "library" / "Lead" / "Featured Album" / "01 Song.wav"
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = "Song"; media.artist = "Lead feat. Guest"; media.albumartist = "Lead"
+    media.album = "Featured Album"; media.track = 1; media.disc = 1; media.save()
+
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate = album["candidates"][0]
+    detail = candidate["track_details"][0]
+    expected_artist = "Lead feat. Guest" if keep_in_artist else "Lead"
+    assert (detail["proposed"], detail["proposed_artist"]) == ("Song feat. Guest", expected_artist)
+    assert candidate["recordings"][0]["title"] == "Song feat. Guest"
+    assert candidate["recordings"][0]["track_artist"] == expected_artist
+    assert candidate["proposed_diff"]["tracks"]["to"] == ["Song feat. Guest"]
+
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": candidate["id"],
+    }).status_code == 200
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    expected_changes = {"title": {"from": "Song", "to": "Song feat. Guest"}}
+    if not keep_in_artist:
+        expected_changes["artist"] = {"from": "Lead feat. Guest", "to": "Lead"}
+    assert {key: preview.json["items"][0]["changes"][key] for key in expected_changes} == expected_changes
+
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    for field in ("path", "changes", "action", "duplicate_of", "target_path"):
+        assert executed.json["items"][0][field] == preview.json["items"][0][field]
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    tags = MediaFile(str(path))
+    assert (item.title, item.artist, item.albumartist) == ("Song feat. Guest", expected_artist, "Lead")
+    assert (tags.title, tags.artist, tags.albumartist) == ("Song feat. Guest", expected_artist, "Lead")
+
+
+def test_ftintitle_custom_marker_and_bracket_projection_reaches_final_tags(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    config_path = Path(app.config["BEETS_CONFIG"])
+    document = yaml.safe_load(config_path.read_text())
+    document["ftintitle"] = {"custom_words": ["alongside"], "bracket_keywords": ["remix"]}
+    assert client.post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "feat. {0}",
+        "beets_config": yaml.safe_dump(document, sort_keys=False),
+    }).status_code == 302
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "123e4567-e89b-42d3-a456-426614174097",
+        "artist": "Lead", "album": "Custom Feature Album", "track_count": 1,
+        "tracks": [{
+            "title": "Song [Remix]", "position": 1, "medium_position": 1,
+            "recording_id": "recording-custom-feature", "track_artist": "Lead alongside Guest",
+            "artist_credit_source": "track",
+        }],
+    }]
+    path = tmp_path / "library" / "Lead" / "Custom Feature Album" / "01 Song Remix.wav"
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = "Song [Remix]"; media.artist = "Lead alongside Guest"; media.albumartist = "Lead"
+    media.album = "Custom Feature Album"; media.save()
+
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate = album["candidates"][0]
+    detail = candidate["track_details"][0]
+    assert (detail["proposed"], detail["proposed_artist"]) == ("Song feat. Guest [Remix]", "Lead")
+    with sqlite3.connect(app.config["APP_DB"]) as database:
+        raw = json.loads(database.execute(
+            "SELECT provider_data_json FROM metadata_candidates WHERE id = ?", (candidate["id"],)
+        ).fetchone()[0])
+    assert raw["tracks"][0]["title"] == "Song [Remix]"
+    assert raw["tracks"][0]["track_artist"] == "Lead alongside Guest"
+
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": candidate["id"],
+    }).status_code == 200
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    changes = preview.json["items"][0]["changes"]
+    assert changes["title"] == {"from": "Song [Remix]", "to": "Song feat. Guest [Remix]"}
+    assert changes["artist"] == {"from": "Lead alongside Guest", "to": "Lead"}
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    assert executed.json["items"][0]["changes"] == changes
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    tags = MediaFile(str(path))
+    assert (item.title, item.artist, item.albumartist) == ("Song feat. Guest [Remix]", "Lead", "Lead")
+    assert (tags.title, tags.artist, tags.albumartist) == ("Song feat. Guest [Remix]", "Lead", "Lead")
+
+
+def test_enabled_ftintitle_does_not_transform_as_is_import(tmp_path):
+    app = make_app(tmp_path)
+    app.config["FTINTITLE"] = {**app.config["FTINTITLE"], "enabled": True}
+    path = tmp_path / "library" / "Lead" / "As Is Album" / "01 Song.wav"
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = "Song"; media.artist = "Lead feat. Guest"; media.albumartist = "Lead"
+    media.album = "As Is Album"; media.save()
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": None,
+    }).status_code == 200
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    assert preview.json["selection_mode"] == "as-is"
+    assert preview.json["items"][0]["changes"] == {}
+    assert client.post(f'/api/library-import/albums/{album["id"]}/execute', json={}).status_code == 201
+    tags = MediaFile(str(path))
+    assert (tags.title, tags.artist, tags.albumartist) == ("Song", "Lead feat. Guest", "Lead")
+
+
 @pytest.mark.parametrize("duplicate_action", [None, "skip", "keep-both", "merge", "replace"])
 def test_duplicate_decision_is_persisted_previewed_and_enforced(tmp_path, duplicate_action):
     app = make_app(tmp_path)
@@ -3121,6 +3272,140 @@ def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
     assert b'name="art_sidecar" type="checkbox" value="1" checked' in restarted_page.data
     assert b'name="art_embed" type="checkbox" value="1" checked' in restarted_page.data
     assert b'name="art_replace" type="checkbox" value="1" checked' in restarted_page.data
+
+
+@pytest.mark.parametrize("plugins", ["ftintitle lastgenre", ["ftintitle", "lastgenre"]])
+def test_ftintitle_existing_plugin_forms_hydrate_and_preserve_advanced_config(tmp_path, plugins):
+    app = make_app(tmp_path)
+    config_path = Path(app.config["BEETS_CONFIG"])
+    document = yaml.safe_load(config_path.read_text())
+    document.update({
+        "plugins": plugins,
+        "ftintitle": {
+            "format": "(feat. {0})", "keep_in_artist": True, "auto": False, "drop": True,
+            "custom_words": ["guest"], "bracket_keywords": ["feat"], "future_option": "preserve-me",
+        },
+        "lastgenre": {"canonical": True},
+    })
+    config_path.write_text(yaml.safe_dump(document, sort_keys=False))
+    restarted = create_app({
+        "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(tmp_path / "config"),
+        "BROWSE_ROOTS": [str(tmp_path)],
+    })
+    page = restarted.test_client().get("/settings").get_data(as_text=True)
+    assert 'name="ftintitle_enabled" type="checkbox" value="1" checked' in page
+    assert 'value="(feat. {0})"' in page
+    assert 'name="ftintitle_keep_in_artist" type="checkbox" value="1" checked' in page
+
+    response = restarted.test_client().post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "[feat. {}]",
+        "ftintitle_keep_in_artist": "1", "beets_config": config_path.read_text(),
+    })
+    assert response.status_code == 302
+    saved = yaml.safe_load(config_path.read_text())
+    assert saved["plugins"] == ["lastgenre", "ftintitle"]
+    assert saved["lastgenre"] == {"canonical": True}
+    assert saved["ftintitle"] == {
+        "format": "[feat. {}]", "keep_in_artist": True, "preserve_album_artist": True,
+        "auto": True, "drop": False, "custom_words": ["guest"], "bracket_keywords": ["feat"],
+        "future_option": "preserve-me",
+    }
+
+
+def test_ftintitle_disable_and_invalid_format_are_safe(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    config_path = Path(app.config["BEETS_CONFIG"])
+    source = config_path.read_text() + "ftintitle:\n  custom_words: [guest]\n"
+    invalid = client.post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "feat.", "beets_config": source,
+    })
+    assert invalid.status_code == 200
+    assert b"FtInTitle format must include the guest" in invalid.data
+    assert b'value="feat."' in invalid.data
+    assert "custom_words: [guest]" in invalid.get_data(as_text=True)
+
+    invalid_list = client.post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "feat. {0}",
+        "beets_config": config_path.read_text() + "ftintitle:\n  custom_words: guest\n",
+    })
+    assert invalid_list.status_code == 200
+    assert b"ftintitle custom_words setting must be a list" in invalid_list.data
+
+    enabled = client.post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_enabled": "1", "ftintitle_format": "feat. {0}", "beets_config": source,
+    })
+    assert enabled.status_code == 302
+    saved = yaml.safe_load(config_path.read_text())
+    assert "ftintitle" in saved["plugins"]
+    assert saved["ftintitle"]["preserve_album_artist"] is True
+    assert saved["ftintitle"]["auto"] is True
+    assert saved["ftintitle"]["drop"] is False
+
+    disabled = client.post("/settings", data={
+        "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
+        "ftintitle_format": "feat. {0}", "beets_config": config_path.read_text(),
+    })
+    assert disabled.status_code == 302
+    saved = yaml.safe_load(config_path.read_text())
+    assert "ftintitle" not in saved["plugins"]
+    assert saved["ftintitle"]["custom_words"] == ["guest"]
+
+
+def test_ftintitle_projection_uses_upstream_parsing_and_formatting(tmp_path):
+    app = make_app(tmp_path)
+    candidate = {"artist": "Lead", "tracks": [
+        {"title": "Song (Live)", "track_artist": "Lead feat. Guest"},
+        {"title": "Song [Remix]", "track_artist": "Lead feat. Guest"},
+        {"title": "Custom [Remix]", "track_artist": "Lead alongside Guest"},
+        {"title": "Existing feat. Guest", "track_artist": "Lead feat. Guest"},
+        {"title": "Bracket", "track_artist": "Lead [feat. Guest"},
+        {"title": "No feature", "track_artist": "Lead presents Guest"},
+    ]}
+    app.config["FTINTITLE"] = {
+        **app.config["FTINTITLE"], "enabled": True, "format": "feat. {0}", "keep_in_artist": False,
+        "custom_words": ["alongside"], "bracket_keywords": ["live", "remix"],
+    }
+    projected = _effective_candidate(app, candidate)
+    assert candidate["tracks"][0] == {"title": "Song (Live)", "track_artist": "Lead feat. Guest"}
+    assert projected["tracks"][0] == {"title": "Song feat. Guest (Live)", "track_artist": "Lead"}
+    assert projected["tracks"][1] == {"title": "Song feat. Guest [Remix]", "track_artist": "Lead"}
+    assert projected["tracks"][2] == {"title": "Custom feat. Guest [Remix]", "track_artist": "Lead"}
+    assert projected["tracks"][3] == {"title": "Existing feat. Guest", "track_artist": "Lead"}
+    assert projected["tracks"][4] == candidate["tracks"][4]
+    assert projected["tracks"][5] == candidate["tracks"][5]
+
+
+def test_ftintitle_preserve_album_artist_candidate_semantics(tmp_path):
+    app = make_app(tmp_path)
+    candidate = {
+        "artist": "Lead feat. Guest",
+        "tracks": [{"title": "Song", "track_artist": "Lead feat. Guest"}],
+    }
+    app.config["FTINTITLE"] = {**app.config["FTINTITLE"], "enabled": True, "preserve_album_artist": True}
+    assert _effective_candidate(app, candidate) == candidate
+    app.config["FTINTITLE"]["preserve_album_artist"] = False
+    projected = _effective_candidate(app, candidate)
+    assert projected["artist"] == "Lead feat. Guest"
+    assert projected["tracks"] == [{"title": "Song feat. Guest", "track_artist": "Lead"}]
+
+
+def test_projection_recheck_never_weakens_strict_readiness():
+    album = {
+        "execution_status": "not-run", "candidate_status": "complete", "candidate_error": "",
+        "decision": "pending", "selected_candidate_id": 7, "duplicate_preflight": {"status": "clear"},
+        "tracks": [{"id": 1, "exception": None}],
+        "candidates": [{
+            "id": 7, "confidence": .99, "track_count_mismatch": False, "unmatched_track_count": 0,
+            "hard_mismatches": [], "matched_track_count": 1,
+            "track_details": [{"status": "matched", "local": "Song", "proposed": "Song"}],
+        }],
+    }
+    assert _album_bulk_readiness(album) == (False, "selected candidate is not an exact 100% match")
 
 
 def test_existing_fetch_art_setting_migrates_to_sidecar_only_defaults(tmp_path):

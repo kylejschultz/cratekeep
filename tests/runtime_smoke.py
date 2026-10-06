@@ -33,6 +33,7 @@ TRACKS = {
     "feature_extra": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "08 Extra feat. Rich Homie Quan.wav",
     "feature_realest": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "09 U Da Realest.wav",
     "feature_ratchet": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "10 Mainstream Ratchet.wav",
+    "feature_disabled": Path("Disabled Lead") / "Disabled Feature Album" / "01 Disabled Song.wav",
     "queue_safe": Path("Queue Safe") / "Safe Match" / "01 Safe.wav",
     "queue_tied": Path("Queue Tied") / "Tied Match" / "01 Tied.wav",
     "queue_lower": Path("Queue Lower") / "Lower Match" / "01 Lower.wav",
@@ -93,10 +94,17 @@ def make_fixture(root: Path) -> dict[str, Path]:
         if name.startswith("feature_"):
             tags.track = int(track.stem.split(" ", 1)[0])
             tags.disc = 1
+            if name == "feature_extra":
+                tags.title = "Extra [Remix]"
+                tags.artist = "2 Chainz feat. Rich Homie Quan"
+                tags.albumartist = "2 Chainz"
+            elif name == "feature_disabled":
+                tags.artist = "Disabled Lead feat. Guest"
+                tags.albumartist = "Disabled Lead"
             tags.save()
-    # Fourteen real top-level scopes plus these 112 empty scopes make exactly
+    # Fifteen real top-level scopes plus these 111 empty scopes make exactly
     # 126 active rows, so removing one ready folder exercises a 6 -> 5 clamp.
-    for number in range(112):
+    for number in range(111):
         (root / "library" / f"ZZ Pagination Folder {number:03d}").mkdir(parents=True)
     return tracks
 
@@ -173,7 +181,7 @@ def install_provider_fixtures(state_path: Path) -> dict[str, int]:
             "track_count": 4, "media": [{"position": 1, "format": "CD", "track_count": 4}],
             "tracks": [
                 {"title": "Used 2", "position": 1, "medium_position": 1, "length_ms": 1000},
-                {"title": "Extra", "position": 8, "medium_position": 1, "length_ms": 287000,
+                {"title": "Extra [Remix]", "position": 8, "medium_position": 1, "length_ms": 287000,
                  "track_artist": "2 Chainz feat. Rich Homie Quan", "artist_credit_source": "track"},
                 {"title": "U Da Realest", "position": 9, "medium_position": 1, "length_ms": 1000},
                 {"title": "Mainstream Ratchet", "position": 10, "medium_position": 1, "length_ms": 1000},
@@ -187,13 +195,38 @@ def install_provider_fixtures(state_path: Path) -> dict[str, int]:
                    year, proposed_diff_json, provider_data_json, created_at
                ) VALUES (?, 'musicbrainz', ?, 1, 1.0, ?, ?, ?, ?, ?, ?)""",
             (feature_album[0], feature_release_id, "2 Chainz", "B.O.A.T.S. II #METIME", "2013",
-             json.dumps({"tracks": {"from": ["Used 2", "Extra feat. Rich Homie Quan", "U Da Realest", "Mainstream Ratchet"],
-                                            "to": ["Used 2", "Extra", "U Da Realest", "Mainstream Ratchet"]}}, sort_keys=True),
+             json.dumps({"tracks": {"from": ["Used 2", "Extra [Remix]", "U Da Realest", "Mainstream Ratchet"],
+                                            "to": ["Used 2", "Extra feat. Rich Homie Quan [Remix]", "U Da Realest", "Mainstream Ratchet"]}}, sort_keys=True),
              json.dumps(feature_data, sort_keys=True), now),
         ).lastrowid
         database.execute(
             "UPDATE album_reviews SET candidate_status = 'complete', candidate_error = '', updated_at = ? WHERE id = ?",
             (now, feature_album[0]),
+        )
+        disabled_album = database.execute(
+            "SELECT id FROM album_reviews WHERE artist = ? AND album = ?",
+            ("Disabled Lead", "Disabled Feature Album"),
+        ).fetchone()
+        assert disabled_album is not None, "disabled featured-artist fixture album was not inventoried"
+        disabled_release_id = "123e4567-e89b-42d3-a456-426614174089"
+        disabled_data = {
+            "provider_id": disabled_release_id, "artist": "Disabled Lead", "album": "Disabled Feature Album",
+            "track_count": 1, "media": [{"position": 1, "format": "CD", "track_count": 1}],
+            "tracks": [{"title": "Disabled Song", "position": 1, "medium_position": 1,
+                        "track_artist": "Disabled Lead feat. Guest", "artist_credit_source": "track"}],
+            "retrieval": {"search_score": None, "source": "deterministic-provider-fixture-mock"},
+        }
+        candidate_ids["feature_disabled"] = database.execute(
+            """INSERT INTO metadata_candidates(
+                   album_review_id, provider, provider_id, rank, confidence, artist, album,
+                   year, proposed_diff_json, provider_data_json, created_at
+               ) VALUES (?, 'musicbrainz', ?, 1, 1.0, ?, ?, NULL, '{}', ?, ?)""",
+            (disabled_album[0], disabled_release_id, "Disabled Lead", "Disabled Feature Album",
+             json.dumps(disabled_data, sort_keys=True), now),
+        ).lastrowid
+        database.execute(
+            "UPDATE album_reviews SET candidate_status = 'complete', candidate_error = '', updated_at = ? WHERE id = ?",
+            (now, disabled_album[0]),
         )
     return candidate_ids
 
@@ -237,6 +270,25 @@ def set_artwork_settings(page: Page, base_url: str, *, sidecar: bool, embed: boo
     assert page.locator('input[name="art_replace"]').is_checked() is replace
 
 
+def set_ftintitle_settings(page: Page, base_url: str, *, enabled: bool) -> None:
+    page.goto(f"{base_url}/settings#metadata", wait_until="networkidle")
+    page.locator("#settings-tab-metadata").click()
+    toggle = page.locator('input[name="ftintitle_enabled"]')
+    toggle.set_checked(enabled)
+    if enabled:
+        page.locator('input[name="ftintitle_format"]').fill("feat. {0}")
+        page.locator('input[name="ftintitle_keep_in_artist"]').set_checked(False)
+        assert page.locator("#ftintitle-options").is_visible()
+    else:
+        assert page.locator("#ftintitle-options").is_hidden()
+    with page.expect_navigation(wait_until="networkidle"):
+        page.get_by_role("button", name="Save settings").click()
+    page.goto(f"{base_url}/settings#metadata", wait_until="networkidle")
+    page.locator("#settings-tab-metadata").click()
+    assert page.locator('input[name="ftintitle_enabled"]').is_checked() is enabled
+    assert page.locator("#ftintitle-options").is_visible() is enabled
+
+
 def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[str, Path]) -> dict:
     page_errors: list[str] = []
     console_errors: list[str] = []
@@ -244,6 +296,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     folder_page_timings_ms: dict[str, float] = {}
     sequential_proof: list[dict] = []
     inline_scan_state_proof: dict[str, dict[str, str]] = {}
+    ftintitle_config_proof: dict[str, object] = {}
     inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -281,6 +334,20 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.evaluate("sessionStorage.length") == 0
         assert not page.locator("body").evaluate("element => element.classList.contains('dark-mode')")
         page.screenshot(path=evidence / "01-settings-initial.png", full_page=True)
+
+        set_ftintitle_settings(page, base_url, enabled=True)
+        page.screenshot(path=evidence / "01-ftintitle-enabled.png", full_page=True)
+        config_text = (state_path / "config.yaml").read_text(encoding="utf-8")
+        assert "- ftintitle" in config_text
+        assert "format: feat. {0}" in config_text
+        assert "auto: true" in config_text
+        assert "drop: false" in config_text
+        ftintitle_config_proof["enabled"] = {
+            "plugin": "- ftintitle" in config_text,
+            "format": "format: feat. {0}" in config_text,
+            "auto": "auto: true" in config_text,
+            "drop_false": "drop: false" in config_text,
+        }
 
         page.locator("#theme-toggle").click()
         assert page.locator("body").evaluate("element => element.classList.contains('dark-mode')")
@@ -349,7 +416,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         unselected_status = page.locator('.review-folder[data-folder-path="Queue Unselected"] .status-pill')
         unselected_status_before = unselected_status.inner_text()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as scan_info:
-            page.locator("#library-import-scan-selected").click()
+            # Dispatch synchronously so the intentionally brief queued render is
+            # observed before the handler's two-animation-frame transition.
+            page.evaluate("document.getElementById('library-import-scan-selected').click()")
             queued = {
                 "safe": safe_status.inner_text(),
                 "sequential": sequential_status.inner_text(),
@@ -670,14 +739,14 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                 cells = rows.locator("td")
                 assert cells.count() == 5
                 row_text = rows.inner_text()
-                assert "Extra feat. Rich Homie Quan" in row_text and "Extra" in row_text
+                assert "Extra feat. Rich Homie Quan [Remix]" in row_text and "Extra [Remix]" in row_text
                 assert "2 Chainz feat. Rich Homie Quan" in row_text
-                assert cells.nth(1).locator(".track-metadata-title").inner_text() == "Extra feat. Rich Homie Quan"
-                assert cells.nth(1).locator(".track-metadata-artist").inner_text() == "Artist: 2 Chainz"
-                assert cells.nth(2).locator(".track-metadata-title").inner_text() == "Extra"
-                assert cells.nth(2).locator(".track-metadata-artist").inner_text() == "Artist: 2 Chainz feat. Rich Homie Quan"
-                assert "Title: Extra feat. Rich Homie Quan (changed)" in cells.nth(1).get_attribute("aria-label")
-                assert "Artist: 2 Chainz (changed)" in cells.nth(1).get_attribute("aria-label")
+                assert cells.nth(1).locator(".track-metadata-title").inner_text() == "Extra [Remix]"
+                assert cells.nth(1).locator(".track-metadata-artist").inner_text() == "Artist: 2 Chainz feat. Rich Homie Quan"
+                assert cells.nth(2).locator(".track-metadata-title").inner_text() == "Extra feat. Rich Homie Quan [Remix]"
+                assert cells.nth(2).locator(".track-metadata-artist").inner_text() == "Artist: 2 Chainz"
+                assert "Title: Extra [Remix] (changed)" in cells.nth(1).get_attribute("aria-label")
+                assert "Artist: 2 Chainz feat. Rich Homie Quan (changed)" in cells.nth(1).get_attribute("aria-label")
                 assert "UNMATCHED" not in row_text
                 assert all(title not in row_text for title in ("Used 2", "U Da Realest", "Mainstream Ratchet"))
                 page.screenshot(path=evidence / screenshot)
@@ -705,6 +774,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                 with page.expect_response(lambda response: response.url.endswith("/execute")) as failed_info:
                     page.locator("#library-import-in-place").click()
                 assert failed_info.value.status == 502
+                page.wait_for_function(
+                    "document.getElementById('library-import-execution-result').textContent.includes('retry is available')"
+                )
                 assert "retry is available" in page.locator("#library-import-execution-result").inner_text()
                 assert page.locator("#library-import-in-place").inner_text() == "Import"
                 assert page.locator("#library-import-modal").is_visible()
@@ -753,9 +825,21 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "feature_extra", has_art=False, screenshot="04-feature-track-changes-desktop-dark.png"
         )
         extra_item = next(item for item in feature_result["items"] if item["changes"].get("title"))
-        assert extra_item["changes"]["title"] == {"from": "Extra feat. Rich Homie Quan", "to": "Extra"}
-        assert extra_item["changes"]["artist"] == {"from": "2 Chainz", "to": "2 Chainz feat. Rich Homie Quan"}
+        assert extra_item["changes"]["title"] == {
+            "from": "Extra [Remix]", "to": "Extra feat. Rich Homie Quan [Remix]",
+        }
+        assert extra_item["changes"]["artist"] == {"from": "2 Chainz feat. Rich Homie Quan", "to": "2 Chainz"}
         assert "albumartist" not in extra_item["changes"]
+
+        set_ftintitle_settings(page, base_url, enabled=False)
+        disabled_config = (state_path / "config.yaml").read_text(encoding="utf-8")
+        assert "- ftintitle" not in disabled_config
+        ftintitle_config_proof["disabled"] = {"plugin": "- ftintitle" in disabled_config}
+        disabled_result = import_candidate(
+            "feature_disabled", has_art=False, screenshot="04-ftintitle-disabled-desktop-dark.png"
+        )
+        disabled_changes = disabled_result["items"][0]["changes"]
+        assert "title" not in disabled_changes and "artist" not in disabled_changes
 
         as_is_review = open_folder_album("As Is Artist")
         as_is_review.click(force=True)
@@ -781,6 +865,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         "folder_page_timings_ms": folder_page_timings_ms,
         "inline_scan_state_proof": inline_scan_state_proof,
         "sequential_candidate_proof": sequential_proof,
+        "ftintitle_config_proof": ftintitle_config_proof,
         "inbox_retention": {"before": inbox_before, "after": inbox_after},
     }
 
@@ -853,12 +938,27 @@ def main() -> None:
     assert file_genres == expected_genres
     feature_db = by_path[tracks["feature_extra"].name]
     assert (feature_db["title"], feature_db["artist"], feature_db["albumartist"]) == (
-        "Extra", "2 Chainz feat. Rich Homie Quan", "2 Chainz",
+        "Extra feat. Rich Homie Quan [Remix]", "2 Chainz", "2 Chainz",
     )
     feature_tags = MediaFile(str(tracks["feature_extra"]))
     assert (feature_tags.title, feature_tags.artist, feature_tags.albumartist) == (
-        "Extra", "2 Chainz feat. Rich Homie Quan", "2 Chainz",
+        "Extra feat. Rich Homie Quan [Remix]", "2 Chainz", "2 Chainz",
     )
+    disabled_db = by_path[tracks["feature_disabled"].name]
+    disabled_tags = MediaFile(str(tracks["feature_disabled"]))
+    assert (disabled_db["title"], disabled_db["artist"], disabled_db["albumartist"]) == (
+        "Disabled Song", "Disabled Lead feat. Guest", "Disabled Lead",
+    )
+    assert (disabled_tags.title, disabled_tags.artist, disabled_tags.albumartist) == (
+        "Disabled Song", "Disabled Lead feat. Guest", "Disabled Lead",
+    )
+    with sqlite3.connect(args.state_path / "app.db") as database:
+        raw_feature = json.loads(database.execute(
+            "SELECT provider_data_json FROM metadata_candidates WHERE provider_id = ?",
+            ("123e4567-e89b-42d3-a456-426614174088",),
+        ).fetchone()[0])
+    assert raw_feature["tracks"][1]["title"] == "Extra [Remix]"
+    assert raw_feature["tracks"][1]["track_artist"] == "2 Chainz feat. Rich Homie Quan"
     result = {
         "fixture_sha256_before": before,
         "fixture_sha256_after": after,
@@ -877,8 +977,21 @@ def main() -> None:
         "genre_results": {name: by_path[path.name]["genre"] for name, path in tracks.items() if name in GENRES},
         "file_genre_results": file_genres,
         "feature_credit_result": {
+            "raw_candidate": {
+                "title": raw_feature["tracks"][1]["title"],
+                "artist": raw_feature["tracks"][1]["track_artist"],
+            },
             "database": {key: feature_db[key] for key in ("title", "artist", "albumartist")},
             "file": {"title": feature_tags.title, "artist": feature_tags.artist, "albumartist": feature_tags.albumartist},
+        },
+        "feature_disabled_result": {
+            "database": {key: disabled_db[key] for key in ("title", "artist", "albumartist")},
+            "file": {"title": disabled_tags.title, "artist": disabled_tags.artist,
+                     "albumartist": disabled_tags.albumartist},
+        },
+        "inbox_config_proof": {
+            "command_config_path": str(args.state_path / "config.yaml"),
+            "ftintitle_disabled_after_parity_check": "- ftintitle" not in (args.state_path / "config.yaml").read_text(),
         },
         **browser_result,
     }

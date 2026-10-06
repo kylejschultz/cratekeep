@@ -1,4 +1,4 @@
 Flask>=3.0,<4
-beets>=2.2,<3
+beets>=2.13.1,<3
 gunicorn>=22,<24
 Pillow>=11,<13

@@ -364,9 +364,24 @@
       <label class="check-label"><input name="art_replace" type="checkbox" value="1"{% if settings.get('art_replace') == '1' %} checked{% endif %}> Replace existing sidecar and embedded artwork</label>
       <small>Sidecar and embedding are independent. Existing <code>cover.jpg</code> files and embedded art are preserved unless replacement is enabled. Missing candidate art is a visible no-op and never removes existing art.</small>
     </section>
+    <section class="settings-section" aria-labelledby="plugins-title">
+      <h2 id="plugins-title">Featured artists</h2>
+      <p>FtInTitle moves a trailing featured-artist credit from the track artist into the title before a Library candidate is reviewed.</p>
+      <label class="check-label"><input id="ftintitle_enabled" name="ftintitle_enabled" type="checkbox" value="1"{% if ftintitle.enabled %} checked{% endif %}> Move featured artists into track titles (FtInTitle)</label>
+      <div id="ftintitle-options"{% if not ftintitle.enabled %} hidden{% endif %}>
+        <label for="ftintitle_format">Feature format</label>
+        <input id="ftintitle_format" name="ftintitle_format" type="text" value="{{ ftintitle.format }}" placeholder="feat. {0}">
+        <small>Use <code>{}</code> or <code>{0}</code> for the guest artist. Parentheses or brackets in this format are preserved.</small>
+        <label class="check-label"><input name="ftintitle_keep_in_artist" type="checkbox" value="1"{% if ftintitle.keep_in_artist %} checked{% endif %}> Keep featured artists in the track artist field</label>
+        <input name="ftintitle_preserve_album_artist" type="hidden" value="1">
+        <label class="check-label"><input type="checkbox" checked disabled> Preserve album artist (skip matching track credits)</label>
+        <small>The release <code>albumartist</code> field is always retained. This option controls whether tracks whose artist exactly equals that release artist are left unchanged.</small>
+      </div>
+      <small><code>fetchart</code> and <code>ftintitle</code> are explicitly integrated into reviewed Library imports. Other YAML plugins may work in the beets Inbox CLI, but are not guaranteed in Library import.</small>
+    </section>
     <section class="settings-section" aria-labelledby="beets-title">
       <h2 id="beets-title">Beets configuration</h2>
-      <p>Edit advanced options in the generated <code>config.yaml</code>. Library/database paths, core import safety settings, and the fetchart plugin state are managed by the form and will be normalized when saved.</p>
+      <p>Edit advanced options in the generated <code>config.yaml</code>. Library/database paths, core import safety settings, and the fetchart/FtInTitle plugin states are managed by the form and will be normalized when saved.</p>
       <label for="beets_config">YAML configuration</label>
       <textarea id="beets_config" name="beets_config" spellcheck="false">{{ beets_config }}</textarea>
     </section>
@@ -586,6 +601,13 @@
       const hashTab = window.location.hash.slice(1);
       selectSettingsTab(settingsTabs.some(tab => tab.dataset.settingsTab === hashTab) ? hashTab : {{ active_tab|tojson }});
       window.addEventListener('hashchange', () => selectSettingsTab(window.location.hash.slice(1)));
+    }
+    const ftintitleEnabled = document.getElementById('ftintitle_enabled');
+    const ftintitleOptions = document.getElementById('ftintitle-options');
+    if (ftintitleEnabled && ftintitleOptions) {
+      const syncFtInTitle = () => { ftintitleOptions.hidden = !ftintitleEnabled.checked; };
+      ftintitleEnabled.addEventListener('change', syncFtInTitle);
+      syncFtInTitle();
     }
 
     function setStatus(message, isError = false) {

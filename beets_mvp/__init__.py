@@ -19,6 +19,13 @@ from pathlib import Path
 import yaml
 from beets import config as beets_config
 from beets.library import Item, Library
+from beetsplug.ftintitle import (
+    DEFAULT_BRACKET_KEYWORDS,
+    FtInTitlePlugin,
+    contains_feat,
+    find_feat_part,
+    split_on_feat,
+)
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
 from mediafile import Image as MediaImage, ImageType, MediaFile, UnreadableFileError
 from PIL import Image as PillowImage, UnidentifiedImageError
@@ -47,6 +54,17 @@ MUSICBRAINZ_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+FTINTITLE_DEFAULTS = {
+    "enabled": False,
+    "format": "feat. {0}",
+    "keep_in_artist": False,
+    "preserve_album_artist": True,
+    "drop": False,
+    "auto": True,
+    "custom_words": [],
+    "bracket_keywords": list(DEFAULT_BRACKET_KEYWORDS),
+    "projection_requires_recheck": False,
+}
 
 
 class LibraryImportExecutionError(RuntimeError):
@@ -538,7 +556,7 @@ def _write_beets_config(app: Flask, content: str | None = None) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _build_beets_config(app: Flask, settings: dict[str, str], content: str, fetch_art: bool) -> str:
+def _beets_config_document(content: str) -> dict:
     if len(content.encode("utf-8")) > MAX_BEETS_CONFIG_BYTES:
         raise ValueError("Beets configuration must be smaller than 128 KB.")
     try:
@@ -548,6 +566,84 @@ def _build_beets_config(app: Flask, settings: dict[str, str], content: str, fetc
         raise ValueError(f"Beets configuration is not valid YAML: {detail}") from exc
     if not isinstance(document, dict):
         raise ValueError("Beets configuration must be a YAML mapping.")
+    return document
+
+
+def _plugin_names(document: dict) -> list[str]:
+    plugins = document.get("plugins", [])
+    if isinstance(plugins, str):
+        plugins = plugins.split()
+    if plugins is None:
+        plugins = []
+    if not isinstance(plugins, list) or any(not isinstance(plugin, str) for plugin in plugins):
+        raise ValueError("The beets plugins setting must be a list or space-separated string.")
+    return list(dict.fromkeys(plugins))
+
+
+def _ftintitle_settings(content: str) -> dict:
+    values = dict(FTINTITLE_DEFAULTS)
+    try:
+        document = _beets_config_document(content)
+        plugins = _plugin_names(document)
+    except ValueError:
+        return values
+    values["enabled"] = "ftintitle" in plugins
+    values["projection_requires_recheck"] = values["enabled"] or "ftintitle" in document
+    try:
+        section = _validated_ftintitle_section(document)
+        if isinstance(section.get("format"), str):
+            values["format"] = section["format"]
+        for key in ("keep_in_artist", "preserve_album_artist", "drop", "auto"):
+            if isinstance(section.get(key), bool):
+                values[key] = section[key]
+        values["custom_words"] = _validated_string_list(section, "custom_words", [])
+        values["bracket_keywords"] = _validated_string_list(
+            section, "bracket_keywords", list(DEFAULT_BRACKET_KEYWORDS)
+        )
+    except ValueError:
+        # Keep plugin activation truthful so the first-class controls can fix
+        # a malformed advanced section on the next save.
+        return values
+    return values
+
+
+def _validated_ftintitle_section(document: dict) -> dict:
+    section = document.get("ftintitle")
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError("The ftintitle section must be a YAML mapping.")
+    _validated_string_list(section, "custom_words", [])
+    _validated_string_list(section, "bracket_keywords", list(DEFAULT_BRACKET_KEYWORDS))
+    return section
+
+
+def _validated_string_list(section: dict, key: str, default: list[str]) -> list[str]:
+    value = section.get(key, default)
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"The ftintitle {key} setting must be a list of non-empty strings.")
+    return [item.strip() for item in value]
+
+
+def _validate_ftintitle_settings(values: dict) -> None:
+    if not values.get("enabled"):
+        return
+    feat_format = values.get("format")
+    if not isinstance(feat_format, str) or not feat_format.strip():
+        raise ValueError("FtInTitle format must include a valid guest placeholder.")
+    guest = "CratekeepFeaturedArtist"
+    try:
+        rendered = feat_format.format(guest)
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        raise ValueError("FtInTitle format must format one guest using {} or {0}.") from exc
+    if guest not in rendered:
+        raise ValueError("FtInTitle format must include the guest using {} or {0}.")
+
+
+def _build_beets_config(
+    app: Flask, settings: dict[str, str], content: str, fetch_art: bool, ftintitle: dict | None = None
+) -> str:
+    document = _beets_config_document(content)
 
     import_config = document.get("import", {})
     if import_config is None:
@@ -556,14 +652,21 @@ def _build_beets_config(app: Flask, settings: dict[str, str], content: str, fetc
         raise ValueError("The beets import section must be a YAML mapping.")
     import_config.update(move=True, write=True, autotag=False, resume=False)
 
-    plugins = document.get("plugins", [])
-    if isinstance(plugins, str):
-        plugins = plugins.split()
-    if plugins is None:
-        plugins = []
-    if not isinstance(plugins, list) or any(not isinstance(plugin, str) for plugin in plugins):
-        raise ValueError("The beets plugins setting must be a list or space-separated string.")
-    plugins = list(dict.fromkeys(plugin for plugin in plugins if plugin != "fetchart"))
+    plugins = [plugin for plugin in _plugin_names(document) if plugin != "fetchart"]
+    section = _validated_ftintitle_section(document)
+    if ftintitle is not None:
+        _validate_ftintitle_settings(ftintitle)
+        plugins = [plugin for plugin in plugins if plugin != "ftintitle"]
+        if ftintitle.get("enabled"):
+            plugins.append("ftintitle")
+            section.update(
+                auto=True,
+                drop=False,
+                format=ftintitle["format"].strip(),
+                keep_in_artist=bool(ftintitle.get("keep_in_artist")),
+                preserve_album_artist=True,
+            )
+            document["ftintitle"] = section
     if fetch_art:
         plugins.append("fetchart")
 
@@ -749,6 +852,9 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         for key in ("INBOX_PATH", "LIBRARY_PATH"):
             Path(app.config[key]).mkdir(parents=True, exist_ok=True)
         _write_beets_config(app)
+        app.config["FTINTITLE"] = _ftintitle_settings(
+            Path(app.config["BEETS_CONFIG"]).read_text(encoding="utf-8")
+        )
         beets_config.set_file(app.config["BEETS_CONFIG"])
         beets_config.read(user=False, defaults=True)
 
@@ -757,6 +863,7 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
     current = _load_settings(app.config["APP_DB"])
     config_path = Path(app.config["BEETS_CONFIG"])
     config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    ftintitle = _ftintitle_settings(config_text)
     if request.method == "POST":
         inbox_path = request.form.get("inbox_path", "").strip()
         library_path = request.form.get("library_path", "").strip()
@@ -789,10 +896,19 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             "art_replace": "1" if request.form.get("art_replace") else "",
         }
         submitted_config = request.form.get("beets_config", config_text)
+        submitted_ftintitle = {
+            "enabled": bool(request.form.get("ftintitle_enabled")),
+            "format": request.form.get("ftintitle_format", ftintitle["format"]),
+            "keep_in_artist": bool(request.form.get("ftintitle_keep_in_artist")),
+            # Cratekeep's reviewed import always preserves the release artist.
+            "preserve_album_artist": True,
+        }
         rendered_config = None
         if not first_run:
             try:
-                rendered_config = _build_beets_config(app, values, submitted_config, values["fetch_art"] == "1")
+                rendered_config = _build_beets_config(
+                    app, values, submitted_config, values["fetch_art"] == "1", submitted_ftintitle
+                )
             except ValueError as exc:
                 errors.append(str(exc))
         if not errors:
@@ -815,6 +931,7 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             flash(error, "error")
         current = values
         config_text = submitted_config
+        ftintitle = submitted_ftintitle
 
     defaults = _default_paths()
     return render_template(
@@ -825,6 +942,7 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
         default_library=defaults["library_path"],
         has_token=bool(current.get("navidrome_token")),
         beets_config=config_text,
+        ftintitle=ftintitle,
         build_sha=app.config["BUILD_SHA"],
         active_tab=active_tab,
         page=page,
@@ -1140,7 +1258,11 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
                 if row["album_id"] is not None and row["execution_status"] not in {"complete", "failed"}
                 and row["candidate_status"] == "complete" and not row["candidate_error"]
                 and row["state"] not in {"rejected", "skipped"}
-                and row["selected_confidence"] == 1.0
+                # A managed projection can make the persisted provider score
+                # stale after settings change. Include it for payload-level
+                # recomputation; _album_bulk_readiness remains the strict gate.
+                and (app.config.get("FTINTITLE", {}).get("projection_requires_recheck")
+                     or row["selected_confidence"] == 1.0)
             },
         })
 
@@ -1811,6 +1933,61 @@ def _candidate_match(query: dict, candidate: dict, *, exact_mbid: bool = False) 
     return score_release(query, candidate, exact_mbid=exact)
 
 
+def _effective_candidate(app: Flask, candidate: dict) -> dict:
+    """Project explicitly supported plugin behavior without mutating evidence.
+
+    Provider JSON remains the audit source. This adapter only calls the bundled
+    FtInTitle parser helpers; it never constructs a plugin or runs import hooks.
+    """
+    options = app.config.get("FTINTITLE", FTINTITLE_DEFAULTS)
+    if not options.get("enabled"):
+        return candidate
+    projected = dict(candidate)
+    albumartist = _normalize_metadata(candidate.get("artist"))
+    projected_tracks = []
+    drop_feat = bool(options.get("drop", False))
+    feat_format = str(options.get("format") or FTINTITLE_DEFAULTS["format"])
+    keep_in_artist = bool(options.get("keep_in_artist"))
+    preserve_album_artist = bool(options.get("preserve_album_artist", True))
+    custom_words = list(options.get("custom_words") or [])
+    bracket_keywords = list(options.get("bracket_keywords") or [])
+    for raw_track in candidate.get("tracks", []) if isinstance(candidate.get("tracks"), list) else []:
+        if not isinstance(raw_track, dict):
+            projected_tracks.append(raw_track)
+            continue
+        track = dict(raw_track)
+        artist = _normalize_metadata(track.get("track_artist"))
+        title = _normalize_track_title(track.get("title"))
+        structurally_valid = artist.count("(") == artist.count(")") and artist.count("[") == artist.count("]")
+        if preserve_album_artist and albumartist and artist == albumartist:
+            projected_tracks.append(track)
+            continue
+        for_artist = not albumartist or albumartist in artist
+        if artist and structurally_valid:
+            _, featured = split_on_feat(
+                artist, for_artist=for_artist, custom_words=custom_words
+            )
+            feat_part = find_feat_part(artist, albumartist, custom_words) if featured else None
+            if feat_part:
+                if not keep_in_artist:
+                    track["track_artist"] = split_on_feat(
+                        artist, custom_words=custom_words
+                    )[0]
+                if not drop_feat and not contains_feat(title, custom_words):
+                    try:
+                        track["title"] = FtInTitlePlugin.insert_ft_into_title(
+                            title, feat_format.format(feat_part), bracket_keywords
+                        )
+                    except (AttributeError, IndexError, KeyError, ValueError):
+                        # A hand-edited invalid YAML format remains visible in
+                        # Settings and is rejected on save; it cannot alter a
+                        # reviewed candidate in the meantime.
+                        track = dict(raw_track)
+        projected_tracks.append(track)
+    projected["tracks"] = projected_tracks
+    return projected
+
+
 def _candidate_confidence(query: dict, candidate: dict, *, exact_mbid: bool = False) -> float:
     return _candidate_match(query, candidate, exact_mbid=exact_mbid)["confidence"]
 
@@ -1895,9 +2072,9 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
             (album_review_id, musicbrainz_id),
         ).fetchone()
         values = (
-            1, _candidate_confidence(query, candidate, exact_mbid=True), _normalize_metadata(candidate.get("artist")),
+            1, _candidate_confidence(query, _effective_candidate(app, candidate), exact_mbid=True), _normalize_metadata(candidate.get("artist")),
             _normalize_metadata(candidate.get("album")), str(candidate.get("year")) if candidate.get("year") else None,
-            json.dumps(_candidate_diff(query, candidate), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
+            json.dumps(_candidate_diff(query, _effective_candidate(app, candidate)), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
         )
         if existing:
             candidate_id = existing["id"]
@@ -1943,7 +2120,9 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[
                 candidate for candidate in raw[:MAX_CANDIDATES_PER_ALBUM]
                 if isinstance(candidate, dict) and candidate.get("provider_id")
             ]
-            candidates.sort(key=lambda candidate: (-_candidate_confidence(query, candidate), str(candidate["provider_id"])))
+            candidates.sort(key=lambda candidate: (
+                -_candidate_confidence(query, _effective_candidate(app, candidate)), str(candidate["provider_id"])
+            ))
             with _connect(app.config["APP_DB"]) as db:
                 selected = db.execute(
                     """SELECT candidates.provider, candidates.provider_id
@@ -1972,10 +2151,11 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[
                                album_review_id, provider, provider_id, rank, confidence, artist, album,
                                year, proposed_diff_json, provider_data_json, schema_version, created_at
                            ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (album["id"], str(candidate["provider_id"]), rank, _candidate_confidence(query, candidate),
+                        (album["id"], str(candidate["provider_id"]), rank,
+                         _candidate_confidence(query, _effective_candidate(app, candidate)),
                          _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
                          str(candidate.get("year")) if candidate.get("year") else None,
-                         json.dumps(_candidate_diff(query, candidate), sort_keys=True),
+                         json.dumps(_candidate_diff(query, _effective_candidate(app, candidate)), sort_keys=True),
                          json.dumps(candidate, sort_keys=True), CANDIDATE_SCHEMA_VERSION, _now()),
                     )
                 selected_id = None
@@ -1987,7 +2167,7 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[
                     ).fetchone()
                     selected_id = refreshed["id"] if refreshed else None
                 elif candidates:
-                    matches = [_candidate_match(query, candidate) for candidate in candidates]
+                    matches = [_candidate_match(query, _effective_candidate(app, candidate)) for candidate in candidates]
                     best = matches[0]
                     tied = len(matches) > 1 and matches[1]["confidence"] == best["confidence"]
                     exact_tracks = (
@@ -2134,7 +2314,8 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
             serialized_candidates = []
             for candidate in candidates:
                 provider_data = json.loads(candidate["provider_data_json"])
-                match = _candidate_match(query, provider_data)
+                effective_candidate = _effective_candidate(app, provider_data)
+                match = _candidate_match(query, effective_candidate)
                 serialized_candidates.append({
                     "id": candidate["id"], "provider": candidate["provider"],
                     "provider_id": candidate["provider_id"], "rank": candidate["rank"],
@@ -2146,16 +2327,16 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "hard_mismatches": match["hard_mismatches"],
                     "selected_by_mbid": match["selected_by_mbid"],
                     "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
-                    "genre": _candidate_genre(provider_data) or None,
+                    "genre": _candidate_genre(effective_candidate) or None,
                     "genre_evidence": provider_data.get("genre_evidence"),
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
                     "release_type": provider_data.get("release_type"),
                     "release_status": provider_data.get("status"), "country": provider_data.get("country"),
                     "artwork_url": _persisted_artwork_source(provider_data),
                     "artwork": provider_data.get("artwork"),
-                    "media": provider_data.get("media", []), "recordings": provider_data.get("tracks", []),
+                    "media": provider_data.get("media", []), "recordings": effective_candidate.get("tracks", []),
                     "retrieval": provider_data.get("retrieval", {}),
-                    "proposed_diff": json.loads(candidate["proposed_diff_json"]),
+                    "proposed_diff": _candidate_diff(query, effective_candidate),
                     "track_details": match["track_details"],
                     "duplicate_preflight": _duplicate_preflight(
                         app, tracks, query, match["track_details"], managed_items
@@ -2450,6 +2631,7 @@ def _library_import_plans(
     details = {}
     if provider_data:
         query = _album_query(app, album)
+        provider_data = _effective_candidate(app, provider_data)
         details = {
             detail["position"]: detail for detail in _candidate_match(query, provider_data)["track_details"]
             if detail.get("local") is not None
