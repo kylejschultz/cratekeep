@@ -270,8 +270,11 @@ def set_artwork_settings(page: Page, base_url: str, *, sidecar: bool, embed: boo
     assert page.locator('input[name="art_replace"]').is_checked() is replace
 
 
-def set_ftintitle_settings(page: Page, base_url: str, *, enabled: bool) -> None:
-    page.goto(f"{base_url}/settings#metadata", wait_until="networkidle")
+def set_ftintitle_settings(
+    page: Page, base_url: str, *, enabled: bool, evidence: Path | None = None,
+) -> None:
+    origin = "inbox" if enabled else "settings#metadata"
+    page.goto(f"{base_url}/{origin}", wait_until="networkidle")
     page.locator("#settings-tab-metadata").click()
     toggle = page.locator('input[name="ftintitle_enabled"]')
     toggle.set_checked(enabled)
@@ -281,8 +284,12 @@ def set_ftintitle_settings(page: Page, base_url: str, *, enabled: bool) -> None:
         assert page.locator("#ftintitle-options").is_visible()
     else:
         assert page.locator("#ftintitle-options").is_hidden()
-    with page.expect_navigation(wait_until="networkidle"):
+    if enabled and evidence:
+        page.screenshot(path=evidence / "01-inbox-ftintitle-before-save.png", full_page=True)
+    with page.expect_navigation(wait_until="networkidle") as navigation:
         page.get_by_role("button", name="Save settings").click()
+    assert navigation.value is not None
+    assert navigation.value.status != 405
     page.goto(f"{base_url}/settings#metadata", wait_until="networkidle")
     page.locator("#settings-tab-metadata").click()
     assert page.locator('input[name="ftintitle_enabled"]').is_checked() is enabled
@@ -335,8 +342,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert not page.locator("body").evaluate("element => element.classList.contains('dark-mode')")
         page.screenshot(path=evidence / "01-settings-initial.png", full_page=True)
 
-        set_ftintitle_settings(page, base_url, enabled=True)
-        page.screenshot(path=evidence / "01-ftintitle-enabled.png", full_page=True)
+        set_ftintitle_settings(page, base_url, enabled=True, evidence=evidence)
+        page.screenshot(path=evidence / "01-ftintitle-enabled-settings.png", full_page=True)
         config_text = (state_path / "config.yaml").read_text(encoding="utf-8")
         assert "- ftintitle" in config_text
         assert "format: feat. {0}" in config_text

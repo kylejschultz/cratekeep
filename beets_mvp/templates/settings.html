@@ -329,7 +329,7 @@
     <header class="page-head"><h1>{{ 'Inbox' if page == 'inbox' else 'Settings' }}</h1><p>{{ 'Review pending library selections and apply approved albums.' if page == 'inbox' else 'Manage storage, integrations, and the active beets configuration.' }}</p></header>
   {% endif %}
   {% for category, message in get_flashed_messages(with_categories=true) %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}
-  <form method="post">
+  <form method="post" action="{{ url_for('setup') if first_run else url_for('settings') }}">
     {% if not first_run %}
     <div class="settings-tabs" role="tablist" aria-label="Settings sections">
       <button class="settings-tab" id="settings-tab-general" type="button" role="tab" aria-selected="true" aria-controls="settings-panel-general" tabindex="0" data-settings-tab="general">General</button>

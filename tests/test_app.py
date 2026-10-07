@@ -3467,12 +3467,24 @@ def test_setup_and_settings_routes_have_distinct_lifecycle_pages(tmp_path):
     setup_page = client.get("/setup")
     assert b'class="setup-mode"' in setup_page.data
     assert b'Set up Cratekeep' in setup_page.data
+    assert b'<form method="post" action="/setup">' in setup_page.data
 
-    client.post("/setup", data={
+    setup_response = client.post("/setup", data={
         "inbox_path": str(tmp_path / "inbox"),
         "library_path": str(tmp_path / "library"),
     })
+    assert setup_response.status_code == 302
+    assert setup_response.headers["Location"].endswith("/")
     assert client.get("/setup").headers["Location"].endswith("/settings")
+
+    settings_page = client.get("/settings")
+    assert settings_page.status_code == 200
+    assert b'<form method="post" action="/settings">' in settings_page.data
+
+    inbox_page = client.get("/inbox")
+    assert inbox_page.status_code == 200
+    assert b'<form method="post" action="/settings">' in inbox_page.data
+    assert client.post("/inbox").status_code == 405
 
 
 def tagged_wav(path: Path, *, artist: str, album: str, title: str = "Track") -> None:
