@@ -190,6 +190,7 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
     return {
         "provider_id": release.get("id", ""), "release_group_id": release_group.get("id"),
         "artist": artist, "album": release.get("title", ""), "date": date,
+        "release_disambiguation": " ".join(str(release.get("disambiguation") or "").split()),
         "year": date[:4] if date else None, "track_count": release.get("track-count", len(flattened)),
         "release_type": release_group.get("primary-type"), "country": release.get("country"),
         "media": media, "tracks": flattened,

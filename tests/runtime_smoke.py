@@ -34,6 +34,7 @@ TRACKS = {
     "feature_realest": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "09 U Da Realest.wav",
     "feature_ratchet": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "10 Mainstream Ratchet.wav",
     "feature_disabled": Path("Disabled Lead") / "Disabled Feature Album" / "01 Disabled Song.wav",
+    "deluxe": Path("Big Sean") / "Dark Sky Paradise (Deluxe)" / "01 Blessings.wav",
     "queue_safe": Path("Queue Safe") / "Safe Match" / "01 Safe.wav",
     "queue_tied": Path("Queue Tied") / "Tied Match" / "01 Tied.wav",
     "queue_lower": Path("Queue Lower") / "Lower Match" / "01 Lower.wav",
@@ -46,6 +47,7 @@ GENRES = {"case": "Alternative Rock", "sidecar": "Rock", "embed": "Jazz", "prese
 CASE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174099"
 SEARCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174077"
 EXISTING_SIDECAR_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174002"
+DELUXE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174010"
 
 
 def request_json(url: str):
@@ -102,9 +104,14 @@ def make_fixture(root: Path) -> dict[str, Path]:
                 tags.artist = "Disabled Lead feat. Guest"
                 tags.albumartist = "Disabled Lead"
             tags.save()
-    # Fifteen real top-level scopes plus these 111 empty scopes make exactly
+        if name == "deluxe":
+            tags.title = "Blessings"
+            tags.artist = "Big Sean feat. Drake"
+            tags.albumartist = "Big Sean"
+            tags.save()
+    # Sixteen real top-level scopes plus these 110 empty scopes make exactly
     # 126 active rows, so removing one ready folder exercises a 6 -> 5 clamp.
-    for number in range(111):
+    for number in range(110):
         (root / "library" / f"ZZ Pagination Folder {number:03d}").mkdir(parents=True)
     return tracks
 
@@ -304,6 +311,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     sequential_proof: list[dict] = []
     inline_scan_state_proof: dict[str, dict[str, str]] = {}
     ftintitle_config_proof: dict[str, object] = {}
+    deluxe_proof: dict[str, object] = {}
     inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -568,6 +576,74 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator("#settings-tab-library-import").click()
         page.get_by_text("2 folders selected", exact=False).wait_for()
         page.screenshot(path=evidence / "03-selection-restored.png", full_page=True)
+
+        # Exact-release edition evidence projects the confirmed local suffix
+        # through review, dry-run, database, and file tags without changing the
+        # raw MusicBrainz title or appending the unrelated "clean" note.
+        deluxe_review = open_folder_album("Big Sean")
+        deluxe_review.click(force=True)
+        page.locator("#library-import-modal:not([hidden])").wait_for()
+        page.locator("#library-import-open-mbid-search").click()
+        page.locator("#library-import-mbid").fill(DELUXE_RELEASE_ID)
+        with page.expect_response(lambda response: response.url.endswith("/rematch")) as deluxe_rematch:
+            page.locator("#library-import-mbid-search").click()
+        assert deluxe_rematch.value.status == 200
+        deluxe_payload = deluxe_rematch.value.json()
+        deluxe_candidate = deluxe_payload["proposed_match"]
+        assert deluxe_candidate["album"] == "Dark Sky Paradise (Deluxe)"
+        assert deluxe_candidate["release_disambiguation"] == "deluxe, clean"
+        assert "album" not in deluxe_candidate["proposed_diff"]
+        assert deluxe_candidate["recordings"][0]["title"] == "Blessings feat. Drake"
+        facts = page.locator(".candidate-option[open] .candidate-fact")
+        assert facts.filter(has_text="Album").locator("dd").first.inner_text() == "Dark Sky Paradise (Deluxe)"
+        assert facts.filter(has_text="MusicBrainz release note").locator("dd").inner_text() == "deluxe, clean"
+        assert facts.filter(has_text="Album").first.get_attribute("data-changed") == "false"
+        with sqlite3.connect(state_path / "app.db") as database:
+            deluxe_raw = json.loads(database.execute(
+                "SELECT provider_data_json FROM metadata_candidates WHERE id = ?", (deluxe_candidate["id"],),
+            ).fetchone()[0])
+        assert deluxe_raw["album"] == "Dark Sky Paradise"
+        assert deluxe_raw["release_disambiguation"] == "deluxe, clean"
+        page.screenshot(path=evidence / "04-deluxe-review-desktop-dark.png", full_page=True)
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.screenshot(path=evidence / "04-deluxe-review-narrow-dark.png", full_page=True)
+        assert page.locator(".album-modal-dialog").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        ), "narrow deluxe review must not overflow"
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        preview_response = page.evaluate("""async ({albumId, candidateId}) => {
+          const response = await fetch(`/api/library-import/albums/${albumId}/preview`, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({candidate_id:candidateId}),
+          });
+          return {status: response.status, body: await response.json()};
+        }""", {"albumId": deluxe_payload["id"], "candidateId": deluxe_candidate["id"]})
+        assert preview_response["status"] == 200
+        preview_changes = preview_response["body"]["items"][0]["changes"]
+        assert "album" not in preview_changes
+        assert preview_changes["title"] == {"from": "Blessings", "to": "Blessings feat. Drake"}
+        assert preview_changes["artist"] == {"from": "Big Sean feat. Drake", "to": "Big Sean"}
+        with page.expect_response(lambda response: response.url.endswith("/execute")) as deluxe_execute:
+            page.locator("#library-import-in-place").click()
+        assert deluxe_execute.value.status == 201
+        deluxe_result = deluxe_execute.value.json()
+        assert deluxe_result["items"][0]["changes"] == preview_changes
+        deluxe_tags = MediaFile(str(tracks["deluxe"]))
+        assert (deluxe_tags.album, deluxe_tags.title, deluxe_tags.artist) == (
+            "Dark Sky Paradise (Deluxe)", "Blessings feat. Drake", "Big Sean",
+        )
+        deluxe_proof = {
+            "review_album": deluxe_candidate["album"],
+            "release_note": deluxe_candidate["release_disambiguation"],
+            "raw_provider_album": deluxe_raw["album"],
+            "raw_provider_release_note": deluxe_raw["release_disambiguation"],
+            "preview_changes": preview_changes,
+            "execution_changes": deluxe_result["items"][0]["changes"],
+            "file": {"album": deluxe_tags.album, "title": deluxe_tags.title, "artist": deluxe_tags.artist},
+        }
+        page.locator("#library-import-in-place", has_text="Close").click()
+        page.locator("#library-import-modal").wait_for(state="hidden")
+
         candidate_review = open_folder_album("Sidecar Artist")
         candidate_review.click(force=True)
         page.locator("#library-import-modal:not([hidden])").wait_for()
@@ -879,6 +955,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         "inline_scan_state_proof": inline_scan_state_proof,
         "sequential_candidate_proof": sequential_proof,
         "ftintitle_config_proof": ftintitle_config_proof,
+        "deluxe_edition_proof": deluxe_proof,
         "inbox_retention": {"before": inbox_before, "after": inbox_after},
     }
 

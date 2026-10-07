@@ -1791,6 +1791,85 @@ def test_enabled_ftintitle_projection_equals_preview_database_and_file_tags(tmp_
     assert (tags.title, tags.artist, tags.albumartist) == ("Song feat. Guest", expected_artist, "Lead")
 
 
+def test_confirmed_release_edition_matches_review_preview_database_file_and_rematch(tmp_path):
+    app = make_app(tmp_path)
+    app.config["FTINTITLE"] = {
+        **app.config["FTINTITLE"], "enabled": True, "format": "feat. {0}", "keep_in_artist": False,
+    }
+
+    def provider(query, *, limit):
+        return [{
+            "provider_id": query.get("musicbrainz_id", "123e4567-e89b-42d3-a456-426614174010"),
+            "artist": "Big Sean", "album": "Dark Sky Paradise",
+            "release_disambiguation": "deluxe, clean", "track_count": 1,
+            "tracks": [{
+                "title": "Blessings", "track_artist": "Big Sean feat. Drake",
+                "artist_credit_source": "track", "position": 1, "medium_position": 1,
+                "length_ms": 1000, "recording_id": "recording-blessings",
+            }],
+        }]
+
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    path = tmp_path / "library" / "Big Sean" / "Dark Sky Paradise (Deluxe)" / "01 Blessings.wav"
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.title = "Blessings"; media.artist = "Big Sean feat. Drake"; media.albumartist = "Big Sean"
+    media.album = "Dark Sky Paradise (Deluxe)"; media.track = media.disc = 1; media.save()
+    client = app.test_client()
+
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate = album["candidates"][0]
+    assert candidate["album"] == "Dark Sky Paradise (Deluxe)"
+    assert candidate["release_disambiguation"] == "deluxe, clean"
+    assert "album" not in candidate["proposed_diff"]
+    assert candidate["recordings"][0]["title"] == "Blessings feat. Drake"
+    assert candidate["track_details"][0]["proposed"] == "Blessings feat. Drake"
+    with sqlite3.connect(app.config["APP_DB"]) as database:
+        stored = database.execute(
+            "SELECT album, proposed_diff_json, provider_data_json FROM metadata_candidates WHERE id = ?",
+            (candidate["id"],),
+        ).fetchone()
+    raw = json.loads(stored[2])
+    assert stored[0] == raw["album"] == "Dark Sky Paradise"
+    assert "album" not in json.loads(stored[1])
+    assert raw["release_disambiguation"] == "deluxe, clean"
+
+    release_id = "123e4567-e89b-42d3-a456-426614174011"
+    rematched = client.post(
+        f'/api/library-import/albums/{album["id"]}/rematch', json={"musicbrainz_id": release_id},
+    )
+    assert rematched.status_code == 200
+    candidate = rematched.json["proposed_match"]
+    assert candidate["provider_id"] == release_id
+    assert candidate["album"] == "Dark Sky Paradise (Deluxe)"
+    assert candidate["release_disambiguation"] == "deluxe, clean"
+    assert "album" not in candidate["proposed_diff"]
+
+    assert client.patch(f'/api/library-import/albums/{album["id"]}', json={
+        "decision": "approved", "candidate_id": candidate["id"],
+    }).status_code == 200
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={"dry_run": True})
+    assert preview.status_code == 200
+    changes = preview.json["items"][0]["changes"]
+    assert "album" not in changes
+    assert changes["title"] == {"from": "Blessings", "to": "Blessings feat. Drake"}
+    assert changes["artist"] == {"from": "Big Sean feat. Drake", "to": "Big Sean"}
+
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={})
+    assert executed.status_code == 201
+    assert executed.json["items"][0]["changes"] == changes
+    item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
+    tags = MediaFile(str(path))
+    assert (item.album, item.title, item.artist) == (
+        "Dark Sky Paradise (Deluxe)", "Blessings feat. Drake", "Big Sean",
+    )
+    assert (tags.album, tags.title, tags.artist) == (
+        "Dark Sky Paradise (Deluxe)", "Blessings feat. Drake", "Big Sean",
+    )
+
+
 def test_ftintitle_custom_marker_and_bracket_projection_reaches_final_tags(tmp_path):
     app = make_app(tmp_path)
     client = app.test_client()
@@ -2440,6 +2519,18 @@ def test_musicbrainz_track_artist_credit_precedence_joinphrases_and_fallbacks():
     assert _artist_credit_text([{"name": "Partial", "joinphrase": " feat. "}, None]) == ""
 
 
+@pytest.mark.parametrize("exact", [False, True])
+def test_musicbrainz_release_parser_preserves_whitespace_normalized_disambiguation(exact):
+    release = _normalize_release({
+        "id": "release", "title": "Dark Sky Paradise",
+        "disambiguation": "  deluxe,   clean  ",
+        "artist-credit": [{"name": "Big Sean"}], "media": [],
+    }, exact=exact)
+
+    assert release["album"] == "Dark Sky Paradise"
+    assert release["release_disambiguation"] == "deluxe, clean"
+
+
 def test_musicbrainz_http_404_is_a_release_not_found_error(monkeypatch):
     def missing(request, timeout):
         raise urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
@@ -3024,7 +3115,7 @@ def test_legacy_candidates_are_marked_stale_then_refreshed_without_losing_decisi
     assert refreshed["selected_candidate_id"] == refreshed["candidates"][0]["id"]
     assert refreshed["candidate_status"] == "complete"
     with sqlite3.connect(app.config["APP_DB"]) as db:
-        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 4
+        assert db.execute("SELECT schema_version FROM metadata_candidates").fetchone()[0] == 5
 
     restarted.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
         "provider_id": "different-release", "artist": query["artist"], "album": query["album"],
@@ -3378,6 +3469,27 @@ def test_ftintitle_projection_uses_upstream_parsing_and_formatting(tmp_path):
     assert projected["tracks"][3] == {"title": "Existing feat. Guest", "track_artist": "Lead"}
     assert projected["tracks"][4] == candidate["tracks"][4]
     assert projected["tracks"][5] == candidate["tracks"][5]
+
+
+@pytest.mark.parametrize(("local_album", "canonical_album", "release_note", "expected", "changed"), [
+    ("Dark Sky Paradise (Deluxe)", "Dark Sky Paradise", "deluxe", "Dark Sky Paradise (Deluxe)", False),
+    ("Dark Sky Paradise [DELUXE]", "dark sky paradise", " deluxe,   clean ", "Dark Sky Paradise [DELUXE]", False),
+    ("Dark Sky Paradise", "Dark Sky Paradise", "deluxe", "Dark Sky Paradise", False),
+    ("Dark Sky Paradise (Remastered)", "Dark Sky Paradise", "deluxe", "Dark Sky Paradise", True),
+    ("Dark Sky Paradise (Deluxe)", "Dark Sky Paradise (Deluxe)", "deluxe", "Dark Sky Paradise (Deluxe)", False),
+])
+def test_reviewed_library_album_edition_projection_is_conservative(
+    tmp_path, local_album, canonical_album, release_note, expected, changed,
+):
+    app = make_app(tmp_path)
+    candidate = {"album": canonical_album, "release_disambiguation": release_note, "tracks": []}
+
+    projected = _effective_candidate(app, candidate, {"album": local_album})
+
+    assert projected["album"] == expected
+    assert candidate == {"album": canonical_album, "release_disambiguation": release_note, "tracks": []}
+    diff = _candidate_diff({"artist": "", "album": local_album, "tracks": []}, projected)
+    assert diff.get("album") == ({"from": local_album, "to": expected} if changed else None)
 
 
 def test_ftintitle_preserve_album_artist_candidate_semantics(tmp_path):

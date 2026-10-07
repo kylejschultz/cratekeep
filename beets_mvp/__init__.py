@@ -47,7 +47,7 @@ MAX_LIBRARY_IMPORT_ALBUMS = 50
 MAX_CANDIDATE_ALBUMS = 25
 MAX_CANDIDATES_PER_ALBUM = 5
 FOLDER_PAGE_SIZE = 25
-CANDIDATE_SCHEMA_VERSION = 4
+CANDIDATE_SCHEMA_VERSION = 5
 LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
 DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip"}
 MUSICBRAINZ_ID_PATTERN = re.compile(
@@ -1933,16 +1933,35 @@ def _candidate_match(query: dict, candidate: dict, *, exact_mbid: bool = False) 
     return score_release(query, candidate, exact_mbid=exact)
 
 
-def _effective_candidate(app: Flask, candidate: dict) -> dict:
-    """Project explicitly supported plugin behavior without mutating evidence.
+def _effective_candidate(app: Flask, candidate: dict, query: dict | None = None) -> dict:
+    """Project reviewed-Library behavior without mutating provider evidence.
 
-    Provider JSON remains the audit source. This adapter only calls the bundled
-    FtInTitle parser helpers; it never constructs a plugin or runs import hooks.
+    Provider JSON remains the audit source. Album-edition preservation requires
+    local Library metadata and is deliberately not applied to Inbox/beets CLI
+    imports. FtInTitle projection only calls bundled parser helpers; it never
+    constructs a plugin or runs import hooks.
     """
+    projected = dict(candidate)
+    local_album = _normalize_metadata(query.get("album")) if isinstance(query, dict) else ""
+    canonical_album = _normalize_metadata(candidate.get("album"))
+    suffix = re.fullmatch(
+        r"(?P<base>.+?)\s*(?:\((?P<parenthesized>[^\[\]()]+)\)|\[(?P<bracketed>[^\[\]()]+)\])",
+        local_album,
+    )
+    if suffix:
+        local_base = _normalize_metadata(suffix.group("base"))
+        qualifier = _normalize_metadata(suffix.group("parenthesized") or suffix.group("bracketed"))
+        release_notes = [
+            _normalize_metadata(part) for part in
+            re.split(r"[,;]", str(candidate.get("release_disambiguation") or ""))
+        ]
+        if (_metadata_key(canonical_album) == _metadata_key(local_base)
+                and _metadata_key(qualifier) in {_metadata_key(note) for note in release_notes if note}):
+            projected["album"] = local_album
+
     options = app.config.get("FTINTITLE", FTINTITLE_DEFAULTS)
     if not options.get("enabled"):
-        return candidate
-    projected = dict(candidate)
+        return projected
     albumartist = _normalize_metadata(candidate.get("artist"))
     projected_tracks = []
     drop_feat = bool(options.get("drop", False))
@@ -2072,9 +2091,9 @@ def _rematch_album_by_musicbrainz_id(app: Flask, album_review_id: int, musicbrai
             (album_review_id, musicbrainz_id),
         ).fetchone()
         values = (
-            1, _candidate_confidence(query, _effective_candidate(app, candidate), exact_mbid=True), _normalize_metadata(candidate.get("artist")),
+            1, _candidate_confidence(query, _effective_candidate(app, candidate, query), exact_mbid=True), _normalize_metadata(candidate.get("artist")),
             _normalize_metadata(candidate.get("album")), str(candidate.get("year")) if candidate.get("year") else None,
-            json.dumps(_candidate_diff(query, _effective_candidate(app, candidate)), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
+            json.dumps(_candidate_diff(query, _effective_candidate(app, candidate, query)), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
         )
         if existing:
             candidate_id = existing["id"]
@@ -2121,7 +2140,7 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[
                 if isinstance(candidate, dict) and candidate.get("provider_id")
             ]
             candidates.sort(key=lambda candidate: (
-                -_candidate_confidence(query, _effective_candidate(app, candidate)), str(candidate["provider_id"])
+                -_candidate_confidence(query, _effective_candidate(app, candidate, query)), str(candidate["provider_id"])
             ))
             with _connect(app.config["APP_DB"]) as db:
                 selected = db.execute(
@@ -2152,10 +2171,10 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[
                                year, proposed_diff_json, provider_data_json, schema_version, created_at
                            ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (album["id"], str(candidate["provider_id"]), rank,
-                         _candidate_confidence(query, _effective_candidate(app, candidate)),
+                         _candidate_confidence(query, _effective_candidate(app, candidate, query)),
                          _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
                          str(candidate.get("year")) if candidate.get("year") else None,
-                         json.dumps(_candidate_diff(query, _effective_candidate(app, candidate)), sort_keys=True),
+                         json.dumps(_candidate_diff(query, _effective_candidate(app, candidate, query)), sort_keys=True),
                          json.dumps(candidate, sort_keys=True), CANDIDATE_SCHEMA_VERSION, _now()),
                     )
                 selected_id = None
@@ -2167,7 +2186,7 @@ def _generate_musicbrainz_candidates(app: Flask, limit: int, *, album_ids: list[
                     ).fetchone()
                     selected_id = refreshed["id"] if refreshed else None
                 elif candidates:
-                    matches = [_candidate_match(query, _effective_candidate(app, candidate)) for candidate in candidates]
+                    matches = [_candidate_match(query, _effective_candidate(app, candidate, query)) for candidate in candidates]
                     best = matches[0]
                     tied = len(matches) > 1 and matches[1]["confidence"] == best["confidence"]
                     exact_tracks = (
@@ -2314,7 +2333,7 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
             serialized_candidates = []
             for candidate in candidates:
                 provider_data = json.loads(candidate["provider_data_json"])
-                effective_candidate = _effective_candidate(app, provider_data)
+                effective_candidate = _effective_candidate(app, provider_data, query)
                 match = _candidate_match(query, effective_candidate)
                 serialized_candidates.append({
                     "id": candidate["id"], "provider": candidate["provider"],
@@ -2326,12 +2345,14 @@ def _album_review_payloads(app: Flask, album_ids: list[int] | None = None) -> li
                     "unmatched_track_count": match["unmatched_track_count"],
                     "hard_mismatches": match["hard_mismatches"],
                     "selected_by_mbid": match["selected_by_mbid"],
-                    "artist": candidate["artist"], "album": candidate["album"], "year": candidate["year"],
+                    "artist": _normalize_metadata(effective_candidate.get("artist")),
+                    "album": _normalize_metadata(effective_candidate.get("album")), "year": candidate["year"],
                     "genre": _candidate_genre(effective_candidate) or None,
                     "genre_evidence": provider_data.get("genre_evidence"),
                     "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
                     "release_type": provider_data.get("release_type"),
                     "release_status": provider_data.get("status"), "country": provider_data.get("country"),
+                    "release_disambiguation": provider_data.get("release_disambiguation"),
                     "artwork_url": _persisted_artwork_source(provider_data),
                     "artwork": provider_data.get("artwork"),
                     "media": provider_data.get("media", []), "recordings": effective_candidate.get("tracks", []),
@@ -2631,7 +2652,7 @@ def _library_import_plans(
     details = {}
     if provider_data:
         query = _album_query(app, album)
-        provider_data = _effective_candidate(app, provider_data)
+        provider_data = _effective_candidate(app, provider_data, query)
         details = {
             detail["position"]: detail for detail in _candidate_match(query, provider_data)["track_details"]
             if detail.get("local") is not None

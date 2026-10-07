@@ -1129,6 +1129,7 @@
         year:['M3 5h18v16H3z','M16 3v4','M8 3v4','M3 10h18'],
         tracks:['M4 6h16','M4 12h16','M4 18h10'],
         media:['M4 5h16v14H4z','M8 9h8','M8 15h8','M9 15l-1 4','M15 15l1 4'],
+        note:['M5 3h14v18H5z','M8 8h8','M8 12h8','M8 16h5'],
         region:['M5 21V4','M5 5h11l-1 4 1 4H5'],
         local:['M6 2h8l4 4v16H6z','M14 2v5h5','m9 14 2 2 4-4'],
         online:['M7 18h10a4 4 0 0 0 .4-8 6 6 0 0 0-11.3 1.2A3.5 3.5 0 0 0 7 18','m9 14 2 2 4-4'],
@@ -1257,6 +1258,7 @@
         return [
           {kind:'artist', label:'Artist', value:value.artist || 'Unknown artist', changed:!value.is_as_is && metadataChanged(current.artist, value.artist)},
           {kind:'album', label:'Album', value:value.album || 'Unknown album', changed:!value.is_as_is && metadataChanged(current.album, value.album)},
+          ...(!value.is_as_is && value.release_disambiguation ? [{kind:'note', label:'MusicBrainz release note', value:value.release_disambiguation, changed:false}] : []),
           {kind:'genre', label:'Genre', value:genreEvidence, changed:!value.is_as_is && Boolean(value.genre) && metadataChanged(current.genre, value.genre)},
           {kind:'year', label:'Release Year', value:year.value, changed:year.changed, localYear:year.localYear, proposedYear:year.proposedYear, comparison:year.changed},
           {kind:'tracks', label:'Tracks changed', value:trackChanges.length ? `${trackChanges.length} track${trackChanges.length === 1 ? '' : 's'} changed` : 'All tracks matched', changed:trackChanges.length > 0, changeCount:trackChanges.length, tracks:trackChanges, expandable:!value.is_as_is},
