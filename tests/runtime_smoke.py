@@ -425,13 +425,19 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as scan_info:
             # Dispatch synchronously so the intentionally brief queued render is
             # observed before the handler's two-animation-frame transition.
-            page.evaluate("document.getElementById('library-import-scan-selected').click()")
-            queued = {
-                "safe": safe_status.inner_text(),
-                "sequential": sequential_status.inner_text(),
-                "unselected": unselected_status.inner_text(),
-            }
-            assert queued == {"safe": "Queued", "sequential": "Queued", "unselected": unselected_status_before}
+            queued = page.evaluate("""() => {
+              const status = path => document.querySelector(
+                `.review-folder[data-folder-path="${path}"] .status-pill`
+              ).innerText.trim();
+              document.getElementById('library-import-scan-selected').click();
+              return {
+                safe: status('Queue Safe'),
+                sequential: status('Queue Sequential'),
+                unselected: status('Queue Unselected'),
+              };
+            }""")
+            expected_queued = {"safe": "Queued", "sequential": "Queued", "unselected": unselected_status_before}
+            assert queued == expected_queued, f"queued status mismatch: expected {expected_queued}, got {queued}"
             inline_scan_state_proof["queued"] = queued
             page.wait_for_function("""() => {
               const selected = ['Queue Safe', 'Queue Sequential'];
