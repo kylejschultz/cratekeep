@@ -69,6 +69,7 @@ button,.save-button { min-height:2.1rem; padding:.35rem .65rem; }
 }
 @media (max-width:520px) {
   .content main,main { padding:.7rem; }
+  .summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
 }
 @media (pointer:coarse) {
   :is(button,.nav-link,input,select,summary) { min-height:2.75rem; }
