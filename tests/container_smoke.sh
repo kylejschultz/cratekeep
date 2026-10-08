@@ -7,12 +7,24 @@ fixture_root=$(mktemp -d "${TMPDIR:-/tmp}/cratekeep-container-smoke.XXXXXX")
 container_name="cratekeep-smoke-$$"
 python_bin=${PYTHON:-python3}
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+source_patch="$fixture_root/source.patch"
 
 cleanup() {
   docker rm -f "$container_name" >/dev/null 2>&1 || true
   rm -rf "$fixture_root"
 }
 trap cleanup EXIT INT TERM
+
+source_commit=$(git -C "$repo_root" rev-parse --verify HEAD)
+if git -C "$repo_root" rev-parse --verify HEAD^ >/dev/null 2>&1; then
+  git -C "$repo_root" diff --binary HEAD^..HEAD > "$source_patch"
+else
+  empty_tree=$(git -C "$repo_root" hash-object -t tree /dev/null)
+  git -C "$repo_root" diff --binary "$empty_tree" HEAD > "$source_patch"
+fi
+source_diff_sha256=$("$python_bin" -c \
+  'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+  "$source_patch")
 
 mkdir -p "$fixture_root/state" "$fixture_root/fixtures"
 chmod 0777 "$fixture_root/state" "$fixture_root/fixtures"
@@ -50,4 +62,6 @@ PYTHONPATH="$repo_root:$repo_root/tests${PYTHONPATH:+:$PYTHONPATH}" "$python_bin
   --app-inbox /fixtures/inbox \
   --app-library /fixtures/library \
   --state-path "$fixture_root/state" \
-  --evidence-dir "$evidence"
+  --evidence-dir "$evidence" \
+  --source-commit "$source_commit" \
+  --source-diff-sha256 "$source_diff_sha256"

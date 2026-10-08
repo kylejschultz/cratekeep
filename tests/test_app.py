@@ -67,6 +67,28 @@ def test_health_and_empty_lists(tmp_path):
     assert app.config["BEETS_DB"] == str(tmp_path / "config" / "library.db")
     assert app.config["BEETS_CONFIG"] == str(tmp_path / "config" / "config.yaml")
 
+
+def test_container_smoke_forwards_every_required_runtime_option():
+    repo_root = Path(__file__).resolve().parent.parent
+    runtime = (repo_root / "tests/runtime_smoke.py").read_text(encoding="utf-8")
+    wrapper = (repo_root / "tests/container_smoke.sh").read_text(encoding="utf-8")
+    required = set(re.findall(
+        r'parser\.add_argument\(\s*["\'](?P<option>--[a-z0-9-]+)["\'][^)]*required=True',
+        runtime,
+    ))
+    invocation = wrapper.split('"$python_bin" tests/runtime_smoke.py', 1)[1]
+
+    assert required == {
+        "--fixture-root", "--state-path", "--evidence-dir",
+        "--source-commit", "--source-diff-sha256",
+    }
+    assert required <= set(re.findall(r"--[a-z0-9-]+", invocation))
+    assert '--source-commit "$source_commit"' in invocation
+    assert '--source-diff-sha256 "$source_diff_sha256"' in invocation
+    assert 'git -C "$repo_root" diff --binary HEAD^..HEAD' in wrapper
+    assert 'git -C "$repo_root" diff --binary "$empty_tree" HEAD' in wrapper
+
+
 def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     page = make_app(tmp_path).test_client().get("/")
 
