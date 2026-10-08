@@ -1,6 +1,7 @@
 import hashlib
 import json
 import copy
+import re
 from io import BytesIO
 import shutil
 import sqlite3
@@ -2171,7 +2172,7 @@ def test_inbox_route_owns_library_import_review_workspace(tmp_path):
     assert b": \"library-import\");" in page.data
 
 
-def test_library_route_exposes_summary_search_sort_and_existing_edits(tmp_path):
+def test_library_route_is_album_first_searchable_and_lazy(tmp_path):
     app = make_app(tmp_path)
     root = tmp_path / "library"
     library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
@@ -2185,7 +2186,8 @@ def test_library_route_exposes_summary_search_sort_and_existing_edits(tmp_path):
     ]
     for item in tracks:
         Path(item.path.decode()).write_bytes(b"audio")
-        library.add(item)
+    first_album = library.add_album([tracks[1], tracks[2]])
+    shared_album = library.add_album([tracks[0]])
 
     client = app.test_client()
     page = client.get("/library")
@@ -2194,28 +2196,460 @@ def test_library_route_exposes_summary_search_sort_and_existing_edits(tmp_path):
     assert b"<span>Tracks</span><strong>3</strong>" in page.data
     assert b"<span>Albums</span><strong>2</strong>" in page.data
     assert b"<span>Artists</span><strong>2</strong>" in page.data
-    assert b"Top artists" in page.data and b"Recently added" in page.data
+    assert b"Top artists" in page.data and b"Recently added albums" in page.data
     assert b'name="q" type="search"' in page.data
     assert b'name="sort"' in page.data and b'name="order"' in page.data
-    assert b'action="/api/items/' in page.data
+    browse = page.data.split(b'id="browse-title"', 1)[1]
+    assert b"Browse albums" in page.data
+    assert b"Alpha Song" not in browse and b"Beta Song" not in browse
+    assert b'action="/api/items/' not in page.data
+    assert f'data-album-id="{first_album.id}"'.encode() in page.data
+    assert f'data-album-id="{shared_album.id}"'.encode() in page.data
 
-    filtered = client.get("/library?q=artist+b&sort=title&order=desc")
+    filtered = client.get("/library?q=artist+b&sort=album&order=desc")
     browse = filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Beta Song" in browse
-    assert b"Alpha Song" not in browse
-    assert b'option value="title" selected' in filtered.data
+    assert b"Shared" in browse and b"First" not in browse
+    assert b'option value="album" selected' in filtered.data
     assert b'option value="desc" selected' in filtered.data
 
-    artist_filtered = client.get("/library?q=song&sort=title&order=desc&artist=Artist+A")
+    artist_filtered = client.get("/library?q=song&sort=album&order=desc&artist=Artist+A")
     artist_browse = artist_filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Alpha Song" in artist_browse and b"Beta Song" not in artist_browse
+    assert b"First" in artist_browse and b"Shared" not in artist_browse
     assert b'name="artist" value="Artist A"' in artist_filtered.data
-    assert b'q=song&amp;sort=title&amp;order=desc&amp;artist=Artist+A' in artist_filtered.data
 
     album_filtered = client.get("/library?sort=album&order=asc&album=Shared")
     album_browse = album_filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Beta Song" in album_browse and b"Alpha Song" not in album_browse
+    assert b"Shared" in album_browse and b"First" not in album_browse
     assert b'name="album" value="Shared"' in album_filtered.data
+
+    detail = client.get(f"/api/library/albums/{first_album.id}")
+    assert [track["title"] for track in detail.json["tracks"]] == ["Alpha Song", "Other Song"]
+
+
+def managed_wav_album(app, tmp_path, *, artist="Artist", album_name="Album", titles=("First", "Second")):
+    items = []
+    for number, title in enumerate(titles, 1):
+        path = tmp_path / "library" / artist / album_name / f"{number:02d} {title}.wav"
+        write_wav(path)
+        media = MediaFile(str(path))
+        media.title, media.artist, media.albumartist, media.album = title, artist, artist, album_name
+        media.genre, media.year, media.track, media.disc = "Rock", 2020, number, 1
+        media.save()
+        item = Item.from_path(path)
+        item.albumartist = artist
+        items.append(item)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    return library, library.add_album(items), paths_for_items(items)
+
+
+def paths_for_items(items):
+    return [Path(item.path.decode()) for item in items]
+
+
+def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path):
+    app = make_app(tmp_path)
+    library, album, paths = managed_wav_album(app, tmp_path)
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    original_tracks = copy.deepcopy(opened["tracks"])
+    original_paths = [path.resolve() for path in paths]
+
+    edited = client.patch(f"/api/library/albums/{album.id}", json={
+        "album": "New Album", "albumartist": "New Album Artist", "genre": "Jazz", "year": 2024,
+        "expected_fingerprint": opened["fingerprint"],
+    })
+    assert edited.status_code == 200
+    assert edited.json["album"]["fingerprint"] != opened["fingerprint"]
+    for before, after in zip(original_tracks, edited.json["album"]["tracks"]):
+        assert (after["album"], after["albumartist"], after["genre"], after["year"]) == (
+            "New Album", "New Album Artist", "Jazz", 2024,
+        )
+        assert (after["title"], after["artist"], after["track"], after["disc"]) == (
+            before["title"], before["artist"], before["track"], before["disc"],
+        )
+    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+    for path in paths:
+        media = MediaFile(str(path))
+        assert (media.album, media.albumartist, media.genre, media.year) == (
+            "New Album", "New Album Artist", "Jazz", 2024,
+        )
+
+    second_id = edited.json["album"]["tracks"][1]["id"]
+    track_edit = client.patch(f"/api/library/albums/{album.id}/tracks/{second_id}", json={
+        "title": "Changed Second", "artist": "Guest", "album": "New Album",
+        "albumartist": "New Album Artist", "genre": "Jazz", "year": 2024, "track": 2, "disc": 1,
+        "expected_fingerprint": edited.json["album"]["fingerprint"],
+    })
+    assert track_edit.status_code == 200
+    assert [track["title"] for track in track_edit.json["album"]["tracks"]] == ["First", "Changed Second"]
+    assert MediaFile(str(paths[0])).title == "First"
+    assert (MediaFile(str(paths[1])).title, MediaFile(str(paths[1])).artist) == ("Changed Second", "Guest")
+    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+
+    assert client.patch(f"/api/library/albums/{album.id}", json={
+        "genre": "Soul", "expected_fingerprint": opened["fingerprint"],
+    }).status_code == 409
+    assert client.patch(f"/api/library/albums/{album.id}", json={
+        "title": "Nope", "expected_fingerprint": track_edit.json["album"]["fingerprint"],
+    }).status_code == 400
+    assert client.patch(f"/api/library/albums/{album.id}", json={
+        "year": "not-an-int", "expected_fingerprint": track_edit.json["album"]["fingerprint"],
+    }).status_code == 400
+    assert client.patch(f"/api/library/albums/{album.id}", json={
+        "year": 2024.5, "expected_fingerprint": track_edit.json["album"]["fingerprint"],
+    }).status_code == 400
+    assert client.patch(f"/api/library/albums/{album.id}/tracks/999999", json={
+        "title": "Nope", "expected_fingerprint": track_edit.json["album"]["fingerprint"],
+    }).status_code == 404
+
+
+def test_managed_album_edit_rolls_back_first_file_and_database_on_second_write_failure(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    library, album, paths = managed_wav_album(app, tmp_path)
+    opened = app.test_client().get(f"/api/library/albums/{album.id}").json
+    original = [(MediaFile(str(path)).album, path.read_bytes()) for path in paths]
+    original_write = Item.write
+    calls = 0
+
+    def fail_second_write(item, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second-file failure")
+        return original_write(item, *args, **kwargs)
+
+    monkeypatch.setattr(Item, "write", fail_second_write)
+    response = app.test_client().patch(f"/api/library/albums/{album.id}", json={
+        "album": "Should Roll Back", "expected_fingerprint": opened["fingerprint"],
+    })
+    assert response.status_code == 500
+    assert response.json["code"] == "mutation_rolled_back"
+    refreshed = library.get_album(album.id)
+    assert [item.album for item in refreshed.items()] == ["Album", "Album"]
+    assert [MediaFile(str(path)).album for path in paths] == [value[0] for value in original]
+    assert [Path(item.path.decode()).resolve() for item in refreshed.items()] == [path.resolve() for path in paths]
+
+
+def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mutating(tmp_path):
+    app = make_app(tmp_path)
+    library, album, paths = managed_wav_album(
+        app, tmp_path, album_name="Dark Sky Paradise (Deluxe)", titles=("First Song", "Second Song")
+    )
+    release_id = "123e4567-e89b-42d3-a456-426614174000"
+    provider_calls = []
+
+    def provider(query, *, limit):
+        provider_calls.append((query["musicbrainz_id"], limit))
+        return [{
+            "provider_id": release_id, "release_group_id": "group-1", "artist": "Artist",
+            "album": "Dark Sky Paradise", "date": "2024-03-01", "year": "2024",
+            "release_disambiguation": "Deluxe", "country": "US", "release_type": "Album",
+            "track_count": 2, "media": [{"position": 1, "format": "CD"}],
+            "tracks": [
+                {"title": "First Song Remastered", "track_artist": "Artist", "position": 1,
+                 "medium_position": 1, "recording_id": "recording-1"},
+                {"title": "Second Song", "track_artist": "Artist", "position": 2,
+                 "medium_position": 1, "recording_id": "recording-2"},
+            ],
+            "retrieval": {"source": "release-id", "search_score": None},
+        }]
+
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    before_db = [(item.title, item.mb_trackid, Path(item.path.decode()).resolve()) for item in album.items()]
+    before_files = [path.read_bytes() for path in paths]
+    preview = client.post(f"/api/library/albums/{album.id}/rematch/preview", json={
+        "musicbrainz_id": release_id, "expected_fingerprint": opened["fingerprint"],
+    })
+    assert preview.status_code == 201
+    assert preview.json["applicable"] is True
+    assert preview.json["candidate"]["album"] == "Dark Sky Paradise (Deluxe)"
+    assert preview.json["candidate"]["raw_album"] == "Dark Sky Paradise"
+    assert preview.json["changes"][0]["changes"]["title"]["to"] == "First Song Remastered"
+    assert [(item.title, item.mb_trackid, Path(item.path.decode()).resolve()) for item in album.items()] == before_db
+    assert [path.read_bytes() for path in paths] == before_files
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        evidence, status = db.execute(
+            "SELECT evidence_json, status FROM managed_album_rematches WHERE id = ?",
+            (preview.json["preview_id"],),
+        ).fetchone()
+    assert json.loads(evidence)["album"] == "Dark Sky Paradise"
+    assert status == "pending"
+
+    applied = client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
+        "preview_id": preview.json["preview_id"], "expected_fingerprint": preview.json["fingerprint"],
+    })
+    assert applied.status_code == 200
+    assert applied.json["changes"] == preview.json["changes"]
+    assert provider_calls == [(release_id, 1)]
+    assert [item.title for item in library.get_album(album.id).items()] == ["First Song Remastered", "Second Song"]
+    assert [item.mb_trackid for item in library.get_album(album.id).items()] == ["recording-1", "recording-2"]
+    assert [MediaFile(str(path)).title for path in paths] == ["First Song Remastered", "Second Song"]
+    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == [path.resolve() for path in paths]
+    assert client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
+        "preview_id": preview.json["preview_id"], "expected_fingerprint": preview.json["fingerprint"],
+    }).status_code == 409
+
+
+def test_managed_album_rematch_rolls_back_on_second_tag_failure(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    library, album, paths = managed_wav_album(app, tmp_path)
+    release_id = "123e4567-e89b-42d3-a456-426614174000"
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": release_id, "artist": "Artist", "album": "Changed Album", "year": "2025",
+        "track_count": 2, "tracks": [
+            {"title": "First Updated", "track_artist": "Artist", "position": 1,
+             "medium_position": 1, "recording_id": "new-1"},
+            {"title": "Second Updated", "track_artist": "Artist", "position": 2,
+             "medium_position": 1, "recording_id": "new-2"},
+        ], "retrieval": {"source": "release-id"},
+    }]
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    preview = client.post(f"/api/library/albums/{album.id}/rematch/preview", json={
+        "musicbrainz_id": release_id, "expected_fingerprint": opened["fingerprint"],
+    }).json
+    assert preview["applicable"] is True
+    original_write = Item.write
+    calls = 0
+
+    def fail_second_write(item, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected rematch tag failure")
+        return original_write(item, *args, **kwargs)
+
+    monkeypatch.setattr(Item, "write", fail_second_write)
+    failed = client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
+        "preview_id": preview["preview_id"], "expected_fingerprint": preview["fingerprint"],
+    })
+    assert failed.status_code == 500 and failed.json["code"] == "mutation_rolled_back"
+    assert [(item.title, item.album, item.mb_trackid) for item in library.get_album(album.id).items()] == [
+        ("First", "Album", ""), ("Second", "Album", ""),
+    ]
+    assert [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths] == [
+        ("First", "Album"), ("Second", "Album"),
+    ]
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute(
+            "SELECT status FROM managed_album_rematches WHERE id = ?", (preview["preview_id"],)
+        ).fetchone()[0] == "pending"
+
+
+def test_managed_album_rematch_rolls_back_when_audit_claim_is_lost(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    library, album, paths = managed_wav_album(app, tmp_path)
+    release_id = "123e4567-e89b-42d3-a456-426614174000"
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": release_id, "artist": "Artist", "album": "Audited Album", "year": "2026",
+        "track_count": 2, "tracks": [
+            {"title": "Audited First", "track_artist": "Artist", "position": 1,
+             "medium_position": 1, "recording_id": "audit-1"},
+            {"title": "Audited Second", "track_artist": "Artist", "position": 2,
+             "medium_position": 1, "recording_id": "audit-2"},
+        ], "retrieval": {"source": "release-id"},
+    }]
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    preview = client.post(f"/api/library/albums/{album.id}/rematch/preview", json={
+        "musicbrainz_id": release_id, "expected_fingerprint": opened["fingerprint"],
+    }).json
+    original_db = [(item.title, item.album, item.mb_trackid, Path(item.path.decode()).resolve())
+                   for item in library.get_album(album.id).items()]
+    original_files = [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths]
+
+    import beets_mvp
+    original_finalize = beets_mvp._finalize_managed_rematch
+
+    def lose_audit_claim(target_app, preview_id, result):
+        with sqlite3.connect(target_app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE managed_album_rematches SET status = 'pending' WHERE id = ? AND status = 'applying'",
+                (preview_id,),
+            )
+        original_finalize(target_app, preview_id, result)
+
+    monkeypatch.setattr(beets_mvp, "_finalize_managed_rematch", lose_audit_claim)
+    failed = client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
+        "preview_id": preview["preview_id"], "expected_fingerprint": preview["fingerprint"],
+    })
+    assert failed.status_code == 500 and failed.json["code"] == "preview_audit_failed"
+    assert [(item.title, item.album, item.mb_trackid, Path(item.path.decode()).resolve())
+            for item in library.get_album(album.id).items()] == original_db
+    assert [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths] == original_files
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        row = db.execute(
+            "SELECT status, result_json, applied_at FROM managed_album_rematches WHERE id = ?",
+            (preview["preview_id"],),
+        ).fetchone()
+    assert row == ("pending", None, None)
+
+
+def test_managed_album_mismatched_mbid_preview_cannot_apply(tmp_path):
+    app = make_app(tmp_path)
+    _, album, paths = managed_wav_album(app, tmp_path)
+    release_id = "123e4567-e89b-42d3-a456-426614174000"
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": release_id, "artist": "Artist", "album": "Album", "track_count": 1,
+        "tracks": [{"title": "First", "track_artist": "Artist", "position": 1,
+                    "medium_position": 1, "recording_id": "recording-1"}],
+        "retrieval": {"source": "release-id"},
+    }]
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    before = [path.read_bytes() for path in paths]
+    preview = client.post(f"/api/library/albums/{album.id}/rematch/preview", json={
+        "musicbrainz_id": release_id, "expected_fingerprint": opened["fingerprint"],
+    })
+    assert preview.status_code == 201
+    assert preview.json["applicable"] is False
+    assert preview.json["inapplicable_reasons"]
+    apply = client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
+        "preview_id": preview.json["preview_id"], "expected_fingerprint": preview.json["fingerprint"],
+    })
+    assert apply.status_code == 409 and apply.json["code"] == "preview_not_applicable"
+    assert [path.read_bytes() for path in paths] == before
+
+
+def test_library_album_pagination_clamps_and_has_no_gaps(tmp_path):
+    app = make_app(tmp_path)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    ids = []
+    for number in range(26):
+        path = tmp_path / "library" / f"Artist {number % 2}" / f"Album {number:02d}" / "track.wav"
+        write_wav(path)
+        ids.append(library.add_album([Item(
+            title=f"Hidden Song {number:02d}", artist=f"Artist {number % 2}",
+            albumartist=f"Artist {number % 2}", album=f"Album {number:02d}", year=2000 + number,
+            track=1, disc=1, path=str(path),
+        )]).id)
+    client = app.test_client()
+    first = client.get("/library?sort=album&order=asc")
+    second = client.get("/library?sort=album&order=asc&page=2")
+    clamped = client.get("/library?sort=album&order=asc&page=999")
+    first_ids = re.findall(rb'data-album-id="(\d+)"', first.data)
+    second_ids = re.findall(rb'data-album-id="(\d+)"', second.data)
+    # Recently-added controls repeat five IDs outside Browse; isolate its section.
+    first_browse = first.data.split(b'id="browse-title"', 1)[1]
+    second_browse = second.data.split(b'id="browse-title"', 1)[1]
+    first_ids = re.findall(rb'class="album-card open-album" type="button" data-album-id="(\d+)"', first_browse)
+    second_ids = re.findall(rb'class="album-card open-album" type="button" data-album-id="(\d+)"', second_browse)
+    assert len(first_ids) == 25 and len(second_ids) == 1
+    assert len(set(first_ids + second_ids)) == 26
+    assert b"Page 2 of 2" in clamped.data
+    assert b"Hidden Song" not in first_browse
+
+
+def test_library_import_promotes_wholly_ungrouped_tracks_to_stable_beets_album(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Imported Artist" / "Imported Album" / "01 Song.wav"
+    tagged_wav(path, artist="Imported Artist", album="Imported Album", title="Song")
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    review = client.get("/api/library-import/reviews").json["albums"][0]
+    assert client.post(
+        f'/api/library-import/albums/{review["id"]}/preview', json={"candidate_id": None}
+    ).status_code == 200
+    executed = client.post(f'/api/library-import/albums/{review["id"]}/execute', json={})
+    assert executed.status_code == 201
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    albums = list(library.albums())
+    assert len(albums) == 1
+    assert [item.id for item in albums[0].items()] == [executed.json["items"][0]["beets_item_id"]]
+    assert f'data-album-id="{albums[0].id}"'.encode() in client.get("/library").data
+
+
+def test_library_promotes_pre_feature_complete_review_without_touching_files(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    root = Path(app.config["LIBRARY_PATH"])
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    paths, items = [], []
+    for number, title in enumerate(("First", "Second"), 1):
+        path = root / "Legacy Artist" / "Legacy Album" / f"{number:02d} {title}.wav"
+        tagged_wav(path, artist="Legacy Artist", album="Legacy Album", title=title)
+        media = MediaFile(str(path)); media.track = number; media.save()
+        item = Item.from_path(path)
+        library.add(item)
+        paths.append(path)
+        items.append(item)
+    assert all(item.album_id is None for item in items)
+    before_bytes = [path.read_bytes() for path in paths]
+    before_tags = [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths]
+    before_paths = [path.resolve() for path in paths]
+    now = "2026-10-08T00:00:00+00:00"
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('fixture', ?, 'complete', ?)",
+            (str(root.resolve()), now),
+        ).lastrowid
+        review_id = db.execute(
+            """INSERT INTO album_reviews(root_path, artist_key, album_key, artist, album, state,
+                      execution_status, updated_at)
+               VALUES (?, 'legacy artist', 'legacy album', 'Legacy Artist', 'Legacy Album',
+                       'approved', 'complete', ?)""",
+            (str(root.resolve()), now),
+        ).lastrowid
+        for path, item in zip(paths, items):
+            stat = path.stat()
+            inventory_id = db.execute(
+                """INSERT INTO library_inventory(root_path, relative_path, size_bytes, mtime_ns, device, inode,
+                          beets_item_id, present, first_seen_job_id, last_seen_job_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (str(root.resolve()), str(path.relative_to(root)), stat.st_size, stat.st_mtime_ns,
+                 stat.st_dev, stat.st_ino, item.id, job_id, job_id),
+            ).lastrowid
+            db.execute("INSERT INTO album_review_tracks(album_review_id, inventory_id) VALUES (?, ?)",
+                       (review_id, inventory_id))
+
+    def forbid_tag_write(*args, **kwargs):
+        raise AssertionError("legacy promotion must not write file tags")
+
+    monkeypatch.setattr(Item, "write", forbid_tag_write)
+    client = app.test_client()
+    first = client.get("/library")
+    assert first.status_code == 200
+    albums = list(library.albums())
+    assert len(albums) == 1
+    assert sorted(item.id for item in albums[0].items()) == sorted(item.id for item in items)
+    assert first.data.count(b'class="album-card open-album"') == 1
+    detail = client.get(f"/api/library/albums/{albums[0].id}")
+    assert detail.status_code == 200
+    assert [track["title"] for track in detail.json["tracks"]] == ["First", "Second"]
+    assert client.get("/library").status_code == 200
+    assert len(list(library.albums())) == 1
+    assert [path.read_bytes() for path in paths] == before_bytes
+    assert [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths] == before_tags
+    assert [Path(item.path.decode()).resolve() for item in library.items()] == before_paths
+
+
+def test_legacy_fallback_keeps_same_title_editions_in_separate_directories(tmp_path):
+    app = make_app(tmp_path)
+    root = Path(app.config["LIBRARY_PATH"])
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    fixtures = (
+        ("Edition A", "release-a", "One", 1),
+        ("Edition A", "release-a", "Two", 2),
+        ("Edition B", "release-b", "One", 1),
+    )
+    original_paths = []
+    for directory, release_id, title, track in fixtures:
+        path = root / "Artist" / directory / f"{track:02d} {title}.wav"
+        tagged_wav(path, artist="Artist", album="Shared Title", title=title)
+        media = MediaFile(str(path)); media.track = track; media.mb_albumid = release_id; media.save()
+        library.add(Item.from_path(path))
+        original_paths.append(path.resolve())
+
+    page = app.test_client().get("/library")
+    albums = list(library.albums())
+    assert page.status_code == 200
+    assert len(albums) == 2
+    assert sorted(len(list(album.items())) for album in albums) == [1, 2]
+    assert page.data.count(b'class="album-card open-album"') == 2
+    assert sorted(Path(item.path.decode()).resolve() for item in library.items()) == sorted(original_paths)
+    assert app.test_client().get("/library").data.count(b'class="album-card open-album"') == 2
+    assert len(list(library.albums())) == 2
 
 
 def test_album_modal_payload_includes_proposal_reasons_diff_and_track_details(tmp_path):

@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import subprocess
 import re
+import threading
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -35,6 +36,11 @@ from .matching import score_release
 
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
 EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
+ALBUM_EDITABLE_FIELDS = {"album", "albumartist", "genre", "year"}
+INTEGER_FIELDS = {"year", "track", "disc"}
+LIBRARY_ALBUM_PAGE_SIZE = 25
+MAX_LEGACY_ALBUM_PROMOTIONS = 100
+MAX_LEGACY_PROMOTION_ITEMS = 2000
 SETTING_KEYS = (
     "inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art",
     "art_sidecar", "art_embed", "art_replace",
@@ -65,6 +71,7 @@ FTINTITLE_DEFAULTS = {
     "bracket_keywords": list(DEFAULT_BRACKET_KEYWORDS),
     "projection_requires_recheck": False,
 }
+_LEGACY_ALBUM_PROMOTION_LOCK = threading.Lock()
 
 
 class LibraryImportExecutionError(RuntimeError):
@@ -73,6 +80,13 @@ class LibraryImportExecutionError(RuntimeError):
         self.code = code
         self.status = status
         self.job_id = job_id
+
+
+class ManagedMutationError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "mutation_failed", status: int = 500) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
 
 
 def create_app(test_config: dict | None = None) -> Flask:
@@ -133,13 +147,18 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/library")
     def library_page():
-        items = _items(app)
+        try:
+            page = int(request.args.get("page", "1"))
+        except ValueError:
+            page = 1
         return render_template(
             "library.html",
             build_sha=app.config["BUILD_SHA"],
-            **_library_page_data(items, request.args.get("q", ""), request.args.get("sort", "artist"),
-                                 request.args.get("order", "asc"), request.args.get("artist", ""),
-                                 request.args.get("album", "")),
+            **_library_page_data(
+                app, request.args.get("q", ""), request.args.get("sort", "artist"),
+                request.args.get("order", "asc"), request.args.get("artist", ""),
+                request.args.get("album", ""), page,
+            ),
         )
 
     @app.get("/healthz")
@@ -173,6 +192,89 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/api/items")
     def items():
         return jsonify(_items(app))
+
+    @app.get("/api/library/albums/<int:album_id>")
+    def managed_album(album_id: int):
+        _promote_legacy_managed_albums(app)
+        album = _managed_album_payload(app, album_id)
+        if album is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(album)
+
+    @app.patch("/api/library/albums/<int:album_id>")
+    def edit_managed_album(album_id: int):
+        values = request.get_json(silent=True)
+        try:
+            fields, expected = _validated_managed_edit(values, ALBUM_EDITABLE_FIELDS)
+            result = _edit_managed_album(app, album_id, fields, expected)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
+
+    @app.patch("/api/library/albums/<int:album_id>/tracks/<int:item_id>")
+    def edit_managed_album_track(album_id: int, item_id: int):
+        values = request.get_json(silent=True)
+        try:
+            fields, expected = _validated_managed_edit(values, EDITABLE_FIELDS)
+            result = _edit_managed_track(app, album_id, item_id, fields, expected)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        if result is False:
+            return jsonify(error="Track does not belong to this album", code="track_not_in_album"), 404
+        return jsonify(result)
+
+    @app.post("/api/library/albums/<int:album_id>/rematch/preview")
+    def preview_managed_album_rematch(album_id: int):
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or set(values) != {"musicbrainz_id", "expected_fingerprint"}:
+            return jsonify(error="request must contain only musicbrainz_id and expected_fingerprint",
+                           code="invalid_request"), 400
+        mbid = values.get("musicbrainz_id")
+        expected = values.get("expected_fingerprint")
+        if not isinstance(mbid, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(mbid):
+            return jsonify(error="Enter a canonical MusicBrainz release UUID.",
+                           code="invalid_musicbrainz_id"), 400
+        if not isinstance(expected, str) or not expected:
+            return jsonify(error="expected_fingerprint is required", code="invalid_request"), 400
+        try:
+            result = _preview_managed_rematch(app, album_id, mbid.lower(), expected)
+        except ProviderError as exc:
+            status = 404 if exc.code == "release_not_found" else (503 if exc.retryable else 502)
+            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), status
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except (OSError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "candidate provider failed", code="provider_error",
+                           retryable=False), 502
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result), 201
+
+    @app.post("/api/library/albums/<int:album_id>/rematch/apply")
+    def apply_managed_album_rematch(album_id: int):
+        values = request.get_json(silent=True)
+        if (not isinstance(values, dict) or set(values) != {"preview_id", "expected_fingerprint"}
+                or not isinstance(values.get("preview_id"), str)
+                or not isinstance(values.get("expected_fingerprint"), str)):
+            return jsonify(error="request must contain only preview_id and expected_fingerprint",
+                           code="invalid_request"), 400
+        try:
+            result = _apply_managed_rematch(
+                app, album_id, values["preview_id"], values["expected_fingerprint"]
+            )
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
 
     @app.post("/api/library/inventory/preview")
     def preview_library_inventory():
@@ -485,18 +587,13 @@ def create_app(test_config: dict | None = None) -> Flask:
         item = library.get_item(item_id)
         if item is None:
             abort(404)
-        for field, value in values.items():
-            if field in {"year", "track", "disc"}:
-                try:
-                    value = int(value or 0)
-                except (TypeError, ValueError):
-                    abort(400, f"{field} must be an integer")
-            _set_item_value(item, field, value)
-        item.store()
         try:
-            item.write()
-        except Exception as exc:
-            abort(500, f"database updated but tag write failed: {exc}")
+            normalized = _validated_edit_fields(values, EDITABLE_FIELDS)
+            _mutate_managed_items([(item, normalized)])
+        except ValueError as exc:
+            abort(400, str(exc))
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
         if request.is_json:
             return jsonify(_serialize_item(item))
         flash("Metadata and file tags updated.")
@@ -768,6 +865,21 @@ def _init_db(path: str) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(album_review_id, provider, provider_id)
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS managed_album_rematches (
+            id TEXT PRIMARY KEY,
+            album_id INTEGER NOT NULL,
+            release_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            evidence_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_json TEXT,
+            created_at TEXT NOT NULL,
+            applied_at TEXT
+        )""")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending_managed_album_rematch
+                       ON managed_album_rematches(album_id) WHERE status = 'pending'""")
         _ensure_column(db, "album_reviews", "execution_status", "TEXT NOT NULL DEFAULT 'not-run'")
         _ensure_column(db, "album_reviews", "execution_error", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(db, "album_reviews", "last_execution_job_id", "INTEGER")
@@ -1002,52 +1114,642 @@ def _items(app: Flask) -> list[dict]:
     return [_serialize_item(item) for item in _library(app).items()]
 
 
+def _promote_legacy_managed_albums(app: Flask) -> dict[str, int]:
+    """Give legacy ungrouped items bounded, stable Beets Album identities.
+
+    Completed Cratekeep reviews are authoritative. The fallback never combines
+    directories, editions with different release IDs, or incomplete metadata;
+    safe singletons become one-item albums instead of remaining invisible.
+    This changes Beets relationships only: ``add_album`` does not write tags.
+    """
+    promoted_groups = promoted_items = 0
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    library = _library(app)  # Also creates the Beets schema on a new install.
+    with _LEGACY_ALBUM_PROMOTION_LOCK:
+        with _connect(app.config["BEETS_DB"]) as db:
+            ungrouped_ids = [row["id"] for row in db.execute(
+                "SELECT id FROM items WHERE album_id IS NULL ORDER BY id LIMIT ?",
+                (MAX_LEGACY_PROMOTION_ITEMS,),
+            ).fetchall()]
+        review_ids = set()
+        with _connect(app.config["APP_DB"]) as db:
+            for offset in range(0, len(ungrouped_ids), 500):
+                chunk = ungrouped_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                review_ids.update(row[0] for row in db.execute(
+                    f"""SELECT DISTINCT albums.id
+                           FROM album_reviews AS albums
+                           JOIN album_review_tracks AS tracks ON tracks.album_review_id = albums.id
+                           JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                          WHERE albums.root_path = ? AND albums.execution_status = 'complete'
+                            AND inventory.beets_item_id IN ({placeholders})""",
+                    (str(root), *chunk),
+                ))
+            # Inspect at most the bounded item window. Reviews that are already
+            # partially grouped must not permanently starve later safe reviews.
+            reviews = [{"id": review_id} for review_id in
+                       sorted(review_ids)[:MAX_LEGACY_PROMOTION_ITEMS]]
+            review_members = {
+                row["id"]: db.execute(
+                    """SELECT inventory.beets_item_id, inventory.present
+                         FROM album_review_tracks AS tracks
+                         JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                        WHERE tracks.album_review_id = ? ORDER BY tracks.inventory_id""",
+                    (row["id"],),
+                ).fetchall()
+                for row in reviews
+            }
+
+        for row in reviews:
+            if promoted_groups >= MAX_LEGACY_ALBUM_PROMOTIONS:
+                break
+            members = review_members[row["id"]]
+            member_ids = [member["beets_item_id"] for member in members]
+            if (not member_ids or len(member_ids) != len(set(member_ids))
+                    or any(not member["present"] or member["beets_item_id"] is None for member in members)
+                    or promoted_items + len(member_ids) > MAX_LEGACY_PROMOTION_ITEMS):
+                continue
+            items = [library.get_item(item_id) for item_id in member_ids]
+            # Never merge into or modify an existing album relationship. A
+            # partially promoted review is deliberately left exactly as-is.
+            if not all(items) or not all(item.get("album_id") is None for item in items):
+                continue
+            library.add_album(items)
+            promoted_groups += 1
+            promoted_items += len(items)
+
+        remaining_groups = MAX_LEGACY_ALBUM_PROMOTIONS - promoted_groups
+        remaining_items = MAX_LEGACY_PROMOTION_ITEMS - promoted_items
+        if remaining_groups <= 0 or remaining_items <= 0:
+            return {"groups": promoted_groups, "items": promoted_items}
+
+        with _connect(app.config["BEETS_DB"]) as db:
+            fallback_rows = db.execute(
+                """SELECT id FROM items WHERE album_id IS NULL ORDER BY id LIMIT ?""",
+                (remaining_items,),
+            ).fetchall()
+        fallback_ids = [row["id"] for row in fallback_rows]
+        represented = set()
+        # Stay below SQLite builds with the traditional 999-variable limit.
+        with _connect(app.config["APP_DB"]) as db:
+            for offset in range(0, len(fallback_ids), 500):
+                chunk = fallback_ids[offset:offset + 500]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                represented.update(row[0] for row in db.execute(
+                    f"""SELECT DISTINCT inventory.beets_item_id
+                           FROM library_inventory AS inventory
+                           JOIN album_review_tracks AS tracks ON tracks.inventory_id = inventory.id
+                           JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                          WHERE albums.root_path = ? AND albums.execution_status = 'complete'
+                            AND inventory.beets_item_id IN ({placeholders})""",
+                    (str(root), *chunk),
+                ))
+
+        fallback_groups = {}
+        for item_id in fallback_ids:
+            if item_id in represented:
+                continue
+            item = library.get_item(item_id)
+            if item is None or item.get("album_id") is not None or not item.get("path"):
+                continue
+            try:
+                path = Path(os.fsdecode(item.path)).resolve(strict=True)
+            except (OSError, TypeError, ValueError):
+                continue
+            if not path.is_file() or not (path.parent == root or root in path.parent.parents):
+                continue
+            artist_key = _metadata_key(item.get("albumartist") or item.get("artist"))
+            album_key = _metadata_key(item.get("album"))
+            if not artist_key or not album_key:
+                continue
+            key = (str(path.parent), artist_key, album_key, _metadata_key(item.get("mb_albumid")))
+            fallback_groups.setdefault(key, []).append(item_id)
+
+        for key in sorted(fallback_groups):
+            if promoted_groups >= MAX_LEGACY_ALBUM_PROMOTIONS:
+                break
+            item_ids = fallback_groups[key]
+            if promoted_items + len(item_ids) > MAX_LEGACY_PROMOTION_ITEMS:
+                continue
+            # Reload under the lock immediately before storing relationships so
+            # repeat requests in this process cannot create duplicate albums.
+            items = [library.get_item(item_id) for item_id in item_ids]
+            if not all(items) or not all(item.get("album_id") is None for item in items):
+                continue
+            library.add_album(items)
+            promoted_groups += 1
+            promoted_items += len(items)
+    return {"groups": promoted_groups, "items": promoted_items}
+
+
 def _library_page_data(
-    items: list[dict], query: str, sort: str, order: str, artist_filter: str = "", album_filter: str = ""
+    app: Flask, query: str, sort: str, order: str, artist_filter: str = "",
+    album_filter: str = "", page: int = 1,
 ) -> dict:
-    """Build the small, read-only browse model used by the Library landing page."""
+    """Return a bounded album page while keeping track rows out of the landing HTML."""
+    _promote_legacy_managed_albums(app)
+    library = _library(app)  # Ensure the Beets schema exists before direct bounded queries.
     query = _normalize_metadata(query)
     artist_filter = _normalize_metadata(artist_filter)
     album_filter = _normalize_metadata(album_filter)
-    sort = sort if sort in {"artist", "album", "title"} else "artist"
-    order = order if order in {"asc", "desc"} else "asc"
-    searchable = ("artist", "album", "title")
-    filtered = [
-        item for item in items
-        if (not query or query.casefold() in " ".join(str(item.get(field) or "") for field in searchable).casefold())
-        and (not artist_filter or _metadata_key(item.get("albumartist") or item.get("artist")) == _metadata_key(artist_filter))
-        and (not album_filter or _metadata_key(item.get("album")) == _metadata_key(album_filter))
-    ]
-    tie_breakers = tuple(field for field in searchable if field != sort) + ("id",)
-
-    def item_key(item: dict) -> tuple:
-        return tuple(str(item.get(field) or "").casefold() for field in (sort, *tie_breakers))
-
-    filtered.sort(key=item_key, reverse=order == "desc")
-    album_keys = {
-        (_metadata_key(item.get("albumartist") or item.get("artist")), _metadata_key(item.get("album")))
-        for item in items
+    sort = sort if sort in {"artist", "album", "year", "recent"} else "artist"
+    order = order if order in {"asc", "desc"} else ("desc" if sort == "recent" else "asc")
+    page = max(1, page)
+    clauses, parameters = [], []
+    artist_expression = """COALESCE(NULLIF(albums.albumartist, ''),
+        (SELECT NULLIF(fallback_items.artist, '') FROM items fallback_items
+          WHERE fallback_items.album_id = albums.id ORDER BY fallback_items.id LIMIT 1),
+        'Unknown artist')"""
+    if query:
+        escaped_query = query.casefold().replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_query}%"
+        clauses.append(f"""(LOWER({artist_expression}) LIKE ? ESCAPE '\\'
+                         OR LOWER(COALESCE(albums.album, '')) LIKE ? ESCAPE '\\'
+                         OR EXISTS (SELECT 1 FROM items search_items
+                                     WHERE search_items.album_id = albums.id
+                                       AND (LOWER(COALESCE(search_items.title, '')) LIKE ? ESCAPE '\\'
+                                            OR LOWER(COALESCE(search_items.artist, '')) LIKE ? ESCAPE '\\')))""")
+        parameters.extend((pattern, pattern, pattern, pattern))
+    if artist_filter:
+        clauses.append(f"LOWER({artist_expression}) = ?")
+        parameters.append(artist_filter.casefold())
+    if album_filter:
+        clauses.append("LOWER(COALESCE(albums.album, '')) = ?")
+        parameters.append(album_filter.casefold())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    columns = {
+        "artist": (f"LOWER({artist_expression})", "LOWER(COALESCE(albums.album, ''))", "albums.year"),
+        "album": ("LOWER(COALESCE(albums.album, ''))", f"LOWER({artist_expression})", "albums.year"),
+        "year": ("albums.year", f"LOWER({artist_expression})", "LOWER(COALESCE(albums.album, ''))"),
+        "recent": ("albums.added",),
     }
-    artist_counts: dict[str, int] = {}
-    for item in items:
-        artist = _normalize_metadata(item.get("albumartist") or item.get("artist")) or "Unknown artist"
-        artist_counts[artist] = artist_counts.get(artist, 0) + 1
-    top_artists = sorted(artist_counts.items(), key=lambda pair: (-pair[1], pair[0].casefold()))[:5]
-    recent = sorted(items, key=lambda item: int(item.get("id") or 0), reverse=True)[:5]
+    direction = "DESC" if order == "desc" else "ASC"
+    ordering = ", ".join(f"{column} {direction}" for column in columns[sort])
+    with _connect(app.config["BEETS_DB"]) as db:
+        matching = db.execute(f"SELECT COUNT(*) FROM albums{where}", parameters).fetchone()[0]
+        page_count = max(1, math.ceil(matching / LIBRARY_ALBUM_PAGE_SIZE))
+        page = min(page, page_count)
+        rows = db.execute(
+            f"""SELECT albums.id FROM albums{where}
+                 ORDER BY {ordering}, albums.id {direction}
+                 LIMIT ? OFFSET ?""",
+            (*parameters, LIBRARY_ALBUM_PAGE_SIZE, (page - 1) * LIBRARY_ALBUM_PAGE_SIZE),
+        ).fetchall()
+        totals = db.execute(
+            f"""SELECT (SELECT COUNT(*) FROM items), (SELECT COUNT(*) FROM albums),
+                       (SELECT COUNT(DISTINCT LOWER({artist_expression})) FROM albums)"""
+        ).fetchone()
+        top_rows = db.execute(
+            f"""SELECT {artist_expression} AS artist,
+                      COUNT(DISTINCT albums.id) AS albums, COUNT(items.id) AS tracks
+                 FROM albums LEFT JOIN items ON items.album_id = albums.id
+                GROUP BY LOWER({artist_expression})
+                ORDER BY albums DESC, tracks DESC, LOWER(artist) LIMIT 5"""
+        ).fetchall()
+        recent_rows = db.execute("SELECT id FROM albums ORDER BY added DESC, id DESC LIMIT 5").fetchall()
+        path_rows = db.execute("SELECT path FROM items").fetchall()
+    albums = [_managed_album_summary(library.get_album(row["id"])) for row in rows]
+    albums = [album for album in albums if album is not None]
+    groups, group_by_artist = [], {}
+    for album in albums:
+        artist = album["albumartist"] or "Unknown artist"
+        key = artist.casefold()
+        if key not in group_by_artist:
+            group_by_artist[key] = {"artist": artist, "albums": []}
+            groups.append(group_by_artist[key])
+        group_by_artist[key]["albums"].append(album)
+    recent_albums = [_managed_album_summary(library.get_album(row["id"])) for row in recent_rows]
+    library_bytes = 0
+    for row in path_rows:
+        try:
+            library_bytes += Path(os.fsdecode(row["path"])).stat().st_size
+        except (OSError, TypeError, ValueError):
+            pass
     return {
-        "items": filtered,
-        "recent_items": recent,
-        "top_artists": [{"name": name, "tracks": count} for name, count in top_artists],
-        "summary": {
-            "tracks": len(items), "albums": len(album_keys), "artists": len(artist_counts),
-            "bytes": sum(item.get("bytes") or 0 for item in items),
-        },
-        "query": query,
-        "sort": sort,
-        "order": order,
-        "artist_filter": artist_filter,
-        "album_filter": album_filter,
+        "albums": albums, "album_groups": groups,
+        "recent_albums": [album for album in recent_albums if album is not None],
+        "top_artists": [dict(row) for row in top_rows],
+        "summary": {"tracks": totals[0], "albums": totals[1], "artists": totals[2], "bytes": library_bytes},
+        "query": query, "sort": sort, "order": order,
+        "artist_filter": artist_filter, "album_filter": album_filter,
+        "page": page, "page_count": page_count, "page_size": LIBRARY_ALBUM_PAGE_SIZE,
+        "matching_albums": matching, "first_result": ((page - 1) * LIBRARY_ALBUM_PAGE_SIZE + 1) if matching else 0,
+        "last_result": min(page * LIBRARY_ALBUM_PAGE_SIZE, matching),
     }
+
+
+def _album_items(album) -> list[Item]:
+    return sorted(
+        list(album.items()),
+        key=lambda item: (
+            int(item.get("disc") or 0), int(item.get("track") or 0),
+            _metadata_key(item.get("title")), int(item.id or 0),
+        ),
+    )
+
+
+def _managed_track_payload(item: Item) -> dict:
+    result = {
+        key: item.get(key)
+        for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")
+    }
+    result["genre"] = _item_genre(item)
+    path = Path(os.fsdecode(item.path)) if item.get("path") else None
+    try:
+        result["bytes"] = path.stat().st_size if path else None
+    except OSError:
+        result["bytes"] = None
+    return result
+
+
+def _managed_album_summary(album) -> dict | None:
+    if album is None:
+        return None
+    items = _album_items(album)
+    genres = [_item_genre(item) for item in items if _item_genre(item)]
+    genre = _normalize_metadata(album.get("genre")) or (genres[0] if genres and len(set(genres)) == 1 else "")
+    size = 0
+    for item in items:
+        try:
+            size += Path(os.fsdecode(item.path)).stat().st_size
+        except (OSError, TypeError, ValueError):
+            pass
+    return {
+        "id": album.id,
+        "album": _normalize_metadata(album.get("album")) or "Unknown album",
+        "albumartist": _normalize_metadata(album.get("albumartist"))
+                       or (_normalize_metadata(items[0].get("artist")) if items else "") or "Unknown artist",
+        "year": int(album.get("year") or 0), "genre": genre,
+        "track_count": len(items), "bytes": size,
+    }
+
+
+def _managed_album_fingerprint(album, items: list[Item] | None = None) -> str:
+    items = items if items is not None else _album_items(album)
+    fields = (
+        "title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc",
+        "mb_trackid", "mb_albumid", "mb_releasegroupid", "albumtype", "country", "media",
+        "tracktotal", "disctotal",
+    )
+    evidence = []
+    for item in items:
+        path = Path(os.fsdecode(item.path))
+        try:
+            stat = path.stat()
+            file_state = [stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino]
+        except OSError:
+            file_state = None
+        evidence.append({
+            "id": item.id, "path": str(path), "stat": file_state,
+            "metadata": {field: (_item_genre(item) if field == "genre" else item.get(field)) for field in fields},
+        })
+    payload = {"album_id": album.id, "items": evidence}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _managed_album_payload(app: Flask, album_id: int) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    summary = _managed_album_summary(album)
+    return {**summary, "tracks": [_managed_track_payload(item) for item in items],
+            "fingerprint": _managed_album_fingerprint(album, items)}
+
+
+def _validated_edit_fields(values: object, allowed: set[str]) -> dict:
+    if not isinstance(values, dict):
+        raise ValueError("a JSON object is required")
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported fields: {', '.join(sorted(unknown))}")
+    if not values:
+        raise ValueError("at least one editable field is required")
+    normalized = {}
+    for field, value in values.items():
+        if field in INTEGER_FIELDS:
+            if isinstance(value, bool):
+                raise ValueError(f"{field} must be an integer")
+            if not isinstance(value, (int, str)):
+                raise ValueError(f"{field} must be an integer")
+            if isinstance(value, str) and value.strip() and not re.fullmatch(r"[+-]?\d+", value.strip()):
+                raise ValueError(f"{field} must be an integer")
+            try:
+                normalized[field] = int(value or 0)
+            except (TypeError, ValueError):
+                raise ValueError(f"{field} must be an integer") from None
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f"{field} must be a string")
+            normalized[field] = _normalize_metadata(value)
+    return normalized
+
+
+def _validated_managed_edit(values: object, allowed: set[str]) -> tuple[dict, str]:
+    if not isinstance(values, dict):
+        raise ValueError("a JSON object is required")
+    expected = values.get("expected_fingerprint")
+    if not isinstance(expected, str) or not expected:
+        raise ValueError("expected_fingerprint is required")
+    fields = _validated_edit_fields({key: value for key, value in values.items() if key != "expected_fingerprint"}, allowed)
+    return fields, expected
+
+
+def _mutate_managed_items(
+    changes: list[tuple[Item, dict]], *, album=None, album_values: dict | None = None,
+    finalize=None,
+) -> list[dict]:
+    """Write tags before DB state and restore every touched item on any failure."""
+    snapshots = []
+    structured = []
+    for item, values in changes:
+        fields = set(values)
+        if "genre" in fields and "genres" in item._fields:
+            fields.add("genres")
+        original = {field: item.get(field) for field in fields}
+        snapshots.append((item, original, os.fsdecode(item.path)))
+        item_changes = {}
+        for field, value in values.items():
+            current = _item_genre(item) if field == "genre" else item.get(field)
+            if current != value:
+                item_changes[field] = {"from": current, "to": value}
+            _set_item_value(item, field, value)
+        structured.append({"item_id": item.id, "changes": item_changes})
+    album_values = album_values or {}
+    album_snapshot = {field: album.get(field) for field in album_values} if album is not None else {}
+    try:
+        for item, _, _ in snapshots:
+            item.write()
+        for item, _, path in snapshots:
+            item.store()
+            if os.fsdecode(item.path) != path:
+                raise OSError("metadata write changed a managed path")
+        if album is not None:
+            for field, value in album_values.items():
+                album[field] = value
+            album.store()
+        # Audit finalization belongs inside the mutation boundary. If it cannot
+        # commit its claimed state, the same snapshots restore tags and Beets.
+        if finalize is not None:
+            finalize()
+    except Exception as exc:
+        rollback_errors = []
+        for item, original, path in snapshots:
+            try:
+                for field, value in original.items():
+                    item[field] = value
+                item.path = os.fsencode(path)
+                item.write()
+                item.store()
+            except Exception as rollback_exc:
+                rollback_errors.append(f"item {item.id}: {rollback_exc}")
+        if album is not None:
+            try:
+                for field, value in album_snapshot.items():
+                    album[field] = value
+                album.store()
+            except Exception as rollback_exc:
+                rollback_errors.append(f"album {album.id}: {rollback_exc}")
+        if rollback_errors:
+            raise ManagedMutationError(
+                f"metadata write failed ({exc}); rollback was incomplete: {'; '.join(rollback_errors)}",
+                code="rollback_failed", status=500,
+            ) from exc
+        if isinstance(exc, ManagedMutationError):
+            raise exc
+        raise ManagedMutationError(
+            f"metadata write failed; original tags and database values were restored: {exc}",
+            code="mutation_rolled_back", status=500,
+        ) from exc
+    return structured
+
+
+def _require_current_album(album, expected: str, items: list[Item]) -> None:
+    if _managed_album_fingerprint(album, items) != expected:
+        raise ManagedMutationError(
+            "The album changed after it was opened. Refresh it before saving.",
+            code="stale_fingerprint", status=409,
+        )
+
+
+def _edit_managed_album(app: Flask, album_id: int, values: dict, expected: str) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    changes = _mutate_managed_items([(item, values) for item in items], album=album, album_values=values)
+    return {"changes": changes, "album": _managed_album_payload(app, album_id)}
+
+
+def _edit_managed_track(app: Flask, album_id: int, item_id: int, values: dict, expected: str):
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    item = next((candidate for candidate in items if candidate.id == item_id), None)
+    if item is None:
+        return False
+    changes = _mutate_managed_items([(item, values)])
+    return {"changes": changes, "album": _managed_album_payload(app, album_id)}
+
+
+def _managed_album_query(album, items: list[Item]) -> dict:
+    tracks = []
+    for item in items:
+        track = {
+            "title": _normalize_track_title(item.get("title")),
+            "artist": _normalize_metadata(item.get("artist")),
+            "disc": int(item.get("disc") or 1), "track": int(item.get("track") or 0),
+        }
+        if item.get("length"):
+            track["duration"] = item.get("length")
+        if item.get("mb_trackid"):
+            track["recording_id"] = item.get("mb_trackid")
+        tracks.append(track)
+    query = {
+        "artist": _normalize_metadata(album.get("albumartist")),
+        "album": _normalize_metadata(album.get("album")), "tracks": tracks,
+    }
+    if album.get("year"):
+        query["year"] = int(album.get("year"))
+    return query
+
+
+def _managed_rematch_plan(app: Flask, album, items: list[Item], raw: dict) -> dict:
+    query = _managed_album_query(album, items)
+    effective = _effective_candidate(app, raw, query)
+    match = _candidate_match(query, effective, exact_mbid=True)
+    details = {detail["position"]: detail for detail in match["track_details"] if detail.get("local") is not None}
+    local_positions = [(int(item.get("disc") or 1), int(item.get("track") or 0)) for item in items]
+    duplicate_positions = [list(position) for position in sorted(
+        {position for position in local_positions if local_positions.count(position) > 1}
+    )]
+    updates, changes = [], []
+    for position, item in enumerate(items, 1):
+        detail = details.get(position)
+        values = _candidate_item_values(effective, detail) if detail else {}
+        item_changes = {}
+        for field, value in values.items():
+            current = _item_genre(item) if field == "genre" else item.get(field)
+            if current != value:
+                item_changes[field] = {"from": current, "to": value}
+        updates.append({"item_id": item.id, "values": values})
+        changes.append({"item_id": item.id, "title": item.get("title"), "changes": item_changes})
+    unsafe_statuses = {"missing", "extra", "unmatched"}
+    unsafe_details = [detail for detail in match["track_details"] if detail["status"] in unsafe_statuses]
+    applicable = (
+        not match["track_count_mismatch"] and not unsafe_details and not duplicate_positions
+        and len(details) == len(items)
+    )
+    reasons = []
+    if match["track_count_mismatch"]:
+        reasons.append("The MusicBrainz release has a different track count.")
+    if unsafe_details:
+        reasons.append("One or more tracks could not be mapped unambiguously.")
+    if duplicate_positions:
+        reasons.append("The local album contains duplicate disc/track positions.")
+    return {
+        "candidate": {
+            "musicbrainz_id": raw.get("provider_id"), "album": effective.get("album"),
+            "artist": effective.get("artist"), "date": effective.get("date") or effective.get("year"),
+            "release_note": raw.get("release_disambiguation") or "",
+            "media": raw.get("media") or [], "region": raw.get("country") or "",
+            "raw_album": raw.get("album"), "raw_artist": raw.get("artist"),
+        },
+        "match": {key: match[key] for key in (
+            "confidence", "distance", "recommendation", "reasons", "track_details",
+            "track_count_mismatch", "matched_track_count", "unmatched_track_count", "hard_mismatches",
+        )},
+        "changes": changes, "updates": updates, "applicable": applicable,
+        "inapplicable_reasons": reasons, "duplicate_local_positions": duplicate_positions,
+    }
+
+
+def _preview_managed_rematch(app: Flask, album_id: int, mbid: str, expected: str) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    raw_candidates = app.config["MUSICBRAINZ_PROVIDER"](
+        {**_managed_album_query(album, items), "musicbrainz_id": mbid}, limit=1
+    )
+    if not isinstance(raw_candidates, list):
+        raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+    if not raw_candidates or not isinstance(raw_candidates[0], dict):
+        raise ProviderError(
+            "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
+            code="release_not_found",
+        )
+    raw = raw_candidates[0]
+    if str(raw.get("provider_id") or "").lower() != mbid:
+        raise ProviderError("MusicBrainz returned a different release identity", code="provider_identity_mismatch")
+    plan = _managed_rematch_plan(app, album, items, raw)
+    preview_id = secrets.token_urlsafe(24)
+    evidence_json = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    plan_json = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    evidence_sha = hashlib.sha256(f"{evidence_json}\n{plan_json}".encode()).hexdigest()
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute("DELETE FROM managed_album_rematches WHERE album_id = ? AND status = 'pending'", (album_id,))
+        db.execute(
+            """INSERT INTO managed_album_rematches
+                   (id, album_id, release_id, fingerprint, evidence_json, plan_json,
+                    evidence_sha256, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+            (preview_id, album_id, mbid, expected, evidence_json, plan_json, evidence_sha, _now()),
+        )
+        db.execute(
+            """DELETE FROM managed_album_rematches WHERE status != 'pending' AND id NOT IN
+                   (SELECT id FROM managed_album_rematches WHERE status != 'pending'
+                    ORDER BY COALESCE(applied_at, created_at) DESC LIMIT 100)"""
+        )
+    public_plan = {key: value for key, value in plan.items() if key != "updates"}
+    return {"preview_id": preview_id, "status": "preview", "fingerprint": expected,
+            "evidence_sha256": evidence_sha, **public_plan}
+
+
+def _apply_managed_rematch(app: Flask, album_id: int, preview_id: str, expected: str) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    with _connect(app.config["APP_DB"]) as db:
+        row = db.execute("SELECT * FROM managed_album_rematches WHERE id = ?", (preview_id,)).fetchone()
+    if row is None or row["album_id"] != album_id:
+        raise ManagedMutationError("Rematch preview does not belong to this album.",
+                                   code="preview_album_mismatch", status=409)
+    if row["status"] != "pending":
+        raise ManagedMutationError("Rematch preview has already been applied or superseded.",
+                                   code="preview_not_pending", status=409)
+    items = _album_items(album)
+    current = _managed_album_fingerprint(album, items)
+    if expected != row["fingerprint"] or current != row["fingerprint"]:
+        raise ManagedMutationError("The album changed after this preview. Create a new preview.",
+                                   code="stale_fingerprint", status=409)
+    evidence_json, plan_json = row["evidence_json"], row["plan_json"]
+    evidence_sha = hashlib.sha256(f"{evidence_json}\n{plan_json}".encode()).hexdigest()
+    if evidence_sha != row["evidence_sha256"]:
+        raise ManagedMutationError("Stored rematch evidence failed integrity validation.",
+                                   code="preview_integrity_failed", status=409)
+    plan = json.loads(plan_json)
+    if not plan["applicable"]:
+        raise ManagedMutationError("This preview has an incomplete or ambiguous track mapping and cannot be applied.",
+                                   code="preview_not_applicable", status=409)
+    by_id = {item.id: item for item in items}
+    if set(by_id) != {update["item_id"] for update in plan["updates"]}:
+        raise ManagedMutationError("The album track identity changed after preview.",
+                                   code="stale_fingerprint", status=409)
+    changes = [(by_id[update["item_id"]], update["values"]) for update in plan["updates"]]
+    first_values = plan["updates"][0]["values"] if plan["updates"] else {}
+    album_values = {field: first_values[field] for field in ALBUM_EDITABLE_FIELDS if field in first_values}
+    with _connect(app.config["APP_DB"]) as db:
+        claimed = db.execute(
+            "UPDATE managed_album_rematches SET status = 'applying' WHERE id = ? AND status = 'pending'",
+            (preview_id,),
+        ).rowcount
+    if claimed != 1:
+        raise ManagedMutationError("Rematch preview was applied concurrently.",
+                                   code="preview_not_pending", status=409)
+    finalized = {}
+
+    def finalize_rematch():
+        refreshed = _managed_album_payload(app, album_id)
+        result = {
+            "preview_id": preview_id, "status": "applied", "evidence_sha256": evidence_sha,
+            "changes": plan["changes"], "candidate": plan["candidate"],
+            "fingerprint": refreshed["fingerprint"], "album": refreshed,
+        }
+        _finalize_managed_rematch(app, preview_id, result)
+        finalized["result"] = result
+
+    try:
+        _mutate_managed_items(
+            changes, album=album, album_values=album_values, finalize=finalize_rematch,
+        )
+    except Exception:
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE managed_album_rematches SET status = 'pending' WHERE id = ? AND status = 'applying'",
+                (preview_id,),
+            )
+        raise
+    return finalized["result"]
+
+
+def _finalize_managed_rematch(app: Flask, preview_id: str, result: dict) -> None:
+    """Commit the single-use audit record; callers retain metadata snapshots."""
+    with _connect(app.config["APP_DB"]) as db:
+        cursor = db.execute(
+            """UPDATE managed_album_rematches SET status = 'applied', result_json = ?, applied_at = ?
+                 WHERE id = ? AND status = 'applying'""",
+            (json.dumps(result, sort_keys=True), _now(), preview_id),
+        )
+        if cursor.rowcount != 1:
+            raise ManagedMutationError("Rematch audit state changed during apply.",
+                                       code="preview_audit_failed", status=500)
 
 
 FOLDER_STATUSES = {"all", "not-scanned", "ready", "needs-review", "error", "imported"}
@@ -2892,6 +3594,7 @@ def _apply_artwork(app: Flask, plans: list[dict], jpeg: bytes, summary: dict) ->
 
 def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
     library = _library(app)
+    album_items = []
     for plan in plans:
         if plan["action"] == "skip":
             continue
@@ -2932,6 +3635,18 @@ def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
         if Path(os.fsdecode(item.path)).resolve() != plan["absolute_path"]:
             raise OSError(f"beets changed the file path for {plan['path']}")
         plan["beets_item_id"] = item.id
+        album_items.append(item)
+    # Cratekeep imports one reviewed release at a time. Promote a wholly
+    # ungrouped result to Beets' first-class Album model so Library can use the
+    # stable album ID without inventing a path-derived identity. Existing
+    # album relationships and duplicate merge/replace identities are preserved.
+    if album_items and all(item.get("album_id") is None for item in album_items):
+        # Reload through this Library handle: plans may carry models obtained
+        # from the read-side handle used during planning, and mixing their
+        # SQLite transactions can retain a write lock.
+        grouped_items = [library.get_item(item.id) for item in album_items]
+        if all(grouped_items):
+            library.add_album(grouped_items)
 
 
 def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:

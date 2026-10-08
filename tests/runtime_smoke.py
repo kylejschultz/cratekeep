@@ -48,6 +48,8 @@ CASE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174099"
 SEARCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174077"
 EXISTING_SIDECAR_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174002"
 DELUXE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174010"
+LIBRARY_MATCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174077"
+LIBRARY_MISMATCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174011"
 
 
 def request_json(url: str):
@@ -312,6 +314,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     inline_scan_state_proof: dict[str, dict[str, str]] = {}
     ftintitle_config_proof: dict[str, object] = {}
     deluxe_proof: dict[str, object] = {}
+    managed_library_proof: dict[str, object] = {}
+    viewport_checks: dict[str, object] = {}
     inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -942,6 +946,108 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator("#library-import-in-place").inner_text() == "Close"
         page.locator("#library-import-in-place").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
+
+        # Managed Library: album-only landing, lazy detail, manual writes,
+        # exact-ID preview/apply, mismatch blocking, and responsive modal.
+        page.evaluate("localStorage.removeItem('cratekeep-theme')")
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        page.goto(f"{base_url}/library?q=As+Is+Artist&sort=artist&order=asc", wait_until="networkidle")
+        assert page.locator("#browse-title").inner_text() == "Browse albums"
+        assert page.locator(".album-card").count() == 1
+        assert page.locator(".track-row").count() == 0
+        assert "As Is Song" not in page.locator(".browse").inner_text()
+        assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+        viewport_checks["desktop_1440x1000_no_horizontal_overflow"] = True
+        page.screenshot(path=evidence / "12-library-albums-desktop-light.png", full_page=True)
+        page.locator("#theme-toggle").click()
+        assert page.locator("body").evaluate("element => element.classList.contains('dark-mode')")
+        album_card = page.locator(".album-card").first
+        album_id = int(album_card.get_attribute("data-album-id"))
+        with page.expect_response(lambda response: response.url.endswith(f"/api/library/albums/{album_id}")):
+            album_card.click()
+        page.locator("#album-modal:not([hidden])").wait_for()
+        assert page.locator("#track-list .track-row").count() == 1
+        page.screenshot(path=evidence / "13-library-album-modal-desktop-dark.png", full_page=True)
+        initial = request_json(f"{base_url}/api/library/albums/{album_id}")
+        original_path = next(item["path"] for item in request_json(f"{base_url}/api/items")
+                             if item["id"] == initial["tracks"][0]["id"])
+        page.locator('#album-form [name="genre"]').fill("Soul")
+        page.locator('#album-form [name="year"]').fill("2023")
+        with page.expect_response(lambda response: response.request.method == "PATCH"
+                                  and response.url.endswith(f"/api/library/albums/{album_id}")) as album_edit_info:
+            page.locator('#album-form button[type="submit"]').click()
+        album_edit = album_edit_info.value.json()
+        assert (album_edit["album"]["genre"], album_edit["album"]["year"]) == ("Soul", 2023)
+        page.wait_for_function("document.getElementById('album-status').textContent.includes('updated')")
+        page.locator("#track-list .track-row button").click()
+        page.locator("#track-form:not([hidden])").wait_for()
+        page.locator('#track-form [name="title"]').fill("As Is Song Edited")
+        with page.expect_response(lambda response: response.request.method == "PATCH"
+                                  and "/tracks/" in response.url) as track_edit_info:
+            page.locator('#track-form button[type="submit"]').click()
+        track_response = track_edit_info.value
+        assert track_response.status == 200, track_response.text()
+        track_edit = track_response.json()
+        page.wait_for_function("document.getElementById('album-status').textContent.includes('Song metadata')")
+        assert track_edit["album"]["tracks"][0]["title"] == "As Is Song Edited"
+        page.locator("#open-rematch").click()
+        page.locator("#musicbrainz-id").fill(LIBRARY_MATCH_RELEASE_ID)
+        before_preview = request_json(f"{base_url}/api/library/albums/{album_id}")
+        with page.expect_response(lambda response: response.url.endswith("/rematch/preview")) as preview_info:
+            page.locator('#rematch-form button[type="submit"]').click()
+        preview = preview_info.value.json()
+        assert preview["applicable"] is True
+        page.wait_for_function("document.getElementById('rematch-status').textContent.includes('Preview only')")
+        assert request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"] == before_preview["fingerprint"]
+        page.screenshot(path=evidence / "14-library-rematch-preview-desktop-dark.png", full_page=True)
+        with page.expect_response(lambda response: response.url.endswith("/rematch/apply")) as apply_info:
+            page.locator("#apply-rematch").click()
+        applied = apply_info.value.json()
+        assert applied["changes"] == preview["changes"]
+        page.wait_for_function("document.getElementById('rematch-status').textContent.includes('applied')")
+        assert request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"] == applied["fingerprint"]
+        assert next(item["path"] for item in request_json(f"{base_url}/api/items")
+                    if item["id"] == initial["tracks"][0]["id"]) == original_path
+        page.locator("#musicbrainz-id").fill(LIBRARY_MISMATCH_RELEASE_ID)
+        with page.expect_response(lambda response: response.url.endswith("/rematch/preview")) as mismatch_info:
+            page.locator('#rematch-form button[type="submit"]').click()
+        mismatch = mismatch_info.value.json()
+        assert mismatch["applicable"] is False
+        page.wait_for_function("document.getElementById('rematch-status').textContent.includes('Preview only')")
+        assert page.locator("#apply-rematch").is_disabled()
+        mismatch_fingerprint = request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"]
+        assert mismatch_fingerprint == applied["fingerprint"]
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator("#rematch-modal .modal-panel").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        )
+        viewport_checks["mobile_390x844_rematch_no_horizontal_overflow"] = True
+        page.screenshot(path=evidence / "15-library-rematch-mismatch-mobile-dark.png", full_page=True)
+        page.keyboard.press("Escape")
+        assert page.locator("#rematch-modal").is_hidden()
+        assert page.locator("#open-rematch").evaluate("element => document.activeElement === element")
+        viewport_checks["mobile_escape_restores_nested_modal_focus"] = True
+        assert page.locator("#album-modal .modal-panel").evaluate(
+            "element => element.scrollWidth <= element.clientWidth"
+        )
+        viewport_checks["mobile_390x844_album_no_horizontal_overflow"] = True
+        page.screenshot(path=evidence / "16-library-album-mobile-dark.png", full_page=True)
+        page.keyboard.press("Escape")
+        assert page.locator("#album-modal").is_hidden()
+        managed_library_proof.update({
+            "album_id": album_id, "path_before": original_path,
+            "path_after": next(item["path"] for item in request_json(f"{base_url}/api/items")
+                               if item["id"] == initial["tracks"][0]["id"]),
+            "before": initial, "after": applied["album"],
+            "album_edit": album_edit["changes"], "track_edit": track_edit["changes"],
+            "preview_changes": preview["changes"], "apply_changes": applied["changes"],
+            "preview_fingerprint": preview["fingerprint"], "applied_fingerprint": applied["fingerprint"],
+            "mismatch_reasons": mismatch["inapplicable_reasons"],
+            "mismatch_apply_disabled": True,
+            "provider_call_count": 2, "provider_preview_requests": 2,
+            "apply_refetched_provider": False,
+            "preview_apply_parity": preview["changes"] == applied["changes"],
+        })
         browser.close()
 
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
@@ -956,6 +1062,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         "sequential_candidate_proof": sequential_proof,
         "ftintitle_config_proof": ftintitle_config_proof,
         "deluxe_edition_proof": deluxe_proof,
+        "managed_library_proof": managed_library_proof,
+        "viewport_checks": viewport_checks,
         "inbox_retention": {"before": inbox_before, "after": inbox_after},
     }
 
@@ -968,6 +1076,8 @@ def main() -> None:
     parser.add_argument("--app-library")
     parser.add_argument("--state-path", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--source-diff-sha256", required=True)
     args = parser.parse_args()
     args.fixture_root.mkdir(parents=True, exist_ok=True)
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -977,7 +1087,7 @@ def main() -> None:
         name: {"path": str(path.resolve()), "device": path.stat().st_dev, "inode": path.stat().st_ino}
         for name, path in tracks.items()
     }
-    app_library = Path(args.app_library).absolute() if args.app_library else (args.fixture_root / "library").resolve()
+    app_library = Path(args.app_library).resolve() if args.app_library else (args.fixture_root / "library").resolve()
     configure(
         args.base_url.rstrip("/"),
         args.app_inbox or str((args.fixture_root / "inbox").resolve()),
@@ -985,7 +1095,7 @@ def main() -> None:
     )
     browser_result = run_browser(args.base_url.rstrip("/"), args.state_path, args.evidence_dir, tracks)
     after = {name: sha256(path) for name, path in tracks.items()}
-    assert before["as_is"] == after["as_is"], "as-is direct import changed source audio bytes"
+    assert before["as_is"] != after["as_is"], "managed Library edits did not update the fixture tags"
     assert all(track.exists() for track in tracks.values()), "direct import moved or removed a source file"
     host_identity_after = {
         name: {"path": str(path.resolve()), "device": path.stat().st_dev, "inode": path.stat().st_ino}
@@ -1004,6 +1114,26 @@ def main() -> None:
         assert reported_path.is_absolute()
         assert reported_path.is_relative_to(app_library)
         assert reported_path == expected_app_path
+    managed_tags = MediaFile(str(tracks["as_is"]))
+    assert (managed_tags.title, managed_tags.album, managed_tags.albumartist,
+            managed_tags.genre, managed_tags.year) == (
+        "As Is Song Edited", "As Is Album (MBID Edition)", "As Is Artist", "Soul", 2024,
+    )
+    managed_proof = browser_result["managed_library_proof"]
+    managed_track = managed_proof["after"]["tracks"][0]
+    managed_proof.update({
+        "database_values": {
+            key: managed_track[key] for key in ("title", "album", "albumartist", "artist", "genre", "year")
+        },
+        "file_values": {
+            "title": managed_tags.title, "album": managed_tags.album,
+            "albumartist": managed_tags.albumartist, "artist": managed_tags.artist,
+            "genre": managed_tags.genre, "year": managed_tags.year,
+        },
+        "db_file_parity": all(managed_track[key] == getattr(managed_tags, key)
+                              for key in ("title", "album", "albumartist", "artist", "genre", "year")),
+        "path_unchanged": managed_proof["path_before"] == managed_proof["path_after"],
+    })
 
     sidecar_tags = MediaFile(str(tracks["sidecar"]))
     embed_tags = MediaFile(str(tracks["embed"]))
@@ -1050,6 +1180,10 @@ def main() -> None:
     assert raw_feature["tracks"][1]["title"] == "Extra [Remix]"
     assert raw_feature["tracks"][1]["track_artist"] == "2 Chainz feat. Rich Homie Quan"
     result = {
+        "source_identity": {
+            "commit_at_run": args.source_commit,
+            "working_diff_sha256": args.source_diff_sha256,
+        },
         "fixture_sha256_before": before,
         "fixture_sha256_after": after,
         "host_identity_before": host_identity_before,

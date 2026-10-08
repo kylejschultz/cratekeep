@@ -66,6 +66,12 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
             base["artist"] = f'{query["artist"]} Different'
         return [base]
     assert limit == 1
+    if release_id == "123e4567-e89b-42d3-a456-426614174011":
+        return [{
+            "provider_id": release_id, "artist": query["artist"], "album": query["album"],
+            "track_count": 0, "media": [], "tracks": [],
+            "retrieval": {"search_score": None, "source": "release-id"},
+        }]
     candidate = {
         "provider_id": release_id,
         "artist": query["artist"],
@@ -77,7 +83,8 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
         "track_count": len(query.get("tracks", [])),
         "media": [{"position": 1, "format": "CD", "track_count": len(query.get("tracks", []))}],
         "tracks": [
-            {"title": track.get("title"), "position": index, "medium_position": 1}
+            {"title": track.get("title"), "position": index, "medium_position": 1,
+             "track_artist": track.get("artist"), "recording_id": f"managed-recording-{index}"}
             for index, track in enumerate(query.get("tracks", []), 1)
         ],
         "artwork": {
