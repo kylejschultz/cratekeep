@@ -302,6 +302,7 @@
       .review-footer button { width:100%; }
     }
   </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app-shell.css') }}">
 </head>
 <body{% if first_run %} class="setup-mode"{% endif %}>
 {% if not first_run %}

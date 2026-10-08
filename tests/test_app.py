@@ -1,6 +1,7 @@
 import hashlib
 import json
 import copy
+import os
 import re
 from io import BytesIO
 import shutil
@@ -1823,7 +1824,7 @@ def test_confirmed_release_edition_matches_review_preview_database_file_and_rema
     def provider(query, *, limit):
         return [{
             "provider_id": query.get("musicbrainz_id", "123e4567-e89b-42d3-a456-426614174010"),
-            "artist": "Big Sean", "album": "Dark Sky Paradise",
+            "artist": "Big Sean", "album": "BULLY",
             "release_disambiguation": "deluxe, clean", "track_count": 1,
             "tracks": [{
                 "title": "Blessings", "track_artist": "Big Sean feat. Drake",
@@ -1833,18 +1834,18 @@ def test_confirmed_release_edition_matches_review_preview_database_file_and_rema
         }]
 
     app.config["MUSICBRAINZ_PROVIDER"] = provider
-    path = tmp_path / "library" / "Big Sean" / "Dark Sky Paradise (Deluxe)" / "01 Blessings.wav"
+    path = tmp_path / "library" / "Big Sean" / "BULLY - DELUXE" / "01 Blessings.wav"
     write_wav(path)
     media = MediaFile(str(path))
     media.title = "Blessings"; media.artist = "Big Sean feat. Drake"; media.albumartist = "Big Sean"
-    media.album = "Dark Sky Paradise (Deluxe)"; media.track = media.disc = 1; media.save()
+    media.album = "BULLY - DELUXE"; media.track = media.disc = 1; media.save()
     client = app.test_client()
 
     assert client.post("/api/library/inventory/preview").status_code == 201
     assert client.post("/api/library-import/candidates", json={}).status_code == 201
     album = client.get("/api/library-import/reviews").json["albums"][0]
     candidate = album["candidates"][0]
-    assert candidate["album"] == "Dark Sky Paradise (Deluxe)"
+    assert candidate["album"] == "BULLY - DELUXE"
     assert candidate["release_disambiguation"] == "deluxe, clean"
     assert "album" not in candidate["proposed_diff"]
     assert candidate["recordings"][0]["title"] == "Blessings feat. Drake"
@@ -1855,7 +1856,7 @@ def test_confirmed_release_edition_matches_review_preview_database_file_and_rema
             (candidate["id"],),
         ).fetchone()
     raw = json.loads(stored[2])
-    assert stored[0] == raw["album"] == "Dark Sky Paradise"
+    assert stored[0] == raw["album"] == "BULLY"
     assert "album" not in json.loads(stored[1])
     assert raw["release_disambiguation"] == "deluxe, clean"
 
@@ -1866,7 +1867,7 @@ def test_confirmed_release_edition_matches_review_preview_database_file_and_rema
     assert rematched.status_code == 200
     candidate = rematched.json["proposed_match"]
     assert candidate["provider_id"] == release_id
-    assert candidate["album"] == "Dark Sky Paradise (Deluxe)"
+    assert candidate["album"] == "BULLY - DELUXE"
     assert candidate["release_disambiguation"] == "deluxe, clean"
     assert "album" not in candidate["proposed_diff"]
 
@@ -1886,10 +1887,10 @@ def test_confirmed_release_edition_matches_review_preview_database_file_and_rema
     item = next(iter(Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).items()))
     tags = MediaFile(str(path))
     assert (item.album, item.title, item.artist) == (
-        "Dark Sky Paradise (Deluxe)", "Blessings feat. Drake", "Big Sean",
+        "BULLY - DELUXE", "Blessings feat. Drake", "Big Sean",
     )
     assert (tags.album, tags.title, tags.artist) == (
-        "Dark Sky Paradise (Deluxe)", "Blessings feat. Drake", "Big Sean",
+        "BULLY - DELUXE", "Blessings feat. Drake", "Big Sean",
     )
 
 
@@ -2194,7 +2195,7 @@ def test_inbox_route_owns_library_import_review_workspace(tmp_path):
     assert b": \"library-import\");" in page.data
 
 
-def test_library_route_is_album_first_searchable_and_lazy(tmp_path):
+def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     root = tmp_path / "library"
     library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
@@ -2210,6 +2211,29 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path):
         Path(item.path.decode()).write_bytes(b"audio")
     first_album = library.add_album([tracks[1], tracks[2]])
     shared_album = library.add_album([tracks[0]])
+    with sqlite3.connect(app.config["BEETS_DB"]) as database:
+        for item in tracks:
+            database.execute("UPDATE items SET path = ? WHERE id = ?",
+                             (os.fsencode(Path(item.path.decode()).name), item.id))
+    cover = root / "cover.jpg"
+    cover.write_bytes(b"landing must not read or decode this payload")
+    original_read_bytes = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda path: (
+        pytest.fail("Library landing read full artwork bytes") if path == cover
+        else original_read_bytes(path)
+    ))
+    monkeypatch.setattr("beets_mvp._normalize_artwork_bytes", lambda payload: pytest.fail(
+        "Library landing decoded artwork"
+    ))
+    import beets_mvp
+    original_discovery = beets_mvp._managed_album_artwork_source
+    discoveries = []
+
+    def counted_discovery(current_app, items):
+        discoveries.append(tuple(item.id for item in items))
+        return original_discovery(current_app, items)
+
+    monkeypatch.setattr(beets_mvp, "_managed_album_artwork_source", counted_discovery)
 
     client = app.test_client()
     page = client.get("/library")
@@ -2218,6 +2242,8 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path):
     assert b"<span>Tracks</span><strong>3</strong>" in page.data
     assert b"<span>Albums</span><strong>2</strong>" in page.data
     assert b"<span>Artists</span><strong>2</strong>" in page.data
+    assert b"<span>Library size</span><strong>&lt;0.1 MB</strong>" in page.data
+    assert len(discoveries) == 2
     assert b"Top artists" in page.data and b"Recently added albums" in page.data
     assert b'name="q" type="search"' in page.data
     assert b'name="sort"' in page.data and b'name="order"' in page.data
@@ -2227,6 +2253,8 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path):
     assert b'action="/api/items/' not in page.data
     assert f'data-album-id="{first_album.id}"'.encode() in page.data
     assert f'data-album-id="{shared_album.id}"'.encode() in page.data
+    assert b'data-album-cover' in page.data and b'/artwork' in page.data
+    assert b'id="choose-artwork"' in page.data and b'id="refresh-artwork"' in page.data
 
     filtered = client.get("/library?q=artist+b&sort=album&order=desc")
     browse = filtered.data.split(b'id="browse-title"', 1)[1]
@@ -2355,7 +2383,7 @@ def test_managed_album_edit_rolls_back_first_file_and_database_on_second_write_f
 def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mutating(tmp_path):
     app = make_app(tmp_path)
     library, album, paths = managed_wav_album(
-        app, tmp_path, album_name="Dark Sky Paradise (Deluxe)", titles=("First Song", "Second Song")
+        app, tmp_path, album_name="BULLY - DELUXE", titles=("First Song", "Second Song")
     )
     release_id = "123e4567-e89b-42d3-a456-426614174000"
     provider_calls = []
@@ -2364,7 +2392,7 @@ def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mut
         provider_calls.append((query["musicbrainz_id"], limit))
         return [{
             "provider_id": release_id, "release_group_id": "group-1", "artist": "Artist",
-            "album": "Dark Sky Paradise", "date": "2024-03-01", "year": "2024",
+            "album": "BULLY", "date": "2024-03-01", "year": "2024",
             "release_disambiguation": "Deluxe", "country": "US", "release_type": "Album",
             "track_count": 2, "media": [{"position": 1, "format": "CD"}],
             "tracks": [
@@ -2386,8 +2414,8 @@ def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mut
     })
     assert preview.status_code == 201
     assert preview.json["applicable"] is True
-    assert preview.json["candidate"]["album"] == "Dark Sky Paradise (Deluxe)"
-    assert preview.json["candidate"]["raw_album"] == "Dark Sky Paradise"
+    assert preview.json["candidate"]["album"] == "BULLY - DELUXE"
+    assert preview.json["candidate"]["raw_album"] == "BULLY"
     assert preview.json["changes"][0]["changes"]["title"]["to"] == "First Song Remastered"
     assert [(item.title, item.mb_trackid, Path(item.path.decode()).resolve()) for item in album.items()] == before_db
     assert [path.read_bytes() for path in paths] == before_files
@@ -2396,7 +2424,7 @@ def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mut
             "SELECT evidence_json, status FROM managed_album_rematches WHERE id = ?",
             (preview.json["preview_id"],),
         ).fetchone()
-    assert json.loads(evidence)["album"] == "Dark Sky Paradise"
+    assert json.loads(evidence)["album"] == "BULLY"
     assert status == "pending"
 
     applied = client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
@@ -2412,6 +2440,160 @@ def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mut
     assert client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
         "preview_id": preview.json["preview_id"], "expected_fingerprint": preview.json["fingerprint"],
     }).status_code == 409
+
+
+def test_managed_artwork_upload_and_exact_refresh_preview_apply_preserve_metadata_paths(tmp_path):
+    app = make_app(tmp_path)
+    app.config.update(ART_SIDECAR=True, ART_EMBED=True)
+    library, album, paths = managed_wav_album(app, tmp_path)
+    release_id = "123e4567-e89b-42d3-a456-426614174000"
+    album.mb_albumid = release_id
+    album.store()
+    for item in album.items():
+        item.mb_albumid = release_id
+        item.store()
+    provider_calls = []
+    refreshed_jpeg = jpeg_bytes((10, 120, 80))
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: provider_calls.append(
+        (query["musicbrainz_id"], limit)
+    ) or [{
+        "provider_id": release_id, "artist": "Artist", "album": "Album", "tracks": [],
+        "artwork": {"available": True, "source": "cover-art-archive",
+                    "entity": "release", "mbid": release_id},
+    }]
+    app.config["ARTWORK_FETCHER"] = lambda candidate: refreshed_jpeg
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    original_paths = [path.resolve() for path in paths]
+    original_metadata = [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths]
+
+    uploaded = client.post(f"/api/library/albums/{album.id}/artwork/upload-preview", data={
+        "expected_fingerprint": opened["fingerprint"],
+        "artwork": (BytesIO(jpeg_bytes((160, 20, 40))), "cover.png"),
+    })
+    assert uploaded.status_code == 201
+    assert client.get(uploaded.json["preview_url"]).status_code == 200
+    replacement_preview = client.post(f"/api/library/albums/{album.id}/artwork/upload-preview", data={
+        "expected_fingerprint": opened["fingerprint"],
+        "artwork": (BytesIO(jpeg_bytes((160, 20, 40))), "cover.png"),
+    })
+    assert replacement_preview.status_code == 201
+    assert client.get(uploaded.json["preview_url"]).status_code == 404
+    assert client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": uploaded.json["preview_id"], "expected_fingerprint": opened["fingerprint"],
+    }).status_code == 409
+    uploaded = replacement_preview
+    assert not (paths[0].parent / "cover.jpg").exists()
+    assert all(not (MediaFile(str(path)).images or []) for path in paths)
+    applied = client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": uploaded.json["preview_id"], "expected_fingerprint": opened["fingerprint"],
+    })
+    assert applied.status_code == 200
+    assert applied.json["sidecars_written"] == 1 and applied.json["tracks_embedded"] == 2
+    uploaded_bytes = (paths[0].parent / "cover.jpg").read_bytes()
+    assert all((MediaFile(str(path)).images or [])[0].data == uploaded_bytes for path in paths)
+    assert client.get(f"/api/library/albums/{album.id}/artwork").status_code == 200
+
+    before_refresh = client.get(f"/api/library/albums/{album.id}").json
+    refresh = client.post(f"/api/library/albums/{album.id}/artwork/refresh-preview", json={
+        "expected_fingerprint": before_refresh["fingerprint"],
+    })
+    assert refresh.status_code == 201
+    assert refresh.json["release_id"] == release_id and provider_calls == [(release_id, 1)]
+    assert (paths[0].parent / "cover.jpg").read_bytes() == uploaded_bytes
+    sidecar = paths[0].parent / "cover.jpg"
+    externally_changed = uploaded_bytes + b"external artwork change"
+    sidecar.write_bytes(externally_changed)
+    refreshed = client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": refresh.json["preview_id"],
+        "expected_fingerprint": before_refresh["fingerprint"],
+    })
+    assert refreshed.status_code == 409 and refreshed.json["code"] == "stale_artwork"
+    assert sidecar.read_bytes() == externally_changed
+    refresh = client.post(f"/api/library/albums/{album.id}/artwork/refresh-preview", json={
+        "expected_fingerprint": before_refresh["fingerprint"],
+    })
+    assert refresh.status_code == 201 and provider_calls == [(release_id, 1), (release_id, 1)]
+    refreshed = client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": refresh.json["preview_id"],
+        "expected_fingerprint": before_refresh["fingerprint"],
+    })
+    assert refreshed.status_code == 200
+    assert sidecar.read_bytes() == refreshed_jpeg
+    assert all((MediaFile(str(path)).images or [])[0].data == refreshed_jpeg for path in paths)
+    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+    assert [(MediaFile(str(path)).title, MediaFile(str(path)).album) for path in paths] == original_metadata
+
+
+def test_managed_artwork_failure_rolls_back_and_rejects_sidecar_symlink(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    app.config.update(ART_SIDECAR=True, ART_EMBED=True)
+    _, album, paths = managed_wav_album(app, tmp_path)
+    original_jpeg = jpeg_bytes((20, 40, 80))
+    sidecar = paths[0].parent / "cover.jpg"
+    sidecar.write_bytes(original_jpeg)
+    for path in paths:
+        media = MediaFile(str(path))
+        media.images = [MediaImage(original_jpeg, desc="Original", type=ImageType.front)]
+        media.save()
+    original_paths = [path.resolve() for path in paths]
+    original_file_bytes = [path.read_bytes() for path in paths]
+    original_metadata = [
+        (media.title, media.artist, media.album, media.albumartist, media.genre,
+         media.year, media.track, media.disc)
+        for media in (MediaFile(str(path)) for path in paths)
+    ]
+    client = app.test_client()
+    opened = client.get(f"/api/library/albums/{album.id}").json
+    preview = client.post(f"/api/library/albums/{album.id}/artwork/upload-preview", data={
+        "expected_fingerprint": opened["fingerprint"],
+        "artwork": (BytesIO(jpeg_bytes((180, 140, 20))), "replacement.jpg"),
+    }).json
+    original_save = MediaFile.save
+    calls = 0
+
+    def fail_second_save(media, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected artwork write failure")
+        return original_save(media, *args, **kwargs)
+
+    monkeypatch.setattr(MediaFile, "save", fail_second_save)
+    failed = client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": preview["preview_id"], "expected_fingerprint": opened["fingerprint"],
+    })
+    assert failed.status_code == 500 and failed.json["code"] == "artwork_mutation_rolled_back"
+    assert sidecar.read_bytes() == original_jpeg
+    assert [path.read_bytes() for path in paths] == original_file_bytes
+    assert all((MediaFile(str(path)).images or [])[0].data == original_jpeg for path in paths)
+    assert [
+        (media.title, media.artist, media.album, media.albumartist, media.genre,
+         media.year, media.track, media.disc)
+        for media in (MediaFile(str(path)) for path in paths)
+    ] == original_metadata
+    assert [path.resolve() for path in paths] == original_paths
+    assert not list(paths[0].parent.glob(".*.cratekeep-art-*.bak"))
+    assert client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": preview["preview_id"], "expected_fingerprint": opened["fingerprint"],
+    }).status_code == 409
+
+    monkeypatch.setattr(MediaFile, "save", original_save)
+    outside = tmp_path / "outside-cover.jpg"
+    outside.write_bytes(b"outside must remain untouched")
+    sidecar.unlink()
+    sidecar.symlink_to(outside)
+    current = client.get(f"/api/library/albums/{album.id}").json
+    unsafe_preview = client.post(f"/api/library/albums/{album.id}/artwork/upload-preview", data={
+        "expected_fingerprint": current["fingerprint"],
+        "artwork": (BytesIO(jpeg_bytes((1, 2, 3))), "unsafe.jpg"),
+    }).json
+    rejected = client.post(f"/api/library/albums/{album.id}/artwork/apply", json={
+        "preview_id": unsafe_preview["preview_id"],
+        "expected_fingerprint": current["fingerprint"],
+    })
+    assert rejected.status_code == 409 and rejected.json["code"] == "managed_path_invalid"
+    assert outside.read_bytes() == b"outside must remain untouched"
 
 
 def test_managed_album_rematch_rolls_back_on_second_tag_failure(tmp_path, monkeypatch):
@@ -3933,6 +4115,12 @@ def test_ftintitle_projection_uses_upstream_parsing_and_formatting(tmp_path):
     ("Dark Sky Paradise", "Dark Sky Paradise", "deluxe", "Dark Sky Paradise", False),
     ("Dark Sky Paradise (Remastered)", "Dark Sky Paradise", "deluxe", "Dark Sky Paradise", True),
     ("Dark Sky Paradise (Deluxe)", "Dark Sky Paradise (Deluxe)", "deluxe", "Dark Sky Paradise (Deluxe)", False),
+    ("BULLY - DELUXE", "BULLY", "deluxe", "BULLY - DELUXE", False),
+    ("BULLY – Deluxe", "bully", "DELUXE", "BULLY – Deluxe", False),
+    ("BULLY — Deluxe", "BULLY", "deluxe, clean", "BULLY — Deluxe", False),
+    ("BULLY: Deluxe", "BULLY", "deluxe", "BULLY: Deluxe", False),
+    ("BULLY - CLEAN", "BULLY", "deluxe", "BULLY", True),
+    ("BULLY-DELUXE", "BULLY", "deluxe", "BULLY", True),
 ])
 def test_reviewed_library_album_edition_projection_is_conservative(
     tmp_path, local_album, canonical_album, release_note, expected, changed,

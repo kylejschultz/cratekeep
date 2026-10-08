@@ -1,0 +1,75 @@
+/* Shared Cratekeep palette and compact shell. Page-specific layouts stay local. */
+:root {
+  color-scheme: light;
+  --page:#f1f4f3; --surface:#fff; --subtle:#f5f8f7; --text:#17211e;
+  --muted:#60706a; --border:#bdc9c4; --soft:#dbe3df; --accent:#176b55;
+  --accent-hover:#105441; --hover:#105441; --focus:#b45309; --success:#e1f1ea;
+  --sidebar:#172521; --side-text:#eef4f1; --side-muted:#a9b8b2; --active:#294039;
+  --modal-surface:#f1f4f3; --modal-panel:#fff; --modal-border:#bdc9c4;
+  --modal-subtle:#edf3f0; --modal-accent:#176b55; --modal-accent-hover:#105441;
+  --overlay:rgb(8 20 16 / 72%);
+}
+body.dark-mode {
+  color-scheme: dark;
+  --page:#111916; --surface:#19231f; --subtle:#202d28; --text:#edf4f1;
+  --muted:#aabbb4; --border:#506159; --soft:#34453e; --accent:#65c3a4;
+  --accent-hover:#83d2b8; --hover:#83d2b8; --focus:#f7b955; --success:#294337;
+  --sidebar:#0b1210; --side-text:#e8f0ec; --side-muted:#9cada6; --active:#2c4139;
+  --modal-surface:#19231f; --modal-panel:#202d28; --modal-border:#506159;
+  --modal-subtle:#26342e; --modal-accent:#65c3a4; --modal-accent-hover:#83d2b8;
+}
+body { font-size:14px; line-height:1.4; }
+.sidebar { width:11.75rem; padding:.7rem .6rem; }
+.content { margin-left:11.75rem; }
+.brand { gap:.5rem; padding:.1rem .35rem .65rem; }
+.brand img,.mobile-header img { width:1.75rem; height:1.75rem; }
+.brand-name { font-size:.95rem; }
+.brand-tagline { font-size:.68rem; }
+.nav-list { gap:.1rem; margin:.65rem 0; }
+.nav-link { gap:.5rem; min-height:2rem; padding:.3rem .5rem; font-size:.82rem; }
+.sidebar-footer { gap:.45rem; padding:.55rem .1rem 0; }
+.utility-link,.theme-toggle { font-size:.72rem; }
+.collapse-button { top:4.35rem; }
+body.sidebar-collapsed .sidebar { width:4.25rem; }
+body.sidebar-collapsed .content { margin-left:4.25rem; }
+.content main,main { padding:clamp(.85rem,2vw,1.4rem); }
+.page-header,.page-head { margin-bottom:.85rem; }
+h1,.page-head h1 { font-size:clamp(1.4rem,2.5vw,1.65rem); }
+.lede,.page-head p { margin-top:.25rem; }
+.summary-grid { gap:.55rem; }
+.summary-card,.card { padding:.7rem .8rem; }
+.summary-value,.card strong { font-size:1.4rem; }
+.section { margin-top:1.2rem; }
+.section-heading { margin-bottom:.5rem; }
+.section-heading h2 { font-size:1.15rem; }
+th,td { padding:.45rem .6rem; }
+.library-list { gap:.6rem; }
+.item-card { padding:.7rem; }
+.item-header { margin-bottom:.55rem; padding-bottom:.45rem; }
+.metadata-form { gap:.5rem; }
+.field,input,select,textarea,button { font-size:.86rem; }
+.field input,.control input,.control select,input[type=text],input[type=password],input[type=url],select {
+  min-height:2.1rem; padding:.35rem .5rem;
+}
+button,.save-button { min-height:2.1rem; padding:.35rem .65rem; }
+.settings-tabs { margin-bottom:.65rem; }
+.settings-tab { padding:.45rem .7rem; }
+.settings-section { margin-top:.65rem; padding:.8rem; }
+.settings-section label { margin-top:.7rem; }
+.inventory-summary,.import-actions { margin-top:.65rem; }
+.review-folder-summary { padding:.3rem .45rem; }
+.modal-head,.browser-header { padding:.7rem .85rem; }
+.modal-body,.browser-body { padding:.75rem .85rem; }
+.modal-head h2,.browser-header h2 { font-size:1.05rem; }
+.modal-head p { margin:.1rem 0 0; }
+@media (max-width:760px) {
+  .content,body.sidebar-collapsed .content { margin-left:0; }
+  .mobile-header { padding:.4rem .7rem; }
+  .sidebar { width:min(17rem,86vw); }
+}
+@media (max-width:520px) {
+  .content main,main { padding:.7rem; }
+}
+@media (pointer:coarse) {
+  :is(button,.nav-link,input,select,summary) { min-height:2.75rem; }
+}

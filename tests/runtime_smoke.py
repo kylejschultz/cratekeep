@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import platform
 import re
 import sqlite3
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -17,6 +19,7 @@ from pathlib import Path
 
 from mediafile import Image as MediaImage, ImageType, MediaFile
 from playwright.sync_api import Page, sync_playwright
+from beets_mvp import _format_bytes
 
 from runtime_app import ARTWORK_JPEG, EXISTING_ARTWORK_JPEG
 
@@ -34,7 +37,7 @@ TRACKS = {
     "feature_realest": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "09 U Da Realest.wav",
     "feature_ratchet": Path("2 Chainz") / "B.O.A.T.S. II #METIME" / "10 Mainstream Ratchet.wav",
     "feature_disabled": Path("Disabled Lead") / "Disabled Feature Album" / "01 Disabled Song.wav",
-    "deluxe": Path("Big Sean") / "Dark Sky Paradise (Deluxe)" / "01 Blessings.wav",
+    "deluxe": Path("Big Sean") / "BULLY - DELUXE" / "01 Blessings.wav",
     "queue_safe": Path("Queue Safe") / "Safe Match" / "01 Safe.wav",
     "queue_tied": Path("Queue Tied") / "Tied Match" / "01 Tied.wav",
     "queue_lower": Path("Queue Lower") / "Lower Match" / "01 Lower.wav",
@@ -50,6 +53,7 @@ EXISTING_SIDECAR_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174002"
 DELUXE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174010"
 LIBRARY_MATCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174077"
 LIBRARY_MISMATCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174011"
+LIBRARY_NO_ART_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174012"
 
 
 def request_json(url: str):
@@ -319,6 +323,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
+        browser_version = browser.version
         page: Page = browser.new_page(viewport={"width": 1440, "height": 1000})
         expected_failure = {"kind": None}
         page.on("pageerror", lambda error: page_errors.append(str(error)))
@@ -330,6 +335,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                                                   expected_failure["kind"] == "execute" and response.status == 502
                                               ) or (
                                                   expected_failure["kind"] == "rematch" and response.status == 503
+                                              ) or (
+                                                  expected_failure["kind"] == "artwork" and response.status == 409
                                               )})
             if "/api/" in response.url
             else None,
@@ -594,19 +601,19 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert deluxe_rematch.value.status == 200
         deluxe_payload = deluxe_rematch.value.json()
         deluxe_candidate = deluxe_payload["proposed_match"]
-        assert deluxe_candidate["album"] == "Dark Sky Paradise (Deluxe)"
+        assert deluxe_candidate["album"] == "BULLY - DELUXE"
         assert deluxe_candidate["release_disambiguation"] == "deluxe, clean"
         assert "album" not in deluxe_candidate["proposed_diff"]
         assert deluxe_candidate["recordings"][0]["title"] == "Blessings feat. Drake"
         facts = page.locator(".candidate-option[open] .candidate-fact")
-        assert facts.filter(has_text="Album").locator("dd").first.inner_text() == "Dark Sky Paradise (Deluxe)"
+        assert facts.filter(has_text="Album").locator("dd").first.inner_text() == "BULLY - DELUXE"
         assert facts.filter(has_text="MusicBrainz release note").locator("dd").inner_text() == "deluxe, clean"
         assert facts.filter(has_text="Album").first.get_attribute("data-changed") == "false"
         with sqlite3.connect(state_path / "app.db") as database:
             deluxe_raw = json.loads(database.execute(
                 "SELECT provider_data_json FROM metadata_candidates WHERE id = ?", (deluxe_candidate["id"],),
             ).fetchone()[0])
-        assert deluxe_raw["album"] == "Dark Sky Paradise"
+        assert deluxe_raw["album"] == "BULLY"
         assert deluxe_raw["release_disambiguation"] == "deluxe, clean"
         page.screenshot(path=evidence / "04-deluxe-review-desktop-dark.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
@@ -634,7 +641,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert deluxe_result["items"][0]["changes"] == preview_changes
         deluxe_tags = MediaFile(str(tracks["deluxe"]))
         assert (deluxe_tags.album, deluxe_tags.title, deluxe_tags.artist) == (
-            "Dark Sky Paradise (Deluxe)", "Blessings feat. Drake", "Big Sean",
+            "BULLY - DELUXE", "Blessings feat. Drake", "Big Sean",
         )
         deluxe_proof = {
             "review_album": deluxe_candidate["album"],
@@ -956,6 +963,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator(".album-card").count() == 1
         assert page.locator(".track-row").count() == 0
         assert "As Is Song" not in page.locator(".browse").inner_text()
+        expected_library_size = _format_bytes(sum(item["bytes"] for item in request_json(f"{base_url}/api/items")))
+        assert page.locator(".summary-grid .card").last.locator("strong").inner_text() == expected_library_size
+        assert expected_library_size != "0 MB"
+        assert page.locator(".album-card [data-album-cover]").get_by_text("No art").is_visible()
         assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
         viewport_checks["desktop_1440x1000_no_horizontal_overflow"] = True
         page.screenshot(path=evidence / "12-library-albums-desktop-light.png", full_page=True)
@@ -1008,6 +1019,66 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"] == applied["fingerprint"]
         assert next(item["path"] for item in request_json(f"{base_url}/api/items")
                     if item["id"] == initial["tracks"][0]["id"]) == original_path
+        page.locator("#rematch-close").click()
+        page.locator("#rematch-modal").wait_for(state="hidden")
+
+        # Managed artwork is always preview-first. Exercise upload and exact-MBID
+        # refresh through the visible controls, then prove a no-art refresh is a no-op.
+        upload_fixture = evidence / ".managed-upload.jpg"
+        upload_fixture.write_bytes(EXISTING_ARTWORK_JPEG)
+        before_upload = request_json(f"{base_url}/api/library/albums/{album_id}")
+        with page.expect_file_chooser() as chooser_info:
+            page.locator("#choose-artwork").click()
+        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload_info:
+            chooser_info.value.set_files(str(upload_fixture))
+        upload_fixture.unlink()
+        upload_preview = upload_info.value.json()
+        assert upload_info.value.status == 201 and upload_preview["source"] == "upload"
+        page.locator("#artwork-preview:not([hidden])").wait_for()
+        assert request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"] == before_upload["fingerprint"]
+        assert not (tracks["as_is"].parent / "cover.jpg").exists()
+        page.screenshot(path=evidence / "17-managed-artwork-upload-preview.png")
+        with page.expect_response(lambda response: response.url.endswith("/artwork/apply")) as upload_apply_info:
+            page.locator("#apply-artwork").click()
+        upload_applied = upload_apply_info.value.json()
+        assert upload_applied["sidecars_written"] == 1 and upload_applied["tracks_embedded"] == 1
+        assert (tracks["as_is"].parent / "cover.jpg").read_bytes() == EXISTING_ARTWORK_JPEG
+        assert (MediaFile(str(tracks["as_is"])).images or [])[0].data == EXISTING_ARTWORK_JPEG
+        assert page.locator("#album-artwork-current img").is_visible()
+        assert page.locator(".album-card [data-album-cover] img").is_visible()
+        assert page.locator(".recent-cover img").first.is_visible()
+
+        before_refresh_art = request_json(f"{base_url}/api/library/albums/{album_id}")
+        with page.expect_response(lambda response: response.url.endswith("/artwork/refresh-preview")) as refresh_info:
+            page.locator("#refresh-artwork").click()
+        refresh_preview = refresh_info.value.json()
+        assert refresh_info.value.status == 201 and refresh_preview["release_id"] == LIBRARY_MATCH_RELEASE_ID
+        assert (tracks["as_is"].parent / "cover.jpg").read_bytes() == EXISTING_ARTWORK_JPEG
+        assert request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"] == before_refresh_art["fingerprint"]
+        with page.expect_response(lambda response: response.url.endswith("/artwork/apply")) as refresh_apply_info:
+            page.locator("#apply-artwork").click()
+        refresh_applied = refresh_apply_info.value.json()
+        assert (tracks["as_is"].parent / "cover.jpg").read_bytes() == ARTWORK_JPEG
+        assert (MediaFile(str(tracks["as_is"])).images or [])[0].data == ARTWORK_JPEG
+
+        page.locator("#open-rematch").click()
+        page.locator("#musicbrainz-id").fill(LIBRARY_NO_ART_RELEASE_ID)
+        with page.expect_response(lambda response: response.url.endswith("/rematch/preview")):
+            page.locator('#rematch-form button[type="submit"]').click()
+        with page.expect_response(lambda response: response.url.endswith("/rematch/apply")):
+            page.locator("#apply-rematch").click()
+        page.locator("#rematch-close").click()
+        preserved_art_sha = hashlib.sha256((tracks["as_is"].parent / "cover.jpg").read_bytes()).hexdigest()
+        expected_failure["kind"] = "artwork"
+        with page.expect_response(lambda response: response.url.endswith("/artwork/refresh-preview")) as no_art_info:
+            page.locator("#refresh-artwork").click()
+        expected_failure["kind"] = None
+        assert no_art_info.value.status == 409
+        page.wait_for_function("document.getElementById('album-status').textContent.includes('existing artwork was preserved')")
+        assert hashlib.sha256((tracks["as_is"].parent / "cover.jpg").read_bytes()).hexdigest() == preserved_art_sha
+
+        before_mismatch_fingerprint = request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"]
+        page.locator("#open-rematch").click()
         page.locator("#musicbrainz-id").fill(LIBRARY_MISMATCH_RELEASE_ID)
         with page.expect_response(lambda response: response.url.endswith("/rematch/preview")) as mismatch_info:
             page.locator('#rematch-form button[type="submit"]').click()
@@ -1016,7 +1087,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.wait_for_function("document.getElementById('rematch-status').textContent.includes('Preview only')")
         assert page.locator("#apply-rematch").is_disabled()
         mismatch_fingerprint = request_json(f"{base_url}/api/library/albums/{album_id}")["fingerprint"]
-        assert mismatch_fingerprint == applied["fingerprint"]
+        assert mismatch_fingerprint == before_mismatch_fingerprint
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.locator("#rematch-modal .modal-panel").evaluate(
             "element => element.scrollWidth <= element.clientWidth"
@@ -1044,16 +1115,59 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "preview_fingerprint": preview["fingerprint"], "applied_fingerprint": applied["fingerprint"],
             "mismatch_reasons": mismatch["inapplicable_reasons"],
             "mismatch_apply_disabled": True,
-            "provider_call_count": 2, "provider_preview_requests": 2,
+            "provider_call_count": 5, "provider_preview_requests": 5,
             "apply_refetched_provider": False,
             "preview_apply_parity": preview["changes"] == applied["changes"],
+            "library_bytes": {"expected": expected_library_size, "rendered": expected_library_size},
+            "artwork": {
+                "upload_preview_sha256": upload_preview["sha256"],
+                "upload_apply_sha256": upload_applied["sha256"],
+                "refresh_preview_sha256": refresh_preview["sha256"],
+                "refresh_apply_sha256": refresh_applied["sha256"],
+                "preview_apply_parity": (
+                    upload_preview["sha256"] == upload_applied["sha256"]
+                    and refresh_preview["sha256"] == refresh_applied["sha256"]
+                ),
+                "no_art_preserved_sha256": preserved_art_sha,
+            },
         })
+
+        # Shared shell/palette/density contract across every primary page.
+        primary_pages = {"overview": "/", "inbox": "/inbox", "library": "/library", "settings": "/settings"}
+        palette_proof = {}
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        for mode in ("light", "dark"):
+            expected_tokens = None
+            for name, path in primary_pages.items():
+                page.evaluate("mode => mode === 'dark' ? localStorage.setItem('cratekeep-theme','dark') : localStorage.removeItem('cratekeep-theme')", mode)
+                page.goto(f"{base_url}{path}", wait_until="networkidle")
+                tokens = page.evaluate("""() => {
+                  const body=getComputedStyle(document.body), style=body;
+                  return {page:style.getPropertyValue('--page').trim(),accent:style.getPropertyValue('--accent').trim(),
+                          surface:style.getPropertyValue('--surface').trim(),fontSize:body.fontSize,
+                          sidebar:document.getElementById('sidebar')?.getBoundingClientRect().width};
+                }""")
+                expected_tokens = expected_tokens or tokens
+                assert tokens == expected_tokens, f"shared {mode} tokens drifted on {name}: {tokens}"
+                assert tokens["fontSize"] == "14px" and tokens["sidebar"] <= 190
+                assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+                page.screenshot(path=evidence / f"18-{name}-desktop-{mode}.png")
+            palette_proof[mode] = expected_tokens
+        page.set_viewport_size({"width": 390, "height": 844})
+        for name, path in primary_pages.items():
+            page.evaluate("localStorage.setItem('cratekeep-theme','dark')")
+            page.goto(f"{base_url}{path}", wait_until="networkidle")
+            assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+            page.screenshot(path=evidence / f"19-{name}-mobile-dark.png")
+        viewport_checks["primary_pages_shared_palette"] = palette_proof
+        viewport_checks["primary_pages_desktop_light_dark_and_mobile_no_overflow"] = True
         browser.close()
 
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
     inbox_after = request_json(f"{base_url}/api/inbox")
     assert inbox_after == inbox_before and inbox_after, "full-library imports must not alter Inbox retention"
     return {
+        "browser_version": browser_version,
         "page_errors": page_errors, "console_errors": unexpected_console,
         "expected_failure_console": [message for message in console_errors if message not in unexpected_console],
         "network": network,
@@ -1221,6 +1335,12 @@ def main() -> None:
     }
     results_path = args.evidence_dir / "runtime-results.json"
     results_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    (args.evidence_dir / "environment-identity.json").write_text(json.dumps({
+        "hostname": platform.node(), "platform": platform.platform(),
+        "python": sys.version, "browser": browser_result["browser_version"],
+        "fixture_root": str(args.fixture_root.resolve()),
+        "state_path": str(args.state_path.resolve()),
+    }, indent=2) + "\n", encoding="utf-8")
     manifest = [f"{sha256(path)}  {path.name}" for path in sorted(args.evidence_dir.iterdir()) if path.is_file()]
     (args.evidence_dir / "SHA256SUMS").write_text("\n".join(manifest) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))

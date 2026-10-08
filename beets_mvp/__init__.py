@@ -9,7 +9,9 @@ import secrets
 import sqlite3
 import subprocess
 import re
+import shutil
 import threading
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -27,7 +29,7 @@ from beetsplug.ftintitle import (
     find_feat_part,
     split_on_feat,
 )
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, url_for
 from mediafile import Image as MediaImage, ImageType, MediaFile, UnreadableFileError
 from PIL import Image as PillowImage, UnidentifiedImageError
 
@@ -46,6 +48,9 @@ SETTING_KEYS = (
     "art_sidecar", "art_embed", "art_replace",
 )
 MAX_ARTWORK_BYTES = 10 * 1024 * 1024
+MAX_ARTWORK_PIXELS = 40_000_000
+MAX_MANAGED_ARTWORK_PREVIEWS = 8
+MANAGED_ARTWORK_PREVIEW_TTL = 15 * 60
 TRUSTED_ARTWORK_HOSTS = {"coverartarchive.org", "archive.org"}
 MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
@@ -109,6 +114,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["BEETS_DB"] = str(state_path / "library.db")
     app.config["APP_DB"] = str(state_path / "app.db")
     app.config["BEETS_CONFIG"] = str(state_path / "config.yaml")
+    app.config["MANAGED_ARTWORK_PREVIEWS"] = {}
+    app.config["MANAGED_ARTWORK_PREVIEW_LOCK"] = threading.RLock()
     _init_db(app.config["APP_DB"])
     _apply_settings(app, _load_settings(app.config["APP_DB"]))
 
@@ -200,6 +207,91 @@ def create_app(test_config: dict | None = None) -> Flask:
         if album is None:
             return jsonify(error="Managed album not found", code="album_not_found"), 404
         return jsonify(album)
+
+    @app.get("/api/library/albums/<int:album_id>/artwork")
+    def managed_album_artwork(album_id: int):
+        album = _library(app).get_album(album_id)
+        if album is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        try:
+            artwork = _managed_album_artwork_bytes(app, _album_items(album))
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if artwork is None:
+            return jsonify(error="This album has no sidecar or embedded front artwork.",
+                           code="artwork_not_found"), 404
+        return send_file(BytesIO(artwork[0]), mimetype="image/jpeg", max_age=0,
+                         download_name="cover.jpg", conditional=False)
+
+    @app.post("/api/library/albums/<int:album_id>/artwork/upload-preview")
+    def preview_managed_artwork_upload(album_id: int):
+        uploaded = request.files.get("artwork")
+        expected = request.form.get("expected_fingerprint", "")
+        if uploaded is None or not expected:
+            return jsonify(error="artwork and expected_fingerprint are required",
+                           code="invalid_request"), 400
+        try:
+            payload = uploaded.stream.read(MAX_ARTWORK_BYTES + 1)
+            jpeg = _normalize_artwork_bytes(payload)
+            result = _create_managed_artwork_preview(
+                app, album_id, expected, jpeg, source="upload",
+                message="Upload validated. Review the preview, then choose Replace artwork.",
+            )
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code), 400
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result), 201
+
+    @app.post("/api/library/albums/<int:album_id>/artwork/refresh-preview")
+    def preview_managed_artwork_refresh(album_id: int):
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or set(values) != {"expected_fingerprint"}:
+            return jsonify(error="request must contain only expected_fingerprint",
+                           code="invalid_request"), 400
+        try:
+            result = _preview_managed_artwork_refresh(
+                app, album_id, values.get("expected_fingerprint")
+            )
+        except ProviderError as exc:
+            status = 404 if exc.code == "release_not_found" else (503 if exc.retryable else 502)
+            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), status
+        except (ManagedMutationError, LibraryImportExecutionError) as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except (OSError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "artwork provider failed", code="provider_error"), 502
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result), 201
+
+    @app.get("/api/library/albums/<int:album_id>/artwork/previews/<preview_id>")
+    def managed_artwork_preview_image(album_id: int, preview_id: str):
+        preview = _get_managed_artwork_preview(app, album_id, preview_id)
+        if preview is None:
+            return jsonify(error="Artwork preview expired. Choose artwork again.",
+                           code="preview_expired"), 404
+        return send_file(BytesIO(preview["jpeg"]), mimetype="image/jpeg", max_age=0,
+                         download_name="preview.jpg", conditional=False)
+
+    @app.post("/api/library/albums/<int:album_id>/artwork/apply")
+    def apply_managed_artwork(album_id: int):
+        values = request.get_json(silent=True)
+        if (not isinstance(values, dict) or set(values) != {"preview_id", "expected_fingerprint"}
+                or not isinstance(values.get("preview_id"), str)
+                or not isinstance(values.get("expected_fingerprint"), str)):
+            return jsonify(error="request must contain only preview_id and expected_fingerprint",
+                           code="invalid_request"), 400
+        try:
+            result = _apply_managed_artwork_preview(
+                app, album_id, values["preview_id"], values["expected_fingerprint"]
+            )
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
 
     @app.patch("/api/library/albums/<int:album_id>")
     def edit_managed_album(album_id: int):
@@ -1310,7 +1402,8 @@ def _library_page_data(
         ).fetchall()
         recent_rows = db.execute("SELECT id FROM albums ORDER BY added DESC, id DESC LIMIT 5").fetchall()
         path_rows = db.execute("SELECT path FROM items").fetchall()
-    albums = [_managed_album_summary(library.get_album(row["id"])) for row in rows]
+    summary_cache: dict[int, dict | None] = {}
+    albums = [_managed_album_summary(app, library.get_album(row["id"]), summary_cache) for row in rows]
     albums = [album for album in albums if album is not None]
     groups, group_by_artist = [], {}
     for album in albums:
@@ -1320,12 +1413,14 @@ def _library_page_data(
             group_by_artist[key] = {"artist": artist, "albums": []}
             groups.append(group_by_artist[key])
         group_by_artist[key]["albums"].append(album)
-    recent_albums = [_managed_album_summary(library.get_album(row["id"])) for row in recent_rows]
+    recent_albums = [
+        _managed_album_summary(app, library.get_album(row["id"]), summary_cache) for row in recent_rows
+    ]
     library_bytes = 0
     for row in path_rows:
         try:
-            library_bytes += Path(os.fsdecode(row["path"])).stat().st_size
-        except (OSError, TypeError, ValueError):
+            library_bytes += _managed_path(app, row["path"]).stat().st_size
+        except (ManagedMutationError, OSError, TypeError, ValueError):
             pass
     return {
         "albums": albums, "album_groups": groups,
@@ -1350,13 +1445,32 @@ def _album_items(album) -> list[Item]:
     )
 
 
-def _managed_track_payload(item: Item) -> dict:
+def _managed_path(app: Flask, raw_path: object) -> Path:
+    """Resolve a Beets path only within the configured managed library root."""
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    decoded = Path(os.fsdecode(raw_path))
+    candidate = decoded if decoded.is_absolute() else root / decoded
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ManagedMutationError(
+            "A managed library path is missing or unreadable.", code="managed_path_invalid", status=409
+        ) from exc
+    if resolved == root or root not in resolved.parents or candidate.is_symlink() or not resolved.is_file():
+        raise ManagedMutationError(
+            "A managed library path is outside the configured library root.",
+            code="managed_path_invalid", status=409,
+        )
+    return resolved
+
+
+def _managed_track_payload(app: Flask, item: Item) -> dict:
     result = {
         key: item.get(key)
         for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")
     }
     result["genre"] = _item_genre(item)
-    path = Path(os.fsdecode(item.path)) if item.get("path") else None
+    path = _managed_path(app, item.path) if item.get("path") else None
     try:
         result["bytes"] = path.stat().st_size if path else None
     except OSError:
@@ -1364,26 +1478,36 @@ def _managed_track_payload(item: Item) -> dict:
     return result
 
 
-def _managed_album_summary(album) -> dict | None:
+def _managed_album_summary(
+    app: Flask, album, cache: dict[int, dict | None] | None = None,
+) -> dict | None:
     if album is None:
         return None
+    if cache is not None and album.id in cache:
+        return cache[album.id]
     items = _album_items(album)
     genres = [_item_genre(item) for item in items if _item_genre(item)]
     genre = _normalize_metadata(album.get("genre")) or (genres[0] if genres and len(set(genres)) == 1 else "")
     size = 0
     for item in items:
         try:
-            size += Path(os.fsdecode(item.path)).stat().st_size
-        except (OSError, TypeError, ValueError):
+            size += _managed_path(app, item.path).stat().st_size
+        except (ManagedMutationError, OSError, TypeError, ValueError):
             pass
-    return {
+    artwork_source = _managed_album_artwork_source(app, items)
+    summary = {
         "id": album.id,
         "album": _normalize_metadata(album.get("album")) or "Unknown album",
         "albumartist": _normalize_metadata(album.get("albumartist"))
                        or (_normalize_metadata(items[0].get("artist")) if items else "") or "Unknown artist",
         "year": int(album.get("year") or 0), "genre": genre,
         "track_count": len(items), "bytes": size,
+        "artwork_available": artwork_source is not None,
+        "artwork_url": url_for("managed_album_artwork", album_id=album.id) if artwork_source else None,
     }
+    if cache is not None:
+        cache[album.id] = summary
+    return summary
 
 
 def _managed_album_fingerprint(album, items: list[Item] | None = None) -> str:
@@ -1414,9 +1538,348 @@ def _managed_album_payload(app: Flask, album_id: int) -> dict | None:
     if album is None:
         return None
     items = _album_items(album)
-    summary = _managed_album_summary(album)
-    return {**summary, "tracks": [_managed_track_payload(item) for item in items],
+    summary = _managed_album_summary(app, album)
+    return {**summary, "tracks": [_managed_track_payload(app, item) for item in items],
             "fingerprint": _managed_album_fingerprint(album, items)}
+
+
+def _normalize_artwork_bytes(payload: bytes) -> bytes:
+    if not payload:
+        raise LibraryImportExecutionError(
+            "Artwork is empty; existing artwork was not changed.",
+            code="artwork_invalid", status=400,
+        )
+    if len(payload) > MAX_ARTWORK_BYTES:
+        raise LibraryImportExecutionError(
+            "Artwork exceeds the 10 MB limit; existing artwork was not changed.",
+            code="artwork_too_large", status=400,
+        )
+    try:
+        with PillowImage.open(BytesIO(payload)) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+                raise ValueError(f"unsupported artwork format {image.format or 'unknown'}")
+            if image.width <= 0 or image.height <= 0 or image.width * image.height > MAX_ARTWORK_PIXELS:
+                raise ValueError("artwork dimensions are invalid or too large")
+            image.seek(0)
+            normalized = image.convert("RGB")
+            output = BytesIO()
+            normalized.save(output, format="JPEG", quality=90, optimize=False, progressive=False)
+            return output.getvalue()
+    except (OSError, ValueError, TypeError, UnidentifiedImageError,
+            PillowImage.DecompressionBombError) as exc:
+        raise LibraryImportExecutionError(
+            f"Artwork validation failed before artwork was changed: {exc}",
+            code="artwork_invalid", status=400,
+        ) from exc
+
+
+def _managed_album_artwork_source(app: Flask, items: list[Item]) -> str | None:
+    """Discover artwork cheaply for summaries; never read or decode sidecar bytes."""
+    paths = [_managed_path(app, item.path) for item in items]
+    for folder in dict.fromkeys(path.parent for path in paths):
+        sidecar = folder / "cover.jpg"
+        if not sidecar.is_symlink() and sidecar.is_file():
+            return "sidecar"
+    if paths:
+        try:
+            if MediaFile(str(paths[0])).images:
+                return "embedded"
+        except (OSError, UnreadableFileError):
+            pass
+    return None
+
+
+def _managed_album_artwork_bytes(app: Flask, items: list[Item]) -> tuple[bytes, str] | None:
+    """Return normalized browser-safe art without disclosing or accepting a path."""
+    paths = [_managed_path(app, item.path) for item in items]
+    for folder in dict.fromkeys(path.parent for path in paths):
+        sidecar = folder / "cover.jpg"
+        try:
+            if sidecar.is_symlink() or not sidecar.is_file():
+                continue
+            payload = sidecar.read_bytes()
+            return _normalize_artwork_bytes(payload), "sidecar"
+        except (OSError, LibraryImportExecutionError):
+            continue
+    for path in paths:
+        try:
+            images = MediaFile(str(path)).images or []
+            front = next((image for image in images if image.type == ImageType.front), None)
+            image = front or (images[0] if images else None)
+            if image is not None:
+                return _normalize_artwork_bytes(image.data), "embedded"
+        except (OSError, UnreadableFileError, LibraryImportExecutionError):
+            continue
+    return None
+
+
+def _managed_artwork_state_fingerprint(app: Flask, items: list[Item]) -> str:
+    """Fingerprint configured artwork destinations using bounded filesystem metadata."""
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    paths = [_managed_path(app, item.path) for item in items]
+    evidence = []
+    if app.config["ART_SIDECAR"]:
+        for destination in dict.fromkeys(path.parent / "cover.jpg" for path in paths):
+            try:
+                stat = destination.lstat()
+                evidence.append(("sidecar", str(destination.relative_to(root)), stat.st_size, stat.st_mtime_ns,
+                                 stat.st_dev, stat.st_ino, destination.is_symlink()))
+            except OSError:
+                evidence.append(("sidecar", str(destination.relative_to(root)), None))
+    if app.config["ART_EMBED"]:
+        for path in paths:
+            stat = path.stat()
+            evidence.append(("embedded", str(path.relative_to(root)), stat.st_size, stat.st_mtime_ns,
+                             stat.st_dev, stat.st_ino))
+    return hashlib.sha256(json.dumps(evidence, separators=(",", ":")).encode()).hexdigest()
+
+
+def _purge_managed_artwork_previews_locked(app: Flask) -> None:
+    previews = app.config["MANAGED_ARTWORK_PREVIEWS"]
+    cutoff = time.monotonic() - MANAGED_ARTWORK_PREVIEW_TTL
+    for preview_id in [key for key, value in previews.items() if value["created"] < cutoff]:
+        previews.pop(preview_id, None)
+    while len(previews) >= MAX_MANAGED_ARTWORK_PREVIEWS:
+        oldest = min(previews, key=lambda key: previews[key]["created"])
+        previews.pop(oldest, None)
+
+
+def _invalidate_managed_artwork_previews_locked(app: Flask, album_id: int) -> None:
+    previews = app.config["MANAGED_ARTWORK_PREVIEWS"]
+    for preview_id in [key for key, value in previews.items() if value["album_id"] == album_id]:
+        previews.pop(preview_id, None)
+
+
+def _get_managed_artwork_preview(app: Flask, album_id: int, preview_id: str) -> dict | None:
+    with app.config["MANAGED_ARTWORK_PREVIEW_LOCK"]:
+        _purge_managed_artwork_previews_locked(app)
+        preview = app.config["MANAGED_ARTWORK_PREVIEWS"].get(preview_id)
+        return dict(preview) if preview and preview["album_id"] == album_id else None
+
+
+def _create_managed_artwork_preview(
+    app: Flask, album_id: int, expected: object, jpeg: bytes, *, source: str, message: str,
+    release_id: str | None = None,
+) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    if not isinstance(expected, str) or not expected:
+        raise ManagedMutationError("expected_fingerprint is required", code="invalid_request", status=400)
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    destinations = {
+        "sidecar": bool(app.config["ART_SIDECAR"]),
+        "embedded": bool(app.config["ART_EMBED"]),
+    }
+    if not any(destinations.values()):
+        raise ManagedMutationError(
+            "Enable sidecar and/or embedded artwork in Settings before replacing artwork.",
+            code="artwork_destinations_disabled", status=409,
+        )
+    with app.config["MANAGED_ARTWORK_PREVIEW_LOCK"]:
+        _purge_managed_artwork_previews_locked(app)
+        _invalidate_managed_artwork_previews_locked(app, album_id)
+        preview_id = secrets.token_urlsafe(24)
+        app.config["MANAGED_ARTWORK_PREVIEWS"][preview_id] = {
+            "album_id": album_id, "fingerprint": expected, "jpeg": jpeg,
+            "artwork_fingerprint": _managed_artwork_state_fingerprint(app, items),
+            "created": time.monotonic(), "source": source, "release_id": release_id,
+        }
+    return {
+        "preview_id": preview_id, "status": "preview", "source": source,
+        "release_id": release_id, "sha256": hashlib.sha256(jpeg).hexdigest(),
+        "bytes": len(jpeg), "destinations": destinations, "message": message,
+        "preview_url": url_for("managed_artwork_preview_image", album_id=album_id,
+                               preview_id=preview_id),
+    }
+
+
+def _preview_managed_artwork_refresh(app: Flask, album_id: int, expected: object) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    if not isinstance(expected, str) or not expected:
+        raise ManagedMutationError("expected_fingerprint is required", code="invalid_request", status=400)
+    _require_current_album(album, expected, items)
+    release_ids = {
+        str(value).lower() for value in [album.get("mb_albumid"), *(item.get("mb_albumid") for item in items)]
+        if value
+    }
+    if len(release_ids) != 1 or not MUSICBRAINZ_ID_PATTERN.fullmatch(next(iter(release_ids), "")):
+        raise ManagedMutationError(
+            "This album has no single valid MusicBrainz release ID; artwork was not changed.",
+            code="artwork_release_id_unavailable", status=409,
+        )
+    release_id = next(iter(release_ids))
+    candidates = app.config["MUSICBRAINZ_PROVIDER"](
+        {**_managed_album_query(album, items), "musicbrainz_id": release_id}, limit=1
+    )
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        raise ProviderError(
+            "The exact MusicBrainz release is unavailable; artwork was not changed.",
+            code="release_not_found",
+        )
+    candidate = candidates[0]
+    if str(candidate.get("provider_id") or "").lower() != release_id:
+        raise ProviderError("MusicBrainz returned a different release identity",
+                            code="provider_identity_mismatch")
+    artwork = candidate.get("artwork")
+    if not isinstance(artwork, dict) or not artwork.get("available"):
+        raise ManagedMutationError(
+            "No front artwork is available for this exact release or its release group; existing artwork was preserved.",
+            code="artwork_unavailable", status=409,
+        )
+    jpeg = app.config["ARTWORK_FETCHER"](candidate)
+    return _create_managed_artwork_preview(
+        app, album_id, expected, jpeg, source="musicbrainz", release_id=release_id,
+        message="Exact-release artwork fetched. Review the preview, then choose Apply artwork.",
+    )
+
+
+def _atomic_sidecar_write(destination: Path, payload: bytes) -> None:
+    temporary = destination.parent / f".cover.{secrets.token_hex(8)}.tmp"
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _managed_artwork_backup(path: Path) -> Path:
+    backup = path.parent / f".{path.name}.cratekeep-art-{secrets.token_hex(8)}.bak"
+    shutil.copy2(path, backup, follow_symlinks=False)
+    return backup
+
+
+def _replace_managed_artwork(app: Flask, items: list[Item], jpeg: bytes) -> dict:
+    paths = [_managed_path(app, item.path) for item in items]
+    destinations = {
+        "sidecar": bool(app.config["ART_SIDECAR"]),
+        "embedded": bool(app.config["ART_EMBED"]),
+    }
+    if not any(destinations.values()):
+        raise ManagedMutationError(
+            "Artwork destinations were disabled after preview; existing artwork was preserved.",
+            code="artwork_destinations_disabled", status=409,
+        )
+    sidecar_paths = list(dict.fromkeys(path.parent / "cover.jpg" for path in paths))
+    for destination in sidecar_paths:
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise ManagedMutationError(
+                "A cover.jpg destination is not a safe regular file; existing artwork was preserved.",
+                code="managed_path_invalid", status=409,
+            )
+    sidecar_backups: dict[Path, Path | None] = {}
+    embedded_backups: dict[Path, Path] = {}
+    try:
+        if destinations["sidecar"]:
+            for destination in sidecar_paths:
+                sidecar_backups[destination] = (
+                    _managed_artwork_backup(destination) if destination.exists() else None
+                )
+        if destinations["embedded"]:
+            for path in paths:
+                embedded_backups[path] = _managed_artwork_backup(path)
+    except Exception as exc:
+        for backup in [*sidecar_backups.values(), *embedded_backups.values()]:
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+        raise ManagedMutationError(
+            f"Artwork replacement could not create safe local backups; existing artwork was preserved: {exc}",
+            code="artwork_backup_failed", status=500,
+        ) from exc
+    touched_sidecars: list[Path] = []
+    touched_embedded: list[Path] = []
+    try:
+        if destinations["sidecar"]:
+            for destination in sidecar_paths:
+                touched_sidecars.append(destination)
+                _atomic_sidecar_write(destination, jpeg)
+        if destinations["embedded"]:
+            for path in paths:
+                touched_embedded.append(path)
+                media = MediaFile(str(path))
+                media.images = [MediaImage(jpeg, desc="Front cover", type=ImageType.front)]
+                media.save()
+                if _managed_path(app, path) != path:
+                    raise OSError("artwork update changed a managed path")
+    except Exception as exc:
+        rollback_errors = []
+        failed_backups = set()
+        for path in reversed(touched_embedded):
+            try:
+                embedded_backups[path].replace(path)
+            except OSError as rollback_exc:
+                failed_backups.add(embedded_backups[path])
+                rollback_errors.append(f"embedded rollback: {rollback_exc}")
+        for destination in reversed(touched_sidecars):
+            backup = sidecar_backups[destination]
+            try:
+                if backup is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    backup.replace(destination)
+            except OSError as rollback_exc:
+                if backup is not None:
+                    failed_backups.add(backup)
+                rollback_errors.append(f"sidecar rollback: {rollback_exc}")
+        for backup in [*sidecar_backups.values(), *embedded_backups.values()]:
+            if backup is not None and backup not in failed_backups:
+                backup.unlink(missing_ok=True)
+        if rollback_errors:
+            raise ManagedMutationError(
+                f"Artwork replacement failed ({exc}); rollback was incomplete: {'; '.join(rollback_errors)}",
+                code="artwork_rollback_failed", status=500,
+            ) from exc
+        raise ManagedMutationError(
+            f"Artwork replacement failed; all touched artwork was restored: {exc}",
+            code="artwork_mutation_rolled_back", status=500,
+        ) from exc
+    for backup in [*sidecar_backups.values(), *embedded_backups.values()]:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+    return {
+        "sidecars_written": len(sidecar_paths) if destinations["sidecar"] else 0,
+        "tracks_embedded": len(paths) if destinations["embedded"] else 0,
+    }
+
+
+def _apply_managed_artwork_preview(
+    app: Flask, album_id: int, preview_id: str, expected: str,
+) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    with app.config["MANAGED_ARTWORK_PREVIEW_LOCK"]:
+        _purge_managed_artwork_previews_locked(app)
+        preview = app.config["MANAGED_ARTWORK_PREVIEWS"].get(preview_id)
+        if preview is None or preview["album_id"] != album_id:
+            raise ManagedMutationError(
+                "Artwork preview expired or was already applied. Choose artwork again.",
+                code="preview_expired", status=409,
+            )
+        if preview["fingerprint"] != expected:
+            raise ManagedMutationError("Artwork preview does not match this album state.",
+                                       code="stale_fingerprint", status=409)
+        items = _album_items(album)
+        _require_current_album(album, expected, items)
+        if preview["artwork_fingerprint"] != _managed_artwork_state_fingerprint(app, items):
+            _invalidate_managed_artwork_previews_locked(app, album_id)
+            raise ManagedMutationError(
+                "Artwork changed after this preview was created. Choose artwork again.",
+                code="stale_artwork", status=409,
+            )
+        jpeg = preview["jpeg"]
+        source = preview["source"]
+        _invalidate_managed_artwork_previews_locked(app, album_id)
+        mutation = _replace_managed_artwork(app, items, jpeg)
+    return {
+        "status": "applied", "source": source,
+        "sha256": hashlib.sha256(jpeg).hexdigest(), **mutation,
+        "album": _managed_album_payload(app, album_id),
+    }
 
 
 def _validated_edit_fields(values: object, allowed: set[str]) -> dict:
@@ -2647,12 +3110,16 @@ def _effective_candidate(app: Flask, candidate: dict, query: dict | None = None)
     local_album = _normalize_metadata(query.get("album")) if isinstance(query, dict) else ""
     canonical_album = _normalize_metadata(candidate.get("album"))
     suffix = re.fullmatch(
-        r"(?P<base>.+?)\s*(?:\((?P<parenthesized>[^\[\]()]+)\)|\[(?P<bracketed>[^\[\]()]+)\])",
+        r"(?P<base>.+?)(?:\s*\((?P<parenthesized>[^\[\]()]+)\)"
+        r"|\s*\[(?P<bracketed>[^\[\]()]+)\]"
+        r"|(?:\s(?P<separator>[-\u2013\u2014])|(?P<colon>:))\s+(?P<separated>.+))",
         local_album,
     )
     if suffix:
         local_base = _normalize_metadata(suffix.group("base"))
-        qualifier = _normalize_metadata(suffix.group("parenthesized") or suffix.group("bracketed"))
+        qualifier = _normalize_metadata(
+            suffix.group("parenthesized") or suffix.group("bracketed") or suffix.group("separated")
+        )
         release_notes = [
             _normalize_metadata(part) for part in
             re.split(r"[,;]", str(candidate.get("release_disambiguation") or ""))
@@ -3538,18 +4005,9 @@ def _fetch_and_normalize_artwork(candidate: dict) -> bytes:
             payload = response.read(MAX_ARTWORK_BYTES + 1)
             if len(payload) > MAX_ARTWORK_BYTES:
                 raise ValueError("artwork exceeds 10 MB limit")
-        with PillowImage.open(BytesIO(payload)) as image:
-            if image.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
-                raise ValueError(f"unsupported artwork format {image.format or 'unknown'}")
-            if image.width <= 0 or image.height <= 0 or image.width * image.height > 40_000_000:
-                raise ValueError("artwork dimensions are invalid or too large")
-            image.seek(0)
-            normalized = image.convert("RGB")
-            output = BytesIO()
-            normalized.save(output, format="JPEG", quality=90, optimize=False, progressive=False)
-            return output.getvalue()
+        return _normalize_artwork_bytes(payload)
     except (
-        OSError, ValueError, TypeError, urllib.error.URLError,
+        OSError, ValueError, TypeError, urllib.error.URLError, LibraryImportExecutionError,
         UnidentifiedImageError, PillowImage.DecompressionBombError,
     ) as exc:
         raise LibraryImportExecutionError(

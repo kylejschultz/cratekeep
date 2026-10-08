@@ -96,8 +96,12 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
         },
         "retrieval": {"search_score": None, "source": "release-id"},
     }
+    if release_id == "123e4567-e89b-42d3-a456-426614174012":
+        candidate["artwork"] = {
+            "available": False, "source": "cover-art-archive", "status": "missing",
+        }
     if release_id == "123e4567-e89b-42d3-a456-426614174010":
-        candidate["album"] = "Dark Sky Paradise"
+        candidate["album"] = "BULLY"
         candidate["release_disambiguation"] = "deluxe, clean"
         candidate["tracks"] = [{
             "title": "Blessings", "track_artist": "Big Sean feat. Drake",
