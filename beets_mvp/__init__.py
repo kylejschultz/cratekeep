@@ -1448,11 +1448,11 @@ def _album_items(album) -> list[Item]:
 def _managed_path(app: Flask, raw_path: object) -> Path:
     """Resolve a Beets path only within the configured managed library root."""
     root = Path(app.config["LIBRARY_PATH"]).resolve()
-    decoded = Path(os.fsdecode(raw_path))
-    candidate = decoded if decoded.is_absolute() else root / decoded
     try:
+        decoded = Path(os.fsdecode(raw_path))
+        candidate = decoded if decoded.is_absolute() else root / decoded
         resolved = candidate.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         raise ManagedMutationError(
             "A managed library path is missing or unreadable.", code="managed_path_invalid", status=409
         ) from exc
@@ -1470,12 +1470,29 @@ def _managed_track_payload(app: Flask, item: Item) -> dict:
         for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")
     }
     result["genre"] = _item_genre(item)
-    path = _managed_path(app, item.path) if item.get("path") else None
     try:
+        path = _managed_path(app, item.path) if item.get("path") else None
         result["bytes"] = path.stat().st_size if path else None
-    except OSError:
+    except (ManagedMutationError, OSError, TypeError, ValueError):
         result["bytes"] = None
     return result
+
+
+def _readable_managed_paths(app: Flask, items: list[Item]) -> list[Path]:
+    """Resolve only usable managed files for read-only browsing operations."""
+    paths = []
+    for item in items:
+        try:
+            paths.append(_managed_path(app, item.path))
+        except (ManagedMutationError, OSError, TypeError, ValueError):
+            continue
+    return paths
+
+
+def _require_managed_item_paths(app: Flask, items: list[Item]) -> None:
+    """Keep mutations strict even though read-only browsing tolerates stale rows."""
+    for item in items:
+        _managed_path(app, item.path)
 
 
 def _managed_album_summary(
@@ -1575,7 +1592,7 @@ def _normalize_artwork_bytes(payload: bytes) -> bytes:
 
 def _managed_album_artwork_source(app: Flask, items: list[Item]) -> str | None:
     """Discover artwork cheaply for summaries; never read or decode sidecar bytes."""
-    paths = [_managed_path(app, item.path) for item in items]
+    paths = _readable_managed_paths(app, items)
     for folder in dict.fromkeys(path.parent for path in paths):
         sidecar = folder / "cover.jpg"
         if not sidecar.is_symlink() and sidecar.is_file():
@@ -1591,7 +1608,7 @@ def _managed_album_artwork_source(app: Flask, items: list[Item]) -> str | None:
 
 def _managed_album_artwork_bytes(app: Flask, items: list[Item]) -> tuple[bytes, str] | None:
     """Return normalized browser-safe art without disclosing or accepting a path."""
-    paths = [_managed_path(app, item.path) for item in items]
+    paths = _readable_managed_paths(app, items)
     for folder in dict.fromkeys(path.parent for path in paths):
         sidecar = folder / "cover.jpg"
         try:
@@ -2003,6 +2020,7 @@ def _edit_managed_album(app: Flask, album_id: int, values: dict, expected: str) 
         return None
     items = _album_items(album)
     _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
     changes = _mutate_managed_items([(item, values) for item in items], album=album, album_values=values)
     return {"changes": changes, "album": _managed_album_payload(app, album_id)}
 
@@ -2013,6 +2031,7 @@ def _edit_managed_track(app: Flask, album_id: int, item_id: int, values: dict, e
         return None
     items = _album_items(album)
     _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
     item = next((candidate for candidate in items if candidate.id == item_id), None)
     if item is None:
         return False
@@ -2098,6 +2117,7 @@ def _preview_managed_rematch(app: Flask, album_id: int, mbid: str, expected: str
         return None
     items = _album_items(album)
     _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
     raw_candidates = app.config["MUSICBRAINZ_PROVIDER"](
         {**_managed_album_query(album, items), "musicbrainz_id": mbid}, limit=1
     )
@@ -2152,6 +2172,7 @@ def _apply_managed_rematch(app: Flask, album_id: int, preview_id: str, expected:
     if expected != row["fingerprint"] or current != row["fingerprint"]:
         raise ManagedMutationError("The album changed after this preview. Create a new preview.",
                                    code="stale_fingerprint", status=409)
+    _require_managed_item_paths(app, items)
     evidence_json, plan_json = row["evidence_json"], row["plan_json"]
     evidence_sha = hashlib.sha256(f"{evidence_json}\n{plan_json}".encode()).hexdigest()
     if evidence_sha != row["evidence_sha256"]:

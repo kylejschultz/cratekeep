@@ -2211,13 +2211,20 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
         Path(item.path.decode()).write_bytes(b"audio")
     first_album = library.add_album([tracks[1], tracks[2]])
     shared_album = library.add_album([tracks[0]])
+    stale = Item(
+        title="0 Missing Song", artist="Artist A", albumartist="Artist A", album="First",
+        genre="Jazz", year=2023, path=str(root / "missing.mp3"), album_id=first_album.id,
+    )
+    library.add(stale)
     with sqlite3.connect(app.config["BEETS_DB"]) as database:
-        for item in tracks:
+        for item in [*tracks, stale]:
             database.execute("UPDATE items SET path = ? WHERE id = ?",
                              (os.fsencode(Path(item.path.decode()).name), item.id))
     cover = root / "cover.jpg"
-    cover.write_bytes(b"landing must not read or decode this payload")
+    cover.write_bytes(jpeg_bytes((20, 40, 80)))
     original_read_bytes = Path.read_bytes
+    import beets_mvp
+    original_normalize_artwork = beets_mvp._normalize_artwork_bytes
     monkeypatch.setattr(Path, "read_bytes", lambda path: (
         pytest.fail("Library landing read full artwork bytes") if path == cover
         else original_read_bytes(path)
@@ -2225,7 +2232,6 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
     monkeypatch.setattr("beets_mvp._normalize_artwork_bytes", lambda payload: pytest.fail(
         "Library landing decoded artwork"
     ))
-    import beets_mvp
     original_discovery = beets_mvp._managed_album_artwork_source
     discoveries = []
 
@@ -2239,7 +2245,7 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
     page = client.get("/library")
     assert page.status_code == 200
     assert b'aria-current="page"' in page.data
-    assert b"<span>Tracks</span><strong>3</strong>" in page.data
+    assert b"<span>Tracks</span><strong>4</strong>" in page.data
     assert b"<span>Albums</span><strong>2</strong>" in page.data
     assert b"<span>Artists</span><strong>2</strong>" in page.data
     assert b"<span>Library size</span><strong>&lt;0.1 MB</strong>" in page.data
@@ -2273,7 +2279,23 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
     assert b'name="album" value="Shared"' in album_filtered.data
 
     detail = client.get(f"/api/library/albums/{first_album.id}")
-    assert [track["title"] for track in detail.json["tracks"]] == ["Alpha Song", "Other Song"]
+    assert detail.status_code == 200
+    stale_payload = next(track for track in detail.json["tracks"] if track["id"] == stale.id)
+    assert stale_payload["bytes"] is None
+    assert all(
+        track["bytes"] == len(b"audio")
+        for track in detail.json["tracks"] if track["id"] != stale.id
+    )
+    monkeypatch.setattr(Path, "read_bytes", original_read_bytes)
+    monkeypatch.setattr(beets_mvp, "_normalize_artwork_bytes", original_normalize_artwork)
+    assert client.get(f"/api/library/albums/{first_album.id}/artwork").status_code == 200
+    valid_before = (root / "a.mp3").read_bytes()
+    blocked = client.patch(f"/api/library/albums/{first_album.id}/tracks/{stale.id}", json={
+        "title": "Must not write", "expected_fingerprint": detail.json["fingerprint"],
+    })
+    assert blocked.status_code == 409 and blocked.json["code"] == "managed_path_invalid"
+    assert library.get_item(stale.id).title == "0 Missing Song"
+    assert (root / "a.mp3").read_bytes() == valid_before
 
 
 def managed_wav_album(app, tmp_path, *, artist="Artist", album_name="Album", titles=("First", "Second")):
