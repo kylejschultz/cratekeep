@@ -498,7 +498,11 @@ def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path)
     assert b"MusicBrainz release added and selected. No files were changed." in modal
     assert b'class="browser-actions review-footer"' in modal
     assert b'data-review-decision="rejected"' not in modal
-    assert b'id="library-import-in-place" class="approve-button">Import' in modal
+    assert b'id="library-import-in-place" class="approve-button" aria-busy="false"' in modal
+    assert b'class="button-spinner" aria-hidden="true" hidden' in modal
+    assert b'class="button-label">Import' in modal
+    assert b'The candidate details and track changes above are the review.' not in modal
+    assert b'id="library-import-success" class="import-success" role="status"' in html
     assert b'Skip for now' not in modal
     assert b'id="library-import-preview"' not in modal
     assert b'id="library-import-execution-apply"' not in modal
@@ -3495,9 +3499,9 @@ def test_album_review_multi_select_keeps_sequential_single_album_flow(tmp_path):
     assert b'id="folder-select-page" type="checkbox"' in html
     assert b'id="library-import-review-exceptions"' in html
     assert b"const selectedFolders = new Set();" in html
-    assert b"reviewSequence = albumReviews.map(album => album.id)" in html
-    assert b"await fetch(`/api/library-import/albums/${nextId}`)" in html
-    assert b"if (transitionToken !== reviewTransitionToken" in html
+    assert b"reviewSequence = [...albumReviews]" in html
+    assert b"const album = reviewSequence[0]" in html
+    assert b"await fetch(`/api/library-import/albums/${nextId}`)" not in html
     assert b"reviewSequence.shift();" in html
     assert b"folderRequestController.abort()" in html
     assert b"requestSequence !== folderRequestSequence" in html
@@ -4358,7 +4362,8 @@ def test_folder_scan_upgrades_legacy_album_key_without_losing_review_identity(tm
         Item(title="Song", artist="Legacy Artist", albumartist="Legacy Artist",
              album="Legacy Album", path=str(track))
     )
-    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query)]
+    provider_queries = []
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: provider_queries.append(query) or [exact_candidate(query)]
     client = app.test_client()
 
     assert client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]}).status_code == 201
@@ -4374,13 +4379,98 @@ def test_folder_scan_upgrades_legacy_album_key_without_losing_review_identity(tm
 
     rescanned = client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]})
     assert rescanned.status_code == 201
+    assert rescanned.json["folders"][0]["changed"] is False
+    assert len(provider_queries) == 1
     expanded = client.get(
         "/api/library-import/folders/albums", query_string={"folder": "Selected"}
     ).json["albums"]
     assert len(expanded) == 1
     assert expanded[0]["id"] == album_id
     assert expanded[0]["decision"] == "approved"
-    assert expanded[0]["selected_candidate_id"] is not None
+    assert expanded[0]["selected_candidate_id"] == candidate_id
+
+    sibling = tmp_path / "library" / "Sibling" / "Album" / "01 Other.wav"
+    tagged_wav(sibling, artist="Legacy Artist", album="Legacy Album", title="Other")
+    Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"]).add(
+        Item(title="Other", artist="Legacy Artist", albumartist="Legacy Artist",
+             album="Legacy Album", path=str(sibling))
+    )
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Sibling"]}).status_code == 201
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        sibling_album_id = db.execute(
+            "SELECT id FROM album_reviews WHERE artist_key LIKE 'sibling%'"
+        ).fetchone()[0]
+        sibling_inventory_id = db.execute(
+            "SELECT id FROM library_inventory WHERE relative_path LIKE 'Sibling/%'"
+        ).fetchone()[0]
+        db.execute("DELETE FROM metadata_candidates WHERE album_review_id=?", (sibling_album_id,))
+        db.execute("DELETE FROM album_review_tracks WHERE album_review_id=?", (sibling_album_id,))
+        db.execute("DELETE FROM album_reviews WHERE id=?", (sibling_album_id,))
+        db.execute(
+            "INSERT INTO album_review_tracks(album_review_id, inventory_id) VALUES (?, ?)",
+            (album_id, sibling_inventory_id),
+        )
+        db.execute("UPDATE album_reviews SET artist_key='legacy artist' WHERE id=?", (album_id,))
+
+    media = MediaFile(str(track))
+    media.title = "Song changed"
+    media.save()
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]}).status_code == 201
+    selected_tracks = client.get(
+        "/api/library-import/folders/albums", query_string={"folder": "Selected"}
+    ).json["albums"][0]["tracks"]
+    sibling_album = client.get(
+        "/api/library-import/folders/albums", query_string={"folder": "Sibling"}
+    ).json["albums"][0]
+    assert [item["path"] for item in selected_tracks] == ["Selected/Album/01 Song.wav"]
+    assert [item["path"] for item in sibling_album["tracks"]] == ["Sibling/Album/01 Other.wav"]
+    assert sibling_album["id"] != album_id
+    assert sibling_album["decision"] == "pending"
+
+
+def test_folder_expansion_reconciles_deleted_album_and_preserves_unchanged_review(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "library" / "Artist Folder"
+    kept = root / "Album A" / "01 Kept.wav"
+    removed = root / "Album B" / "01 Removed.wav"
+    tagged_wav(kept, artist="Artist", album="Album A", title="Kept")
+    tagged_wav(removed, artist="Artist", album="Album B", title="Removed")
+    provider_queries = []
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: provider_queries.append(query["album"]) or [exact_candidate(query)]
+    client = app.test_client()
+
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Artist Folder"]}).status_code == 201
+    albums = client.get("/api/library-import/folders/albums", query_string={"folder": "Artist Folder"}).json["albums"]
+    album_a = next(album for album in albums if album["album"] == "Album A")
+    saved = client.patch(f'/api/library-import/albums/{album_a["id"]}', json={
+        "decision": "approved", "candidate_id": album_a["selected_candidate_id"],
+    }).json
+    provider_queries.clear()
+    removed.unlink()
+    removed.parent.rmdir()
+
+    # The first bounded scope expansion after a hard page load reconciles disk.
+    assert client.get("/api/library-import/folders").json["folders"][0]["album_count"] == 2
+    refreshed = client.get("/api/library-import/folders/albums", query_string={"folder": "Artist Folder"})
+    assert refreshed.status_code == 200
+    assert [(album["album"], album["decision"], album["selected_candidate_id"])
+            for album in refreshed.json["albums"]] == [("Album A", "approved", saved["selected_candidate_id"])]
+    assert refreshed.json["reconciliation"]["removed_files"] == 1
+    assert provider_queries == []
+    assert client.get("/api/library-import/folders").json["folders"][0]["album_count"] == 1
+
+    media = MediaFile(str(kept))
+    media.title = "Kept (changed)"
+    media.save()
+    changed = client.post("/api/library-import/folders/scan", json={"folders": ["Artist Folder"]})
+    assert changed.status_code == 201
+    assert changed.json["folders"][0]["changed_files"] == 1
+    assert provider_queries == ["Album A"]
+    changed_album = client.get(
+        "/api/library-import/folders/albums", query_string={"folder": "Artist Folder"}
+    ).json["albums"][0]
+    assert changed_album["decision"] == "approved"
+    assert changed_album["selected_candidate_id"] is not None
 
 
 def test_selected_scan_reports_partial_album_failure_without_losing_success(tmp_path):
@@ -4545,6 +4635,8 @@ def test_folder_queue_ui_has_persistent_selection_lazy_expansion_and_accessible_
     assert "/api/library-import/folders/albums?folder=" in html
     assert 'aria-modal="true" aria-labelledby="library-import-confirm-title"' in html
     assert "folderConfirmModal.addEventListener('keydown'" in html
-    assert "reviewSequence = albumReviews.map" in html
+    assert "reviewSequence = [...albumReviews]" in html
+    assert "const album = reviewSequence[0]" in html
+    assert "/api/library-import/albums/${nextId}" not in html
     assert "data-review-decision=\"skipped\"" in html
     assert "@media (max-width: 520px)" in html

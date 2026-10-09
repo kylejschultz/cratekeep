@@ -320,6 +320,13 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     deluxe_proof: dict[str, object] = {}
     managed_library_proof: dict[str, object] = {}
     viewport_checks: dict[str, object] = {}
+    accidental = tracks["sidecar"].parent.parent / "Accidental Album" / "01 Wrong.wav"
+    write_wav(accidental)
+    accidental_tags = MediaFile(str(accidental))
+    accidental_tags.title = "Wrong"
+    accidental_tags.artist = accidental_tags.albumartist = "Wrong Artist"
+    accidental_tags.album = "Accidental Album"
+    accidental_tags.save()
     inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -383,6 +390,48 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.screenshot(path=evidence / "02-settings-dark-refresh.png", full_page=True)
 
         page.locator("#settings-tab-library-import").click()
+        page.locator(".review-folder").first.wait_for()
+
+        # A hard refresh followed by ordinary expansion reconciles an album
+        # deleted after scan while preserving the unchanged album's decision.
+        search = page.locator("#library-import-search")
+        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
+                                  and "q=Sidecar" in urllib.parse.unquote_plus(response.url)):
+            search.fill("Sidecar")
+        page.get_by_role("checkbox", name="Select folder Sidecar Artist", exact=True).check()
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")):
+            page.locator("#library-import-scan-selected").click()
+        scanned_sidecar = request_json(f"{base_url}/api/library-import/folders/albums?folder=Sidecar%20Artist")
+        assert len(scanned_sidecar["albums"]) == 2
+        kept_sidecar = next(album for album in scanned_sidecar["albums"] if album["album"] == "Sidecar Album")
+        saved_candidate_id = kept_sidecar["selected_candidate_id"]
+        page.evaluate("""async ({id, candidateId}) => {
+          const response = await fetch(`/api/library-import/albums/${id}`, {
+            method:'PATCH', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({decision:'approved', candidate_id:candidateId}),
+          });
+          if (!response.ok) throw new Error(`save failed: ${response.status}`);
+        }""", {"id": kept_sidecar["id"], "candidateId": saved_candidate_id})
+        accidental.unlink(); accidental.parent.rmdir()
+        page.reload(wait_until="networkidle")
+        page.locator("#settings-tab-library-import").click()
+        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
+                                  and "q=Sidecar" in urllib.parse.unquote_plus(response.url)):
+            page.locator("#library-import-search").fill("Sidecar")
+        with page.expect_response(lambda response: "/api/library-import/folders/albums?" in response.url) as reconciled_info:
+            page.get_by_role("button", name="Expand Sidecar Artist").click()
+        reconciled_sidecar = reconciled_info.value.json()
+        assert len(reconciled_sidecar["albums"]) == 1
+        assert reconciled_sidecar["albums"][0]["album"] == "Sidecar Album"
+        assert reconciled_sidecar["albums"][0]["decision"] == "approved"
+        assert reconciled_sidecar["albums"][0]["selected_candidate_id"] == saved_candidate_id
+        assert reconciled_sidecar["reconciliation"]["removed_files"] == 1
+        assert "1 albums · 1 tracks" in page.locator(".review-folder-count").inner_text()
+        page.screenshot(path=evidence / "02-deleted-album-reconciled-dark.png", full_page=True)
+        page.get_by_role("checkbox", name="Select folder Sidecar Artist", exact=True).uncheck()
+        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
+                                  and "q=" in response.url):
+            search.fill("")
         page.locator(".review-folder").first.wait_for()
         assert page.locator(".review-folder").count() == 25
         started = time.perf_counter()
@@ -514,10 +563,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert active_by_path["Queue Sequential"]["album_count"] == 2
         assert active_by_path["Queue Sequential"]["track_count"] == 2
         page.screenshot(path=evidence / "03-folder-bulk-import.png", full_page=True)
-        with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as first_album_info:
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/exceptions")) as first_album_info:
             page.locator("#library-import-review-exceptions").click()
         page.locator("#library-import-modal:not([hidden])").wait_for()
-        first_payload = first_album_info.value.json()
+        first_payload = first_album_info.value.json()["albums"][0]
         first_exception = page.locator("#library-import-modal-title").inner_text()
         page.get_by_role("button", name="Skip", exact=True).click()
         page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_exception)
@@ -527,11 +576,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator("#library-import-modal").wait_for(state="hidden")
 
         # Reopening starts a fresh run. A failed first import stays on the same
-        # album; retry success advances to a freshly fetched second payload.
-        with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as reopened_info:
+        # album; retry success advances using the already-loaded second payload.
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/exceptions")) as reopened_info:
             page.locator("#library-import-review-exceptions").click()
         page.locator("#library-import-modal:not([hidden])").wait_for()
-        reopened_payload = reopened_info.value.json()
+        reopened_albums = reopened_info.value.json()["albums"]
+        reopened_payload, next_payload = reopened_albums
         assert reopened_payload["id"] == first_payload["id"]
         first_title = page.locator("#library-import-modal-title").inner_text()
         execute_pattern = re.compile(r".*/api/library-import/albums/\d+/execute$")
@@ -547,10 +597,19 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator("#library-import-modal-title").inner_text() == first_title
         assert page.locator("#library-import-in-place").inner_text() == "Import"
 
-        with page.expect_response(lambda response: re.search(r"/api/library-import/albums/\d+$", response.url)) as next_album_info:
-            with page.expect_response(lambda response: response.url.endswith("/execute")) as first_execute:
-                page.locator("#library-import-in-place").click()
-        next_payload = next_album_info.value.json()
+        page.evaluate("""() => {
+          const nativeFetch = window.fetch.bind(window);
+          window.fetch = async (...args) => {
+            if (String(args[0]).endsWith('/execute')) await new Promise(resolve => setTimeout(resolve, 300));
+            return nativeFetch(...args);
+          };
+        }""")
+        with page.expect_response(lambda response: response.url.endswith("/execute")) as first_execute:
+            page.locator("#library-import-in-place").click()
+            assert page.locator("#library-import-in-place").is_disabled()
+            assert page.locator("#library-import-in-place").get_attribute("aria-busy") == "true"
+            assert page.locator("#library-import-in-place .button-spinner").is_visible()
+            page.locator("#library-import-in-place").click(force=True)
         first_body = first_execute.value.request.post_data_json
         sequential_proof.append({"album_id": reopened_payload["id"], "candidate_id": first_body["candidate_id"],
                                  "owned_candidate_ids": [candidate["id"] for candidate in reopened_payload["candidates"]]})
@@ -573,10 +632,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             folder["path"] == "Queue Sequential"
             for folder in request_json(f"{base_url}/api/library-import/folders")["folders"]
         )
-        page.locator("#library-import-in-place", has_text="Close").wait_for()
-        page.screenshot(path=evidence / "03-sequential-exceptions-complete.png", full_page=True)
-        page.locator("#library-import-in-place").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
+        assert "imported successfully" in page.locator("#library-import-success").inner_text()
+        assert page.locator("#library-import-search").evaluate("element => document.activeElement === element")
+        page.screenshot(path=evidence / "03-sequential-exceptions-complete.png", full_page=True)
 
         # Populate the existing detailed-review smoke fixtures through the
         # compatibility inventory endpoint without exposing obsolete controls.
@@ -652,8 +711,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "execution_changes": deluxe_result["items"][0]["changes"],
             "file": {"album": deluxe_tags.album, "title": deluxe_tags.title, "artist": deluxe_tags.artist},
         }
-        page.locator("#library-import-in-place", has_text="Close").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
+        assert "BULLY - DELUXE" in page.locator("#library-import-success").inner_text()
 
         candidate_review = open_folder_album("Sidecar Artist")
         candidate_review.click(force=True)
@@ -889,10 +948,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                                if "/api/library-import/albums/" in event["url"]]
             assert not any(event["url"].endswith("/preview") for event in import_requests)
             assert sum(event["url"].endswith("/execute") for event in import_requests) == (2 if mock_failure else 1)
-            page.locator("#library-import-in-place", has_text="Close").wait_for()
-            assert page.locator("#library-import-modal").is_visible()
-            page.locator("#library-import-in-place").click()
             page.locator("#library-import-modal").wait_for(state="hidden")
+            assert TRACKS[name].parts[0] in page.locator("#library-import-success").inner_text()
             return payload
 
         set_artwork_settings(page, base_url, sidecar=True, embed=False, replace=False)
@@ -947,12 +1004,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.url.endswith("/execute")) as response_info:
             page.locator("#library-import-in-place").click()
         assert response_info.value.status in {200, 201}, response_info.value.status
-        assert page.locator("#library-import-modal").is_visible()
-        page.locator("#library-import-in-place", has_text="Close").wait_for()
-        page.screenshot(path=evidence / "11-as-is-direct-success.png", full_page=True)
-        assert page.locator("#library-import-in-place").inner_text() == "Close"
-        page.locator("#library-import-in-place").click()
         page.locator("#library-import-modal").wait_for(state="hidden")
+        assert "As Is Artist" in page.locator("#library-import-success").inner_text()
+        page.screenshot(path=evidence / "11-as-is-direct-success.png", full_page=True)
 
         # Managed Library: album-only landing, lazy detail, manual writes,
         # exact-ID preview/apply, mismatch blocking, and responsive modal.

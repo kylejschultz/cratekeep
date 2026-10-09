@@ -190,6 +190,11 @@
     .album-modal-dialog .browser-body { padding:.8rem 1rem; }
     .album-modal-section { margin-bottom:.7rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
     .album-modal-section h3 { margin:0 0 .45rem; font-size:.88rem; }
+    .import-success { margin:.65rem 0; padding:.62rem .75rem; border:1px solid #397052; border-radius:.4rem; color:#163d29; background:#d9eee1; font-weight:650; }
+    body.dark-mode .import-success { border-color:#78a68a; color:#e9fff0; background:#294337; }
+    .button-spinner { display:inline-block; width:.9rem; height:.9rem; margin-right:.4rem; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; vertical-align:-.12rem; animation:button-spin .7s linear infinite; }
+    .button-spinner[hidden] { display:none; }
+    @keyframes button-spin { to { transform:rotate(360deg); } }
     .candidate-picker { margin-bottom:.7rem; }
     .candidate-picker-header { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.45rem; }
     .candidate-picker-header h3 { margin:0; font-size:.82rem; }
@@ -398,6 +403,7 @@
         <select id="library-import-filter"><option value="all">Active queue</option><option value="not-scanned">Not scanned</option><option value="ready">Ready</option><option value="needs-review">Needs review</option><option value="error">Error</option></select>
       </div>
       <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite">Loading folders…</p>
+      <p id="library-import-success" class="import-success" role="status" aria-live="polite" aria-atomic="true" hidden></p>
       <label for="folder-select-page"><input id="folder-select-page" type="checkbox"> Select this page</label>
       <div id="library-import-review-list" class="review-list"></div>
       <nav class="review-pagination" aria-label="Library folder pages">
@@ -482,10 +488,7 @@
           <small>Merge and replace require one unambiguous recording-ID match and a current, path-safe inventory snapshot. Cratekeep stops on missing or ambiguous identity instead of guessing.</small>
         </section>
         <p id="library-import-modal-message" class="browser-status operation-status" role="status" aria-live="polite"></p>
-        <section class="album-modal-section" aria-label="Import action">
-          <p>The candidate details and track changes above are the review. Import validates the current files, then registers them and applies approved tags in place. Files are never moved or copied.</p>
-          <p id="library-import-execution-result" class="operation-status" role="status" aria-live="polite"></p>
-        </section>
+        <p id="library-import-execution-result" class="operation-status" role="status" aria-live="polite"></p>
       </div>
       <footer class="browser-actions review-footer">
         <div class="review-footer-group">
@@ -493,7 +496,7 @@
           <button type="button" class="secondary" data-review-decision="skipped">Skip</button>
         </div>
         <div class="review-footer-group">
-          <button type="button" id="library-import-in-place" class="approve-button">Import</button>
+          <button type="button" id="library-import-in-place" class="approve-button" aria-busy="false"><span class="button-spinner" aria-hidden="true" hidden></span><span class="button-label">Import</span></button>
         </div>
       </footer>
     </section>
@@ -754,6 +757,7 @@
     const candidateHelp = document.getElementById('candidate-generate-help');
     const reviewList = document.getElementById('library-import-review-list');
     const reviewStatus = document.getElementById('library-import-review-status');
+    const importSuccess = document.getElementById('library-import-success');
     const reviewPrevious = document.getElementById('library-import-review-previous');
     const reviewNext = document.getElementById('library-import-review-next');
     const reviewPage = document.getElementById('library-import-review-page');
@@ -1100,7 +1104,9 @@
 
     function resetImportAction() {
       const importButton = document.getElementById('library-import-in-place');
-      importButton.textContent = 'Import'; importButton.disabled = false;
+      importButton.querySelector('.button-label').textContent = 'Import';
+      importButton.querySelector('.button-spinner').hidden = true;
+      importButton.setAttribute('aria-busy', 'false'); importButton.disabled = false;
       const result = document.getElementById('library-import-execution-result');
       result.dataset.busy = 'false';
       result.textContent = 'Choose metadata, then import in place. The server validates every file before writing.';
@@ -1349,7 +1355,10 @@
       message.dataset.busy = 'false'; message.textContent = '';
       const executionResult = document.getElementById('library-import-execution-result');
       const importButton = document.getElementById('library-import-in-place');
-      importButton.disabled = album.execution_status === 'complete'; importButton.textContent = 'Import';
+      importButton.disabled = album.execution_status === 'complete';
+      importButton.querySelector('.button-label').textContent = 'Import';
+      importButton.querySelector('.button-spinner').hidden = true;
+      importButton.setAttribute('aria-busy', 'false');
       reviewSucceeded = album.execution_status === 'complete';
       executionResult.textContent = album.execution_status === 'complete'
         ? 'This album has already been imported.'
@@ -1396,20 +1405,51 @@
       if (clearSequence) reviewSequence = [];
       const returnFocus = reviewReturnFocus;
       resetAlbumReviewState();
-      if (returnFocus) returnFocus.focus();
+      if (returnFocus?.isConnected && !returnFocus.disabled) returnFocus.focus();
+      else document.getElementById('library-import-search')?.focus();
     }
 
     async function openNextQueuedReview(returnFocus) {
-      const nextId = reviewSequence[0];
-      if (!nextId) return false;
-      const transitionToken = ++reviewTransitionToken;
-      const response = await fetch(`/api/library-import/albums/${nextId}`);
-      const album = await readApiResponse(response, 'Unable to load the next album review');
-      if (transitionToken !== reviewTransitionToken || reviewSequence[0] !== nextId) return false;
+      const album = reviewSequence[0];
+      if (!album) return false;
+      ++reviewTransitionToken;
       reviewSequence.shift();
       closeReview(false, false);
       openReview(album, returnFocus);
       return true;
+    }
+
+    function removeImportedAlbumFromQueue(album) {
+      albumReviews = albumReviews.filter(item => item.id !== album.id);
+      reviewSequence = reviewSequence.filter(item => item.id !== album.id);
+      const albumButton = document.querySelector(`.review-album[data-album-id="${album.id}"]`);
+      const albumRow = albumButton?.closest('.review-album-row');
+      const scope = album.source_paths?.[0]?.split('/')[0] || '.';
+      const folder = foldersOnPage.find(item => item.path === scope);
+      const folderArticle = albumRow?.closest('.review-folder')
+        || [...document.querySelectorAll('.review-folder')].find(element => element.dataset.folderPath === scope);
+      albumRow?.remove();
+      if (folder) {
+        folder.album_count = Math.max(0, folder.album_count - 1);
+        folder.track_count = Math.max(0, folder.track_count - album.tracks.length);
+        folder.available_album_count = Math.max(0, folder.available_album_count - 1);
+        const count = folderArticle?.querySelector('.review-folder-count');
+        if (count) count.textContent = `${folder.album_count} albums · ${folder.track_count} tracks`;
+        if (folder.album_count === 0) {
+          folderArticle?.remove(); foldersOnPage = foldersOnPage.filter(item => item !== folder);
+          totalFolders = Math.max(0, totalFolders - 1);
+        }
+      }
+      if (selectedFolders.has(scope)) {
+        selectedFolderSummary.available_album_count = Math.max(0, selectedFolderSummary.available_album_count - 1);
+        const key = album.ready ? 'ready_album_count' : 'exception_count';
+        selectedFolderSummary[key] = Math.max(0, selectedFolderSummary[key] - 1);
+        folderSelectionSummary.textContent = `${selectedFolders.size} ${selectedFolders.size === 1 ? 'folder' : 'folders'} selected · ${selectedFolderSummary.available_album_count} albums available`;
+        folderImport.textContent = `Import ready (${selectedFolderSummary.ready_album_count})`;
+        folderImport.disabled = selectedFolderSummary.ready_album_count === 0;
+        folderExceptions.textContent = `Review exceptions (${selectedFolderSummary.exception_count})`;
+        folderExceptions.disabled = selectedFolderSummary.exception_count === 0;
+      }
     }
 
     function requestCloseReview(clearSequence = true) {
@@ -1545,6 +1585,7 @@
         }
       }));
       async function importSelectedAlbum(button) {
+        if (button.getAttribute('aria-busy') === 'true') return;
         const result = document.getElementById('library-import-execution-result');
         const selected = activeAlbum.candidates.find(candidate => candidate.id === activeCandidateId);
         const preflight = selected?.duplicate_preflight || activeAlbum.duplicate_preflight || {status:'clear'};
@@ -1558,7 +1599,9 @@
           return;
         }
         button.disabled = true;
-        button.setAttribute('aria-busy', 'true'); result.dataset.busy = 'true';
+        button.setAttribute('aria-busy', 'true');
+        button.querySelector('.button-spinner').hidden = false;
+        button.querySelector('.button-label').textContent = 'Importing…'; result.dataset.busy = 'true';
         result.textContent = 'Validating files, registering them, and applying approved metadata in place…';
         try {
           const payload = {candidate_id: activeCandidateId === 'as-is' ? null : activeCandidateId};
@@ -1568,21 +1611,22 @@
           });
           const data = await readApiResponse(response, 'Unable to import this album');
           result.dataset.busy = 'false';
-          const artMessage = data.artwork?.message ? ` ${data.artwork.message}` : '';
-          result.textContent = `${data.files} files imported in place; no files were moved or copied.${artMessage}`;
+          const importedAlbum = activeAlbum;
+          importSuccess.textContent = `${importedAlbum.artist} — ${importedAlbum.album} imported successfully.`;
+          importSuccess.hidden = false;
           selectedAlbumIds.delete(activeAlbum.id);
-          await loadReviewItems();
+          removeImportedAlbumFromQueue(importedAlbum);
           if (reviewSequence.length) {
             await openNextQueuedReview(document.getElementById('library-import-review-exceptions'));
             return;
           }
           reviewSucceeded = true;
-          document.getElementById('library-import-modal-close').hidden = true;
-          button.textContent = 'Close'; button.disabled = false; button.focus();
+          closeReview(false);
         } catch (error) {
           result.dataset.busy = 'false'; result.textContent = error.message || 'Unable to import this album.';
-          button.textContent = 'Import'; button.disabled = false;
+          button.querySelector('.button-label').textContent = 'Import'; button.disabled = false;
         } finally {
+          button.querySelector('.button-spinner').hidden = true;
           button.setAttribute('aria-busy', 'false');
         }
       }
@@ -1708,6 +1752,8 @@
       try {
         const response = await fetch(`/api/library-import/folders/albums?folder=${encodeURIComponent(folder.path)}`);
         const data = await readApiResponse(response, 'Unable to load folder albums');
+        folder.album_count = data.albums.length; folder.track_count = data.items.length;
+        body.parentElement.querySelector('.review-folder-count').textContent = `${folder.album_count} albums · ${folder.track_count} tracks`;
         albumReviews = [...albumReviews.filter(existing => !data.albums.some(album => album.id === existing.id)), ...data.albums];
         const children = data.albums.map(album => folderAlbumRow(album, data.items));
         if (!children.length) { const empty = document.createElement('p'); empty.textContent = 'No reviewable albums in this folder.'; children.push(empty); }
@@ -1843,7 +1889,7 @@
       try {
         const response = await fetch('/api/library-import/bulk/exceptions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({folders:[...selectedFolders]})});
         const data = await readApiResponse(response, 'Unable to load exceptions'); albumReviews = data.albums;
-        reviewSequence = albumReviews.map(album => album.id);
+        reviewSequence = [...albumReviews];
         await openNextQueuedReview(folderExceptions);
       } catch (error) { reviewStatus.textContent = error.message; }
       finally { setOperationBusy(folderExceptions, reviewStatus, false); }
