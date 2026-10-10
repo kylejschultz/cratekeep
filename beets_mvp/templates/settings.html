@@ -49,7 +49,7 @@
     .remove-inbox:hover { color:#fff; background:#8f1d14; }
     .add-inbox { margin-top:.7rem; }
     small { display: block; margin-top: .3rem; color: var(--muted); }
-    button { margin-top: 1.5rem; padding: .65rem 1rem; color: #fff; border: 1px solid var(--accent); border-radius: .3rem; background: var(--accent); cursor: pointer; }
+    button { margin-top: 1.5rem; padding: .65rem 1rem; color: var(--button-secondary-text); border: 1px solid var(--button-secondary-border); border-radius: .3rem; background: var(--button-secondary-bg); cursor: pointer; }
     button:hover { background: var(--accent-hover); }
     button:disabled { cursor: not-allowed; opacity: .55; }
     .path-picker button, .browser button { margin-top: 0; }
@@ -144,8 +144,9 @@
     .review-bulk-actions { position:sticky; bottom:.5rem; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; padding:.5rem .65rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); box-shadow:0 2px 10px rgba(0,0,0,.12); }
     .review-bulk-actions label { display:flex; align-items:center; gap:.45rem; margin:0; font-size:.8rem; }
     .review-bulk-actions button { margin:0; }
-    .review-pagination { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; }
-    .review-pagination button { margin:0; }
+    .review-pagination { display:flex; align-items:center; justify-content:center; flex-wrap:nowrap; gap:.3rem; margin-top:.75rem; }
+    .review-pagination button { min-width:2rem; margin:0; padding:.3rem .45rem; }
+    .review-pagination .page-label { margin:0 .25rem; white-space:nowrap; }
     .review-folder { border-bottom:1px solid var(--border); background:transparent; }
     .review-folder:last-child { border-bottom:0; }
     .review-folder .review-folder { margin-left:1rem; border-left:1px solid var(--border); }
@@ -376,6 +377,8 @@
       <label>Library path
         <div class="path-picker"><input id="library_path" name="library_path" type="text" required value="{{ settings.get('library_path', default_library) }}"><button type="button" data-open-picker="library_path">Browse</button></div>
       </label><small>Destination folder for the managed music library.</small>
+      <label class="check-label"><input name="inbox_auto_match" type="checkbox" value="1"{% if settings.get('inbox_auto_match') == '1' %} checked{% endif %}> Automatically find MusicBrainz matches for new Inbox albums</label>
+      <small>Candidate lookup only: this never approves a match, writes tags, moves files, or imports music.</small>
     </section>
     <section class="settings-section" aria-labelledby="navidrome-title">
       <h2 id="navidrome-title">Navidrome</h2><p>Optional rescan integration.</p>
@@ -431,11 +434,11 @@
       <label for="folder-select-page"><input id="folder-select-page" type="checkbox"> Select this page</label>
       <div id="library-import-review-list" class="review-list"></div>
       <nav class="review-pagination" aria-label="Library folder pages">
-        <button id="library-import-review-first" class="secondary" type="button" disabled>First</button>
-        <button id="folder-page-previous" class="secondary" type="button" disabled>Previous</button>
-        <label class="page-jump">Page <input id="library-import-page-input" type="number" min="1" value="1"> <span id="folder-page-total" aria-live="polite">of 1</span></label>
-        <button id="folder-page-next" class="secondary" type="button" disabled>Next</button>
-        <button id="library-import-review-last" class="secondary" type="button" disabled>Last</button>
+        <button id="library-import-review-first" class="secondary" type="button" aria-label="First page" title="First" disabled>«</button>
+        <button id="folder-page-previous" class="secondary" type="button" aria-label="Previous page" title="Previous" disabled>‹</button>
+        <span id="folder-page-total" class="page-label" aria-live="polite">Page 1 of 1</span>
+        <button id="folder-page-next" class="secondary" type="button" aria-label="Next page" title="Next" disabled>›</button>
+        <button id="library-import-review-last" class="secondary" type="button" aria-label="Last page" title="Last" disabled>»</button>
       </nav>
       <div class="review-bulk-actions" aria-label="Selected folder actions"><span id="library-import-selection-summary" class="selection-summary">0 folders selected · 0 albums available</span><div class="selection-actions"><button id="library-import-scan-selected" type="button" disabled>Scan selected</button><button id="library-import-ready" type="button" disabled>Import ready (0)</button><button id="library-import-review-exceptions" class="secondary" type="button" disabled>Review exceptions (0)</button></div></div>
       <div hidden aria-hidden="true"><button id="inventory-preview" type="button"></button><button id="candidate-generate" type="button"></button><small id="candidate-generate-help"></small><p id="inventory-status"></p><div id="inventory-summary"></div><input id="library-import-select-all" type="checkbox"><button id="library-import-review-selected" type="button"></button><button id="library-import-review-previous" type="button"></button><span id="library-import-review-page"></span><button id="library-import-review-next" type="button"></button></div>
@@ -1738,7 +1741,6 @@
     const folderPrevious = document.getElementById('folder-page-previous');
     const folderNext = document.getElementById('folder-page-next');
     const folderLast = document.getElementById('library-import-review-last');
-    const folderPageInput = document.getElementById('library-import-page-input');
     const folderPageTotal = document.getElementById('folder-page-total');
     const folderSelectionSummary = document.getElementById('library-import-selection-summary');
     const folderScan = document.getElementById('library-import-scan-selected');
@@ -1845,7 +1847,7 @@
       const selectedHere = foldersOnPage.filter(folder => selectedFolders.has(folder.path)).length;
       folderSelectPage.checked = foldersOnPage.length > 0 && selectedHere === foldersOnPage.length;
       folderSelectPage.indeterminate = selectedHere > 0 && selectedHere < foldersOnPage.length;
-      folderPageInput.value = currentFolderPage; folderPageInput.max = totalFolderPages; folderPageTotal.textContent = `of ${totalFolderPages}`;
+      folderPageTotal.textContent = `Page ${currentFolderPage} of ${totalFolderPages}`;
       folderFirst.disabled = folderPrevious.disabled = currentFolderPage <= 1;
       folderNext.disabled = folderLast.disabled = currentFolderPage >= totalFolderPages;
     }
@@ -1876,8 +1878,6 @@
     folderPrevious.addEventListener('click', () => loadFolderItems(currentFolderPage - 1));
     folderNext.addEventListener('click', () => loadFolderItems(currentFolderPage + 1));
     folderLast.addEventListener('click', () => loadFolderItems(totalFolderPages));
-    function jumpToFolderPage() { loadFolderItems(Math.min(totalFolderPages, Math.max(1, Number.parseInt(folderPageInput.value, 10) || 1))); }
-    folderPageInput.addEventListener('change', jumpToFolderPage); folderPageInput.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); jumpToFolderPage(); } });
     let folderSearchTimer; folderSearch.addEventListener('input', () => { clearTimeout(folderSearchTimer); folderSearchTimer = setTimeout(() => loadFolderItems(1), 250); });
     folderFilter.addEventListener('change', () => loadFolderItems(1));
 

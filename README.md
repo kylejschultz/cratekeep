@@ -69,15 +69,17 @@ gunicorn --bind 127.0.0.1:8788 --workers 1 --threads 4 'beets_mvp:create_app()'
 | `STATE_PATH` | `./data/config` | SQLite databases and generated beets config. |
 | `SECRET_KEY` | generated in `$STATE_PATH/secret.key` | Optional override for advanced deployments. The generated key is retained across restarts when `$STATE_PATH` is mounted persistently. |
 
-Inbox and library paths are chosen during first-run setup. The in-app Settings page also manages optional Navidrome details, an explicit artwork-fetching opt-in, and an advanced YAML editor for `$STATE_PATH/config.yaml`. On save, Cratekeep validates and normalizes the YAML; library/database paths, core import safety options, and `fetchart` plugin state remain controlled by the form.
+Inbox and library paths are chosen during first-run setup. They must be distinct, non-nested, non-symlinked roots. The in-app Settings page also manages optional Navidrome details, an explicit artwork-fetching opt-in, **Automatically find MusicBrainz matches for new Inbox albums**, and an advanced YAML editor for `$STATE_PATH/config.yaml`. Automatic matching is disabled by default and performs bounded candidate lookup only: it never approves metadata, writes tags, moves files, or imports. On save, Cratekeep validates and normalizes the YAML; library/database paths, core import safety options, and `fetchart` plugin state remain controlled by the form.
 
-The overview remains at `/`. The dedicated `/inbox` page groups waiting selections by named source and provides preview-then-import actions. The separate Library import queue remains under Settings, while `/library` provides collection counts, recently added tracks, top artists, searchable/sortable browsing, and the existing metadata edit forms. To safely correct a completed import, open its track in Library, change only **Artist**, leave **Album artist** unchanged, and save; the editor updates both the beets database and the existing file tag in place.
+The overview remains at `/` and is intentionally high-level: one bounded status row per named Inbox plus the five most recent managed albums. The dedicated `/inbox` page inventories each immediate source album under its stable named-Inbox ID and provides the same current-metadata, scored-candidate, artwork, changed-track, exact-MBID, As Is, approval/skip, duplicate, progress, and retry review hierarchy as Library import. The separate Library import queue remains under Settings, while `/library` provides collection counts, recent albums, top artists, searchable/sortable album browsing, and lazy album editing. Library browsing and the Settings folder queue use compact `« ‹ Page X of Y › »` pagination.
+
+An approved Inbox candidate is written explicitly before Beets runs; approved **As Is** imports do not rewrite tags. Both then execute `beet import --quiet --quiet-fallback asis --noautotag --move`, so `import.autotag` remains disabled and Beets owns sanitization and destination selection. Cratekeep preserves every custom YAML `paths` mapping. When the user supplied no `paths` section, generated config explicitly uses the live-compatible policy `default: $albumartist/$album/$track $title`, `singleton: Non-Album/$artist/$title`, and `comp: Compilations/$album/$track $title`, producing `Album artist/Album/01 Title.ext` (not `Album (year)`). A `--pretend` preflight and destination-collision check run before mutation. Success is recorded only after every reviewed source file is absent, every exact predicted destination is a regular file inside the managed library, and each destination has exactly one Beets database item; unrelated concurrent Beets IDs are ignored. Candidate artwork is fetched once, embedded before the move when enabled, and any sidecar is finalized only in verified destination album folders.
 
 Artwork fetching is opt-in. When enabled, saving `cover.jpg` is on by default for backward compatibility; embedding is off. The two destinations are independent. Existing sidecars and embedded images are preserved unless **Replace existing sidecar and embedded artwork** is explicitly enabled. Cratekeep uses Cover Art Archive front art for the selected exact MusicBrainz release, falling back to release-group front art only when exact-release art is absent. Missing art is a visible no-op.
 
 ## API overview
 
-Imports require a preview followed by an explicit execute call:
+The original simple preview API remains for compatibility, but it cannot execute a selection that has entered the reviewed Inbox workflow. New clients should use the reviewed album APIs:
 
 ```sh
 curl -sS -X POST http://localhost:8788/api/imports/preview \
@@ -89,7 +91,13 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 
 - `GET /healthz` — liveness check
 - `GET /api/browse?path=/userMedia` — list directories beneath the container's browse root
-- `GET /api/inbox` — aggregate immediate import candidates across named sources; each row includes `inbox_id` and `inbox_name`
+- `GET /api/inbox` — legacy immediate selection list across named sources
+- `GET /api/inbox/reviews` — reconcile and list persisted reviewed Inbox albums, scoped by stable source ID and current root
+- `POST /api/inbox/scan` — explicitly reconcile all named Inbox snapshots
+- `POST /api/inbox/candidates` — bounded manual MusicBrainz lookup for one `album_id`
+- `GET|PATCH /api/inbox/albums/<id>` — read or save candidate/As Is approval, skip, exceptions, and duplicate policy
+- `POST /api/inbox/albums/<id>/rematch` — exact MusicBrainz release UUID lookup through the shared provider/scorer
+- `POST /api/inbox/albums/<id>/execute` — `{"dry_run":true}` preflight or execute an approved current review through Beets
 - `GET /api/items` — list beets library metadata
 - `GET /api/library-import/reviews` — list persisted track groups and album review records, paginated by album (`limit`/`offset`, 25 albums by default)
 - `GET /api/library-import/folders` — list literal immediate-child library folders, 25 per page, with search and persisted-state status filtering
@@ -105,7 +113,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `POST /api/library-import/albums/<id>/preview` — save the match-screen selection and dry-run the in-place import without queueing it through Inbox
 - `POST /api/library-import/albums/<id>/execute` — preview or execute an approved album in place; the match screen sends `candidate_id` and optional `duplicate_action` so the selection is saved before execution, while API clients may send `{"dry_run":true}` to validate without mutation
 - `POST /api/imports/preview` — snapshot a selection from the supplied `inbox_id`; legacy clients may omit it only when exactly one inbox is configured
-- `POST /api/imports/<id>/execute` — execute a reviewed import
+- `POST /api/imports/<id>/execute` — deprecated simple execution for a selection that has not entered reviewed Inbox state
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
 - `POST /api/navidrome/rescan` — request a scan from the configured endpoint
 
@@ -168,8 +176,8 @@ already-tested image artifact to the main-push publish job. Pull requests never 
 
 ## Limitations
 
-- Cratekeep is designed for one trusted user and one process. It has no authentication, authorization, CSRF protection, job queue, or background workers.
-- Imports are synchronous and may occupy the sole Gunicorn worker for up to one hour.
+- Cratekeep is designed for one trusted user and one process. It has no authentication, authorization, CSRF protection, or durable job queue. Optional Inbox auto-match uses one bounded in-process daemon thread; restarting safely leaves unmatched albums available for manual or later lookup.
+- Reviewed Inbox imports are synchronous and may occupy the sole Gunicorn worker for up to one hour. Metadata/artwork failures restore backed-up source files. If Beets itself fails after moving some files, Cratekeep restores only files still present at the source, audits the partial outcome, and explicitly reports that already-moved files were not rolled back.
 - Folder scan and bulk import return bounded summaries after their synchronous requests; there is no background progress stream. Selection supports the visible page and persists for the browser session; there is deliberately no server-side “select all matching” mode.
 - MusicBrainz matching is an explicit, bounded metadata lookup. Each search hit is resolved to canonical release/release-group type and region, media, position, recording, title, duration, genre-vote evidence, and CAA artwork availability before a deterministic beets-inspired distance is calculated. The MusicBrainz search score remains retrieval metadata and never contributes to confidence. A supplied release ID selects that canonical candidate but never overrides evidence-based confidence or recommendation. Recommendations and per-field penalties are bounded and explainable, and track-count mismatches can never report 100%. Candidate lookup and review decisions do not mutate media; only the separate execution action for an approved review writes tags and optional artwork. Library execution never runs a beets import.
 - Duplicate resolution is explicit and recording-ID based. Without a selected candidate recording ID Cratekeep cannot classify a track as a duplicate, and merge/replace reject multiple managed matches; Cratekeep surfaces ambiguity instead of approximating identity. There is no automatic duplicate policy, progress stream, undo, or delete endpoint.

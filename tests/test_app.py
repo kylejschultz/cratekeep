@@ -7,6 +7,8 @@ from io import BytesIO
 import shutil
 import sqlite3
 import subprocess
+import threading
+import time
 import urllib.error
 import wave
 from pathlib import Path
@@ -102,48 +104,42 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     assert b'href="/settings"' in page.data
     assert b'id="overview-title"' in page.data
     assert b'id="inbox-title"' in page.data
-    assert b'id="library-title"' in page.data
-    assert b'Inbox is empty' in page.data
-    assert b'Library is empty' in page.data
+    assert b'id="recent-title"' in page.data
+    assert b'No managed albums yet' in page.data
     assert b'src="/static/cratekeep-logo.png"' in page.data
-    assert b'aria-controls="sidebar"' in page.data
     assert b'id="theme-toggle"' in page.data
-    assert b'title="Build SHA"' in page.data
-    assert b'https://github.com/kylejschultz/cratekeep' in page.data
-    assert b'body.dark-mode' in page.data
+    assert b'app-shell.css' in page.data
 
-def test_index_renders_inbox_data_and_library_edit_form(tmp_path, monkeypatch):
+def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr(
-        "beets_mvp._inbox_candidates",
-        lambda current_app: [{"path": "new-album", "files": 2, "bytes": 1536 * 1024**2}],
-    )
-    item = {
-        "id": 7,
-        "title": "Example track",
-        "artist": "Example artist",
-        "album": "Example album",
-        "albumartist": "Example artist",
-        "genre": "Rock",
-        "year": 2026,
-        "track": 1,
-        "disc": 1,
-        "path": str(tmp_path / "Example track.mp3"),
-        "bytes": 2 * 1024**2,
-    }
-    Path(item["path"]).write_bytes(b"x" * (2 * 1024**2))
-    monkeypatch.setattr("beets_mvp._items", lambda current_app: [item])
+    monkeypatch.setattr("beets_mvp._inbox_review_groups", lambda current_app: [{
+        "id":"source", "name":"Downloads", "path":str(tmp_path / "inbox"), "error":"",
+        "albums":[{"id":1, "candidate_status":"not-run", "decision":"pending"}],
+    }])
+    monkeypatch.setattr("beets_mvp._library_page_data", lambda *args, **kwargs: {
+        "recent_albums":[{"id":7,"album":"Example album","albumartist":"Example artist",
+                          "year":2026,"track_count":2,"artwork_url":None}],
+        "summary":{"tracks":2,"albums":1,"artists":1,"bytes":1024},
+    })
 
     page = app.test_client().get("/")
 
-    assert b"new-album" in page.data
-    assert b"2 audio files waiting" in page.data
-    assert b'<th class="numeric" scope="col">Size</th>' in page.data
-    assert page.data.count(b"1.5 GB") == 2
-    assert b"Example track" in page.data
-    assert b'action="/api/items/7"' in page.data
-    assert b'name="title" value="Example track"' in page.data
-    assert b"Save changes" in page.data
+    assert b"Downloads" in page.data and b"Example album" in page.data
+    assert b"Open Inbox" in page.data and b"Open Library" in page.data
+    assert b'action="/api/items/' not in page.data
+    assert b"Save changes" not in page.data
+
+
+def test_overview_marks_unreadable_inbox_totals_unavailable_instead_of_stale(tmp_path):
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Once Readable" / "01 Song.wav")
+    client = app.test_client()
+    assert len(client.get("/api/inbox/reviews").json["albums"]) == 1
+    (tmp_path / "inbox").rename(tmp_path / "inbox-unavailable")
+    page = client.get("/").get_data(as_text=True)
+    assert "Totals unavailable — source could not be read" in page
+    assert "one or more source totals are unavailable" in page
+    assert '<p class="summary-value">0</p>' in page
 
 def test_format_bytes_handles_megabytes_zero_and_unknown():
     assert _format_bytes(5 * 1024**2) == "5.0 MB"
@@ -2436,7 +2432,7 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
 
     filtered = client.get("/library?q=artist+b&sort=album&order=desc")
     browse = filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Shared" in browse and b"First" not in browse
+    assert b"Shared" in browse and b'data-album-title>First<' not in browse
     assert b'option value="album" selected' in filtered.data
     assert b'option value="desc" selected' in filtered.data
 
@@ -2447,7 +2443,7 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
 
     album_filtered = client.get("/library?sort=album&order=asc&album=Shared")
     album_browse = album_filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Shared" in album_browse and b"First" not in album_browse
+    assert b"Shared" in album_browse and b'data-album-title>First<' not in album_browse
     assert b'name="album" value="Shared"' in album_filtered.data
 
     detail = client.get(f"/api/library/albums/{first_album.id}")
@@ -3647,7 +3643,7 @@ def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html
     assert b"Albums ${pageStart}\xe2\x80\x93${pageEnd} of ${reviewTotalAlbums}" in html
-    assert b">Previous<" in html and b">Next<" in html
+    assert b'aria-label="Previous page"' in html and b'aria-label="Next page"' in html
 
 
 def test_album_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
@@ -4065,12 +4061,14 @@ def test_candidate_schema_defaults_distinguish_fresh_and_upgraded_databases(tmp_
             "SELECT id, state, selected_candidate_id, candidate_status, execution_status FROM album_reviews ORDER BY id"
         ).fetchall()
         versions = db.execute("SELECT schema_version FROM metadata_candidates ORDER BY id").fetchall()
+        source_columns = {row[1]: row[4] for row in db.execute("PRAGMA table_info(album_reviews)")}
     assert upgraded_default == "1"
     assert rows == [
         (1, "approved", 1, "stale", "not-run"),
         (2, "approved", 2, "complete", "complete"),
     ]
     assert versions == [(1,), (1,)]
+    assert source_columns["source_kind"] == "'library'" and source_columns["source_id"] == "''"
 
 
 def test_album_modal_actions_remain_workflow_only(tmp_path):
@@ -4393,15 +4391,15 @@ def test_invalid_beets_config_is_rejected_without_persisting(tmp_path):
 
 def test_dashboard_uses_compact_light_admin_visual_contract(tmp_path):
     page = make_app(tmp_path).test_client().get("/")
+    stylesheet = (Path(__file__).parents[1] / "beets_mvp/static/app-shell.css").read_bytes()
 
-    assert b"color-scheme:light" in page.data
-    assert b'--font-sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI"' in page.data
-    assert b"--page:#e7e9ec" in page.data
-    assert b"font:16px/1.5 var(--font-sans)" in page.data
+    assert b"color-scheme: light" in stylesheet
+    assert b"--page:#f1f4f3" in stylesheet
+    assert b'app-shell.css' in page.data
+    assert b'font:16px/1.5 ui-sans-serif' in page.data
     assert b"width:13.5rem" in page.data
-    assert b"border-right:1px solid var(--soft)" in page.data
-    assert b"box-shadow:0 1px 2px" in page.data
-    assert b"prefers-color-scheme:dark" not in page.data
+    assert b"summary-grid" in page.data
+    assert b"prefers-color-scheme:dark" not in stylesheet
 
 
 def test_setup_and_settings_routes_have_distinct_lifecycle_pages(tmp_path):
@@ -4797,9 +4795,10 @@ def test_bulk_import_requires_confirmation_revalidates_and_isolates_failures(tmp
 
 def test_folder_queue_ui_has_persistent_selection_lazy_expansion_and_accessible_confirmation(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    for control in ("library-import-search", "library-import-filter", "folder-select-page", "library-import-page-input",
+    for control in ("library-import-search", "library-import-filter", "folder-select-page",
                     "library-import-scan-selected", "library-import-ready", "library-import-review-exceptions"):
         assert f'id="{control}"' in html
+    assert 'id="library-import-page-input"' not in html
     assert "sessionStorage.setItem(folderSelectionKey" in html
     assert "/api/library-import/folders/albums?folder=" in html
     assert 'aria-modal="true" aria-labelledby="library-import-confirm-title"' in html
@@ -4809,3 +4808,863 @@ def test_folder_queue_ui_has_persistent_selection_lazy_expansion_and_accessible_
     assert "/api/library-import/albums/${nextId}" not in html
     assert "data-review-decision=\"skipped\"" in html
     assert "@media (max-width: 520px)" in html
+
+
+def configure_named_inboxes(app, roots: list[Path], names: list[str] | None = None, **extra):
+    names = names or [f"Source {index}" for index in range(1, len(roots) + 1)]
+    existing = app.config["INBOXES"]
+    data = {
+        "inbox_id": [existing[index]["id"] if index < len(existing) else "" for index in range(len(roots))],
+        "inbox_name": names,
+        "inbox_path": [str(root) for root in roots],
+        "library_path": app.config["LIBRARY_PATH"],
+        **extra,
+    }
+    response = app.test_client().post("/settings", data=data)
+    assert response.status_code == 302
+
+
+def tagged_inbox_wav(path: Path, *, artist="Artist", album="Album", title="Song", track=1):
+    write_wav(path)
+    media = MediaFile(str(path))
+    media.artist = media.albumartist = artist
+    media.album = album
+    media.title = title
+    media.track = track
+    media.save()
+
+
+def approve_inbox_candidate(client, app, *, artwork: dict | None = None):
+    candidate = {
+        **exact_candidate({
+            "artist": "Artist", "album": "Album",
+            "tracks": [{"title": "Song", "artist": "Artist", "duration": 1}],
+        }),
+        "date": "2024-03-02", "year": "2024", "genre": "Rock",
+        "release_type": "Album", "country": "US",
+        "media": [{"position": 1, "format": "CD", "track_count": 1}],
+    }
+    if artwork is not None:
+        candidate["artwork"] = artwork
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [candidate]
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    matched = client.post("/api/inbox/candidates", json={"album_id": album["id"]}).json["album"]
+    chosen = matched["candidates"][0]
+    approved = client.patch(
+        f"/api/inbox/albums/{album['id']}",
+        json={"decision": "approved", "candidate_id": chosen["id"]},
+    )
+    assert approved.status_code == 200
+    return approved.json
+
+
+def complete_mock_inbox_move(app, source: Path, *, add_unrelated: bool = False):
+    destination = Path(app.config["LIBRARY_PATH"]) / "Artist" / "Album" / "01 Song.wav"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(source, destination)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    library.add(Item.from_path(destination))
+    if add_unrelated:
+        unrelated = Path(app.config["LIBRARY_PATH"]) / "Concurrent" / "Other" / "01 Other.wav"
+        tagged_inbox_wav(unrelated, artist="Concurrent", album="Other", title="Other")
+        library.add(Item.from_path(unrelated))
+    return destination
+
+
+def test_inbox_review_identity_is_scoped_by_stable_named_source(tmp_path):
+    app = make_app(tmp_path)
+    roots = [tmp_path / "inbox", tmp_path / "inbox-two"]
+    roots[1].mkdir()
+    for root in roots:
+        tagged_inbox_wav(root / "Same" / "01 Song.wav")
+    configure_named_inboxes(app, roots, ["One", "Two"])
+    client = app.test_client()
+
+    albums = client.get("/api/inbox/reviews").json["albums"]
+    assert len(albums) == 2
+    assert len({album["id"] for album in albums}) == 2
+    assert len({album["source_id"] for album in albums}) == 2
+    first_id = albums[0]["id"]
+    first_source_id = app.config["INBOXES"][0]["id"]
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query)]
+    matched = client.post("/api/inbox/candidates", json={"album_id": first_id}).json["album"]
+    client.patch(
+        f"/api/inbox/albums/{first_id}",
+        json={"decision":"approved", "candidate_id":matched["candidates"][0]["id"]},
+    )
+
+    configure_named_inboxes(app, roots, ["Renamed", "Two"])
+    renamed = client.get("/api/inbox/reviews").json["albums"]
+    assert next(album for album in renamed if album["source_id"] == first_source_id)["id"] == first_id
+
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    configure_named_inboxes(app, [replacement, roots[1]], ["Renamed", "Two"])
+    changed = client.get("/api/inbox/reviews").json["albums"]
+    assert all(album["id"] != first_id for album in changed)
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT present FROM library_inventory WHERE source_id=?", (first_source_id,)).fetchone()[0] == 0
+        stale = db.execute(
+            "SELECT state, candidate_status, selected_candidate_id FROM album_reviews WHERE id=?", (first_id,)
+        ).fetchone()
+        assert stale == ("pending", "stale", None)
+        assert db.execute("SELECT COUNT(*) FROM metadata_candidates WHERE album_review_id=?", (first_id,)).fetchone()[0] == 0
+
+
+def test_inbox_stat_identical_scan_avoids_tag_and_provider_reads(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Stable" / "01 Song.wav")
+    client = app.test_client()
+    first = client.get("/api/inbox/reviews").json["albums"][0]
+    monkeypatch.setattr("beets_mvp._inbox_tag_snapshot", lambda path: pytest.fail("stat-identical tag reread"))
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: pytest.fail("ordinary reload provider call")
+
+    second = client.get("/api/inbox/reviews").json["albums"][0]
+    assert second["id"] == first["id"] and second["candidate_status"] == "not-run"
+
+
+def test_inbox_manual_match_uses_shared_candidate_and_never_auto_approves(tmp_path):
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Manual" / "01 Song.wav")
+    calls = []
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: calls.append(query) or [exact_candidate(query)]
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+
+    matched = client.post("/api/inbox/candidates", json={"album_id": album["id"]})
+    assert matched.status_code == 201 and len(calls) == 1
+    result = matched.json["album"]
+    assert result["candidates"][0]["provider_id"] == "release-1"
+    assert result["decision"] == "pending"
+    assert result["execution_status"] == "not-run"
+
+
+def test_legacy_execute_cannot_bypass_a_root_level_reviewed_album(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Root Song.wav"
+    tagged_inbox_wav(source, album="Root Album")
+    client = app.test_client()
+    assert len(client.get("/api/inbox/reviews").json["albums"]) == 1
+    preview = client.post("/api/imports/preview", json={"path":"Root Song.wav"})
+    assert preview.status_code == 201
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, **kwargs: pytest.fail("must stay reviewed"))
+
+    response = client.post(f"/api/imports/{preview.json['id']}/execute")
+    assert response.status_code == 409
+    assert b"requires an approved review" in response.data
+
+
+def test_inbox_auto_match_setting_defaults_off_and_only_schedules_lookup(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Auto" / "01 Song.wav")
+    scheduled = []
+    monkeypatch.setattr("beets_mvp._start_inbox_auto_match", lambda current_app, ids: scheduled.extend(ids))
+    client = app.test_client()
+    assert app.config["INBOX_AUTO_MATCH"] is False
+    client.get("/api/inbox/reviews")
+    assert scheduled == []
+    inbox = app.config["INBOXES"][0]
+    response = client.post("/settings", data={
+        "inbox_id":[inbox["id"]], "inbox_name":[inbox["name"]], "inbox_path":[inbox["path"]],
+        "library_path":app.config["LIBRARY_PATH"], "inbox_auto_match":"1",
+    })
+    assert response.status_code == 302 and app.config["INBOX_AUTO_MATCH"] is True
+    client.get("/api/inbox/reviews")
+    assert len(scheduled) == 1
+    assert (tmp_path / "inbox" / "Auto" / "01 Song.wav").exists()
+    assert list((tmp_path / "library").iterdir()) == []
+
+
+def test_inbox_auto_match_worker_drains_new_work_and_skips_manual_completion(tmp_path):
+    import beets_mvp
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "A" / "01 Song.wav", album="Album A")
+    tagged_inbox_wav(tmp_path / "inbox" / "B" / "01 Song.wav", album="Album B")
+    albums = app.test_client().get("/api/inbox/reviews").json["albums"]
+    by_name = {album["album"]: album for album in albums}
+    started, release = threading.Event(), threading.Event()
+    calls = []
+    def provider(query, *, limit):
+        calls.append(query["album"])
+        if query["album"] == "Album A":
+            started.set()
+            assert release.wait(5)
+        return [exact_candidate(query, f"release-{query['album']}")]
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    first, second = by_name["Album A"], by_name["Album B"]
+    beets_mvp._start_inbox_auto_match(app, [first["id"]])
+    assert started.wait(5)
+    beets_mvp._start_inbox_auto_match(app, [second["id"]])
+    # A manual lookup completing B while it is queued must make the worker's
+    # final status recheck skip a second provider request.
+    beets_mvp._generate_musicbrainz_candidates(
+        app, 1, album_ids=[second["id"]], root=app.config["INBOXES"][0]["path"],
+        source_kind="inbox", source_id=second["source_id"],
+    )
+    release.set()
+    deadline = time.monotonic() + 5
+    while app.config["INBOX_MATCH_RUNNING"] and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert app.config["INBOX_MATCH_RUNNING"] is False
+    assert calls.count("Album A") == calls.count("Album B") == 1
+    refreshed = app.test_client().get("/api/inbox/reviews").json["albums"]
+    assert all(album["candidate_status"] == "complete" for album in refreshed)
+
+
+def test_inbox_manual_match_racing_auto_match_does_not_repeat_provider(tmp_path):
+    import beets_mvp
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Race" / "01 Song.wav", album="Race Album")
+    album = app.test_client().get("/api/inbox/reviews").json["albums"][0]
+    provider_started, provider_release, manual_started = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+    def provider(query, *, limit):
+        calls.append(query["album"])
+        provider_started.set()
+        assert provider_release.wait(5)
+        return [exact_candidate(query)]
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    beets_mvp._start_inbox_auto_match(app, [album["id"]])
+    assert provider_started.wait(5)
+    responses = []
+    def manual_match():
+        manual_started.set()
+        responses.append(app.test_client().post("/api/inbox/candidates", json={"album_id":album["id"]}))
+    thread = threading.Thread(target=manual_match)
+    thread.start()
+    assert manual_started.wait(5)
+    provider_release.set()
+    thread.join(5)
+    assert not thread.is_alive() and responses[0].status_code == 201
+    assert responses[0].json["result"]["already_matched"] is True
+    assert calls == ["Race Album"]
+
+
+def test_settings_rejects_library_inbox_overlap_and_symlink_root(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    inbox = app.config["INBOXES"][0]
+    nested = Path(app.config["LIBRARY_PATH"]) / "incoming"
+    response = client.post("/settings", data={
+        "inbox_id":[inbox["id"]], "inbox_name":["Inbox"], "inbox_path":[str(nested)],
+        "library_path":app.config["LIBRARY_PATH"],
+    })
+    assert response.status_code == 200
+    assert b"must not be equal or contain one another" in response.data
+    target = tmp_path / "real-inbox"; target.mkdir()
+    alias = tmp_path / "alias-inbox"; alias.symlink_to(target, target_is_directory=True)
+    response = client.post("/settings", data={
+        "inbox_id":[inbox["id"]], "inbox_name":["Inbox"], "inbox_path":[str(alias)],
+        "library_path":app.config["LIBRARY_PATH"],
+    })
+    assert response.status_code == 200
+    assert b"must not be a symlink or filesystem alias" in response.data
+
+    real_library = tmp_path / "real-library"; real_library.mkdir()
+    alias_library = tmp_path / "alias-library"; alias_library.symlink_to(real_library, target_is_directory=True)
+    response = client.post("/settings", data={
+        "inbox_id":[inbox["id"]], "inbox_name":["Inbox"], "inbox_path":[inbox["path"]],
+        "library_path":str(alias_library),
+    })
+    assert response.status_code == 200
+    assert b"Library path must not be a symlink or filesystem alias" in response.data
+
+
+def test_generated_beets_paths_are_live_compatible_and_custom_paths_are_preserved(tmp_path):
+    app = make_app(tmp_path)
+    config_path = Path(app.config["BEETS_CONFIG"])
+    generated = yaml.safe_load(config_path.read_text())
+    assert generated["paths"] == {
+        "default": "$albumartist/$album/$track $title",
+        "singleton": "Non-Album/$artist/$title",
+        "comp": "Compilations/$album/$track $title",
+    }
+    assert "%aunique" not in config_path.read_text() and "year" not in generated["paths"]["default"]
+
+    custom = {
+        "default": "$albumartist/Custom/$album/$track $title",
+        "singleton": "Singles/$artist/$title",
+        "comp": "Various/$album/$track $title",
+        "albumtype:soundtrack": "Soundtracks/$album/$track $title",
+    }
+    inbox = app.config["INBOXES"][0]
+    response = app.test_client().post("/settings", data={
+        "inbox_id":[inbox["id"]], "inbox_name":[inbox["name"]], "inbox_path":[inbox["path"]],
+        "library_path":app.config["LIBRARY_PATH"],
+        "beets_config":yaml.safe_dump({"paths": custom}, sort_keys=False),
+    })
+    assert response.status_code == 302
+    assert yaml.safe_load(config_path.read_text())["paths"] == custom
+
+
+def test_settings_render_failure_does_not_stale_existing_inbox_review(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Stable" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    original_config = Path(app.config["BEETS_CONFIG"]).read_bytes()
+    replacement = tmp_path / "replacement"; replacement.mkdir()
+    import beets_mvp
+    original_stale = beets_mvp._stale_changed_inbox_roots
+
+    def fail_after_staging(database, current, inboxes):
+        original_stale(database, current, inboxes)
+        raise OSError("fixture settings database failure")
+
+    monkeypatch.setattr("beets_mvp._stale_changed_inbox_roots", fail_after_staging)
+    inbox = app.config["INBOXES"][0]
+    with pytest.raises(OSError, match="fixture settings database failure"):
+        client.post("/settings", data={
+            "inbox_id":[inbox["id"]], "inbox_name":[inbox["name"]], "inbox_path":[str(replacement)],
+            "library_path":app.config["LIBRARY_PATH"],
+        })
+    assert Path(app.config["BEETS_CONFIG"]).read_bytes() == original_config
+    monkeypatch.setattr("beets_mvp._stale_changed_inbox_roots", original_stale)
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT state, candidate_status FROM album_reviews WHERE id=?", (album["id"],)).fetchone() == (
+            "pending", "not-run"
+        )
+        assert db.execute("SELECT present FROM library_inventory WHERE root_path=?", (str(tmp_path / "inbox"),)).fetchone()[0] == 1
+
+
+def test_settings_apply_failure_rolls_back_config_database_and_runtime(tmp_path, monkeypatch):
+    import beets_mvp
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Stable" / "01 Song.wav")
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    inbox = app.config["INBOXES"][0]
+    original_config = Path(app.config["BEETS_CONFIG"]).read_bytes()
+    original_apply = beets_mvp._apply_settings
+    replacement = tmp_path / "replacement"; replacement.mkdir()
+
+    def fail_new_settings(current_app, settings):
+        original_apply(current_app, settings)
+        if str(replacement) in settings.get("inboxes_json", ""):
+            raise OSError("fixture Beets apply failure")
+
+    monkeypatch.setattr("beets_mvp._apply_settings", fail_new_settings)
+    with pytest.raises(OSError, match="fixture Beets apply failure"):
+        client.post("/settings", data={
+            "inbox_id":[inbox["id"]], "inbox_name":[inbox["name"]], "inbox_path":[str(replacement)],
+            "library_path":app.config["LIBRARY_PATH"],
+        })
+    assert Path(app.config["BEETS_CONFIG"]).read_bytes() == original_config
+    assert app.config["INBOXES"][0]["path"] == inbox["path"]
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT state,candidate_status FROM album_reviews WHERE id=?", (album["id"],)).fetchone() == (
+            "pending", "not-run"
+        )
+        assert db.execute("SELECT present FROM library_inventory WHERE root_path=?", (inbox["path"],)).fetchone()[0] == 1
+
+
+def test_reviewed_as_is_moves_with_beets_default_album_path_and_is_idempotent(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Move Me" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    monkeypatch.setenv("PATH", f"{Path(os.sys.executable).parent}:{os.environ.get('PATH', '')}")
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    approved = client.patch(
+        f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None}
+    )
+    assert approved.status_code == 200 and approved.json["selection_mode"] == "as-is"
+    preview = client.post(f"/api/inbox/albums/{album['id']}/execute", json={"dry_run":True})
+    assert preview.status_code == 200
+    assert preview.json["destinations"] == ["Artist/Album/01 Song.wav"]
+    executed = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert executed.status_code == 201
+    destination = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    assert destination.exists() and not source.exists()
+    assert executed.json["items"][0]["path"] == str(destination)
+    retried = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert retried.status_code == 200 and retried.json["already_complete"] is True
+
+
+def test_reviewed_as_is_real_beets_move_honors_custom_paths_mapping(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    inbox = app.config["INBOXES"][0]
+    custom = {"default":"$albumartist/Custom/$album/$track $title",
+              "singleton":"Singles/$artist/$title", "comp":"Various/$album/$track $title"}
+    response = app.test_client().post("/settings", data={
+        "inbox_id":[inbox["id"]], "inbox_name":[inbox["name"]], "inbox_path":[inbox["path"]],
+        "library_path":app.config["LIBRARY_PATH"], "beets_config":yaml.safe_dump({"paths":custom}),
+    })
+    assert response.status_code == 302
+    source = tmp_path / "inbox" / "Custom Move" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    monkeypatch.setenv("PATH", f"{Path(os.sys.executable).parent}:{os.environ.get('PATH', '')}")
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    client.patch(f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None})
+    preview = client.post(f"/api/inbox/albums/{album['id']}/execute", json={"dry_run":True})
+    assert preview.status_code == 200
+    assert preview.json["destinations"] == ["Artist/Custom/Album/01 Song.wav"]
+    executed = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    destination = tmp_path / "library" / "Artist" / "Custom" / "Album" / "01 Song.wav"
+    assert executed.status_code == 201 and destination.exists() and not source.exists()
+    assert executed.json["items"][0]["path"] == str(destination)
+
+
+def test_inbox_execution_blocks_track_exceptions_and_destination_collision(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Blocked" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    monkeypatch.setenv("PATH", f"{Path(os.sys.executable).parent}:{os.environ.get('PATH', '')}")
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    track_id = album["tracks"][0]["id"]
+    client.patch(f"/api/inbox/albums/{album['id']}", json={
+        "decision":"approved", "candidate_id":None, "track_exceptions":{str(track_id):"skipped"},
+    })
+    blocked = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert blocked.status_code == 409 and blocked.json["code"] == "partial_album_not_supported"
+    client.patch(f"/api/inbox/albums/{album['id']}", json={
+        "decision":"approved", "candidate_id":None, "track_exceptions":{str(track_id):None},
+    })
+    collision = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    collision.parent.mkdir(parents=True); collision.write_bytes(b"unrelated")
+    blocked = client.post(f"/api/inbox/albums/{album['id']}/execute", json={"dry_run":True})
+    assert blocked.status_code == 409 and blocked.json["code"] == "destination_collision"
+    assert source.exists() and collision.read_bytes() == b"unrelated"
+
+
+def test_inbox_execution_revalidates_after_preflight_and_audits_stale_source(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Changed" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    client.patch(
+        f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None}
+    )
+    calls = []
+    def changing_preflight(current_app, selection, *, pretend=False):
+        calls.append(pretend)
+        assert pretend is True
+        current = source.stat()
+        os.utime(source, ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000))
+        return subprocess.CompletedProcess(["beet"], 0, "preflight", "")
+    monkeypatch.setattr("beets_mvp._run_beets_import", changing_preflight)
+
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 409 and response.json["code"] == "inventory_stale"
+    assert calls == [True] and source.exists()
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        review = db.execute(
+            "SELECT execution_status, execution_error FROM album_reviews WHERE id=?", (album["id"],)
+        ).fetchone()
+        job = db.execute(
+            "SELECT status, error FROM adoption_jobs WHERE kind='inbox_import_execute' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert review[0] == job[0] == "failed"
+    assert "changed after inventory preview" in review[1]
+    assert "changed after inventory preview" in job[1]
+
+
+def test_inbox_execution_blocks_a_source_folder_containing_another_album(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Mixed"
+    tagged_inbox_wav(source / "01 First.wav", album="First", title="First")
+    tagged_inbox_wav(source / "01 Second.wav", album="Second", title="Second")
+    client = app.test_client()
+    albums = client.get("/api/inbox/reviews").json["albums"]
+    assert {album["album"] for album in albums} == {"First", "Second"}
+    first = next(album for album in albums if album["album"] == "First")
+    client.patch(
+        f"/api/inbox/albums/{first['id']}", json={"decision":"approved", "candidate_id":None}
+    )
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, **kwargs: pytest.fail("Beets must not run"))
+
+    response = client.post(f"/api/inbox/albums/{first['id']}/execute", json={})
+    assert response.status_code == 409
+    assert response.json["code"] == "source_contains_other_albums"
+    assert len(list(source.glob("*.wav"))) == 2
+
+
+def test_inbox_beets_failure_restores_candidate_tags_and_audits_retry(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Failure" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        **exact_candidate(query), "artist":"Changed Artist", "album":"Changed Album",
+        "tracks":[{"title":"Changed Song", "artist":"Changed Artist", "position":"1",
+                   "recording_id":"recording-changed"}],
+    }]
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    matched = client.post("/api/inbox/candidates", json={"album_id":album["id"]}).json["album"]
+    candidate_id = matched["candidates"][0]["id"]
+    client.patch(f"/api/inbox/albums/{album['id']}", json={
+        "decision":"approved", "candidate_id":candidate_id,
+    })
+    calls = []
+    def failed_import(current_app, selection, *, pretend=False):
+        calls.append(pretend)
+        return subprocess.CompletedProcess(["beet"], 0 if pretend else 9, "", "fixture beets failure")
+    monkeypatch.setattr("beets_mvp._run_beets_import", failed_import)
+
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 502 and response.json["code"] == "beets_import_failed"
+    assert calls == [True, False] and source.exists()
+    restored = MediaFile(str(source))
+    assert (restored.artist, restored.album, restored.title) == ("Artist", "Album", "Song")
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        review = db.execute(
+            "SELECT execution_status, execution_error, last_execution_job_id FROM album_reviews WHERE id=?",
+            (album["id"],),
+        ).fetchone()
+        assert review[0] == "failed" and "fixture beets failure" in review[1] and review[2]
+
+
+def test_inbox_beets_zero_without_exact_move_fails_closed_and_remains_retryable(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Incomplete" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    client.patch(f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None})
+    calls = []
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, pretend=False, **kwargs: (
+        calls.append(pretend) or subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+    ))
+
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 502 and response.json["code"] == "beets_incomplete"
+    assert calls == [True, False] and source.exists()
+    assert not (tmp_path / "library" / "Artist" / "Album" / "01 Song.wav").exists()
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        review = db.execute(
+            "SELECT execution_status, executed_at FROM album_reviews WHERE id=?", (album["id"],)
+        ).fetchone()
+        inventory = db.execute(
+            "SELECT present FROM library_inventory WHERE source_kind='inbox' AND relative_path='Incomplete/01 Song.wav'"
+        ).fetchone()
+        summary = json.loads(db.execute(
+            "SELECT summary_json FROM adoption_jobs WHERE kind='inbox_import_execute' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0])
+    assert review == ("failed", None) and inventory[0] == 1
+    assert summary["status"] == "failed" and summary["verification"]["expected"] == 1
+    assert summary["verification"]["verified"] == 0
+
+
+def test_inbox_exact_destination_identity_ignores_unrelated_concurrent_beets_ids(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Exact" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    client.patch(f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None})
+
+    def run(current_app, selection, *, pretend=False):
+        if not pretend:
+            complete_mock_inbox_move(current_app, source, add_unrelated=True)
+        return subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+
+    monkeypatch.setattr("beets_mvp._run_beets_import", run)
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 201
+    assert [item["path"] for item in response.json["items"]] == [
+        str(tmp_path / "library" / "Artist" / "Album" / "01 Song.wav")
+    ]
+    assert all("Concurrent" not in item["path"] for item in response.json["items"])
+
+
+def test_inbox_execute_rejects_stale_or_old_schema_candidate_evidence(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Stale Candidate" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app)
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        db.execute("UPDATE album_reviews SET candidate_status='stale', candidate_error='refresh required' WHERE id=?", (album["id"],))
+        db.execute("UPDATE metadata_candidates SET schema_version=1 WHERE id=?", (album["selected_candidate_id"],))
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, **kwargs: pytest.fail("Beets must not run"))
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={"dry_run": True})
+    assert response.status_code == 409 and response.json["code"] == "candidate_stale"
+    assert source.exists()
+
+
+def test_inbox_exact_verifier_rejects_two_aliases_of_one_file_and_item(tmp_path):
+    import beets_mvp
+    app = make_app(tmp_path)
+    destination = tmp_path / "library" / "Real" / "Album" / "01 Song.wav"
+    tagged_inbox_wav(destination)
+    alias = tmp_path / "library" / "Alias"; alias.symlink_to(destination.parent.parent, target_is_directory=True)
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    library.add(Item.from_path(destination))
+    with pytest.raises(LibraryImportExecutionError) as failure:
+        beets_mvp._verify_inbox_move(
+            app, [tmp_path / "missing-one.wav", tmp_path / "missing-two.wav"],
+            ["Real/Album/01 Song.wav", "Alias/Album/01 Song.wav"],
+        )
+    assert failure.value.code == "beets_incomplete"
+    assert "duplicates another expected destination" in str(failure.value)
+
+
+def test_inbox_execution_lock_rejects_overlapping_request_without_running_beets(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Locked" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    album = app.test_client().get("/api/inbox/reviews").json["albums"][0]
+    app.test_client().patch(f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None})
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, **kwargs: pytest.fail("second request must not run"))
+    lock = app.config["INBOX_EXECUTION_LOCK"]
+    lock.acquire()
+    try:
+        response = app.test_client().post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    finally:
+        lock.release()
+    assert response.status_code == 409 and response.json["code"] == "execution_in_progress"
+
+
+def test_replaced_library_root_symlink_fails_closed_after_restart(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Safe" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    album = app.test_client().get("/api/inbox/reviews").json["albums"][0]
+    app.test_client().patch(f"/api/inbox/albums/{album['id']}", json={"decision":"approved", "candidate_id":None})
+    library = tmp_path / "library"; library.rmdir()
+    target = tmp_path / "redirect-target"; target.mkdir()
+    library.symlink_to(target, target_is_directory=True)
+    restarted = create_app({
+        "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": app.config["STATE_PATH"],
+        "BROWSE_ROOTS": [str(tmp_path)],
+    })
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, **kwargs: pytest.fail("Beets must not run"))
+    assert restarted.config["LIBRARY_ROOT_ERROR"]
+    preview = restarted.test_client().post("/api/library/inventory/preview")
+    assert preview.status_code == 400 and b"must not be a symlink" in preview.data
+    executed = restarted.test_client().post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert executed.status_code == 409 and executed.json["code"] == "library_root_unsafe"
+    assert not list(target.iterdir()) and source.exists()
+
+
+@pytest.mark.parametrize("sidecar,embed,replace,existing,available", [
+    (True, False, False, False, True),
+    (False, True, False, False, True),
+    (True, True, False, False, True),
+    (True, True, False, True, True),
+    (True, True, True, True, True),
+    (True, True, True, True, False),
+])
+def test_reviewed_inbox_artwork_is_finalized_only_at_verified_destination(
+    tmp_path, monkeypatch, sidecar, embed, replace, existing, available,
+):
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=sidecar, ART_EMBED=embed, ART_REPLACE=replace)
+    source = tmp_path / "inbox" / "Artwork" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    old_art, new_art = jpeg_bytes((120, 10, 10)), jpeg_bytes((10, 120, 10))
+    source_cover = source.parent / "cover.jpg"
+    final_cover = tmp_path / "library" / "Artist" / "Album" / "cover.jpg"
+    if existing:
+        source_cover.write_bytes(old_art)
+        media = MediaFile(str(source)); media.images = [MediaImage(old_art, type=ImageType.front)]; media.save()
+        final_cover.parent.mkdir(parents=True, exist_ok=True)
+        final_cover.write_bytes(old_art)
+    artwork = ({
+        "available": True, "source": "cover-art-archive", "entity": "release",
+        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+        "thumbnail_url": "https://coverartarchive.org/release/123e4567-e89b-42d3-a456-426614174000/front-250",
+    } if available else None)
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: new_art
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app, artwork=artwork)
+    fetches = []
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: fetches.append(provider_data["provider_id"]) or new_art
+
+    def run(current_app, selection, *, pretend=False):
+        if not pretend:
+            complete_mock_inbox_move(current_app, source)
+        return subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+
+    monkeypatch.setattr("beets_mvp._run_beets_import", run)
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 201
+    destination = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    images = MediaFile(str(destination)).images or []
+    assert fetches == (["release-1"] if available else [])
+    if not available:
+        assert response.json["artwork"]["status"] == "unavailable"
+        assert final_cover.read_bytes() == old_art and images[0].data == old_art
+    elif existing and not replace:
+        assert final_cover.read_bytes() == old_art and images[0].data == old_art
+        assert response.json["artwork"]["sidecars"]["preserved"]
+        assert response.json["artwork"]["embedded"]["preserved"]
+    else:
+        assert (final_cover.exists() and final_cover.read_bytes() == new_art) is sidecar
+        assert (bool(images) and images[0].data == new_art) is embed
+    if source_cover.exists():
+        assert source_cover.read_bytes() == old_art
+    assert not (source.parent / ".cover.jpg").exists()
+    if available:
+        assert response.json["artwork"]["sha256"] == hashlib.sha256(new_art).hexdigest()
+        assert response.json["artwork"]["album_folders"] == [str(destination.parent)]
+
+
+def test_reviewed_inbox_beets_failure_restores_embedded_art_and_preserves_source_sidecar(
+    tmp_path, monkeypatch,
+):
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=True, ART_REPLACE=True)
+    source = tmp_path / "inbox" / "Artwork Failure" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    old_art, new_art = jpeg_bytes((120, 10, 10)), jpeg_bytes((10, 120, 10))
+    cover = source.parent / "cover.jpg"; cover.write_bytes(old_art)
+    media = MediaFile(str(source)); media.images = [MediaImage(old_art, type=ImageType.front)]; media.save()
+    artwork = {
+        "available": True, "source": "cover-art-archive", "entity": "release",
+        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+    }
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: new_art
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app, artwork=artwork)
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, pretend=False, **kwargs:
+        subprocess.CompletedProcess(["beet"], 0 if pretend else 9, "", "fixture failure"))
+
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 502 and response.json["code"] == "beets_import_failed"
+    assert source.exists() and cover.read_bytes() == old_art
+    assert MediaFile(str(source)).images[0].data == old_art
+    assert not (tmp_path / "library" / "Artist" / "Album" / "cover.jpg").exists()
+
+
+def test_reviewed_inbox_destination_sidecar_failure_is_audited_and_retryable(tmp_path, monkeypatch):
+    import beets_mvp
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=True, ART_REPLACE=True)
+    source = tmp_path / "inbox" / "Artwork Retry" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    art = jpeg_bytes((10, 120, 10))
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: art
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app, artwork={
+        "available": True, "source": "cover-art-archive", "entity": "release",
+        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+    })
+    def run(current_app, selection, *, pretend=False):
+        if not pretend:
+            complete_mock_inbox_move(current_app, source)
+        return subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+    monkeypatch.setattr("beets_mvp._run_beets_import", run)
+    original = beets_mvp._apply_inbox_destination_sidecars
+    calls = 0
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            error = LibraryImportExecutionError("fixture sidecar commit failure", code="artwork_destination_failed", status=502)
+            error.diagnostics = {"staged": ["cover.jpg"], "rolled_back": ["cover.jpg"], "rollback_errors": []}
+            raise error
+        return original(*args, **kwargs)
+    monkeypatch.setattr("beets_mvp._apply_inbox_destination_sidecars", fail_once)
+
+    failed = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert failed.status_code == 502 and failed.json["code"] == "artwork_finalize_failed"
+    destination = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    assert destination.exists() and not source.exists() and not (destination.parent / "cover.jpg").exists()
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        state = db.execute("SELECT execution_status,last_execution_job_id FROM album_reviews WHERE id=?", (album["id"],)).fetchone()
+        summary = json.loads(db.execute("SELECT summary_json FROM adoption_jobs WHERE id=?", (state[1],)).fetchone()[0])
+    assert state[0] == "artwork-pending" and summary["status"] == "partial"
+    assert summary["artwork"]["failure"]["rolled_back"] == ["cover.jpg"]
+    assert summary["artwork"]["retryable"] is True
+
+    # Ordinary page/API reconciliation must retain the destination-only
+    # recovery manifest even though Beets already removed the source audio.
+    refreshed = client.get("/api/inbox/reviews")
+    assert refreshed.status_code == 200
+    assert next(item for item in refreshed.json["albums"] if item["id"] == album["id"])["execution_status"] == "artwork-pending"
+    scanned = client.post("/api/inbox/scan", json={"inbox_id": album["source_id"]})
+    assert scanned.status_code == 200
+    assert any(item["id"] == album["id"] for item in scanned.json["inboxes"][0]["albums"])
+    assert client.post(f"/api/inbox/albums/{album['id']}/execute", json={"dry_run":True}).status_code == 200
+    retried = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert retried.status_code == 201 and retried.json["retry_of_job_id"] == state[1]
+    assert "failure" not in retried.json["artwork"]
+    assert retried.json["artwork"]["recovered_from"]["rolled_back"] == ["cover.jpg"]
+    assert (destination.parent / "cover.jpg").read_bytes() == art
+    assert MediaFile(str(destination)).images[0].data == art
+
+
+def test_destination_sidecars_roll_back_first_folder_when_second_commit_fails(tmp_path, monkeypatch):
+    import beets_mvp
+    app = make_app(tmp_path)
+    app.config.update(ART_SIDECAR=True, ART_REPLACE=True)
+    destinations = ["Artist/First/01 Song.wav", "Artist/Second/01 Song.wav"]
+    for relative in destinations:
+        tagged_inbox_wav(tmp_path / "library" / relative)
+    original_replace = Path.replace
+    commits = 0
+    def fail_second_cover(source, target):
+        nonlocal commits
+        if source.name.startswith(".cover.") and source.suffix == ".tmp" and Path(target).name == "cover.jpg":
+            commits += 1
+            if commits == 2:
+                raise OSError("fixture second-folder failure")
+        return original_replace(source, target)
+    monkeypatch.setattr(Path, "replace", fail_second_cover)
+    with pytest.raises(LibraryImportExecutionError) as failure:
+        beets_mvp._apply_inbox_destination_sidecars(app, destinations, jpeg_bytes((1, 2, 3)))
+    assert failure.value.code == "artwork_destination_failed"
+    assert len(failure.value.diagnostics["staged"]) == 2
+    assert all(not (tmp_path / "library" / "Artist" / folder / "cover.jpg").exists()
+               for folder in ("First", "Second"))
+
+
+def test_inbox_modal_contains_library_review_evidence_and_supported_duplicate_policy(tmp_path):
+    client = make_app(tmp_path).test_client()
+    inbox = client.get("/inbox").get_data(as_text=True)
+    settings = client.get("/settings").get_data(as_text=True)
+    for evidence in (
+        "candidate-option", "candidate-confidence", "candidate-fact", "Artist", "Album", "Genre",
+        "Release year", "Release type / media", "Release region", "Local track coverage",
+        "Online track coverage", "View changed tracks", "Exact MusicBrainz release ID",
+        "duplicate", "Approve selection", "button-spinner", "Retry import",
+    ):
+        assert evidence in inbox
+    assert "candidate" in settings and "confidence" in settings and "track" in settings
+    assert '<option value="keep-both">Keep both' in inbox
+    for unsupported in ('value="merge"', 'value="replace"', 'value="skip"'):
+        assert unsupported not in inbox
+    for shell_control in ("collapse-sidebar", "open-sidebar", "sidebar-scrim", "theme-toggle"):
+        assert f'id="{shell_control}"' in inbox
+    assert "GitHub" in inbox and "Build SHA" in inbox
+    assert 'id="inbox-success"' in inbox and "success.focus()" in inbox
+    assert "body:JSON.stringify({inbox_id:album.source_id})" in inbox
+    assert "details.length-localMissing" not in inbox
+    assert "meets the initial auto-import indicator threshold" in inbox
+    assert "candidate-signals" in inbox and "candidate-signal" in inbox
+    for evidence in ("Position differs:", "Duration differs:", "Artist differs:"):
+        assert evidence in inbox
+    for band in ("high", "medium", "low"):
+        assert f'.confidence-band[data-band="{band}"]' in inbox
+    assert "String(candidate.year||candidate.date||'').slice(0,4)" in inbox
+
+
+def test_semantic_button_tokens_meet_normal_contrast_and_pagination_is_four_control(tmp_path):
+    css = (Path(__file__).parents[1] / "beets_mvp/static/app-shell.css").read_text()
+    light_block = css[css.index(":root {"):css.index("body.dark-mode")]
+    dark_block = css[css.index("body.dark-mode"):css.index("button,.button-secondary")]
+    def luminance(value):
+        raw = value.lstrip("#")
+        if len(raw) == 3: raw = "".join(character * 2 for character in raw)
+        channels = [int(raw[index:index + 2], 16) / 255 for index in (0, 2, 4)]
+        channels = [channel / 12.92 if channel <= .04045 else ((channel + .055) / 1.055) ** 2.4 for channel in channels]
+        return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2]
+    def contrast(first, second):
+        light, dark = sorted((luminance(first), luminance(second)), reverse=True)
+        return (light + .05) / (dark + .05)
+    for mode, block in (("light", light_block), ("dark", dark_block)):
+        colors = dict(re.findall(r"(--button-[\w-]+):(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3}))", block))
+        for prefix in ("primary", "secondary", "danger", "disabled"):
+            ratio = contrast(colors[f"--button-{prefix}-text"], colors[f"--button-{prefix}-bg"])
+            assert ratio >= 4.5, f"{mode} {prefix} contrast is only {ratio:.2f}:1"
+    library = make_app(tmp_path).test_client().get("/library").get_data(as_text=True)
+    for label, glyph in (("First", "«"), ("Previous", "‹"), ("Next", "›"), ("Last", "»")):
+        assert f'aria-label="{label} page"' in library and glyph in library
+    settings = make_app(tmp_path / "other").test_client().get("/settings").get_data(as_text=True)
+    assert 'library-import-page-input' not in settings
+    assert 'Page 1 of 1' in settings

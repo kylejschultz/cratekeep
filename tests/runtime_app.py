@@ -8,6 +8,7 @@ activate it, so the seam cannot turn provider URLs into an SSRF path.
 from __future__ import annotations
 
 import base64
+import threading
 import time
 
 from beets_mvp import create_app as create_cratekeep_app
@@ -36,6 +37,9 @@ EXISTING_ARTWORK_JPEG = base64.b64decode(
     "rwj+kD//2Q=="
 )
 
+PROVIDER_CALLS: dict[str, int] = {}
+PROVIDER_LOCK = threading.Lock()
+
 
 def deterministic_artwork_fetcher(candidate: dict) -> bytes:
     artwork = candidate.get("artwork")
@@ -45,6 +49,9 @@ def deterministic_artwork_fetcher(candidate: dict) -> bytes:
 
 def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]:
     """Resolve exact release IDs without external traffic for browser smoke tests."""
+    with PROVIDER_LOCK:
+        album_key = str(query.get("album") or "")
+        PROVIDER_CALLS[album_key] = PROVIDER_CALLS.get(album_key, 0) + 1
     release_id = query.get("musicbrainz_id")
     if not release_id:
         if query["album"] in {"Safe Match", "Sequential First", "Sequential Second", "Provider Error"}:
@@ -58,6 +65,13 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
                         "length_ms": round(float(track.get("duration") or 1) * 1000)}
                        for index, track in enumerate(query.get("tracks", []), 1)],
         }
+        if query["album"] == "Shared Selection":
+            base["provider_id"] = "123e4567-e89b-42d3-a456-426614174013"
+            base["artwork"] = {
+                "available": True, "source": "cover-art-archive", "entity": "release",
+                "mbid": base["provider_id"],
+                "thumbnail_url": f"https://coverartarchive.org/release/{base['provider_id']}/front-250",
+            }
         if query["album"] == "Tied Match":
             return [base, {**base, "provider_id": "queue-release-2"}]
         if query["album"] == "Lower Match":
@@ -120,7 +134,14 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
 
 
 def create_app():
-    return create_cratekeep_app({
+    with PROVIDER_LOCK:
+        PROVIDER_CALLS.clear()
+    app = create_cratekeep_app({
         "ARTWORK_FETCHER": deterministic_artwork_fetcher,
         "MUSICBRAINZ_PROVIDER": deterministic_musicbrainz_provider,
     })
+    @app.get("/__smoke/provider-calls")
+    def provider_calls():
+        with PROVIDER_LOCK:
+            return {"calls": dict(PROVIDER_CALLS), "total": sum(PROVIDER_CALLS.values())}
+    return app

@@ -331,6 +331,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     ftintitle_config_proof: dict[str, object] = {}
     deluxe_proof: dict[str, object] = {}
     managed_library_proof: dict[str, object] = {}
+    inbox_review_proof: dict[str, object] = {}
     viewport_checks: dict[str, object] = {}
     accidental = tracks["sidecar"].parent.parent / "Accidental Album" / "01 Wrong.wav"
     write_wav(accidental)
@@ -449,16 +450,16 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator(".review-folder").first.wait_for()
         assert page.locator(".review-folder").count() == 25
         started = time.perf_counter()
-        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
-                                  and "page=1" in response.url):
-            page.locator("#library-import-page-input").fill("1")
-            page.locator("#library-import-page-input").press("Enter")
         folder_page_timings_ms["page_1"] = round((time.perf_counter() - started) * 1000, 2)
+        page_label = page.locator("#folder-page-total").inner_text()
+        assert page_label.startswith("Page 1 of ")
+        total_pages = int(page_label.rsplit(" ", 1)[1])
+        assert total_pages >= 5
         first_page_name = page.locator(".review-folder-path").first.inner_text()
         page.locator(".review-folder .review-select").first.check()
         started = time.perf_counter()
         page.locator("#folder-page-next").click()
-        page.wait_for_function("document.getElementById('library-import-page-input').value === '2'")
+        page.wait_for_function("total => document.getElementById('folder-page-total').textContent === `Page 2 of ${total}`", arg=total_pages)
         folder_page_timings_ms["page_2"] = round((time.perf_counter() - started) * 1000, 2)
         assert page.locator(".review-folder").count() >= 2
         second_page_name = page.locator(".review-folder-path").first.inner_text()
@@ -467,14 +468,17 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         started = time.perf_counter()
         with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
                                   and "page=1" in response.url):
-            page.locator("#library-import-page-input").fill("1")
-            page.locator("#library-import-page-input").press("Enter")
+            page.locator("#library-import-review-first").click()
         page.get_by_text(first_page_name, exact=True).wait_for()
         folder_page_timings_ms["direct_jump_page_1"] = round((time.perf_counter() - started) * 1000, 2)
         assert page.locator(".review-folder .review-select").first.is_checked()
         page.screenshot(path=evidence / "pagination-1-desktop.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
         page.screenshot(path=evidence / "pagination-narrow.png", full_page=True)
+        pagination = page.locator(".review-pagination")
+        assert pagination.get_by_role("button").count() == 4
+        assert [pagination.get_by_role("button").nth(index).inner_text() for index in range(4)] == ["«", "‹", "›", "»"]
+        assert pagination.evaluate("element => element.scrollWidth <= element.clientWidth")
         assert page.locator("html").evaluate(
             "element => element.scrollWidth <= element.clientWidth"
         ), "narrow folder queue must not create page-level horizontal overflow"
@@ -485,9 +489,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         # Rapid navigation must leave the newest requested page rendered even if
         # the earlier request is aborted or completes after it.
         page.evaluate("() => { loadFolderItems(2); loadFolderItems(5); }")
-        page.wait_for_function("document.getElementById('library-import-page-input').value === '5'")
+        page.wait_for_function("total => document.getElementById('folder-page-total').textContent === `Page 5 of ${total}`", arg=total_pages)
         page.wait_for_timeout(250)
-        assert page.locator("#library-import-page-input").input_value() == "5"
+        assert page.locator("#folder-page-total").inner_text() == f"Page 5 of {total_pages}"
 
         # Select folders across filtered views and exercise scoped scan, safe
         # bulk import confirmation, and exception sequencing.
@@ -558,7 +562,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.get_by_text("2 folders selected", exact=False).wait_for()
         assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (2)"
         page.locator("#library-import-review-last").click()
-        page.wait_for_function("document.getElementById('library-import-page-input').value === '6'")
+        page.wait_for_function("total => document.getElementById('folder-page-total').textContent === `Page ${total} of ${total}`", arg=total_pages)
         page.locator("#library-import-ready").click()
         page.locator("#library-import-confirm-modal:not([hidden])").wait_for()
         assert "2 folders · 1 ready albums · 1 files/tracks · 2 excluded exceptions" in page.locator("#library-import-confirm-summary").inner_text()
@@ -570,7 +574,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert bulk_info.value.status == 201
         assert len(bulk_info.value.json()["imported"]) == 1
         page.get_by_text("1 albums imported", exact=False).wait_for()
-        page.wait_for_function("document.getElementById('library-import-page-input').value === '5'")
+        page.wait_for_function("() => document.getElementById('folder-page-total').textContent.startsWith('Page 5 of ')")
         active_after_bulk = request_json(f"{base_url}/api/library-import/folders")
         active_by_path = {folder["path"]: folder for folder in active_after_bulk["folders"]}
         assert "Queue Safe" not in active_by_path
@@ -688,6 +692,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             ).fetchone()[0])
         assert deluxe_raw["album"] == "BULLY"
         assert deluxe_raw["release_disambiguation"] == "deluxe, clean"
+        page.evaluate("document.body.classList.remove('dark-mode')")
+        page.screenshot(path=evidence / "04-deluxe-review-desktop-light.png", full_page=True)
+        page.evaluate("document.body.classList.add('dark-mode')")
         page.screenshot(path=evidence / "04-deluxe-review-desktop-dark.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
         page.screenshot(path=evidence / "04-deluxe-review-narrow-dark.png", full_page=True)
@@ -1231,35 +1238,116 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert all("Shared Selection" in card.inner_text() for card in cards.all())
         page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
 
-        first_button = cards.nth(0).locator('[data-review][data-path="Shared Selection"]')
+        first_button = cards.nth(0).locator('[data-album-id]').filter(
+            has_text="Shared Selection"
+        ).get_by_role("button", name="Review")
         first_button.click()
         page.locator("#review-status").wait_for(state="visible")
-        page.wait_for_function("document.querySelector('#import').disabled === false")
+        page.get_by_role("radio", name=re.compile("As Is")).click()
+        page.locator("#approve-review").click()
+        page.wait_for_function("document.querySelector('#import-review').disabled === false")
         first_track = fixture_root / "inbox" / "Shared Selection" / "01 First Inbox.wav"
-        os.utime(first_track, None)
+        first_stat = first_track.stat()
+        os.utime(first_track, ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns + 1_000_000))
         expected_failure["kind"] = "inbox-stale"
-        page.locator("#import").click()
+        page.locator("#import-review").click()
         page.wait_for_function("document.querySelector('#review-status').textContent.includes('changed')")
         expected_failure["kind"] = None
         assert page.locator("#review-modal").is_visible()
-        assert page.locator("#import").is_disabled(), "stale previews must require a fresh review"
-        page.locator("#cancel").click()
+        assert page.locator("#import-review").inner_text() == "Retry import"
+        page.locator("#cancel-review").click()
+        page.reload(wait_until="networkidle")
+        cards = page.locator("[data-inbox-id]")
+        first_button = cards.nth(0).locator('[data-album-id]').filter(
+            has_text="Shared Selection"
+        ).get_by_role("button", name="Review")
         first_button.click()
-        page.wait_for_function("document.querySelector('#import').disabled === false")
-        with page.expect_response(lambda response: "/api/imports/" in response.url and response.url.endswith("/execute")) as executed:
-            page.locator("#import").click()
-        assert executed.value.status == 200
-        page.locator("#success").wait_for(state="visible")
-        assert "Downloads" in page.locator("#success").inner_text()
-        page.wait_for_function("!document.querySelectorAll('[data-inbox-id]')[0].querySelector('[data-path=\"Shared Selection\"]')")
-        assert page.locator("#success").evaluate("element => document.activeElement === element")
-        second_button = cards.nth(1).locator('[data-review][data-path="Shared Selection"]')
+        page.locator("#find-matches").click()
+        page.wait_for_function("document.querySelectorAll('#candidate-list .candidate-option').length > 1")
+        candidate = page.locator("#candidate-list .candidate-option").nth(1)
+        assert all(candidate.filter(has_text=label).count() for label in (
+            "Artist", "Album", "Genre", "Release year", "Release type / media",
+            "Release region", "Local track coverage", "Online track coverage",
+        ))
+        page.screenshot(path=evidence / "17-inbox-review-desktop-light.png", full_page=True)
+        page.evaluate("localStorage.setItem('cratekeep-theme','dark');document.body.classList.add('dark-mode')")
+        page.screenshot(path=evidence / "17-inbox-review-desktop-dark.png", full_page=True)
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator("#review-modal .dialog").evaluate("element => element.scrollWidth <= element.clientWidth")
+        page.screenshot(path=evidence / "17-inbox-review-narrow-dark.png", full_page=True)
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        candidate.locator("[role='radio']").click()
+        page.locator("#approve-review").click()
+        page.wait_for_function("document.querySelector('#import-review').disabled === false")
+        with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.url.endswith("/execute") and response.request.post_data == "{}") as executed:
+            page.locator("#import-review").click()
+        assert executed.value.status == 201
+        first_result = executed.value.json()
+        first_destination = fixture_root / "library" / first_result["destinations"][0]
+        assert first_result["destinations"] == ["First Inbox/Shared Selection/01 First Inbox.wav"]
+        assert first_destination.is_file() and not first_track.exists()
+        assert MediaFile(str(first_destination)).images[0].data == ARTWORK_JPEG
+        assert (first_destination.parent / "cover.jpg").read_bytes() == ARTWORK_JPEG
+        assert first_result["artwork"]["sha256"] == hashlib.sha256(ARTWORK_JPEG).hexdigest()
+        page.wait_for_function("""() => ![...document.querySelectorAll('[data-inbox-id]')[0].querySelectorAll('[data-album-id]')]
+          .some(row => row.textContent.includes('Shared Selection'))""")
+        assert page.locator("#inbox-success").evaluate("element => document.activeElement === element")
+        inbox_review_proof.update({
+            "candidate_destination": str(first_destination),
+            "candidate_destination_relative": first_result["destinations"][0],
+            "source_removed": not first_track.exists(),
+            "embedded_art_sha256": hashlib.sha256(MediaFile(str(first_destination)).images[0].data).hexdigest(),
+            "sidecar_art_sha256": sha256(first_destination.parent / "cover.jpg"),
+            "success_focus": True,
+        })
+
+        # Enable lookup-only automatic matching for the still-unmatched second
+        # source. It must populate candidates without approving or importing.
+        provider_calls_before_auto = request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0)
+        library_items_before_auto = request_json(f"{base_url}/api/items")
+        page.goto(f"{base_url}/settings", wait_until="networkidle")
+        page.locator('[name="inbox_auto_match"]').check()
+        with page.expect_navigation(wait_until="networkidle"):
+            page.get_by_role("button", name="Save settings").click()
+        page.goto(f"{base_url}/inbox", wait_until="networkidle")
+        cards = page.locator("[data-inbox-id]")
+        second_source_id = cards.nth(1).get_attribute("data-inbox-id")
+        page.wait_for_function("""async sourceId => {
+          const response = await fetch('/api/inbox/reviews');
+          const data = await response.json();
+          return data.albums.some(album => album.source_id === sourceId && album.candidate_status === 'complete');
+        }""", arg=second_source_id, timeout=10000)
+        provider_calls_after_auto = request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0)
+        assert provider_calls_after_auto == provider_calls_before_auto + 1
+        auto_album = next(album for album in request_json(f"{base_url}/api/inbox/reviews")["albums"]
+                          if album["source_id"] == second_source_id)
+        second_track = fixture_root / "inbox-two" / "Shared Selection" / "01 Second Inbox.wav"
+        assert auto_album["decision"] == "pending" and auto_album["execution_status"] == "not-run"
+        assert second_track.exists() and request_json(f"{base_url}/api/items") == library_items_before_auto
+        page.reload(wait_until="networkidle")
+        page.wait_for_function("""async sourceId => {
+          const data = await (await fetch('/api/inbox/reviews')).json();
+          return data.albums.some(album => album.source_id === sourceId && album.candidate_status === 'complete');
+        }""", arg=second_source_id, timeout=10000)
+        assert request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0) == provider_calls_after_auto
+        inbox_review_proof["auto_match"] = {
+            "calls_before": provider_calls_before_auto, "calls_after": provider_calls_after_auto,
+            "calls_after_reload": request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0),
+            "decision_before_explicit_approval": auto_album["decision"],
+            "execution_before_explicit_approval": auto_album["execution_status"],
+            "source_present_before_approval": second_track.exists(),
+            "library_unchanged_before_approval": True,
+        }
+        cards = page.locator("[data-inbox-id]")
+        second_button = cards.nth(1).locator('[data-review]').first
         second_button.click()
-        page.wait_for_function("document.querySelector('#import').disabled === false")
-        page.locator("#import").click()
-        page.locator("#success").wait_for(state="visible")
-        page.wait_for_function("document.querySelectorAll('[data-inbox-id]')[1].querySelector('[data-count]').textContent.startsWith('0')")
-        assert page.locator("#success").evaluate("element => document.activeElement === element")
+        page.wait_for_function("document.querySelectorAll('#candidate-list .candidate-option').length > 1")
+        assert "pending" in page.locator("#review-status").inner_text()
+        page.get_by_role("radio", name=re.compile("As Is")).click()
+        page.locator("#approve-review").click()
+        page.wait_for_function("document.querySelector('#import-review').disabled === false")
+        page.locator("#import-review").click()
+        page.wait_for_function("document.querySelectorAll('[data-inbox-id]')[1].querySelectorAll('[data-album-id]').length === 0")
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
         page.screenshot(path=evidence / "17-named-inboxes-after-import-mobile.png", full_page=True)
@@ -1283,6 +1371,26 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                 expected_tokens = expected_tokens or tokens
                 assert tokens == expected_tokens, f"shared {mode} tokens drifted on {name}: {tokens}"
                 assert tokens["fontSize"] == "14px" and tokens["sidebar"] <= 190
+                contrast = page.evaluate("""() => {
+                  const luminance = rgb => rgb.slice(0,3).map(value => value / 255)
+                    .map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4)
+                    .reduce((sum,value,index) => sum + value * [.2126,.7152,.0722][index], 0);
+                  const channels = value => (value.match(/[\\d.]+/g) || []).map(Number);
+                  const background = element => { let node=element, color; do {
+                    color=channels(getComputedStyle(node).backgroundColor); node=node.parentElement;
+                  } while(node && color.length === 4 && color[3] === 0); return color;
+                  };
+                  const ratio = element => { const fg=luminance(channels(getComputedStyle(element).color));
+                    const bg=luminance(background(element)); return (Math.max(fg,bg)+.05)/(Math.min(fg,bg)+.05); };
+                  const selectors={primary:'.button-primary,.save-button,button[type="submit"]',
+                    secondary:'button:not(.button-primary):not(.button-quiet):not(.button-danger):not(.remove-inbox):not(:disabled)',
+                    quiet:'.button-quiet',danger:'.button-danger,.remove-inbox'};
+                  return Object.fromEntries(Object.entries(selectors).flatMap(([key,selector]) => {
+                    const element=document.querySelector(selector); return element ? [[key,ratio(element)]] : [];
+                  }));
+                }""")
+                assert all(ratio >= 4.5 for ratio in contrast.values()), f"{mode} {name} button contrast: {contrast}"
+                assert page.locator(".nav-link.button-primary,.album-card.button-primary").count() == 0
                 assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
                 page.screenshot(path=evidence / f"18-{name}-desktop-{mode}.png")
             palette_proof[mode] = expected_tokens
@@ -1291,6 +1399,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             page.evaluate("localStorage.setItem('cratekeep-theme','dark')")
             page.goto(f"{base_url}{path}", wait_until="networkidle")
             assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+            if name == "library":
+                album_pagination = page.locator("nav.pagination")
+                assert album_pagination.locator('[aria-label$=" page"]').count() == 4
+                assert all(glyph in album_pagination.inner_text() for glyph in ("«", "‹", "›", "»"))
+                assert album_pagination.evaluate("element => element.scrollWidth <= element.clientWidth")
             page.screenshot(path=evidence / f"19-{name}-mobile-dark.png")
         viewport_checks["primary_pages_shared_palette"] = palette_proof
         viewport_checks["primary_pages_desktop_light_dark_and_mobile_no_overflow"] = True
@@ -1311,6 +1424,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         "ftintitle_config_proof": ftintitle_config_proof,
         "deluxe_edition_proof": deluxe_proof,
         "managed_library_proof": managed_library_proof,
+        "inbox_review_proof": inbox_review_proof,
         "viewport_checks": viewport_checks,
         "inbox_retention": {"before": inbox_before, "after": inbox_after},
     }
