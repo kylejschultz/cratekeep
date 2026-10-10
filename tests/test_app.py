@@ -267,7 +267,8 @@ def test_setup_uses_compact_logo_typeable_paths_and_modal_browser(tmp_path):
     page = client.get("/setup")
     assert b'src="/static/cratekeep-logo.png"' in page.data
     assert b'.logo { display: block; width: 112px;' in page.data
-    assert b'id="inbox_path"' in page.data
+    assert b'id="inbox-list"' in page.data
+    assert b'id="inbox-path-1"' in page.data
     assert b'readonly' not in page.data
     assert b'role="dialog" aria-modal="true"' in page.data
     assert b'id="browser-breadcrumbs"' in page.data
@@ -351,6 +352,161 @@ def test_rejects_path_escape(tmp_path):
     response = client.post("/api/imports/preview", json={"path": "../outside"})
     assert response.status_code == 400
 
+
+def test_named_inboxes_setup_edit_validation_and_legacy_migration(tmp_path):
+    state = tmp_path / "config"
+    app = create_app({"TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(state),
+                      "BROWSE_ROOTS": [str(tmp_path)]})
+    client = app.test_client()
+    first, second, library = tmp_path / "first", tmp_path / "second", tmp_path / "library"
+    response = client.post("/setup", data={
+        "inbox_id": ["", ""], "inbox_name": ["Downloads", "Recorder"],
+        "inbox_path": [str(first), str(second)], "library_path": str(library),
+    })
+    assert response.status_code == 302
+    assert [row["name"] for row in app.config["INBOXES"]] == ["Downloads", "Recorder"]
+    assert all(len(row["id"]) == 32 for row in app.config["INBOXES"])
+    original_ids = [row["id"] for row in app.config["INBOXES"]]
+
+    for submitted_ids, expected_error in (
+        ([original_ids[0], original_ids[0]], b"may appear only once"),
+        ([original_ids[0], "client-chosen-id"], b"managed by Cratekeep"),
+    ):
+        tampered = client.post("/settings", data={
+            "inbox_id": submitted_ids, "inbox_name": ["Changed one", "Changed two"],
+            "inbox_path": [str(tmp_path / "changed-one"), str(tmp_path / "changed-two")],
+            "library_path": str(library), "beets_config": Path(app.config["BEETS_CONFIG"]).read_text(),
+        })
+        assert tampered.status_code == 200 and expected_error in tampered.data
+        assert [row["id"] for row in app.config["INBOXES"]] == original_ids
+        assert [row["name"] for row in app.config["INBOXES"]] == ["Downloads", "Recorder"]
+        assert not (tmp_path / "changed-one").exists() and not (tmp_path / "changed-two").exists()
+
+    invalid = client.post("/settings", data={
+        "inbox_id": original_ids, "inbox_name": ["Same", "same"],
+        "inbox_path": [str(first), str(first)], "library_path": str(library),
+        "beets_config": Path(app.config["BEETS_CONFIG"]).read_text(),
+    })
+    assert invalid.status_code == 200
+    assert b"Inbox names must be unique" in invalid.data and b"Inbox paths must be unique" in invalid.data
+    assert [row["name"] for row in app.config["INBOXES"]] == ["Downloads", "Recorder"]
+    outside = client.post("/settings", data={
+        "inbox_id": original_ids, "inbox_name": ["Downloads", "Recorder"],
+        "inbox_path": [str(first), "/outside-configured-browse-root"],
+        "library_path": str(library), "beets_config": Path(app.config["BEETS_CONFIG"]).read_text(),
+    })
+    assert outside.status_code == 200 and b"must be inside a mounted directory" in outside.data
+    assert [row["path"] for row in app.config["INBOXES"]] == [str(first), str(second)]
+
+    saved = client.post("/settings", data={
+        "inbox_id": [original_ids[1], ""], "inbox_name": ["Field", "New source"],
+        "inbox_path": [str(tmp_path / "second-edited"), str(tmp_path / "third")], "library_path": str(library),
+        "beets_config": Path(app.config["BEETS_CONFIG"]).read_text(),
+    })
+    assert saved.status_code == 302
+    assert app.config["INBOXES"][0]["id"] == original_ids[1]
+    assert app.config["INBOXES"][1]["id"] not in original_ids
+
+    restarted = create_app({"TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(state),
+                            "BROWSE_ROOTS": [str(tmp_path)]})
+    assert restarted.config["INBOXES"] == app.config["INBOXES"]
+
+    legacy_state = tmp_path / "legacy-config"
+    legacy_state.mkdir()
+    legacy_db = legacy_state / "app.db"
+    _init_db(str(legacy_db))
+    with sqlite3.connect(legacy_db) as db:
+        db.executemany("INSERT INTO app_settings(key,value) VALUES (?,?)", [
+            ("inbox_path", str(first)), ("library_path", str(library)),
+        ])
+        review_job_id = db.execute(
+            "INSERT INTO import_jobs(source,files_json,status,created_at) VALUES (?,?,?,?)",
+            ("album", json.dumps(["album/song.mp3"]), "review", "now"),
+        ).lastrowid
+        settled_job_id = db.execute(
+            "INSERT INTO import_jobs(source,files_json,status,created_at) VALUES (?,?,?,?)",
+            ("old", "[]", "complete", "before"),
+        ).lastrowid
+    legacy = create_app({"TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(legacy_state),
+                         "BROWSE_ROOTS": [str(tmp_path)]})
+    assert [(row["name"], row["path"]) for row in legacy.config["INBOXES"]] == [("Inbox", str(first))]
+    with sqlite3.connect(legacy.config["APP_DB"]) as db:
+        migrated = json.loads(db.execute("SELECT value FROM app_settings WHERE key='inboxes_json'").fetchone()[0])[0]
+        assert migrated["path"] == str(first)
+        review = db.execute("SELECT inbox_id,inbox_root FROM import_jobs WHERE id=?", (review_job_id,)).fetchone()
+        settled = db.execute("SELECT inbox_id,inbox_root FROM import_jobs WHERE id=?", (settled_job_id,)).fetchone()
+        assert review == (migrated["id"], str(first.resolve()))
+        assert settled == (None, None)
+    legacy_client = legacy.test_client()
+    changed_root = tmp_path / "legacy-changed"
+    assert legacy_client.post("/settings", data={
+        "inbox_id": [migrated["id"]], "inbox_name": ["Inbox"], "inbox_path": [str(changed_root)],
+        "library_path": str(library), "beets_config": Path(legacy.config["BEETS_CONFIG"]).read_text(),
+    }).status_code == 302
+    rebound = legacy_client.post(f"/api/imports/{review_job_id}/execute")
+    assert rebound.status_code == 409 and b"changed after preview" in rebound.data
+
+
+def test_named_inbox_api_disambiguates_and_binds_preview_jobs(tmp_path):
+    app = create_app({"TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(tmp_path / "config"),
+                      "BROWSE_ROOTS": [str(tmp_path)]})
+    roots = [tmp_path / "one", tmp_path / "two"]
+    for root in roots:
+        (root / "Shared").mkdir(parents=True)
+        (root / "Shared" / "song.mp3").write_bytes(root.name.encode())
+    library = tmp_path / "library"
+    client = app.test_client()
+    assert client.post("/setup", data={
+        "inbox_id": ["", ""], "inbox_name": ["One", "Two"],
+        "inbox_path": [str(path) for path in roots], "library_path": str(library),
+    }).status_code == 302
+    inboxes = app.config["INBOXES"]
+    candidates = client.get("/api/inbox").json
+    assert [(item["inbox_name"], item["path"]) for item in candidates] == [("One", "Shared"), ("Two", "Shared")]
+    assert client.post("/api/imports/preview", json={"path": "Shared"}).status_code == 400
+    assert client.post("/api/imports/preview", json={"inbox_id": "missing", "path": "Shared"}).status_code == 400
+    preview = client.post("/api/imports/preview", json={"inbox_id": inboxes[1]["id"], "path": "Shared"})
+    assert preview.status_code == 201 and preview.json["inbox_name"] == "Two"
+
+    # Editing the selected ID's path makes the exact preview stale rather than redirecting it.
+    config_text = Path(app.config["BEETS_CONFIG"]).read_text()
+    assert client.post("/settings", data={
+        "inbox_id": [inboxes[0]["id"], inboxes[1]["id"]], "inbox_name": ["One", "Two"],
+        "inbox_path": [str(roots[0]), str(tmp_path / "changed")], "library_path": str(library),
+        "beets_config": config_text,
+    }).status_code == 302
+    stale = client.post(f"/api/imports/{preview.json['id']}/execute")
+    assert stale.status_code == 409 and b"changed after preview" in stale.data
+    assert client.post("/settings", data={
+        "inbox_id": [inboxes[0]["id"]], "inbox_name": ["One"],
+        "inbox_path": [str(roots[0])], "library_path": str(library),
+        "beets_config": config_text,
+    }).status_code == 302
+    removed = client.post(f"/api/imports/{preview.json['id']}/execute")
+    assert removed.status_code == 409 and b"no longer configured" in removed.data
+
+
+def test_named_inbox_symlink_escape_and_unbound_legacy_job_rejection(tmp_path):
+    app = make_app(tmp_path)
+    root = tmp_path / "inbox"
+    outside = tmp_path / "outside.mp3"
+    outside.write_bytes(b"outside")
+    link = root / "linked.mp3"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    client = app.test_client()
+    assert client.post("/api/imports/preview", json={"path": "linked.mp3"}).status_code == 400
+
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        unbound_job_id = db.execute(
+            "INSERT INTO import_jobs(source,files_json,status,created_at) VALUES (?,?,?,?)",
+            ("legacy", json.dumps(["legacy/song.mp3"]), "review", "now"),
+        ).lastrowid
+    unbound = client.post(f"/api/imports/{unbound_job_id}/execute")
+    assert unbound.status_code == 409 and b"not bound to an inbox root" in unbound.data
+
 def test_normal_settings_renders_in_app_page_and_beets_editor(tmp_path):
     page = make_app(tmp_path).test_client().get("/settings")
 
@@ -417,6 +573,16 @@ def test_settings_script_initializes_without_stale_direct_import_references(tmp_
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for rendered JavaScript syntax validation")
 def test_rendered_settings_javascript_has_valid_syntax(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
+    completed = subprocess.run(
+        [shutil.which("node"), "--check", "-"], input=script, text=True, capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for rendered JavaScript syntax validation")
+def test_rendered_inbox_javascript_has_valid_syntax(tmp_path):
+    html = make_app(tmp_path).test_client().get("/inbox").get_data(as_text=True)
     script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
     completed = subprocess.run(
         [shutil.which("node"), "--check", "-"], input=script, text=True, capture_output=True,
@@ -2187,16 +2353,18 @@ def test_library_execution_rerun_is_idempotent(tmp_path):
     assert client.get("/api/library-import/reviews").json["albums"] == []
 
 
-def test_inbox_route_owns_library_import_review_workspace(tmp_path):
-    page = make_app(tmp_path).test_client().get("/inbox")
+def test_inbox_route_owns_named_inbox_workspace_not_library_import_queue(tmp_path):
+    client = make_app(tmp_path).test_client()
+    page = client.get("/inbox")
 
     assert page.status_code == 200
     assert b"<title>Inbox \xc2\xb7 Cratekeep</title>" in page.data
-    assert b"<h1>Inbox</h1>" in page.data
+    assert b"<h1>Named inboxes</h1>" in page.data
     assert b'href="/inbox" aria-current="page"' in page.data
-    assert b'id="library-import-review-list"' in page.data
-    assert b'id="library-import-modal"' in page.data
-    assert b": \"library-import\");" in page.data
+    assert b'id="inbox-grid"' in page.data and b'id="review-modal"' in page.data
+    assert b'id="library-import-review-list"' not in page.data
+    settings = client.get("/settings")
+    assert b'id="library-import-review-list"' in settings.data
 
 
 def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch):
@@ -4265,7 +4433,8 @@ def test_setup_and_settings_routes_have_distinct_lifecycle_pages(tmp_path):
 
     inbox_page = client.get("/inbox")
     assert inbox_page.status_code == 200
-    assert b'<form method="post" action="/settings">' in inbox_page.data
+    assert b'<form method="post" action="/settings">' not in inbox_page.data
+    assert b'id="inbox-grid"' in inbox_page.data
     assert client.post("/inbox").status_code == 405
 
 

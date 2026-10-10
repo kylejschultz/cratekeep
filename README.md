@@ -17,9 +17,9 @@ mkdir -p data/inbox data/library data/config
 APP_UID="$(id -u)" APP_GID="$(id -g)" docker compose up -d
 ```
 
-Open <http://localhost:8788>. Put albums or individual audio files in `data/inbox`. Imported files are moved to `data/library`; application and beets databases are stored in `data/config`.
+Open <http://localhost:8788>. Put albums or individual audio files in `data/inbox`. Imported files are moved to `data/library`; application and beets databases are stored in `data/config`. Additional host sources can be mounted at distinct container paths and named independently in Settings; Cratekeep only needs the container-visible paths.
 
-On first launch, Cratekeep opens a setup screen. Type paths directly or use **Browse** to navigate the container and choose the mounted inbox and library directories, then optionally enter Navidrome rescan details. The choices are stored in `data/config/app.db` and remain editable from the Settings link. Browser paths are container paths; host paths are never exposed to the app.
+On first launch, Cratekeep opens a setup screen with one `Inbox` source. Type paths directly or use **Browse** to navigate the container, add and name any additional mounted inbox sources, and choose the library directory. The choices are stored in `data/config/app.db` and remain editable from the Settings link. Give every host source its own mount destination (for example `/sources/phone` and `/sources/recorder`); browser paths are container paths and host paths are never exposed to the app.
 
 When upgrading an existing Compose installation, stop the container and move the contents of `data/state` to `data/config` before starting the new image. The database filenames and formats are unchanged.
 
@@ -71,7 +71,7 @@ gunicorn --bind 127.0.0.1:8788 --workers 1 --threads 4 'beets_mvp:create_app()'
 
 Inbox and library paths are chosen during first-run setup. The in-app Settings page also manages optional Navidrome details, an explicit artwork-fetching opt-in, and an advanced YAML editor for `$STATE_PATH/config.yaml`. On save, Cratekeep validates and normalizes the YAML; library/database paths, core import safety options, and `fetchart` plugin state remain controlled by the form.
 
-The overview remains at `/`. The dedicated `/inbox` page opens the pending library-import review workspace, while `/library` provides collection counts, recently added tracks, top artists, searchable/sortable browsing, and the existing metadata edit forms. To safely correct a completed import, open its track in Library, change only **Artist**, leave **Album artist** unchanged, and save; the editor updates both the beets database and the existing file tag in place.
+The overview remains at `/`. The dedicated `/inbox` page groups waiting selections by named source and provides preview-then-import actions. The separate Library import queue remains under Settings, while `/library` provides collection counts, recently added tracks, top artists, searchable/sortable browsing, and the existing metadata edit forms. To safely correct a completed import, open its track in Library, change only **Artist**, leave **Album artist** unchanged, and save; the editor updates both the beets database and the existing file tag in place.
 
 Artwork fetching is opt-in. When enabled, saving `cover.jpg` is on by default for backward compatibility; embedding is off. The two destinations are independent. Existing sidecars and embedded images are preserved unless **Replace existing sidecar and embedded artwork** is explicitly enabled. Cratekeep uses Cover Art Archive front art for the selected exact MusicBrainz release, falling back to release-group front art only when exact-release art is absent. Missing art is a visible no-op.
 
@@ -81,7 +81,7 @@ Imports require a preview followed by an explicit execute call:
 
 ```sh
 curl -sS -X POST http://localhost:8788/api/imports/preview \
-  -H 'Content-Type: application/json' -d '{"path":"My Album"}'
+  -H 'Content-Type: application/json' -d '{"inbox_id":"<id from /api/inbox>","path":"My Album"}'
 curl -sS -X POST http://localhost:8788/api/imports/1/execute
 ```
 
@@ -89,7 +89,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 
 - `GET /healthz` — liveness check
 - `GET /api/browse?path=/userMedia` — list directories beneath the container's browse root
-- `GET /api/inbox` — list immediate import candidates
+- `GET /api/inbox` — aggregate immediate import candidates across named sources; each row includes `inbox_id` and `inbox_name`
 - `GET /api/items` — list beets library metadata
 - `GET /api/library-import/reviews` — list persisted track groups and album review records, paginated by album (`limit`/`offset`, 25 albums by default)
 - `GET /api/library-import/folders` — list literal immediate-child library folders, 25 per page, with search and persisted-state status filtering
@@ -104,7 +104,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `POST /api/library-import/albums/<id>/rematch` — validate a MusicBrainz release UUID and rematch through the configured provider
 - `POST /api/library-import/albums/<id>/preview` — save the match-screen selection and dry-run the in-place import without queueing it through Inbox
 - `POST /api/library-import/albums/<id>/execute` — preview or execute an approved album in place; the match screen sends `candidate_id` and optional `duplicate_action` so the selection is saved before execution, while API clients may send `{"dry_run":true}` to validate without mutation
-- `POST /api/imports/preview` — snapshot an inbox selection for review
+- `POST /api/imports/preview` — snapshot a selection from the supplied `inbox_id`; legacy clients may omit it only when exactly one inbox is configured
 - `POST /api/imports/<id>/execute` — execute a reviewed import
 - `PATCH /api/items/<id>` — update `title`, `artist`, `album`, `albumartist`, `genre`, `year`, `track`, or `disc`
 - `POST /api/navidrome/rescan` — request a scan from the configured endpoint

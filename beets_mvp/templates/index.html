@@ -162,14 +162,14 @@
       </section>
       <section class="section" id="inbox" aria-labelledby="inbox-title">
         <div class="section-heading">
-          <div><h2 id="inbox-title">Inbox</h2><p>Music discovered in the configured inbox directory.</p></div>
+          <div><h2 id="inbox-title">Inbox</h2><p>Music discovered across configured inbox sources.</p></div>
           <span class="count">{{ candidates|length }} selection{{ '' if candidates|length == 1 else 's' }}</span>
         </div>
         <div class="panel table-wrap">
           {% if candidates %}
           <table>
-            <thead><tr><th scope="col">Selection</th><th class="numeric" scope="col">Audio files</th><th class="numeric" scope="col">Size</th></tr></thead>
-            <tbody>{% for candidate in candidates %}<tr><td class="path">{{ candidate.path }}</td><td class="numeric">{{ candidate.files }}</td><td class="numeric">{{ candidate.bytes|format_bytes }}</td></tr>{% endfor %}</tbody>
+            <thead><tr><th scope="col">Source</th><th scope="col">Selection</th><th class="numeric" scope="col">Audio files</th><th class="numeric" scope="col">Size</th></tr></thead>
+            <tbody>{% for candidate in candidates %}<tr><td>{{ candidate.inbox_name|default('Inbox') }}</td><td class="path">{{ candidate.path }}</td><td class="numeric">{{ candidate.files }}</td><td class="numeric">{{ candidate.bytes|format_bytes }}</td></tr>{% endfor %}</tbody>
           </table>
           {% else %}<div class="empty-state"><strong>Inbox is empty</strong>Add music to your configured inbox to see it here.</div>{% endif %}
         </div>

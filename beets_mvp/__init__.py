@@ -16,6 +16,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,7 +45,7 @@ LIBRARY_ALBUM_PAGE_SIZE = 25
 MAX_LEGACY_ALBUM_PROMOTIONS = 100
 MAX_LEGACY_PROMOTION_ITEMS = 2000
 SETTING_KEYS = (
-    "inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art",
+    "inboxes_json", "inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art",
     "art_sidecar", "art_embed", "art_replace",
 )
 MAX_ARTWORK_BYTES = 10 * 1024 * 1024
@@ -150,7 +151,9 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/inbox")
     def inbox_page():
-        return _settings_response(app, first_run=False, active_tab="library-import", page="inbox")
+        return render_template(
+            "inbox.html", build_sha=app.config["BUILD_SHA"], inboxes=_inbox_groups(app)
+        )
 
     @app.get("/library")
     def library_page():
@@ -637,18 +640,23 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.post("/api/imports/preview")
     def preview_import():
         relative = _request_value("path")
-        source = _safe_inbox_path(app, relative)
-        files = _audio_files(source)
+        inbox = _request_inbox(app)
+        root = Path(inbox["path"]).resolve()
+        source = _safe_inbox_path(app, inbox["id"], relative)
+        files = _inbox_audio_files(source, root)
         if not files:
             abort(400, "selection contains no supported audio files")
-        file_names = [str(p.relative_to(Path(app.config["INBOX_PATH"]).resolve())) for p in files]
+        file_names = [str(p.relative_to(root)) for p in files]
+        snapshot = [_file_snapshot(path, root) for path in files]
         with _connect(app.config["APP_DB"]) as db:
             cursor = db.execute(
-                "INSERT INTO import_jobs(source, files_json, status, created_at) VALUES (?, ?, 'review', ?)",
-                (relative, json.dumps(file_names), _now()),
+                """INSERT INTO import_jobs(source, files_json, status, created_at, inbox_id, inbox_root)
+                   VALUES (?, ?, 'review', ?, ?, ?)""",
+                (relative, json.dumps(snapshot), _now(), inbox["id"], str(root)),
             )
             job_id = cursor.lastrowid
-        return jsonify(id=job_id, source=relative, files=file_names, status="review"), 201
+        return jsonify(id=job_id, source=relative, files=file_names, status="review",
+                       inbox_id=inbox["id"], inbox_name=inbox["name"]), 201
 
     @app.post("/api/imports/<int:job_id>/execute")
     def execute_import(job_id: int):
@@ -658,10 +666,16 @@ def create_app(test_config: dict | None = None) -> Flask:
                 abort(404)
             if job["status"] != "review":
                 abort(409, "job has already been executed")
-            source = _safe_inbox_path(app, job["source"])
+            inbox = _job_inbox(app, job)
+            root = Path(inbox["path"]).resolve()
+            if job["inbox_root"] and str(root) != job["inbox_root"]:
+                abort(409, "the selected inbox changed after preview; create a new preview")
+            source = _safe_inbox_path(app, inbox["id"], job["source"])
             expected = json.loads(job["files_json"])
-            root = Path(app.config["INBOX_PATH"]).resolve()
-            current = [str(p.relative_to(root)) for p in _audio_files(source)]
+            current_files = _inbox_audio_files(source, root)
+            current = ([_file_snapshot(path, root) for path in current_files]
+                       if expected and isinstance(expected[0], dict)
+                       else [str(path.relative_to(root)) for path in current_files])
             if current != expected:
                 abort(409, "inbox contents changed; create a new preview")
             command = ["beet", "-c", app.config["BEETS_CONFIG"], "import", "--quiet", "--noautotag", "--move", str(source)]
@@ -987,6 +1001,8 @@ def _init_db(path: str) -> None:
         _ensure_column(db, "album_reviews", "duplicate_action", "TEXT")
         _ensure_column(db, "metadata_candidates", "schema_version", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(db, "adoption_reviews", "imported_at", "TEXT")
+        _ensure_column(db, "import_jobs", "inbox_id", "TEXT")
+        _ensure_column(db, "import_jobs", "inbox_root", "TEXT")
         # Older candidate evidence remains visible for audit and keeps all
         # review decisions, but is queued ahead of complete rows for a bounded
         # refresh after evidence or presentation rules change.
@@ -1031,7 +1047,23 @@ def _ensure_column(db: sqlite3.Connection, table: str, column: str, declaration:
 def _load_settings(path: str) -> dict[str, str]:
     with _connect(path) as db:
         rows = db.execute("SELECT key, value FROM app_settings").fetchall()
-    settings = {row["key"]: row["value"] for row in rows if row["key"] in SETTING_KEYS}
+        settings = {row["key"]: row["value"] for row in rows if row["key"] in SETTING_KEYS}
+        if not _valid_settings_inboxes(settings) and settings.get("inbox_path"):
+            inbox_id = uuid.uuid4().hex
+            inbox_root = str(Path(settings["inbox_path"]).expanduser().resolve())
+            settings["inboxes_json"] = json.dumps([{
+                "id": inbox_id, "name": "Inbox", "path": inbox_root,
+            }])
+            db.execute(
+                """INSERT INTO app_settings(key, value) VALUES ('inboxes_json', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (settings["inboxes_json"],),
+            )
+            db.execute(
+                """UPDATE import_jobs SET inbox_id = ?, inbox_root = ?
+                    WHERE status = 'review' AND inbox_id IS NULL AND inbox_root IS NULL""",
+                (inbox_id, inbox_root),
+            )
     # Existing installations that opted into fetching retain beets' historical
     # cover.jpg behavior. Embedding and replacement always require a new opt-in.
     if settings.get("fetch_art") == "1" and "art_sidecar" not in settings:
@@ -1049,8 +1081,10 @@ def _save_settings(path: str, settings: dict[str, str]) -> None:
 
 
 def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
+    inboxes = _valid_settings_inboxes(settings)
     app.config.update(
-        INBOX_PATH=settings.get("inbox_path", ""),
+        INBOXES=inboxes,
+        INBOX_PATH=inboxes[0]["path"] if inboxes else settings.get("inbox_path", ""),
         LIBRARY_PATH=settings.get("library_path", ""),
         NAVIDROME_RESCAN_URL=settings.get("navidrome_rescan_url", ""),
         NAVIDROME_TOKEN=settings.get("navidrome_token", ""),
@@ -1059,10 +1093,10 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         ART_EMBED=settings.get("art_embed", "") == "1",
         ART_REPLACE=settings.get("art_replace", "") == "1",
     )
-    app.config["SETUP_COMPLETE"] = bool(app.config["INBOX_PATH"] and app.config["LIBRARY_PATH"])
+    app.config["SETUP_COMPLETE"] = bool(inboxes and app.config["LIBRARY_PATH"])
     if app.config["SETUP_COMPLETE"]:
-        for key in ("INBOX_PATH", "LIBRARY_PATH"):
-            Path(app.config[key]).mkdir(parents=True, exist_ok=True)
+        for path in [inbox["path"] for inbox in inboxes] + [app.config["LIBRARY_PATH"]]:
+            Path(path).mkdir(parents=True, exist_ok=True)
         _write_beets_config(app)
         app.config["FTINTITLE"] = _ftintitle_settings(
             Path(app.config["BEETS_CONFIG"]).read_text(encoding="utf-8")
@@ -1077,18 +1111,42 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
     config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     ftintitle = _ftintitle_settings(config_text)
     if request.method == "POST":
-        inbox_path = request.form.get("inbox_path", "").strip()
+        inboxes = _submitted_inboxes(request.form, current)
         library_path = request.form.get("library_path", "").strip()
         rescan_url = request.form.get("navidrome_rescan_url", "").strip()
         errors = []
-        if not inbox_path:
-            errors.append("Inbox path is required.")
+        existing_ids = {row["id"] for row in _settings_inboxes(current)}
+        submitted_ids = [row["id"] for row in inboxes if row["id"]]
+        if any(inbox_id not in existing_ids for inbox_id in submitted_ids):
+            errors.append("Inbox IDs are managed by Cratekeep; reload Settings and try again.")
+        if len(submitted_ids) != len(set(submitted_ids)):
+            errors.append("Each existing inbox may appear only once.")
+        if not inboxes:
+            errors.append("At least one inbox is required.")
         if not library_path:
             errors.append("Library path is required.")
-        for label, value in (("Inbox", inbox_path), ("Library", library_path)):
+        names = set()
+        paths = set()
+        roots = _browse_roots(app)
+        for index, inbox in enumerate(inboxes, 1):
+            if not inbox["name"]:
+                errors.append(f"Inbox {index} name is required.")
+            elif inbox["name"].casefold() in names:
+                errors.append("Inbox names must be unique (ignoring case).")
+            names.add(inbox["name"].casefold())
+            if not inbox["path"]:
+                errors.append(f"Inbox {index} path is required.")
+                continue
+            resolved = str(Path(inbox["path"]).expanduser().resolve())
+            inbox["path"] = resolved
+            if resolved in paths:
+                errors.append("Inbox paths must be unique.")
+            paths.add(resolved)
+        for label, value in [(inbox["name"] or f"Inbox {index}", inbox["path"])
+                             for index, inbox in enumerate(inboxes, 1)] + [("Library", library_path)]:
             if value:
                 candidate = Path(value).expanduser().resolve()
-                if not any(candidate == root or root in candidate.parents for root in _browse_roots(app)):
+                if not any(candidate == root or root in candidate.parents for root in roots):
                     errors.append(f"{label} path must be inside a mounted directory shown by Browse.")
         parsed_rescan_url = urllib.parse.urlparse(rescan_url)
         if rescan_url and (parsed_rescan_url.scheme not in {"http", "https"} or not parsed_rescan_url.netloc):
@@ -1098,7 +1156,8 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
         if not token and current.get("navidrome_token") and not request.form.get("clear_navidrome_token"):
             token = current["navidrome_token"]
         values = {
-            "inbox_path": inbox_path,
+            "inboxes_json": json.dumps(inboxes),
+            "inbox_path": inboxes[0]["path"] if inboxes else "",
             "library_path": library_path,
             "navidrome_rescan_url": rescan_url,
             "navidrome_token": token,
@@ -1124,13 +1183,18 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             except ValueError as exc:
                 errors.append(str(exc))
         if not errors:
+            for inbox in inboxes:
+                if not inbox["id"]:
+                    inbox["id"] = uuid.uuid4().hex
+            values["inboxes_json"] = json.dumps(inboxes)
+            values["inbox_path"] = inboxes[0]["path"]
             try:
-                Path(inbox_path).expanduser().mkdir(parents=True, exist_ok=True)
+                for inbox in inboxes:
+                    Path(inbox["path"]).mkdir(parents=True, exist_ok=True)
                 Path(library_path).expanduser().mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 errors.append(f"Could not create a configured directory: {exc}")
         if not errors:
-            values["inbox_path"] = str(Path(inbox_path).expanduser().resolve())
             values["library_path"] = str(Path(library_path).expanduser().resolve())
             if first_run:
                 rendered_config = _build_beets_config(app, values, "", values["fetch_art"] == "1")
@@ -1146,10 +1210,14 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
         ftintitle = submitted_ftintitle
 
     defaults = _default_paths()
+    display_inboxes = _settings_inboxes(current) or [{
+        "id": "", "name": "Inbox", "path": defaults["inbox_path"],
+    }]
     return render_template(
         "settings.html",
         first_run=first_run,
         settings=current,
+        inboxes=display_inboxes,
         default_inbox=defaults["inbox_path"],
         default_library=defaults["library_path"],
         has_token=bool(current.get("navidrome_token")),
@@ -1165,6 +1233,49 @@ def _default_paths() -> dict[str, str]:
     container_data = Path("/data")
     root = container_data if (container_data / "inbox").is_dir() and (container_data / "library").is_dir() else Path.cwd() / "data"
     return {"inbox_path": str(root / "inbox"), "library_path": str(root / "library")}
+
+
+def _settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
+    try:
+        rows = json.loads(settings.get("inboxes_json", "[]"))
+    except (TypeError, json.JSONDecodeError):
+        rows = []
+    inboxes = []
+    if isinstance(rows, list):
+        for row in rows:
+            if (isinstance(row, dict) and isinstance(row.get("id"), str)
+                    and isinstance(row.get("name"), str) and isinstance(row.get("path"), str)):
+                inboxes.append({key: row[key] for key in ("id", "name", "path")})
+    return inboxes
+
+
+def _valid_settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
+    inboxes = _settings_inboxes(settings)
+    names = [row["name"].strip().casefold() for row in inboxes]
+    paths = [str(Path(row["path"]).expanduser().resolve()) for row in inboxes if row["path"].strip()]
+    if (not inboxes or any(not row[key].strip() for row in inboxes for key in ("id", "name", "path"))
+            or len(names) != len(set(names)) or len(paths) != len(set(paths))):
+        return []
+    return [{**row, "name": row["name"].strip(), "path": path} for row, path in zip(inboxes, paths)]
+
+
+def _submitted_inboxes(form, current: dict[str, str]) -> list[dict[str, str]]:
+    names = form.getlist("inbox_name")
+    paths = form.getlist("inbox_path")
+    ids = form.getlist("inbox_id")
+    if not names and len(paths) == 1:  # Compatibility for existing clients and tests.
+        existing = _settings_inboxes(current)
+        return [{
+            "id": existing[0]["id"] if len(existing) == 1 else "",
+            "name": existing[0]["name"] if len(existing) == 1 else "Inbox",
+            "path": paths[0].strip(),
+        }]
+    if not (len(names) == len(paths) == len(ids)):
+        return []
+    return [
+        {"id": submitted_id.strip(), "name": name.strip(), "path": path.strip()}
+        for submitted_id, name, path in zip(ids, names, paths)
+    ]
 
 
 def _browse_roots(app: Flask) -> list[Path]:
@@ -4315,15 +4426,31 @@ def _serialize_item(item) -> dict:
 
 
 def _inbox_candidates(app: Flask) -> list[dict]:
-    root = Path(app.config["INBOX_PATH"]).resolve()
-    candidates = []
-    for entry in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-        if entry.name.startswith(".") or (entry.is_file() and entry.suffix.lower() not in AUDIO_EXTENSIONS):
-            continue
-        files = _audio_files(entry)
-        if files:
-            candidates.append({"path": entry.name, "files": len(files), "bytes": sum(p.stat().st_size for p in files)})
-    return candidates
+    return [candidate for group in _inbox_groups(app) for candidate in group["candidates"]]
+
+
+def _inbox_groups(app: Flask) -> list[dict]:
+    groups = []
+    for inbox in app.config["INBOXES"]:
+        root = Path(inbox["path"]).resolve()
+        candidates = []
+        error = ""
+        try:
+            entries = sorted(root.iterdir(), key=lambda path: path.name.casefold())
+            for entry in entries:
+                if entry.name.startswith(".") or (entry.is_file() and entry.suffix.lower() not in AUDIO_EXTENSIONS):
+                    continue
+                files = _inbox_audio_files(entry, root)
+                if files:
+                    candidates.append({
+                        "path": entry.name, "files": len(files),
+                        "bytes": sum(path.stat().st_size for path in files),
+                        "inbox_id": inbox["id"], "inbox_name": inbox["name"],
+                    })
+        except OSError as exc:
+            error = f"Unable to read this inbox: {exc}"
+        groups.append({**inbox, "candidates": candidates, "error": error})
+    return groups
 
 
 def _format_bytes(value: int | None) -> str:
@@ -4342,14 +4469,59 @@ def _audio_files(path: Path) -> list[Path]:
     return sorted((p.resolve() for p in iterator if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS), key=str)
 
 
-def _safe_inbox_path(app: Flask, relative: str) -> Path:
+def _configured_inbox(app: Flask, inbox_id: str) -> dict[str, str] | None:
+    return next((inbox for inbox in app.config["INBOXES"] if inbox["id"] == inbox_id), None)
+
+
+def _request_inbox(app: Flask) -> dict[str, str]:
+    inbox_id = _request_value("inbox_id")
+    if not inbox_id:
+        if len(app.config["INBOXES"]) != 1:
+            abort(400, "inbox_id is required when multiple inboxes are configured")
+        return app.config["INBOXES"][0]
+    inbox = _configured_inbox(app, inbox_id)
+    if inbox is None:
+        abort(400, "unknown inbox_id")
+    return inbox
+
+
+def _job_inbox(app: Flask, job: sqlite3.Row) -> dict[str, str]:
+    if not job["inbox_id"] or not job["inbox_root"]:
+        abort(409, "this legacy preview is not bound to an inbox root; create a new preview")
+    inbox = _configured_inbox(app, job["inbox_id"])
+    if inbox is None:
+        abort(409, "the selected inbox is no longer configured; create a new preview")
+    return inbox
+
+
+def _safe_inbox_path(app: Flask, inbox_id: str, relative: str) -> Path:
     if not relative:
         abort(400, "path is required")
-    root = Path(app.config["INBOX_PATH"]).resolve()
+    inbox = _configured_inbox(app, inbox_id)
+    if inbox is None:
+        abort(400, "unknown inbox_id")
+    root = Path(inbox["path"]).resolve()
     candidate = (root / relative).resolve()
     if candidate == root or root not in candidate.parents or not candidate.exists():
         abort(400, "path must identify an existing selection inside the inbox")
     return candidate
+
+
+def _inbox_audio_files(path: Path, root: Path) -> list[Path]:
+    files = []
+    for candidate in _audio_files(path):
+        if root not in candidate.parents:
+            abort(400, "selection contains a file outside the selected inbox")
+        files.append(candidate)
+    return files
+
+
+def _file_snapshot(path: Path, root: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    return {
+        "path": str(path.relative_to(root)), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev, "inode": stat.st_ino,
+    }
 
 
 def _request_value(name: str) -> str:

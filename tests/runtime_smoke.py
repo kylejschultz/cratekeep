@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import re
 import sqlite3
@@ -61,8 +62,12 @@ def request_json(url: str):
         return json.load(response)
 
 
-def configure(base_url: str, inbox_path: str, library_path: str) -> None:
-    body = urllib.parse.urlencode({"inbox_path": inbox_path, "library_path": library_path}).encode()
+def configure(base_url: str, inbox_paths: list[str], library_path: str) -> None:
+    body = urllib.parse.urlencode([
+        *(pair for index, path in enumerate(inbox_paths, 1)
+          for pair in (("inbox_id", ""), ("inbox_name", f"Source {index}"), ("inbox_path", path))),
+        ("library_path", library_path),
+    ]).encode()
     opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
     request = urllib.request.Request(f"{base_url}/setup", data=body)
     with opener.open(request, timeout=10) as response:
@@ -82,6 +87,14 @@ def write_wav(path: Path, seconds: int = 1) -> None:
 def make_fixture(root: Path) -> dict[str, Path]:
     (root / "inbox").mkdir(parents=True, exist_ok=True)
     write_wav(root / "inbox" / "Rollback Retained" / "01 Inbox.wav")
+    for folder, artist in (("inbox", "First Inbox"), ("inbox-two", "Second Inbox")):
+        track = root / folder / "Shared Selection" / f"01 {artist}.wav"
+        write_wav(track)
+        tags = MediaFile(str(track))
+        tags.title = artist
+        tags.artist = tags.albumartist = artist
+        tags.album = "Shared Selection"
+        tags.save()
     tracks = {name: root / "library" / relative for name, relative in TRACKS.items()}
     for name, track in tracks.items():
         write_wav(track, 288 if name == "feature_extra" else 1)
@@ -286,8 +299,7 @@ def set_artwork_settings(page: Page, base_url: str, *, sidecar: bool, embed: boo
 def set_ftintitle_settings(
     page: Page, base_url: str, *, enabled: bool, evidence: Path | None = None,
 ) -> None:
-    origin = "inbox" if enabled else "settings#metadata"
-    page.goto(f"{base_url}/{origin}", wait_until="networkidle")
+    page.goto(f"{base_url}/settings#metadata", wait_until="networkidle")
     page.locator("#settings-tab-metadata").click()
     toggle = page.locator('input[name="ftintitle_enabled"]')
     toggle.set_checked(enabled)
@@ -340,6 +352,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             lambda response: network.append({"method": response.request.method, "status": response.status, "url": response.url,
                                               "expected": (
                                                   expected_failure["kind"] == "execute" and response.status == 502
+                                              ) or (
+                                                  expected_failure["kind"] == "inbox-stale" and response.status == 409
                                               ) or (
                                                   expected_failure["kind"] == "rematch" and response.status == 503
                                               ) or (
@@ -1186,6 +1200,71 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             },
         })
 
+        # Named Inbox sources: dynamic settings rows/picker, persistence, disambiguated
+        # same-name selections, stale-preview retry, success, focus, and scoped refresh.
+        fixture_root = tracks["case"].parents[3]
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        page.goto(f"{base_url}/settings", wait_until="networkidle")
+        rows = page.locator("[data-inbox-row]")
+        assert rows.count() == 2
+        rows.nth(0).locator('[name="inbox_name"]').fill("Downloads")
+        rows.nth(1).get_by_role("button", name="Browse").click()
+        assert page.locator("#browser").is_visible()
+        page.locator("#browser-choose").click()
+        assert rows.nth(1).get_by_role("button", name="Browse").evaluate(
+            "element => document.activeElement === element"
+        )
+        page.locator("#add-inbox").click()
+        assert rows.count() == 3
+        rows.nth(2).locator('[name="inbox_name"]').fill("Temporary")
+        rows.nth(2).locator('[name="inbox_path"]').fill(str(fixture_root / "temporary"))
+        rows.nth(2).get_by_role("button", name=re.compile("Remove")).click()
+        assert rows.count() == 2
+        with page.expect_navigation(wait_until="networkidle"):
+            page.get_by_role("button", name="Save settings").click()
+        page.goto(f"{base_url}/settings", wait_until="networkidle")
+        assert page.locator('[name="inbox_name"]').evaluate_all("elements => elements.map(element => element.value)") == ["Downloads", "Source 2"]
+        page.goto(f"{base_url}/inbox", wait_until="networkidle")
+        cards = page.locator("[data-inbox-id]")
+        assert cards.count() == 2
+        assert [card.locator("h2").inner_text() for card in cards.all()] == ["Downloads", "Source 2"]
+        assert all("Shared Selection" in card.inner_text() for card in cards.all())
+        page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
+
+        first_button = cards.nth(0).locator('[data-review][data-path="Shared Selection"]')
+        first_button.click()
+        page.locator("#review-status").wait_for(state="visible")
+        page.wait_for_function("document.querySelector('#import').disabled === false")
+        first_track = fixture_root / "inbox" / "Shared Selection" / "01 First Inbox.wav"
+        os.utime(first_track, None)
+        expected_failure["kind"] = "inbox-stale"
+        page.locator("#import").click()
+        page.wait_for_function("document.querySelector('#review-status').textContent.includes('changed')")
+        expected_failure["kind"] = None
+        assert page.locator("#review-modal").is_visible()
+        assert page.locator("#import").is_disabled(), "stale previews must require a fresh review"
+        page.locator("#cancel").click()
+        first_button.click()
+        page.wait_for_function("document.querySelector('#import').disabled === false")
+        with page.expect_response(lambda response: "/api/imports/" in response.url and response.url.endswith("/execute")) as executed:
+            page.locator("#import").click()
+        assert executed.value.status == 200
+        page.locator("#success").wait_for(state="visible")
+        assert "Downloads" in page.locator("#success").inner_text()
+        page.wait_for_function("!document.querySelectorAll('[data-inbox-id]')[0].querySelector('[data-path=\"Shared Selection\"]')")
+        assert page.locator("#success").evaluate("element => document.activeElement === element")
+        second_button = cards.nth(1).locator('[data-review][data-path="Shared Selection"]')
+        second_button.click()
+        page.wait_for_function("document.querySelector('#import').disabled === false")
+        page.locator("#import").click()
+        page.locator("#success").wait_for(state="visible")
+        page.wait_for_function("document.querySelectorAll('[data-inbox-id]')[1].querySelector('[data-count]').textContent.startsWith('0')")
+        assert page.locator("#success").evaluate("element => document.activeElement === element")
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+        page.screenshot(path=evidence / "17-named-inboxes-after-import-mobile.png", full_page=True)
+        viewport_checks["named_inboxes_picker_persistence_scoped_retry_success"] = True
+
         # Shared shell/palette/density contract across every primary page.
         primary_pages = {"overview": "/", "inbox": "/inbox", "library": "/library", "settings": "/settings"}
         palette_proof = {}
@@ -1219,7 +1298,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
 
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
     inbox_after = request_json(f"{base_url}/api/inbox")
-    assert inbox_after == inbox_before and inbox_after, "full-library imports must not alter Inbox retention"
+    assert any(item["path"] == "Rollback Retained" for item in inbox_before)
+    assert [(item["inbox_name"], item["path"]) for item in inbox_after] == [("Downloads", "Rollback Retained")]
     return {
         "browser_version": browser_version,
         "page_errors": page_errors, "console_errors": unexpected_console,
@@ -1258,7 +1338,11 @@ def main() -> None:
     app_library = Path(args.app_library).resolve() if args.app_library else (args.fixture_root / "library").resolve()
     configure(
         args.base_url.rstrip("/"),
-        args.app_inbox or str((args.fixture_root / "inbox").resolve()),
+        [
+            args.app_inbox or str((args.fixture_root / "inbox").resolve()),
+            str(Path(args.app_inbox).parent / "inbox-two") if args.app_inbox
+            else str((args.fixture_root / "inbox-two").resolve()),
+        ],
         str(app_library),
     )
     browser_result = run_browser(args.base_url.rstrip("/"), args.state_path, args.evidence_dir, tracks)
@@ -1273,7 +1357,7 @@ def main() -> None:
     items = request_json(f"{args.base_url.rstrip('/')}/api/items")
     excluded_queue = {"queue_tied", "queue_lower", "queue_error", "queue_unselected"}
     registered_names = set(tracks) - excluded_queue
-    assert len(items) == len(registered_names)
+    assert len(items) == len(registered_names) + 2
     by_path = {Path(item["path"]).name: item for item in items}
     for name in registered_names:
         path = tracks[name]
