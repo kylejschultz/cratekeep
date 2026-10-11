@@ -7,6 +7,7 @@ import math
 import os
 import secrets
 import sqlite3
+import stat
 import subprocess
 import re
 import shutil
@@ -4428,10 +4429,70 @@ def _apply_inbox_embedded_artwork(
     return result
 
 
-def _apply_inbox_destination_sidecars(app: Flask, destinations: list[str], jpeg: bytes) -> dict:
+def _read_inbox_source_sidecar(path: Path) -> bytes | None:
+    """Read and validate an incoming cover without following filesystem aliases."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Incoming cover.jpg is unreadable; audio was not moved: {exc}",
+            code="source_artwork_unsafe",
+        ) from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise LibraryImportExecutionError(
+            "Incoming cover.jpg is not a safe regular file; audio was not moved.",
+            code="source_artwork_unsafe",
+        )
+    if before.st_size > MAX_ARTWORK_BYTES:
+        raise LibraryImportExecutionError(
+            "Incoming cover.jpg exceeds the 10 MB limit; audio was not moved.",
+            code="source_artwork_unsafe",
+        )
+    descriptor = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise OSError("cover.jpg changed during validation")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            payload = stream.read(MAX_ARTWORK_BYTES + 1)
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Incoming cover.jpg is unreadable or unsafe; audio was not moved: {exc}",
+            code="source_artwork_unsafe",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(payload) > MAX_ARTWORK_BYTES:
+        raise LibraryImportExecutionError(
+            "Incoming cover.jpg exceeds the 10 MB limit; audio was not moved.",
+            code="source_artwork_unsafe",
+        )
+    try:
+        _normalize_artwork_bytes(payload)
+    except LibraryImportExecutionError as exc:
+        raise LibraryImportExecutionError(
+            f"Incoming cover.jpg is invalid; audio was not moved: {exc}",
+            code="source_artwork_unsafe",
+        ) from exc
+    return payload
+
+
+def _apply_inbox_destination_sidecars(
+    app: Flask, destinations: list[str], jpeg: bytes, *, replace: bool | None = None,
+) -> dict:
     result = {"written": [], "preserved": []}
     if not app.config["ART_SIDECAR"]:
         return result
+    replace = bool(app.config["ART_REPLACE"]) if replace is None else replace
     try:
         library_root = _validated_library_root(app)
     except ValueError as exc:
@@ -4448,7 +4509,7 @@ def _apply_inbox_destination_sidecars(app: Flask, destinations: list[str], jpeg:
             raise LibraryImportExecutionError(
                 f"Final artwork destination is unsafe: {destination}", code="artwork_destination_unsafe"
             )
-        if destination.exists() and not app.config["ART_REPLACE"]:
+        if destination.exists() and not replace:
             result["preserved"].append(str(destination))
             continue
         temporary = folder / f".cover.{secrets.token_hex(8)}.tmp"
@@ -4582,7 +4643,7 @@ def _complete_inbox_execution(app: Flask, album_review_id: int, job_id: int, res
 
 
 def _retry_inbox_artwork_finalize(
-    app: Flask, album: sqlite3.Row, rows: list[sqlite3.Row], candidate: sqlite3.Row,
+    app: Flask, album: sqlite3.Row, rows: list[sqlite3.Row], candidate: sqlite3.Row | None,
     job_id: int, *, dry_run: bool,
 ) -> dict:
     previous_job_id = album["last_execution_job_id"]
@@ -4605,7 +4666,7 @@ def _retry_inbox_artwork_finalize(
             f"Pending artwork bytes are unavailable: {exc}", code="artwork_retry_unavailable", status=502, job_id=job_id
         ) from exc
     checksum = hashlib.sha256(jpeg).hexdigest()
-    if checksum != prior.get("artwork", {}).get("sha256"):
+    if checksum != prior.get("artwork", {}).get("sidecar_sha256", prior.get("artwork", {}).get("sha256")):
         raise LibraryImportExecutionError(
             "Pending artwork checksum changed; use Library artwork replacement for recovery.",
             code="artwork_retry_unsafe", status=502, job_id=job_id,
@@ -4629,7 +4690,9 @@ def _retry_inbox_artwork_finalize(
             code="artwork_retry_settings_changed", job_id=job_id,
         )
     try:
-        sidecars = _apply_inbox_destination_sidecars(app, destinations, jpeg)
+        sidecars = _apply_inbox_destination_sidecars(
+            app, destinations, jpeg, replace=bool(prior.get("artwork", {}).get("sidecar_replace", False)),
+        )
     except (OSError, LibraryImportExecutionError) as exc:
         result["artwork"]["failure"] = getattr(exc, "diagnostics", {"error": str(exc)})
         _persist_inbox_artwork_pending(app, album["id"], job_id, str(exc), result, jpeg)
@@ -4733,12 +4796,6 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 code="candidate_stale", job_id=job_id,
             )
         if album["execution_status"] == "artwork-pending":
-            if candidate is None:
-                _fail_library_execution(db, album_review_id, job_id, "pending artwork candidate is unavailable", dry_run)
-                raise LibraryImportExecutionError(
-                    "Pending artwork cannot be finalized because its candidate is unavailable.",
-                    code="artwork_retry_unsafe", status=502, job_id=job_id,
-                )
             artwork_retry = True
         else:
             artwork_retry = False
@@ -4843,6 +4900,13 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
             _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
             exc.job_id = job_id
             raise
+        source_cover = (source if source.is_dir() else source.parent) / "cover.jpg"
+        try:
+            source_sidecar = _read_inbox_source_sidecar(source_cover)
+        except LibraryImportExecutionError as exc:
+            _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
+            exc.job_id = job_id
+            raise
         with tempfile.TemporaryDirectory(prefix="cratekeep-inbox-", dir=app.config["STATE_PATH"]) as backup_dir:
             backup_root = Path(backup_dir)
             backups = []
@@ -4850,10 +4914,6 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 backup = backup_root / f"{index}{path.suffix}"
                 shutil.copy2(path, backup)
                 backups.append((path, backup))
-            sidecars = {}
-            for folder in {path.parent for path in paths}:
-                sidecar = folder / "cover.jpg"
-                sidecars[sidecar] = sidecar.read_bytes() if sidecar.exists() else None
             artwork_bytes = None
             embedded = {"written": [], "preserved": []}
             try:
@@ -4885,11 +4945,6 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                         result["artwork"] = artwork
             except Exception as exc:
                 restored, moved = _restore_inbox_sources(backups)
-                for sidecar, content in sidecars.items():
-                    if sidecar.exists() and content is None:
-                        sidecar.unlink()
-                    elif content is not None:
-                        sidecar.write_bytes(content)
                 result.update(restored_files=restored, already_moved_files=moved)
                 _persist_inbox_execution_failure(app, album_review_id, job_id, str(exc), result)
                 if isinstance(exc, LibraryImportExecutionError):
@@ -4903,11 +4958,6 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 execution = _run_beets_import(app, source)
             except Exception as exc:
                 restored, moved = _restore_inbox_sources(backups)
-                for sidecar, content in sidecars.items():
-                    if sidecar.exists() and content is None:
-                        sidecar.unlink()
-                    elif content is not None and sidecar.parent.exists():
-                        sidecar.write_bytes(content)
                 message = f"Beets import could not complete: {exc}"
                 if moved:
                     message += f" {moved} file(s) were already moved by Beets and were not rolled back."
@@ -4920,11 +4970,6 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
             result.update(returncode=execution.returncode, output=output)
             if execution.returncode != 0:
                 restored, moved = _restore_inbox_sources(backups)
-                for sidecar, content in sidecars.items():
-                    if sidecar.exists() and content is None:
-                        sidecar.unlink()
-                    elif content is not None and sidecar.parent.exists():
-                        sidecar.write_bytes(content)
                 result.update(status="failed", restored_files=restored, already_moved_files=moved)
                 message = f"Beets import failed ({execution.returncode}): {output}"
                 if moved:
@@ -4935,9 +4980,6 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 result["items"] = _verify_inbox_move(app, paths, destinations)
             except LibraryImportExecutionError as exc:
                 restored, moved = _restore_inbox_sources(backups)
-                for sidecar, content in sidecars.items():
-                    if not sidecar.exists() and content is not None and sidecar.parent.exists():
-                        sidecar.write_bytes(content)
                 result.update(
                     restored_files=restored, already_moved_files=moved,
                     verification=getattr(exc, "diagnostics", {"expected": len(destinations)}),
@@ -4945,9 +4987,33 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 _persist_inbox_execution_failure(app, album_review_id, job_id, str(exc), result)
                 exc.job_id = job_id
                 raise
-            if artwork_bytes is not None:
+            sidecar_bytes = None
+            sidecar_replace = False
+            if app.config["ART_SIDECAR"]:
+                if source_sidecar is not None and (not app.config["ART_REPLACE"] or artwork_bytes is None):
+                    sidecar_bytes = source_sidecar
+                elif artwork_bytes is not None:
+                    sidecar_bytes = artwork_bytes
+                    sidecar_replace = bool(app.config["ART_REPLACE"])
+            finalization_bytes = sidecar_bytes if sidecar_bytes is not None else artwork_bytes
+            if finalization_bytes is not None:
+                if "artwork" not in result:
+                    result["artwork"] = {
+                        "status": "preserved", "destinations": {"sidecar": True, "embedded": False},
+                        "replace_existing": False, "embedded": {"written": [], "preserved": []},
+                        "message": "Incoming sidecar artwork is ready for the verified destination.",
+                    }
+                if sidecar_bytes is not None:
+                    result["artwork"].update(
+                        source_sidecar_sha256=(hashlib.sha256(source_sidecar).hexdigest()
+                                               if source_sidecar is not None else None),
+                        sidecar_sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
+                        sidecar_replace=sidecar_replace,
+                    )
                 try:
-                    final_sidecars = _apply_inbox_destination_sidecars(app, destinations, artwork_bytes)
+                    final_sidecars = _apply_inbox_destination_sidecars(
+                        app, destinations, finalization_bytes, replace=sidecar_replace,
+                    )
                 except (OSError, LibraryImportExecutionError) as exc:
                     message = (
                         f"Files moved and verified, but final artwork could not be completed: {exc}. "
@@ -4956,21 +5022,24 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                     result.update(already_moved_files=len(paths), verified_items=len(result["items"]))
                     result["artwork"]["failure"] = getattr(exc, "diagnostics", {"error": str(exc)})
                     _persist_inbox_artwork_pending(
-                        app, album_review_id, job_id, message, result, artwork_bytes
+                        app, album_review_id, job_id, message, result, finalization_bytes
                     )
                     raise LibraryImportExecutionError(
                         message, code="artwork_finalize_failed", status=502, job_id=job_id
                     ) from exc
                 final_by_source = dict(zip((row["relative_path"] for row in rows), destinations))
-                result["artwork"].update(
-                    status="applied", sidecars=final_sidecars,
-                    embedded={
+                update = {
+                    "sidecars": final_sidecars,
+                    "embedded": {
                         "written": [final_by_source[path] for path in embedded["written"]],
                         "preserved": [final_by_source[path] for path in embedded["preserved"]],
                     },
-                    album_folders=sorted({str((Path(app.config["LIBRARY_PATH"]) / path).parent) for path in destinations}),
-                    message="Artwork applied to verified final album destinations.",
-                )
+                    "album_folders": sorted({str((Path(app.config["LIBRARY_PATH"]) / path).parent) for path in destinations}),
+                    "message": "Artwork finalized in verified album destinations; incoming artwork was preserved unless replacement was enabled.",
+                }
+                if artwork_bytes is not None or result["artwork"]["status"] == "preserved":
+                    update["status"] = "applied" if artwork_bytes is not None else "preserved"
+                result["artwork"].update(update)
     except LibraryImportExecutionError:
         raise
     except Exception as exc:

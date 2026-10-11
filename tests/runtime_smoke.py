@@ -95,6 +95,7 @@ def make_fixture(root: Path) -> dict[str, Path]:
         tags.artist = tags.albumartist = artist
         tags.album = "Shared Selection"
         tags.save()
+        (track.parent / "cover.jpg").write_bytes(EXISTING_ARTWORK_JPEG)
     tracks = {name: root / "library" / relative for name, relative in TRACKS.items()}
     for name, track in tracks.items():
         write_wav(track, 288 if name == "feature_extra" else 1)
@@ -1211,6 +1212,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         # same-name selections, stale-preview retry, success, focus, and scoped refresh.
         fixture_root = tracks["case"].parents[3]
         page.set_viewport_size({"width": 1440, "height": 1000})
+        set_artwork_settings(page, base_url, sidecar=True, embed=True, replace=False)
         page.goto(f"{base_url}/settings", wait_until="networkidle")
         rows = page.locator("[data-inbox-row]")
         assert rows.count() == 2
@@ -1279,16 +1281,24 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         candidate.locator("[role='radio']").click()
         page.locator("#approve-review").click()
         page.wait_for_function("document.querySelector('#import-review').disabled === false")
-        with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.url.endswith("/execute") and response.request.post_data == "{}") as executed:
+        with page.expect_response(lambda response: (
+            "/api/inbox/albums/" in response.url and response.url.endswith("/execute")
+            and response.request.post_data_json == {}
+        )) as executed:
             page.locator("#import-review").click()
         assert executed.value.status == 201
+        assert executed.value.request.post_data_json == {}
         first_result = executed.value.json()
         first_destination = fixture_root / "library" / first_result["destinations"][0]
         assert first_result["destinations"] == ["First Inbox/Shared Selection/01 First Inbox.wav"]
         assert first_destination.is_file() and not first_track.exists()
         assert MediaFile(str(first_destination)).images[0].data == ARTWORK_JPEG
-        assert (first_destination.parent / "cover.jpg").read_bytes() == ARTWORK_JPEG
+        assert (first_destination.parent / "cover.jpg").read_bytes() == EXISTING_ARTWORK_JPEG
+        first_source_cover = first_track.parent / "cover.jpg"
+        if first_source_cover.exists():
+            assert first_source_cover.read_bytes() == EXISTING_ARTWORK_JPEG
         assert first_result["artwork"]["sha256"] == hashlib.sha256(ARTWORK_JPEG).hexdigest()
+        assert first_result["artwork"]["sidecar_sha256"] == hashlib.sha256(EXISTING_ARTWORK_JPEG).hexdigest()
         page.wait_for_function("""() => ![...document.querySelectorAll('[data-inbox-id]')[0].querySelectorAll('[data-album-id]')]
           .some(row => row.textContent.includes('Shared Selection'))""")
         assert page.locator("#inbox-success").evaluate("element => document.activeElement === element")
@@ -1298,6 +1308,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "source_removed": not first_track.exists(),
             "embedded_art_sha256": hashlib.sha256(MediaFile(str(first_destination)).images[0].data).hexdigest(),
             "sidecar_art_sha256": sha256(first_destination.parent / "cover.jpg"),
+            "incoming_sidecar_sha256": hashlib.sha256(EXISTING_ARTWORK_JPEG).hexdigest(),
+            "incoming_sidecar_retained": first_source_cover.is_file(),
             "success_focus": True,
         })
 
@@ -1346,7 +1358,32 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.get_by_role("radio", name=re.compile("As Is")).click()
         page.locator("#approve-review").click()
         page.wait_for_function("document.querySelector('#import-review').disabled === false")
-        page.locator("#import-review").click()
+        with page.expect_response(lambda response: (
+            "/api/inbox/albums/" in response.url and response.url.endswith("/execute")
+            and response.request.post_data_json == {}
+        )) as as_is_executed:
+            page.locator("#import-review").click()
+        assert as_is_executed.value.status == 201
+        assert as_is_executed.value.request.post_data_json == {}
+        as_is_result = as_is_executed.value.json()
+        second_destination = fixture_root / "library" / as_is_result["destinations"][0]
+        assert as_is_result["selection_mode"] == "as-is"
+        assert as_is_result["destinations"] == ["Second Inbox/Shared Selection/00 Second Inbox.wav"]
+        assert second_destination.is_file() and not second_track.exists()
+        assert not MediaFile(str(second_destination)).images
+        assert (second_destination.parent / "cover.jpg").read_bytes() == EXISTING_ARTWORK_JPEG
+        second_source_cover = second_track.parent / "cover.jpg"
+        if second_source_cover.exists():
+            assert second_source_cover.read_bytes() == EXISTING_ARTWORK_JPEG
+        inbox_review_proof["as_is"] = {
+            "destination": str(second_destination),
+            "destination_relative": as_is_result["destinations"][0],
+            "source_removed": not second_track.exists(),
+            "source_sidecar_retained": second_source_cover.is_file(),
+            "source_sidecar_sha256": hashlib.sha256(EXISTING_ARTWORK_JPEG).hexdigest(),
+            "destination_sidecar_sha256": sha256(second_destination.parent / "cover.jpg"),
+            "embedded_images": len(MediaFile(str(second_destination)).images or []),
+        }
         page.wait_for_function("document.querySelectorAll('[data-inbox-id]')[1].querySelectorAll('[data-album-id]').length === 0")
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")

@@ -5504,6 +5504,96 @@ def test_reviewed_inbox_artwork_is_finalized_only_at_verified_destination(
         assert response.json["artwork"]["album_folders"] == [str(destination.parent)]
 
 
+@pytest.mark.parametrize("embed,replace,available,existing_embed,expected_sidecar,expected_embed", [
+    (False, False, True, False, "incoming", None),
+    (True, False, True, False, "incoming", "candidate"),
+    (True, True, True, True, "candidate", "candidate"),
+    (True, True, False, True, "incoming", "incoming"),
+])
+def test_reviewed_inbox_carries_incoming_sidecar_without_precreated_destination(
+    tmp_path, monkeypatch, embed, replace, available, existing_embed, expected_sidecar, expected_embed,
+):
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=embed, ART_REPLACE=replace)
+    source = tmp_path / "inbox" / "Incoming Artwork" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    incoming, candidate = jpeg_bytes((91, 23, 47)), jpeg_bytes((14, 151, 72))
+    source_cover = source.parent / "cover.jpg"
+    source_cover.write_bytes(incoming)
+    if existing_embed:
+        media = MediaFile(str(source))
+        media.images = [MediaImage(incoming, type=ImageType.front)]
+        media.save()
+    artwork = ({
+        "available": True, "source": "cover-art-archive", "entity": "release",
+        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+    } if available else None)
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: candidate
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app, artwork=artwork)
+
+    def run(current_app, selection, *, pretend=False):
+        if not pretend:
+            complete_mock_inbox_move(current_app, source)
+        return subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+
+    monkeypatch.setattr("beets_mvp._run_beets_import", run)
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 201
+    destination = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    final_cover = destination.parent / "cover.jpg"
+    assert final_cover.read_bytes() == (incoming if expected_sidecar == "incoming" else candidate)
+    images = MediaFile(str(destination)).images or []
+    if expected_embed is None:
+        assert images == []
+    else:
+        assert images[0].data == (incoming if expected_embed == "incoming" else candidate)
+    assert source_cover.read_bytes() == incoming
+    assert response.json["artwork"]["source_sidecar_sha256"] == hashlib.sha256(incoming).hexdigest()
+    assert response.json["artwork"]["sidecar_sha256"] == hashlib.sha256(final_cover.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "oversized", "unreadable"])
+def test_reviewed_inbox_rejects_unsafe_incoming_sidecar_before_audio_mutation(
+    tmp_path, monkeypatch, unsafe,
+):
+    import beets_mvp
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=True, ART_REPLACE=False)
+    source = tmp_path / "inbox" / "Unsafe Artwork" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    original_audio = source.read_bytes()
+    cover = source.parent / "cover.jpg"
+    if unsafe == "symlink":
+        outside = tmp_path / "outside-cover.jpg"
+        outside.write_bytes(jpeg_bytes((1, 2, 3)))
+        cover.symlink_to(outside)
+    elif unsafe == "oversized":
+        with cover.open("wb") as stream:
+            stream.truncate(beets_mvp.MAX_ARTWORK_BYTES + 1)
+    else:
+        cover.write_bytes(jpeg_bytes((1, 2, 3)))
+        original_open = os.open
+        monkeypatch.setattr(os, "open", lambda path, flags, *args, **kwargs: (
+            (_ for _ in ()).throw(PermissionError("fixture unreadable"))
+            if Path(path) == cover else original_open(path, flags, *args, **kwargs)
+        ))
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app, artwork={
+        "available": True, "source": "cover-art-archive", "entity": "release",
+        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+    })
+    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, pretend=False, **kwargs: (
+        subprocess.CompletedProcess(["beet"], 0, "preflight", "")
+        if pretend else pytest.fail("moving Beets import must not run")
+    ))
+
+    response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert response.status_code == 409 and response.json["code"] == "source_artwork_unsafe"
+    assert source.read_bytes() == original_audio and os.path.lexists(cover)
+    assert not (tmp_path / "library" / "Artist" / "Album" / "01 Song.wav").exists()
+
+
 def test_reviewed_inbox_beets_failure_restores_embedded_art_and_preserves_source_sidecar(
     tmp_path, monkeypatch,
 ):
@@ -5587,6 +5677,50 @@ def test_reviewed_inbox_destination_sidecar_failure_is_audited_and_retryable(tmp
     assert retried.json["artwork"]["recovered_from"]["rolled_back"] == ["cover.jpg"]
     assert (destination.parent / "cover.jpg").read_bytes() == art
     assert MediaFile(str(destination)).images[0].data == art
+
+
+def test_incoming_sidecar_finalize_failure_retries_preserved_bytes(tmp_path, monkeypatch):
+    import beets_mvp
+    app = make_app(tmp_path)
+    app.config.update(FETCH_ART=True, ART_SIDECAR=True, ART_EMBED=True, ART_REPLACE=False)
+    source = tmp_path / "inbox" / "Incoming Retry" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    incoming, candidate = jpeg_bytes((73, 24, 99)), jpeg_bytes((12, 177, 43))
+    source_cover = source.parent / "cover.jpg"
+    source_cover.write_bytes(incoming)
+    app.config["ARTWORK_FETCHER"] = lambda provider_data: candidate
+    client = app.test_client()
+    album = approve_inbox_candidate(client, app, artwork={
+        "available": True, "source": "cover-art-archive", "entity": "release",
+        "mbid": "123e4567-e89b-42d3-a456-426614174000",
+    })
+
+    def run(current_app, selection, *, pretend=False):
+        if not pretend:
+            complete_mock_inbox_move(current_app, source)
+        return subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+
+    monkeypatch.setattr("beets_mvp._run_beets_import", run)
+    original = beets_mvp._apply_inbox_destination_sidecars
+    calls = 0
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise LibraryImportExecutionError("fixture finalization failure", code="artwork_destination_failed")
+        return original(*args, **kwargs)
+    monkeypatch.setattr("beets_mvp._apply_inbox_destination_sidecars", fail_once)
+
+    failed = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert failed.status_code == 502 and failed.json["code"] == "artwork_finalize_failed"
+    destination = tmp_path / "library" / "Artist" / "Album" / "01 Song.wav"
+    assert destination.exists() and source_cover.read_bytes() == incoming
+    assert MediaFile(str(destination)).images[0].data == candidate
+    assert not (destination.parent / "cover.jpg").exists()
+    retried = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert retried.status_code == 201
+    assert (destination.parent / "cover.jpg").read_bytes() == incoming
+    assert retried.json["artwork"]["sidecar_sha256"] == hashlib.sha256(incoming).hexdigest()
 
 
 def test_destination_sidecars_roll_back_first_folder_when_second_commit_fails(tmp_path, monkeypatch):
