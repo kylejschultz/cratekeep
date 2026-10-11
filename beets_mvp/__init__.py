@@ -59,6 +59,7 @@ MAX_BEETS_CONFIG_BYTES = 128 * 1024
 MAX_INVENTORY_SAMPLE = 50
 MAX_LIBRARY_IMPORT_ALBUMS = 50
 MAX_CANDIDATE_ALBUMS = 25
+MAX_INBOX_AUTO_MATCH_PENDING = 100
 MAX_CANDIDATES_PER_ALBUM = 5
 FOLDER_PAGE_SIZE = 25
 CANDIDATE_SCHEMA_VERSION = 5
@@ -159,7 +160,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/inbox")
     def inbox_page():
         return render_template(
-            "inbox.html", build_sha=app.config["BUILD_SHA"], inboxes=_inbox_review_groups(app)
+            "inbox.html", build_sha=app.config["BUILD_SHA"], inboxes=_inbox_review_summaries(app)
         )
 
     @app.get("/library")
@@ -214,12 +215,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.post("/api/inbox/scan")
     def scan_inbox_reviews():
         values = request.get_json(silent=True) or {}
-        if not isinstance(values, dict) or set(values) - {"inbox_id"}:
-            return jsonify(error="request may contain only inbox_id", code="invalid_request"), 400
+        if not isinstance(values, dict) or set(values) - {"inbox_id", "page", "refresh"}:
+            return jsonify(error="request may contain only inbox_id, page, and refresh", code="invalid_request"), 400
         inbox_id = values.get("inbox_id")
         if inbox_id is not None and _configured_inbox(app, inbox_id) is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 400
-        return jsonify(inboxes=_inbox_review_groups(app, inbox_ids={inbox_id} if inbox_id else None))
+        try:
+            page = max(1, int(values.get("page", 1)))
+        except (TypeError, ValueError):
+            return jsonify(error="page must be an integer", code="invalid_request"), 400
+        refresh = values.get("refresh", page == 1)
+        if not isinstance(refresh, bool):
+            return jsonify(error="refresh must be a boolean", code="invalid_request"), 400
+        return jsonify(inboxes=_inbox_review_groups(
+            app, scan=refresh, inbox_ids={inbox_id} if inbox_id else None, page=page,
+        ))
 
     @app.post("/api/inbox/candidates")
     def generate_inbox_candidates():
@@ -1200,6 +1210,20 @@ def _load_settings(path: str) -> dict[str, str]:
                     WHERE status = 'review' AND inbox_id IS NULL AND inbox_root IS NULL""",
                 (inbox_id, inbox_root),
             )
+        # The former setting was global. Preserve an opted-in installation by
+        # applying it to every inbox that existed at migration time. A missing
+        # or disabled global value maps to false, and newly-added inboxes are
+        # always disabled until their own row is explicitly enabled.
+        inboxes = _settings_inboxes(settings)
+        if inboxes and any("auto_match" not in inbox for inbox in inboxes):
+            legacy_enabled = settings.get("inbox_auto_match") == "1"
+            inboxes = [{**inbox, "auto_match": legacy_enabled} for inbox in inboxes]
+            settings["inboxes_json"] = json.dumps(inboxes)
+            db.execute(
+                """INSERT INTO app_settings(key, value) VALUES ('inboxes_json', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (settings["inboxes_json"],),
+            )
     # Existing installations that opted into fetching retain beets' historical
     # cover.jpg behavior. Embedding and replacement always require a new opt-in.
     if settings.get("fetch_art") == "1" and "art_sidecar" not in settings:
@@ -1278,7 +1302,7 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         ART_SIDECAR=settings.get("art_sidecar", "") == "1",
         ART_EMBED=settings.get("art_embed", "") == "1",
         ART_REPLACE=settings.get("art_replace", "") == "1",
-        INBOX_AUTO_MATCH=settings.get("inbox_auto_match", "") == "1",
+        INBOX_AUTO_MATCH=any(inbox.get("auto_match", False) for inbox in inboxes),
     )
     app.config["SETUP_COMPLETE"] = bool(inboxes and app.config["LIBRARY_PATH"])
     app.config["LIBRARY_ROOT_ERROR"] = (
@@ -1391,6 +1415,9 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
         token = request.form.get("navidrome_token", "")
         if not token and current.get("navidrome_token") and not request.form.get("clear_navidrome_token"):
             token = current["navidrome_token"]
+        enabled_inbox_ids = set(request.form.getlist("inbox_auto_match_id"))
+        for inbox in inboxes:
+            inbox["auto_match"] = bool(inbox["id"] and inbox["id"] in enabled_inbox_ids)
         values = {
             "inboxes_json": json.dumps(inboxes),
             "inbox_path": inboxes[0]["path"] if inboxes else "",
@@ -1401,7 +1428,9 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             "art_sidecar": "1" if request.form.get("art_sidecar") else "",
             "art_embed": "1" if request.form.get("art_embed") else "",
             "art_replace": "1" if request.form.get("art_replace") else "",
-            "inbox_auto_match": "1" if request.form.get("inbox_auto_match") else "",
+            # Retained only as a downgrade/migration breadcrumb. Runtime
+            # behavior is exclusively controlled by each inbox JSON row.
+            "inbox_auto_match": "1" if any(row["auto_match"] for row in inboxes) else "",
         }
         submitted_config = request.form.get("beets_config", config_text)
         submitted_ftintitle = {
@@ -1493,7 +1522,10 @@ def _settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
         for row in rows:
             if (isinstance(row, dict) and isinstance(row.get("id"), str)
                     and isinstance(row.get("name"), str) and isinstance(row.get("path"), str)):
-                inboxes.append({key: row[key] for key in ("id", "name", "path")})
+                inboxes.append({
+                    **{key: row[key] for key in ("id", "name", "path")},
+                    **({"auto_match": row["auto_match"]} if isinstance(row.get("auto_match"), bool) else {}),
+                })
     return inboxes
 
 
@@ -1504,7 +1536,10 @@ def _valid_settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
     if (not inboxes or any(not row[key].strip() for row in inboxes for key in ("id", "name", "path"))
             or len(names) != len(set(names)) or len(paths) != len(set(paths))):
         return []
-    return [{**row, "name": row["name"].strip(), "path": path} for row, path in zip(inboxes, paths)]
+    return [
+        {**row, "name": row["name"].strip(), "path": path, "auto_match": bool(row.get("auto_match", False))}
+        for row, path in zip(inboxes, paths)
+    ]
 
 
 def _submitted_inboxes(form, current: dict[str, str]) -> list[dict[str, str]]:
@@ -1516,12 +1551,12 @@ def _submitted_inboxes(form, current: dict[str, str]) -> list[dict[str, str]]:
         return [{
             "id": existing[0]["id"] if len(existing) == 1 else "",
             "name": existing[0]["name"] if len(existing) == 1 else "Inbox",
-            "path": paths[0].strip(),
+            "path": paths[0].strip(), "auto_match": bool(existing and existing[0].get("auto_match")),
         }]
     if not (len(names) == len(paths) == len(ids)):
         return []
     return [
-        {"id": submitted_id.strip(), "name": name.strip(), "path": path.strip()}
+        {"id": submitted_id.strip(), "name": name.strip(), "path": path.strip(), "auto_match": False}
         for submitted_id, name, path in zip(ids, names, paths)
     ]
 
@@ -1768,7 +1803,6 @@ def _library_page_data(
                 ORDER BY albums DESC, tracks DESC, LOWER(artist) LIMIT 5"""
         ).fetchall()
         recent_rows = db.execute("SELECT id FROM albums ORDER BY added DESC, id DESC LIMIT 5").fetchall()
-        path_rows = db.execute("SELECT path FROM items").fetchall()
     summary_cache: dict[int, dict | None] = {}
     albums = [_managed_album_summary(app, library.get_album(row["id"]), summary_cache) for row in rows]
     albums = [album for album in albums if album is not None]
@@ -1783,12 +1817,16 @@ def _library_page_data(
     recent_albums = [
         _managed_album_summary(app, library.get_album(row["id"]), summary_cache) for row in recent_rows
     ]
-    library_bytes = 0
-    for row in path_rows:
-        try:
-            library_bytes += _managed_path(app, row["path"]).stat().st_size
-        except (ManagedMutationError, OSError, TypeError, ValueError):
-            pass
+    # Use the persisted inventory snapshot when available. An installation
+    # that has never inventoried its Library reports an explicit unknown size
+    # instead of blocking navigation to stat every managed audio path.
+    with _connect(app.config["APP_DB"]) as db:
+        size_snapshot = db.execute(
+            """SELECT SUM(size_bytes) FROM library_inventory
+                WHERE source_kind='library' AND root_path=? AND present=1""",
+            (str(Path(app.config["LIBRARY_PATH"]).expanduser().resolve()),),
+        ).fetchone()[0]
+    library_bytes = size_snapshot
     return {
         "albums": albums, "album_groups": groups,
         "recent_albums": [album for album in recent_albums if album is not None],
@@ -1803,30 +1841,17 @@ def _library_page_data(
 
 
 def _overview_data(app: Flask) -> dict:
-    groups = _inbox_review_groups(app)
+    groups = _inbox_review_summaries(app)
     inboxes = []
     for group in groups:
-        root = str(Path(group["path"]).resolve())
-        totals = (None, None)
-        if not group["error"]:
-            with _connect(app.config["APP_DB"]) as db:
-                totals = db.execute(
-                    """SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
-                         FROM library_inventory WHERE source_kind='inbox' AND source_id=?
-                           AND root_path=? AND present=1""",
-                    (group["id"], root),
-                ).fetchone()
-        pending = [album for album in group["albums"] if album["decision"] not in {"rejected", "skipped"}]
-        statuses = {album["candidate_status"] for album in pending}
-        status = "error" if group["error"] or "error" in statuses else (
-            "matching" if "running" in statuses else "needs review" if pending else
-            "reviewed" if group["albums"] else "empty"
+        error = group["scan_error"]
+        status = "error" if error or group["errors"] else (
+            "matching" if group["matching"] else "needs review" if group["albums"] else "empty"
         )
         inboxes.append({
             "id": group["id"], "name": group["name"], "path": group["path"],
-            "pending_albums": len(pending) if not group["error"] else None,
-            "files": totals[0], "bytes": totals[1],
-            "status": status, "error": group["error"],
+            "pending_albums": group["albums"], "files": group["items"], "bytes": group["bytes"],
+            "status": status, "error": error,
         })
     library = _library_page_data(app, "", "recent", "desc", page=1)
     return {
@@ -5762,8 +5787,11 @@ def _sync_inbox_album_reviews(app: Flask, inbox: dict[str, str], root: Path) -> 
             )
 
 
+INBOX_REVIEW_PAGE_SIZE = 25
+
+
 def _inbox_review_groups(
-    app: Flask, *, scan: bool = True, inbox_ids: set[str] | None = None
+    app: Flask, *, scan: bool = True, inbox_ids: set[str] | None = None, page: int = 1,
 ) -> list[dict]:
     result = []
     new_album_ids = []
@@ -5775,18 +5803,83 @@ def _inbox_review_groups(
             if scan:
                 _scan_inbox_inventory(app, inbox)
             root = str(Path(inbox["path"]).resolve())
-            albums = _album_review_payloads(app, root=root, source_kind="inbox", source_id=inbox["id"])
-            new_album_ids.extend(
-                album["id"] for album in albums
-                if album["decision"] == "pending" and album["candidate_status"] in {"not-run", "stale"}
+            with _connect(app.config["APP_DB"]) as db:
+                active_filter = """source_kind='inbox' AND source_id=? AND root_path=?
+                    AND execution_status!='complete' AND state NOT IN ('rejected', 'skipped')
+                    AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id=album_reviews.id)"""
+                total = db.execute(
+                    f"SELECT COUNT(*) FROM album_reviews WHERE {active_filter}", (inbox["id"], root),
+                ).fetchone()[0]
+                offset = min((page - 1) * INBOX_REVIEW_PAGE_SIZE,
+                             max(0, ((total - 1) // INBOX_REVIEW_PAGE_SIZE) * INBOX_REVIEW_PAGE_SIZE))
+                album_ids = [row["id"] for row in db.execute(
+                    f"""SELECT id FROM album_reviews WHERE {active_filter}
+                         ORDER BY artist_key, album_key, id LIMIT ? OFFSET ?""",
+                    (inbox["id"], root, INBOX_REVIEW_PAGE_SIZE, offset),
+                )]
+                if scan:
+                    new_album_ids.extend(
+                        (row["id"], inbox["id"]) for row in db.execute(
+                            f"""SELECT id FROM album_reviews WHERE {active_filter}
+                                 AND candidate_status IN ('not-run', 'stale') ORDER BY id LIMIT ?""",
+                            (inbox["id"], root, MAX_INBOX_AUTO_MATCH_PENDING),
+                        )
+                    )
+            albums = _album_review_payloads(
+                app, album_ids, root=root, source_kind="inbox", source_id=inbox["id"],
             )
         except (OSError, ValueError) as exc:
             albums = []
+            total = 0
+            offset = 0
             error = str(exc)
-        result.append({**inbox, "albums": albums, "error": error})
-    if scan and app.config.get("INBOX_AUTO_MATCH") and new_album_ids:
-        _start_inbox_auto_match(app, new_album_ids[:MAX_CANDIDATE_ALBUMS])
+        page_count = max(1, (total + INBOX_REVIEW_PAGE_SIZE - 1) // INBOX_REVIEW_PAGE_SIZE)
+        result.append({
+            **inbox, "albums": albums, "error": error, "total_albums": total,
+            "page": (offset // INBOX_REVIEW_PAGE_SIZE) + 1, "page_count": page_count,
+            "page_size": INBOX_REVIEW_PAGE_SIZE,
+        })
+    if scan and new_album_ids:
+        enabled_ids = {inbox["id"] for inbox in app.config["INBOXES"] if inbox.get("auto_match")}
+        enabled_album_ids = [album_id for album_id, inbox_id in new_album_ids if inbox_id in enabled_ids]
+        if enabled_album_ids:
+            _start_inbox_auto_match(app, enabled_album_ids[:MAX_INBOX_AUTO_MATCH_PENDING])
     return result
+
+
+def _inbox_review_summaries(app: Flask) -> list[dict]:
+    """Return persisted, bounded status without traversing configured roots."""
+    summaries = []
+    with _connect(app.config["APP_DB"]) as db:
+        for inbox in app.config["INBOXES"]:
+            root = str(Path(inbox["path"]).expanduser().resolve())
+            counts = db.execute(
+                """SELECT COUNT(*) AS albums,
+                          COALESCE(SUM(CASE WHEN candidate_status='running' THEN 1 ELSE 0 END), 0) AS matching,
+                          COALESCE(SUM(CASE WHEN candidate_status='error' THEN 1 ELSE 0 END), 0) AS errors,
+                          COALESCE(SUM(CASE WHEN candidate_status='complete' THEN 1 ELSE 0 END), 0) AS ready
+                     FROM album_reviews
+                    WHERE source_kind='inbox' AND source_id=? AND root_path=?
+                      AND execution_status!='complete' AND state NOT IN ('rejected', 'skipped')""",
+                (inbox["id"], root),
+            ).fetchone()
+            items = db.execute(
+                """SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes FROM library_inventory
+                    WHERE source_kind='inbox' AND source_id=? AND root_path=? AND present=1""",
+                (inbox["id"], root),
+            ).fetchone()
+            scan = db.execute(
+                """SELECT status, error, created_at, finished_at FROM adoption_jobs
+                    WHERE kind='inbox_inventory' AND root_path=? ORDER BY id DESC LIMIT 1""",
+                (root,),
+            ).fetchone()
+            summaries.append({
+                **inbox, "albums": counts["albums"], "items": items["count"], "bytes": items["bytes"],
+                "matching": counts["matching"], "errors": counts["errors"], "ready": counts["ready"],
+                "scanned_at": (scan["finished_at"] or scan["created_at"]) if scan else None,
+                "scan_error": scan["error"] if scan and scan["status"] == "failed" else "",
+            })
+    return summaries
 
 
 def _start_inbox_auto_match(app: Flask, album_ids: list[int]) -> None:
@@ -5794,7 +5887,7 @@ def _start_inbox_auto_match(app: Flask, album_ids: list[int]) -> None:
     with lock:
         pending = app.config["INBOX_MATCH_PENDING"]
         for album_id in album_ids:
-            if len(pending) >= MAX_CANDIDATE_ALBUMS:
+            if len(pending) >= MAX_INBOX_AUTO_MATCH_PENDING:
                 break
             pending.add(album_id)
         if app.config["INBOX_MATCH_RUNNING"]:

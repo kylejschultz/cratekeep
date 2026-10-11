@@ -96,6 +96,13 @@ def make_fixture(root: Path) -> dict[str, Path]:
         tags.album = "Shared Selection"
         tags.save()
         (track.parent / "cover.jpg").write_bytes(EXISTING_ARTWORK_JPEG)
+    for source_index, folder in enumerate(("inbox", "inbox-two")):
+        for index in range(30):
+            track = root / folder / f"Z Synthetic {index:02d}" / "01 Synthetic.wav"
+            write_wav(track)
+            tags = MediaFile(str(track)); tags.title = "Synthetic"
+            tags.artist = tags.albumartist = f"Synthetic Source {source_index} Artist {index:02d}"
+            tags.album = f"Synthetic Album {index:02d}"; tags.save()
     tracks = {name: root / "library" / relative for name, relative in TRACKS.items()}
     for name, track in tracks.items():
         write_wav(track, 288 if name == "feature_extra" else 1)
@@ -333,6 +340,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     deluxe_proof: dict[str, object] = {}
     managed_library_proof: dict[str, object] = {}
     inbox_review_proof: dict[str, object] = {}
+    inbox_page_metrics: dict[str, object] = {}
     viewport_checks: dict[str, object] = {}
     accidental = tracks["sidecar"].parent.parent / "Accidental Album" / "01 Wrong.wav"
     write_wav(accidental)
@@ -343,7 +351,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     accidental_tags.save()
     inbox_before = request_json(f"{base_url}/api/inbox")
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
+        executable = os.environ.get("CHROMIUM_EXECUTABLE")
+        browser = playwright.chromium.launch(executable_path=executable) if executable else playwright.chromium.launch()
         browser_version = browser.version
         page: Page = browser.new_page(viewport={"width": 1440, "height": 1000})
         expected_failure = {"kind": None}
@@ -1039,7 +1048,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator(".album-card").count() == 1
         assert page.locator(".track-row").count() == 0
         assert "As Is Song" not in page.locator(".browse").inner_text()
-        expected_library_size = _format_bytes(sum(item["bytes"] for item in request_json(f"{base_url}/api/items")))
+        with sqlite3.connect(state_path / "app.db") as snapshot_db:
+            snapshot_bytes = snapshot_db.execute(
+                """SELECT SUM(size_bytes) FROM library_inventory
+                    WHERE source_kind='library' AND present=1"""
+            ).fetchone()[0]
+        expected_library_size = _format_bytes(snapshot_bytes)
         assert page.locator(".summary-grid .card").last.locator("strong").inner_text() == expected_library_size
         assert expected_library_size != "0 MB"
         assert page.locator(".album-card [data-album-cover]").get_by_text("No art").is_visible()
@@ -1237,6 +1251,27 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         cards = page.locator("[data-inbox-id]")
         assert cards.count() == 2
         assert [card.locator("h2").inner_text() for card in cards.all()] == ["Downloads", "Source 2"]
+        assert page.locator("[data-inbox-toggle]").evaluate_all(
+            "elements => elements.map(element => element.getAttribute('aria-expanded'))"
+        ) == ["false", "false"]
+        assert all("Shared Selection" not in card.inner_text() for card in cards.all())
+        for index in range(cards.count()):
+            with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
+                cards.nth(index).locator("[data-inbox-toggle]").click()
+            cards.nth(index).locator("[data-album-id]").first.wait_for()
+        assert cards.nth(0).locator("[data-album-id]").count() == 25
+        assert cards.nth(0).locator(".page-label").inner_text() == "Page 1 of 2"
+        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")) as second_page_response:
+            cards.nth(0).get_by_role("button", name="Next page").click()
+        cards.nth(0).locator(".page-label").filter(has_text="Page 2 of 2").wait_for()
+        assert cards.nth(0).locator("[data-album-id]").count() == 7
+        second_page_body = second_page_response.value.body()
+        inbox_page_metrics.update({"page_size":25,"page_2_dom_rows":7,"page_2_payload_bytes":len(second_page_body)})
+        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")) as first_page_response:
+            cards.nth(0).get_by_role("button", name="Previous page").click()
+        cards.nth(0).locator(".page-label").filter(has_text="Page 1 of 2").wait_for()
+        inbox_page_metrics.update({"page_1_dom_rows":cards.nth(0).locator("[data-album-id]").count(),
+                                   "page_1_payload_bytes":len(first_page_response.value.body()),"total_albums":32})
         assert all("Shared Selection" in card.inner_text() for card in cards.all())
         page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
 
@@ -1260,17 +1295,31 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator("#cancel-review").click()
         page.reload(wait_until="networkidle")
         cards = page.locator("[data-inbox-id]")
+        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
+            cards.nth(0).locator("[data-inbox-toggle]").click()
+        cards.nth(0).locator("[data-album-id]").first.wait_for()
         first_button = cards.nth(0).locator('[data-album-id]').filter(
             has_text="Shared Selection"
         ).get_by_role("button", name="Review")
         first_button.click()
         page.locator("#find-matches").click()
+        page.wait_for_function("document.querySelector('#find-matches').getAttribute('aria-busy') === 'true'")
+        assert page.locator("#import-review").get_attribute("aria-busy") == "false"
+        assert page.locator("#import-review .button-spinner").is_hidden()
         page.wait_for_function("document.querySelectorAll('#candidate-list .candidate-option').length > 1")
-        candidate = page.locator("#candidate-list .candidate-option").nth(1)
+        candidate = page.locator("#candidate-list .candidate-option").first
         assert all(candidate.filter(has_text=label).count() for label in (
-            "Artist", "Album", "Genre", "Release year", "Release type / media",
-            "Release region", "Local track coverage", "Online track coverage",
+            "Artist", "Album", "Genre", "Release Year", "Release Type/media",
+            "Release Region", "Local tracks found online", "Online tracks present locally",
         ))
+        track_button = candidate.get_by_role("button", name=re.compile("View track changes"))
+        track_button.click()
+        assert page.locator("#track-comparison-modal").is_visible()
+        assert page.locator("#track-comparison-rows tr:not(.track-explanation-row)").count() == 1
+        assert "Duration differs" in page.locator("#track-comparison-rows").inner_text()
+        page.screenshot(path=evidence / "17-inbox-track-changes-desktop-light.png", full_page=True)
+        page.keyboard.press("Escape")
+        assert track_button.evaluate("element => document.activeElement === element")
         page.screenshot(path=evidence / "17-inbox-review-desktop-light.png", full_page=True)
         page.evaluate("localStorage.setItem('cratekeep-theme','dark');document.body.classList.add('dark-mode')")
         page.screenshot(path=evidence / "17-inbox-review-desktop-dark.png", full_page=True)
@@ -1301,7 +1350,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert first_result["artwork"]["sidecar_sha256"] == hashlib.sha256(EXISTING_ARTWORK_JPEG).hexdigest()
         page.wait_for_function("""() => ![...document.querySelectorAll('[data-inbox-id]')[0].querySelectorAll('[data-album-id]')]
           .some(row => row.textContent.includes('Shared Selection'))""")
-        assert page.locator("#inbox-success").evaluate("element => document.activeElement === element")
+        page.wait_for_function("document.activeElement === document.querySelector('#inbox-success')")
         inbox_review_proof.update({
             "candidate_destination": str(first_destination),
             "candidate_destination_relative": first_result["destinations"][0],
@@ -1318,12 +1367,15 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         provider_calls_before_auto = request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0)
         library_items_before_auto = request_json(f"{base_url}/api/items")
         page.goto(f"{base_url}/settings", wait_until="networkidle")
-        page.locator('[name="inbox_auto_match"]').check()
+        page.locator('[name="inbox_auto_match_id"]').nth(1).check()
         with page.expect_navigation(wait_until="networkidle"):
             page.get_by_role("button", name="Save settings").click()
         page.goto(f"{base_url}/inbox", wait_until="networkidle")
         cards = page.locator("[data-inbox-id]")
         second_source_id = cards.nth(1).get_attribute("data-inbox-id")
+        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
+            cards.nth(1).locator("[data-inbox-toggle]").click()
+        cards.nth(1).locator("[data-album-id]").first.wait_for()
         page.wait_for_function("""async sourceId => {
           const response = await fetch('/api/inbox/reviews');
           const data = await response.json();
@@ -1351,6 +1403,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "library_unchanged_before_approval": True,
         }
         cards = page.locator("[data-inbox-id]")
+        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
+            cards.nth(1).locator("[data-inbox-toggle]").click()
+        cards.nth(1).locator("[data-album-id]").first.wait_for()
         second_button = cards.nth(1).locator('[data-review]').first
         second_button.click()
         page.wait_for_function("document.querySelectorAll('#candidate-list .candidate-option').length > 1")
@@ -1449,7 +1504,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     unexpected_console = assert_no_browser_errors(page_errors, console_errors, network)
     inbox_after = request_json(f"{base_url}/api/inbox")
     assert any(item["path"] == "Rollback Retained" for item in inbox_before)
-    assert [(item["inbox_name"], item["path"]) for item in inbox_after] == [("Downloads", "Rollback Retained")]
+    assert any(item["inbox_name"] == "Downloads" and item["path"] == "Rollback Retained" for item in inbox_after)
+    assert not any(item["path"] == "Shared Selection" for item in inbox_after)
+    assert sum(item["path"].startswith("Z Synthetic") for item in inbox_after) == 60
     return {
         "browser_version": browser_version,
         "page_errors": page_errors, "console_errors": unexpected_console,
@@ -1462,6 +1519,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         "deluxe_edition_proof": deluxe_proof,
         "managed_library_proof": managed_library_proof,
         "inbox_review_proof": inbox_review_proof,
+        "inbox_page_metrics": inbox_page_metrics,
         "viewport_checks": viewport_checks,
         "inbox_retention": {"before": inbox_before, "after": inbox_after},
     }
@@ -1476,12 +1534,15 @@ def main() -> None:
     parser.add_argument("--state-path", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--source-diff-sha256", required=True)
+    parser.add_argument("--source-tree", required=True)
+    parser.add_argument("--source-set-definition", required=True)
     args = parser.parse_args()
     args.fixture_root.mkdir(parents=True, exist_ok=True)
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     tracks = make_fixture(args.fixture_root)
     before = {name: sha256(path) for name, path in tracks.items()}
+    synthetic_before = {str(path.relative_to(args.fixture_root)):sha256(path)
+                        for path in args.fixture_root.rglob("Z Synthetic*/*.wav")}
     host_identity_before = {
         name: {"path": str(path.resolve()), "device": path.stat().st_dev, "inode": path.stat().st_ino}
         for name, path in tracks.items()
@@ -1498,6 +1559,9 @@ def main() -> None:
     )
     browser_result = run_browser(args.base_url.rstrip("/"), args.state_path, args.evidence_dir, tracks)
     after = {name: sha256(path) for name, path in tracks.items()}
+    synthetic_after = {str(path.relative_to(args.fixture_root)):sha256(path)
+                       for path in args.fixture_root.rglob("Z Synthetic*/*.wav")}
+    assert synthetic_after == synthetic_before and len(synthetic_after) == 60
     assert before["as_is"] != after["as_is"], "managed Library edits did not update the fixture tags"
     assert all(track.exists() for track in tracks.values()), "direct import moved or removed a source file"
     host_identity_after = {
@@ -1585,10 +1649,13 @@ def main() -> None:
     result = {
         "source_identity": {
             "commit_at_run": args.source_commit,
-            "working_diff_sha256": args.source_diff_sha256,
+            "tree_at_run": args.source_tree,
+            "definition": args.source_set_definition,
         },
         "fixture_sha256_before": before,
         "fixture_sha256_after": after,
+        "synthetic_match_only": {"files":len(synthetic_after),"unchanged":synthetic_after == synthetic_before,
+                                 "aggregate_sha256":hashlib.sha256(json.dumps(synthetic_after,sort_keys=True).encode()).hexdigest()},
         "host_identity_before": host_identity_before,
         "host_identity_after": host_identity_after,
         "expected_app_library": str(app_library),

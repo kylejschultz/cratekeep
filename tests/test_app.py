@@ -83,13 +83,13 @@ def test_container_smoke_forwards_every_required_runtime_option():
 
     assert required == {
         "--fixture-root", "--state-path", "--evidence-dir",
-        "--source-commit", "--source-diff-sha256",
+        "--source-commit", "--source-tree", "--source-set-definition",
     }
     assert required <= set(re.findall(r"--[a-z0-9-]+", invocation))
     assert '--source-commit "$source_commit"' in invocation
-    assert '--source-diff-sha256 "$source_diff_sha256"' in invocation
-    assert 'git -C "$repo_root" diff --binary HEAD^..HEAD' in wrapper
-    assert 'git -C "$repo_root" diff --binary "$empty_tree" HEAD' in wrapper
+    assert '--source-tree "$source_tree"' in invocation
+    assert '--source-set-definition "$source_set_definition"' in invocation
+    assert "rev-parse --verify 'HEAD^{tree}'" in wrapper
 
 
 def test_index_renders_app_shell_navigation_and_sections(tmp_path):
@@ -112,9 +112,10 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
 
 def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("beets_mvp._inbox_review_groups", lambda current_app: [{
-        "id":"source", "name":"Downloads", "path":str(tmp_path / "inbox"), "error":"",
-        "albums":[{"id":1, "candidate_status":"not-run", "decision":"pending"}],
+    monkeypatch.setattr("beets_mvp._inbox_review_summaries", lambda current_app: [{
+        "id":"source", "name":"Downloads", "path":str(tmp_path / "inbox"),
+        "albums":1, "items":1, "bytes":1024, "matching":0, "errors":0,
+        "ready":0, "scan_error":"", "scanned_at":"2026-10-10",
     }])
     monkeypatch.setattr("beets_mvp._library_page_data", lambda *args, **kwargs: {
         "recent_albums":[{"id":7,"album":"Example album","albumartist":"Example artist",
@@ -130,16 +131,16 @@ def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, 
     assert b"Save changes" not in page.data
 
 
-def test_overview_marks_unreadable_inbox_totals_unavailable_instead_of_stale(tmp_path):
+def test_overview_uses_persisted_inbox_totals_when_source_becomes_unavailable(tmp_path):
     app = make_app(tmp_path)
     tagged_inbox_wav(tmp_path / "inbox" / "Once Readable" / "01 Song.wav")
     client = app.test_client()
     assert len(client.get("/api/inbox/reviews").json["albums"]) == 1
     (tmp_path / "inbox").rename(tmp_path / "inbox-unavailable")
     page = client.get("/").get_data(as_text=True)
-    assert "Totals unavailable — source could not be read" in page
-    assert "one or more source totals are unavailable" in page
-    assert '<p class="summary-value">0</p>' in page
+    assert "Once Readable" not in page
+    assert "1 file" in page
+    assert "one or more source totals are unavailable" not in page
 
 def test_format_bytes_handles_megabytes_zero_and_unknown():
     assert _format_bytes(5 * 1024**2) == "5.0 MB"
@@ -443,6 +444,39 @@ def test_named_inboxes_setup_edit_validation_and_legacy_migration(tmp_path):
     assert rebound.status_code == 409 and b"changed after preview" in rebound.data
 
 
+def test_global_auto_match_migrates_by_stable_id_and_new_inboxes_default_disabled(tmp_path):
+    state = tmp_path / "config"
+    state.mkdir()
+    database = state / "app.db"
+    _init_db(str(database))
+    first, second, library = tmp_path / "first", tmp_path / "second", tmp_path / "library"
+    rows = [
+        {"id": "a" * 32, "name": "First", "path": str(first)},
+        {"id": "b" * 32, "name": "Second", "path": str(second)},
+    ]
+    with sqlite3.connect(database) as db:
+        db.executemany("INSERT INTO app_settings(key,value) VALUES (?,?)", [
+            ("inboxes_json", json.dumps(rows)), ("inbox_path", str(first)),
+            ("library_path", str(library)), ("inbox_auto_match", "1"),
+        ])
+    app = create_app({"TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(state),
+                      "BROWSE_ROOTS": [str(tmp_path)]})
+    assert [(row["id"], row["auto_match"]) for row in app.config["INBOXES"]] == [
+        ("a" * 32, True), ("b" * 32, True),
+    ]
+    third = tmp_path / "third"
+    response = app.test_client().post("/settings", data={
+        "inbox_id": ["b" * 32, "a" * 32, ""],
+        "inbox_name": ["Second", "First", "Third"],
+        "inbox_path": [str(second), str(first), str(third)],
+        "inbox_auto_match_id": ["a" * 32],
+        "library_path": str(library),
+        "beets_config": Path(app.config["BEETS_CONFIG"]).read_text(),
+    })
+    assert response.status_code == 302
+    assert [(row["name"], row["auto_match"]) for row in app.config["INBOXES"]] == [
+        ("Second", False), ("First", True), ("Third", False),
+    ]
 def test_named_inbox_api_disambiguates_and_binds_preview_jobs(tmp_path):
     app = create_app({"TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(tmp_path / "config"),
                       "BROWSE_ROOTS": [str(tmp_path)]})
@@ -586,235 +620,158 @@ def test_rendered_inbox_javascript_has_valid_syntax(tmp_path):
     assert completed.returncode == 0, completed.stderr
 
 
-def test_album_review_modal_renders_compact_accessible_decision_layout(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    modal = html[html.index(b'id="library-import-modal"'):]
-
-    assert b'role="dialog" aria-modal="true"' in modal
-    assert b'aria-labelledby="library-import-modal-title"' in modal
-    assert b'aria-describedby="library-import-modal-description"' in modal
-    assert b'Import validates the current files, then applies the selected metadata in place.' in modal
-    assert b'class="candidate-picker"' in modal
-    assert b'class="album-modal-section alternatives-section"' not in modal
-    assert b'>Choose album metadata<' in modal
-    assert b'id="library-import-open-mbid-search"' in modal
-    assert b'>Search by MBID<' in modal
-    assert b'role="radiogroup" aria-label="Album metadata candidates"' in modal
-    assert b"detail.className = 'candidate-option'" in modal
-    assert b"const asIs = {...current, id:'as-is', is_as_is:true" in modal
-    assert b"label:'Tracks changed'" in modal
-    assert b"candidateReleaseYear(value)" in modal
-    assert b"oldYear.className = 'metadata-old'" in modal
-    assert b"newYear.className = 'metadata-new'" in modal
-    assert b"changeButton.className = 'track-change-button'" in modal
-    assert b"changeButton.textContent = `View track changes (${fact.changeCount})`" in modal
-    assert b"changeButton.setAttribute('aria-label', `View track changes (${fact.changeCount}) for ${value.artist}" in modal
-    assert b"changeButton.setAttribute('aria-haspopup', 'dialog')" in modal
-    assert b"if (fact.changeCount === 0)" in modal
-    assert b"dd.textContent = 'All tracks matched'" in modal
-    assert b'.track-change-button { display:inline; width:auto; margin:0; padding:0; border:0; border-radius:0; appearance:none; background:transparent; color:var(--text); font:inherit; font-weight:700;' in html
-    assert b'.track-change-button:focus-visible { outline:2px solid var(--modal-accent); outline-offset:3px; }' in html
-    assert b"openTrackComparison(fact.tracks" in modal
-    assert b'class="browser track-modal"' in modal
-    assert b'aria-labelledby="track-comparison-title"' in modal
-    assert b'aria-describedby="track-comparison-description"' in modal
-    assert b'<th scope="col">Position</th>' in modal
-    assert b'<th scope="col">Local metadata</th>' in modal
-    assert b'<th scope="col">MusicBrainz metadata</th>' in modal
-    assert b'<th scope="col">Local duration</th>' in modal
-    assert b'<th scope="col">Proposed duration</th>' in modal
-    assert b"row.className = 'track-row-unmatched'" in modal
-    assert b"cell.classList.add('track-cell-changed')" in modal
-    assert b"function appendTrackMetadataCell(row, track, side)" in modal
-    assert b"titleLine.classList.add('track-field-changed')" in modal
-    assert b"artistLine.classList.add('track-field-changed')" in modal
-    assert b"cell.setAttribute('aria-label', `${sourceLabel} metadata. Title:" in modal
-    assert b".track-modal-dialog { width:min(800px,100%);" in html
-    assert b"min-width:860px" not in html
-    assert b"explanationRow.className = 'track-explanation-row'" in modal
-    assert b"const explanations = track.explanations || []" in modal
-    assert b"reviewDialog.inert = true" in modal
-    assert b"reviewDialog.inert = false" in modal
-    assert b"trackComparisonReturnFocus.focus()" in modal
-    assert b"event.stopPropagation(); closeTrackComparison()" in modal
-    assert b"label:'Release Type/media'" in modal
-    assert b"label:'Release Region'" in modal
-    assert b"label:'Local tracks found online'" in modal
-    assert b"label:'Online tracks present locally'" in modal
-    assert b'id="library-import-modal-tracks"' not in modal
-    assert b'class="override-form"' not in modal
-    assert b'id="library-import-rematch-form"' not in modal
-    assert b'A genre changes only when' not in modal
-    assert b'id="library-import-mbid-modal" class="browser track-modal" hidden' in modal
-    assert b'aria-labelledby="library-import-mbid-title"' in modal
-    assert b'aria-describedby="library-import-mbid-description library-import-mbid-status"' in modal
-    assert b'>Search by MusicBrainz release ID<' in modal
-    assert b'id="library-import-mbid-form" class="mbid-search-form" novalidate' in modal
-    assert b'id="library-import-mbid-cancel">Cancel<' in modal
-    assert b'id="library-import-mbid-search">Search<' in modal
-    assert b"reviewDialog.inert = true" in modal
-    assert b"openMbidSearch(openButton)" in modal
-    assert b"event.stopPropagation(); closeMbidSearch()" in modal
-    assert b"if (!force && mbidSearchBusy()) return false" in modal
-    assert b"mbidSearchReturnFocus.focus()" in modal
-    assert b"MusicBrainz release added and selected. No files were changed." in modal
-    assert b'class="browser-actions review-footer"' in modal
-    assert b'data-review-decision="rejected"' not in modal
-    assert b'id="library-import-in-place" class="approve-button" aria-busy="false"' in modal
-    assert b'class="button-spinner" aria-hidden="true" hidden' in modal
-    assert b'class="button-label">Import' in modal
-    assert b'The candidate details and track changes above are the review.' not in modal
-    assert b'id="library-import-success" class="import-success" role="status"' in html
-    assert b'Skip for now' not in modal
-    assert b'id="library-import-preview"' not in modal
-    assert b'id="library-import-execution-apply"' not in modal
-    assert b"Confirm import" not in modal
-    assert b'Queue import' not in modal
-    assert b"/api/library-import/albums/${activeAlbum.id}/preview" not in modal
-    assert b"if (event.key === 'Escape')" in modal
-    assert b"event.key !== 'Tab'" in modal
-    assert b"returnFocus.focus()" in modal
-    assert b'.candidate-option[open]' in html
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
-def test_candidate_track_evidence_is_text_only_when_all_tracks_match(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    start = html.index("function renderTrackChangeFact")
-    end = html.index("function candidateFacts", start)
-    helper = html[start:end]
-    probe = """
-const created = [];
-const modalCalls = [];
-globalThis.document = {
-  createElement(tagName) {
-    const element = {
-      tagName,
-      attributes: {},
-      listeners: {},
-      setAttribute(name, value) { this.attributes[name] = value; },
-      addEventListener(name, listener) { this.listeners[name] = listener; },
-    };
-    created.push(element);
-    return element;
-  },
-};
-globalThis.openTrackComparison = (...args) => modalCalls.push(args);
-function destination() {
-  return {textContent: '', children: [], append(child) { this.children.push(child); }};
-}
-const matched = destination();
-renderTrackChangeFact(matched, {changeCount: 0, tracks: []}, {artist: 'Artist', album: 'Album'});
-const changed = destination();
-const tracks = [{local: 'Old', proposed: 'New'}];
-renderTrackChangeFact(changed, {changeCount: 1, tracks}, {artist: 'Artist', album: 'Album'});
-changed.children[0].listeners.click();
-console.log(JSON.stringify({
-  matched: {textContent: matched.textContent, childCount: matched.children.length},
-  changed: {
-    textContent: changed.children[0].textContent,
-    className: changed.children[0].className,
-    hasPopup: changed.children[0].attributes['aria-haspopup'],
-    childCount: changed.children.length,
-  },
-  createdCount: created.length,
-  modalCall: {tracks: modalCalls[0][0], title: modalCalls[0][1], returnControlMatches: modalCalls[0][2] === changed.children[0]},
-}));
-"""
-    completed = subprocess.run(["node", "-e", f"{helper}\n{probe}"], check=True, capture_output=True, text=True)
-
-    assert json.loads(completed.stdout) == {
-        "matched": {"textContent": "All tracks matched", "childCount": 0},
-        "changed": {
-            "textContent": "View track changes (1)",
-            "className": "track-change-button",
-            "hasPopup": "dialog",
-            "childCount": 1,
-        },
-        "createdCount": 1,
-        "modalCall": {"tracks": [{"local": "Old", "proposed": "New"}], "title": "Artist — Album", "returnControlMatches": True},
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared review output")
+def test_library_and_inbox_use_one_structured_review_presentation(tmp_path):
+    client = make_app(tmp_path).test_client()
+    settings = client.get("/settings").get_data(as_text=True)
+    inbox = client.get("/inbox").get_data(as_text=True)
+    assert 'src="/static/review-presentation.js"' in settings
+    assert 'src="/static/review-presentation.js"' in inbox
+    assert "window.CratekeepReview.renderCandidates" in settings
+    assert "window.CratekeepReview.renderCandidates" in inbox
+    module = Path("beets_mvp/static/review-presentation.js").read_text()
+    fixture = {
+        "current_metadata":{"artist":"Local Artist","album":"Local Album","genre":"Rock","year":"2001"},
+        "tracks":[{"id":1}],
     }
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
-def test_candidate_evidence_uses_release_year_and_identifies_changed_tracks(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    start = html.index("function metadataChanged")
-    end = html.index("function candidateFacts", start)
-    helpers = html[start:end]
-    probe = """
-const result = {
-  years: [
-    candidateReleaseYear({date: '2024-03-17'}),
-    candidateReleaseYear({year: '1999', date: '1999-12-31'}),
-    candidateReleaseYear({year: 'unknown', date: '2003-08-04'}),
-    candidateReleaseYear({date: 'not provided'}),
-  ],
-  yearEvidence: [
-    releaseYearEvidence({year:'2021'}, {date:'2022-03-04'}),
-    releaseYearEvidence({date:'2022-01-01'}, {year:'2022'}),
-    releaseYearEvidence({year:null}, {year:'2024'}),
-  ],
-  changes: changedTrackEvidence([
-    {local:'Old title', proposed:'New title', current_position:[1,1], proposed_position:[1,2], local_duration:120, proposed_duration:130, status:'title-mismatch'},
-    {local:'Part 1: Intro', proposed:'Part 1 — Intro', current_position:[1,2], proposed_position:[1,2], local_duration:90, proposed_duration:90, status:'title-mismatch'},
-    {local:"Don't Stop", proposed:'Don’t Stop', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:180, status:'matched'},
-    {local:'He Said "Go"', proposed:'He Said “Go”', current_position:[1,4], proposed_position:[1,4], local_duration:180, proposed_duration:180, status:'matched'},
-    {local:"Don't Stop", proposed:'Doesn’t Stop', current_position:[1,5], proposed_position:[1,5], local_duration:180, proposed_duration:180, status:'title-mismatch'},
-    {local:'Same', proposed:'Same', current_position:[1,3], proposed_position:[1,3], local_duration:180, proposed_duration:181, status:'matched'},
-    {local:'Artist only', proposed:'Artist only', local_artist:'Lead', proposed_artist:'Lead feat. Guest', current_position:[1,6], proposed_position:[1,6], local_duration:180, proposed_duration:180, status:'matched'},
-    {local:'Old both', proposed:'New both', local_artist:'Lead', proposed_artist:'Lead feat. Guest', current_position:[1,7], proposed_position:[1,7], local_duration:180, proposed_duration:180, status:'matched'},
-    {local:null, proposed:'Bonus', current_position:null, proposed_position:[2,1], local_duration:null, proposed_duration:90, status:'extra'},
-  ]).map(track => ({local:track.local, proposed:track.proposed, localPosition:track.localPosition,
-    local_artist:track.local_artist ?? null, proposed_artist:track.proposed_artist ?? null, artistChanged:track.artistChanged,
-    proposedPosition:track.proposedPosition, durationDelta:track.durationDelta, explanations:track.explanations})),
-  compact: trackEvidence([
-    {local:'Same', proposed:'Same', current_position:[1,1], proposed_position:[1,1], local_duration:180, proposed_duration:null, status:'matched'},
-  ])[0].explanations,
-};
-console.log(JSON.stringify(result));
-"""
-    completed = subprocess.run(["node", "-e", f"{helpers}\n{probe}"], check=True, capture_output=True, text=True)
-
-    assert json.loads(completed.stdout) == {
-        "years": ["2024", "1999", "2003", ""],
-        "yearEvidence": [
-            {"localYear": "2021", "proposedYear": "2022", "changed": True, "value": "2021 → 2022"},
-            {"localYear": "2022", "proposedYear": "2022", "changed": False, "value": "2022"},
-            {"localYear": "", "proposedYear": "2024", "changed": True, "value": "Not provided → 2024"},
-        ],
-        "changes": [
-            {"local": "Old title", "proposed": "New title", "local_artist": None, "proposed_artist": None, "artistChanged": False,
-             "localPosition": "1.01", "proposedPosition": "1.02", "durationDelta": 10,
-             "explanations": ["Title differs: local “Old title” → MusicBrainz “New title”.",
-                              "Position differs: local 1.01 → MusicBrainz 1.02.",
-                              "Duration differs: local 2:00 → MusicBrainz 2:10 (10 seconds longer)."]},
-            {"local": "Part 1: Intro", "proposed": "Part 1 — Intro", "local_artist": None, "proposed_artist": None, "artistChanged": False, "localPosition": "1.02", "proposedPosition": "1.02", "durationDelta": 0,
-             "explanations": ["Title punctuation or formatting differs: local “Part 1: Intro” → MusicBrainz “Part 1 — Intro”."]},
-            {"local": "Don't Stop", "proposed": "Doesn’t Stop", "local_artist": None, "proposed_artist": None, "artistChanged": False, "localPosition": "1.05", "proposedPosition": "1.05", "durationDelta": 0,
-             "explanations": ["Title differs: local “Don't Stop” → MusicBrainz “Doesn’t Stop”."]},
-            {"local": "Artist only", "proposed": "Artist only", "local_artist": "Lead", "proposed_artist": "Lead feat. Guest", "artistChanged": True,
-             "localPosition": "1.06", "proposedPosition": "1.06", "durationDelta": 0,
-             "explanations": ["Artist differs: local “Lead” → proposed “Lead feat. Guest”."]},
-            {"local": "Old both", "proposed": "New both", "local_artist": "Lead", "proposed_artist": "Lead feat. Guest", "artistChanged": True,
-             "localPosition": "1.07", "proposedPosition": "1.07", "durationDelta": 0,
-             "explanations": ["Title differs: local “Old both” → MusicBrainz “New both”.", "Artist differs: local “Lead” → proposed “Lead feat. Guest”."]},
-            {"local": None, "proposed": "Bonus", "local_artist": None, "proposed_artist": None, "artistChanged": False, "localPosition": "", "proposedPosition": "2.01", "durationDelta": None,
-             "explanations": ["MusicBrainz track is not present locally.", "Local duration unavailable."]},
-        ],
-        "compact": [],
+    candidate = {
+        "artist":"Online Artist","album":"Online Album","genre":"Jazz","year":"2002",
+        "provider_id":"release-id","release_type":"Album","country":"GB",
+        "media":[{"format":"CD"}],
+        "track_details":[{"status":"matched","local":"Old title","proposed":"New title",
+                           "local_artist":"Local Artist","proposed_artist":"Online Artist",
+                           "current_position":[1,1],"proposed_position":[1,1],
+                           "local_duration":60,"proposed_duration":70}],
     }
+    probe = f"""
+globalThis.window = globalThis;
+{module}
+const facts = window.CratekeepReview.describeCandidate({json.dumps(fixture)}, {json.dumps(candidate)});
+process.stdout.write(JSON.stringify(facts.map(f => ({{label:f.label,value:f.value,changed:f.changed,tracks:(f.tracks||[]).map(t => ({{titleChanged:t.titleChanged,durationChanged:t.durationChanged,explanations:t.explanations}}))}}))));
+"""
+    completed = subprocess.run([shutil.which("node"), "-"], input=probe, text=True, capture_output=True)
+    assert completed.returncode == 0, completed.stderr
+    facts = {fact["label"]: fact for fact in json.loads(completed.stdout)}
+    assert set(facts) >= {"Artist", "Album", "Genre", "Release Year", "Tracks changed",
+                          "Release Type/media", "Release Region", "Local tracks found online",
+                          "Online tracks present locally"}
+    assert facts["Artist"]["changed"] and facts["Release Year"]["changed"]
+    changed_track = facts["Tracks changed"]["tracks"][0]
+    assert changed_track["titleChanged"] and changed_track["durationChanged"]
+    assert any("Title differs" in item for item in changed_track["explanations"])
+
+
+def test_album_review_modal_uses_shared_presentation_and_accessible_shell(tmp_path):
+    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    modal = html[html.index('id="library-import-modal"'):]
+    shared_js = Path("beets_mvp/static/review-presentation.js").read_text()
+    shared_css = Path("beets_mvp/static/review-presentation.css").read_text()
+
+    for contract in (
+        'role="dialog" aria-modal="true"', 'aria-labelledby="library-import-modal-title"',
+        'aria-describedby="library-import-modal-description"', 'role="radiogroup"',
+        'id="track-comparison-modal"', 'aria-labelledby="track-comparison-title"',
+        'aria-describedby="track-comparison-description"', 'id="library-import-mbid-modal"',
+        'id="library-import-in-place" class="approve-button" aria-busy="false"',
+    ):
+        assert contract in modal
+    for contract in (
+        "function renderCandidates", "function renderTrackRows", "className = 'candidate-option'",
+        "className='candidate-fact'", "className='track-change-button'", "aria-haspopup','dialog'",
+        "className='track-row-unmatched'", "classList.add('track-field-changed')",
+        "className='track-explanation-row'", "label:'Release Type/media'",
+        "label:'Release Region'", "label:'Local tracks found online'", "label:'Online tracks present locally'",
+    ):
+        assert contract in shared_js
+    for selector in (
+        '.candidate-option[open]', '.candidate-fact[data-changed="true"]', '.track-change-button:focus-visible',
+        '.track-comparison-table', '.track-field-changed', '.track-explanation-row td',
+    ):
+        assert selector in shared_css
+    assert "window.CratekeepReview.renderCandidates" in modal
+    assert "window.CratekeepReview.renderTrackRows" in modal
+    assert "reviewDialog.inert = true" in modal and "trackComparisonReturnFocus.focus()" in modal
+    assert "event.stopPropagation(); closeTrackComparison()" in modal
+    assert "if (event.key === 'Escape')" in modal and "event.key !== 'Tab'" in modal
+    assert "returnFocus.focus()" in modal
+    assert 'class="button-spinner" aria-hidden="true" hidden' in modal
+    assert "library-import-queue" not in modal and "Confirm import" not in modal
+
+
+def test_review_presentation_has_one_renderer_and_one_common_stylesheet():
+    settings = Path("beets_mvp/templates/settings.html").read_text()
+    inbox = Path("beets_mvp/templates/inbox.html").read_text()
+    shared_js = Path("beets_mvp/static/review-presentation.js").read_text()
+    shared_css = Path("beets_mvp/static/review-presentation.css").read_text()
+
+    assert settings.count("window.CratekeepReview.renderCandidates") == 1
+    assert inbox.count("window.CratekeepReview.renderCandidates") == 1
+    assert settings.count("window.CratekeepReview.renderTrackRows") == 1
+    assert inbox.count("window.CratekeepReview.renderTrackRows") == 1
+    assert shared_js.count("function renderCandidates") == 1
+    assert shared_js.count("function renderTrackRows") == 1
+    for dead_definition in (
+        "candidateIconPaths", "function candidateFacts", "function candidateIcon",
+        "function trackEvidence", "function appendTrackCell", "function appendTrackMetadataCell",
+        "function matchScorePresentation",
+    ):
+        assert dead_definition not in settings
+        assert dead_definition not in inbox
+    assert not re.search(r"CratekeepReview\.renderCandidates\(\{.*?\}\);\s*return;", settings, re.S)
+
+    inline_styles = "\n".join(re.findall(r"<style>(.*?)</style>", settings + inbox, re.S))
+    definitive_selectors = (
+        ".candidate-option", ".candidate-option-summary", ".candidate-confidence",
+        ".candidate-signals", ".candidate-fact", ".candidate-artwork",
+        ".track-change-button", ".track-comparison-table", ".track-field-changed",
+        ".track-explanation-row", ".score-pill[data-band", ".confidence-band[data-band",
+    )
+    for selector in definitive_selectors:
+        assert selector in shared_css
+        assert selector not in inline_styles
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared review helpers")
+def test_shared_track_evidence_identifies_only_material_changes():
+    module = Path("beets_mvp/static/review-presentation.js").read_text()
+    tracks = [
+        {"local":"Old title","proposed":"New title","current_position":[1,1],"proposed_position":[1,2],"local_duration":120,"proposed_duration":130,"status":"title-mismatch"},
+        {"local":"Part 1: Intro","proposed":"Part 1 — Intro","current_position":[1,2],"proposed_position":[1,2],"local_duration":90,"proposed_duration":90,"status":"title-mismatch"},
+        {"local":"Don't Stop","proposed":"Don’t Stop","current_position":[1,3],"proposed_position":[1,3],"local_duration":180,"proposed_duration":180,"status":"matched"},
+        {"local":"Artist only","proposed":"Artist only","local_artist":"Lead","proposed_artist":"Lead feat. Guest","current_position":[1,4],"proposed_position":[1,4],"local_duration":180,"proposed_duration":180,"status":"matched"},
+        {"local":None,"proposed":"Bonus","current_position":None,"proposed_position":[2,1],"local_duration":None,"proposed_duration":90,"status":"extra"},
+    ]
+    probe = f"""
+globalThis.window = globalThis;
+{module}
+const result = window.CratekeepReview.trackEvidence({json.dumps(tracks)});
+process.stdout.write(JSON.stringify({{changed:result.filter(t => t.titleChanged || t.artistChanged || t.positionChanged || t.durationChanged || t.unpaired), score:window.CratekeepReview.score(.901)}}));
+"""
+    completed = subprocess.run([shutil.which("node"), "-"], input=probe, text=True, capture_output=True)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert len(result["changed"]) == 4
+    assert result["score"] == {"band": "high", "label": "90.1%", "accessibleLabel": "90.1% match confidence; meets the initial auto-import indicator threshold"}
+    assert result["changed"][0]["explanations"] == [
+        "Title differs: local “Old title” → MusicBrainz “New title”.",
+        "Position differs: local 1.01 → MusicBrainz 1.02.",
+        "Duration differs: local 2:00 → MusicBrainz 2:10 (10 seconds longer).",
+    ]
+    assert result["changed"][-1]["explanations"] == [
+        "MusicBrainz track is not present locally.", "Local duration unavailable.",
+    ]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
 def test_library_inventory_score_bands_and_status_semantics(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    module = Path("beets_mvp/static/review-presentation.js").read_text()
     start = html.index("function albumInventoryStatus")
     end = html.index("function renderReviewItems", start)
     helpers = html[start:end]
     probe = """
 const result = {
-  scores: [0.7499, 0.75, 0.8999, 0.90].map(matchScorePresentation),
+  scores: [0.7499, 0.75, 0.8999, 0.90].map(window.CratekeepReview.score),
   statuses: [
     albumInventoryStatus({decision: 'approved'}, []),
     albumInventoryStatus(null, [{status: 'tracked'}]),
@@ -829,7 +786,8 @@ const result = {
 console.log(JSON.stringify(result));
 """
     completed = subprocess.run(
-        [shutil.which("node"), "--input-type=module", "--eval", helpers + probe],
+        [shutil.which("node"), "--input-type=module", "--eval",
+         "globalThis.window=globalThis;\n" + module + "\n" + helpers + probe],
         check=True, capture_output=True, text=True,
     )
     result = json.loads(completed.stdout)
@@ -846,6 +804,7 @@ console.log(JSON.stringify(result));
 
 def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styles(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    shared_css = Path("beets_mvp/static/review-presentation.css").read_text()
 
     assert "% best match" not in html
     assert "score.dataset.band = scorePresentation.band" in html
@@ -861,8 +820,8 @@ def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styl
         "high": ("#fff", "#067647"),
     }
     for band, (foreground, background) in palette.items():
-        assert f'.score-pill[data-band="{band}"]' in html
-        assert f"color:{foreground}; background:{background};" in html
+        assert f'.score-pill[data-band="{band}"]' in shared_css
+        assert f"color:{foreground};background:{background}" in shared_css
         assert _contrast_ratio(foreground, background) >= 4.5
 
     status_palettes = [
@@ -2416,7 +2375,7 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
     assert b"<span>Tracks</span><strong>4</strong>" in page.data
     assert b"<span>Albums</span><strong>2</strong>" in page.data
     assert b"<span>Artists</span><strong>2</strong>" in page.data
-    assert b"<span>Library size</span><strong>&lt;0.1 MB</strong>" in page.data
+    assert b"<span>Library size</span><strong>\xe2\x80\x94</strong>" in page.data
     assert len(discoveries) == 2
     assert b"Top artists" in page.data and b"Recently added albums" in page.data
     assert b'name="q" type="search"' in page.data
@@ -2464,6 +2423,33 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
     assert blocked.status_code == 409 and blocked.json["code"] == "managed_path_invalid"
     assert library.get_item(stale.id).title == "0 Missing Song"
     assert (root / "a.mp3").read_bytes() == valid_before
+
+
+def test_large_library_landing_file_work_is_bounded_to_visible_album_page(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    root = tmp_path / "library"
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    for number in range(80):
+        path = root / f"Artist {number:03d}" / f"Album {number:03d}" / "01 Song.wav"
+        write_wav(path)
+        library.add_album([Item(
+            title="Song", artist=f"Artist {number:03d}", albumartist=f"Artist {number:03d}",
+            album=f"Album {number:03d}", path=str(path),
+        )])
+    original_stat = Path.stat
+    audio_stats = []
+    def counted_stat(path, *args, **kwargs):
+        if path.suffix == ".wav":
+            audio_stats.append(path)
+        return original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "stat", counted_stat)
+
+    page = app.test_client().get("/library")
+
+    assert page.status_code == 200
+    assert b"Showing 1\xe2\x80\x9325 of 80 matching albums" in page.data
+    assert len(set(audio_stats)) <= 30
+    assert len(audio_stats) <= 150
 
 
 def managed_wav_album(app, tmp_path, *, artist="Artist", album_name="Album", titles=("First", "Second")):
@@ -3582,9 +3568,10 @@ def test_rematch_wrong_release_id_stays_selected_with_low_evidence_confidence(tm
 
 def test_library_import_review_markup_is_album_folder_first(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
+    shared = Path("beets_mvp/static/review-presentation.js").read_bytes()
 
-    assert b"document.createElement('details')" in html
-    assert b"document.createElement('summary')" in html
+    assert b"document.createElement('details')" in shared
+    assert b"document.createElement('summary')" in shared
     assert b"review-folder" in html and b"review-album" in html
     assert b"albumReviews.map(renderAlbum)" in html
     assert b"path.textContent = folderPath === '.' ? 'Library root' : folderPath" in html
@@ -3607,17 +3594,18 @@ def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_pat
 
 def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
+    shared = Path("beets_mvp/static/review-presentation.js").read_bytes()
 
     assert b'id="library-import-modal-candidates"' in html
     assert b'id="library-import-modal-proposed"' not in html
     assert b'id="library-import-modal-tracks"' not in html
     assert b'role="radiogroup" aria-label="Album metadata candidates"' in html
-    assert b"summary.setAttribute('role', 'radio')" in html
-    assert b"label:'Release Type/media'" in html
-    assert b"label:'Tracks changed'" in html
-    assert b"Not applicable \xe2\x80\x94 As Is" in html
+    assert b"summary.setAttribute('role','radio')" in shared
+    assert b"label:'Release Type/media'" in shared
+    assert b"label:'Tracks changed'" in shared
+    assert b"Not applicable \xe2\x80\x94 As Is" in shared
     assert b"Math.round(candidate.confidence" not in html
-    assert b"candidates.querySelector('[aria-checked=\"true\"]')?.focus()" in html
+    assert b"container.querySelector('[aria-checked=\"true\"]')?.focus()" in shared
     assert b'id="library-import-open-mbid-search"' in html
     assert b'id="library-import-mbid-modal"' in html
     assert b'id="library-import-rematch-form"' not in html
@@ -3640,7 +3628,7 @@ def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     assert b"renderTrackList" not in html
     assert b"const sourcePaths = albumReview.source_paths.length ? albumReview.source_paths : ['.']" in html
     assert b"status.className = 'status-pill'" in html
-    assert b"matchScorePresentation(albumReview?.highest_confidence)" in html
+    assert b"window.CratekeepReview.score(albumReview.highest_confidence)" in html
     assert b"score.dataset.band = scorePresentation.band" in html
     assert b"Albums ${pageStart}\xe2\x80\x93${pageEnd} of ${reviewTotalAlbums}" in html
     assert b'aria-label="Previous page"' in html and b'aria-label="Next page"' in html
@@ -3815,8 +3803,7 @@ def test_duplicate_warning_is_preflighted_and_gates_direct_import(tmp_path):
 
 
 def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    candidate_ui = html[html.index(b"const candidateIconPaths"):html.index(b"function openReview")]
+    candidate_ui = Path("beets_mvp/static/review-presentation.js").read_bytes()
 
     for label in (
         b"Artist", b"Album", b"Genre", b"Release Year", b"Tracks changed",
@@ -3826,10 +3813,10 @@ def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
         assert label in candidate_ui
     for omitted in (
         b"Duration delta", b"Release ID", b"Release group ID", b"Proposed position",
-        b"Current duration", b"Label", b"Barcode", b"matching service",
+        b"Current duration", b"Barcode", b"matching service",
     ):
         assert omitted not in candidate_ui
-    assert b"candidateIconPaths" in candidate_ui
+    assert b"const iconPaths" in candidate_ui
     assert b"candidate-signals" in candidate_ui
     assert b"candidate-fact" in candidate_ui
     assert b"document.createElement('details')" in candidate_ui
@@ -3837,14 +3824,13 @@ def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
 
 
 def test_album_modal_candidate_rows_keep_numeric_score_selected_state_and_artwork(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
+    shared = Path("beets_mvp/static/review-presentation.js").read_bytes()
 
-    assert b"const scorePresentation = matchScorePresentation(value.confidence)" in html
-    assert b"${selected ? 'Selected \xc2\xb7 ' : ''}${scorePresentation?.label" in html
-    assert b"detail.open = selected" in html
-    assert b"detail.setAttribute('aria-current', String(selected))" in html
-    assert b"if (value.artwork_url)" in html
-    assert b"artwork.src = value.artwork_url" in html
+    assert b"const presentation = score(value.confidence)" in shared
+    assert b"details.open = selected" in shared
+    assert b"details.setAttribute('aria-current', String(selected))" in shared
+    assert b"if(value.artwork_url)" in shared
+    assert b"artwork.src=value.artwork_url" in shared
 
 
 def test_library_import_operations_expose_visible_live_progress(tmp_path):
@@ -3899,8 +3885,9 @@ def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_sc
     }
 
     html = client.get("/settings").data
-    assert b"if (value.artwork_url)" in html
-    assert b"artwork.src = value.artwork_url" in html
+    shared = Path("beets_mvp/static/review-presentation.js").read_bytes()
+    assert b"if(value.artwork_url)" in shared
+    assert b"artwork.src=value.artwork_url" in shared
     assert b"const asIs = {...current, id:'as-is', is_as_is:true, duplicate_preflight:activeAlbum?.duplicate_preflight};" in html
     assert b"artwork_url:null" not in html
     assert b"innerHTML" not in html
@@ -4923,6 +4910,234 @@ def test_inbox_stat_identical_scan_avoids_tag_and_provider_reads(tmp_path, monke
     assert second["id"] == first["id"] and second["candidate_status"] == "not-run"
 
 
+def test_inbox_landing_is_collapsed_and_never_scans_until_named_section_expands(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    tagged_inbox_wav(tmp_path / "inbox" / "Deferred" / "01 Song.wav")
+    monkeypatch.setattr("beets_mvp._scan_inbox_inventory", lambda *args: pytest.fail("landing scanned inbox"))
+
+    page = app.test_client().get("/inbox")
+
+    assert page.status_code == 200
+    assert b'data-inbox-toggle' in page.data and b'aria-expanded="false"' in page.data
+    assert b'class="album-list" data-album-list hidden' in page.data
+    assert b"Never scanned" in page.data
+    assert b"0 items" in page.data and b"built-in method items" not in page.data
+    assert b"/api/inbox/scan" in page.data
+
+
+def test_shell_remains_responsive_while_scoped_inbox_scan_is_held(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    def held_scan(current_app, inbox):
+        started.set()
+        assert release.wait(5)
+        return {"files": 0, "bytes": 0, "changed": 0}
+    monkeypatch.setattr("beets_mvp._scan_inbox_inventory", held_scan)
+    inbox_id = app.config["INBOXES"][0]["id"]
+    responses = []
+    worker = threading.Thread(target=lambda: responses.append(
+        app.test_client().post("/api/inbox/scan", json={"inbox_id": inbox_id})
+    ))
+    worker.start()
+    assert started.wait(2)
+    began = time.monotonic()
+    shell = app.test_client().get("/inbox")
+    elapsed = time.monotonic() - began
+    release.set()
+    worker.join(5)
+    assert shell.status_code == 200 and elapsed < .5
+    assert not worker.is_alive() and responses[0].status_code == 200
+
+
+def test_overview_never_scans_or_calls_provider_while_inbox_scan_is_held(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    def held_scan(current_app, inbox):
+        started.set()
+        assert release.wait(5)
+        return {"files": 0, "bytes": 0, "changed": 0}
+    monkeypatch.setattr("beets_mvp._scan_inbox_inventory", held_scan)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda *args, **kwargs: pytest.fail("overview called provider")
+    inbox_id = app.config["INBOXES"][0]["id"]
+    worker = threading.Thread(target=lambda: app.test_client().post(
+        "/api/inbox/scan", json={"inbox_id": inbox_id, "page": 1, "refresh": True},
+    ))
+    worker.start()
+    assert started.wait(2)
+    began = time.monotonic()
+    overview = app.test_client().get("/")
+    elapsed = time.monotonic() - began
+    release.set(); worker.join(5)
+    assert overview.status_code == 200 and elapsed < .5
+    assert b'id="sidebar"' in overview.data
+
+
+def test_large_inbox_scan_serializes_only_requested_25_album_page(tmp_path):
+    app = make_app(tmp_path)
+    for index in range(60):
+        tagged_inbox_wav(
+            tmp_path / "inbox" / f"Album {index:02d}" / "01 Song.wav",
+            artist=f"Artist {index:02d}", album=f"Album {index:02d}",
+        )
+    client = app.test_client(); inbox_id = app.config["INBOXES"][0]["id"]
+    first = client.post("/api/inbox/scan", json={"inbox_id":inbox_id,"page":1,"refresh":True})
+    second = client.post("/api/inbox/scan", json={"inbox_id":inbox_id,"page":2,"refresh":False})
+    assert first.status_code == second.status_code == 200
+    first_group, second_group = first.json["inboxes"][0], second.json["inboxes"][0]
+    assert (first_group["total_albums"], first_group["page_count"], len(first_group["albums"])) == (60, 3, 25)
+    assert (second_group["total_albums"], second_group["page"], len(second_group["albums"])) == (60, 2, 25)
+    assert {album["id"] for album in first_group["albums"]}.isdisjoint(
+        album["id"] for album in second_group["albums"]
+    )
+    assert len(first.data) < 250_000 and len(second.data) < 250_000
+
+
+def test_per_inbox_auto_match_isolated_match_only_and_reload_idempotent(tmp_path):
+    app = make_app(tmp_path)
+    roots = [tmp_path / "inbox", tmp_path / "inbox-two"]
+    roots[1].mkdir()
+    for root, artist in zip(roots, ("Enabled Artist", "Disabled Artist")):
+        tagged_inbox_wav(root / "Shared Folder" / "01 Song.wav", artist=artist, album="Shared Album")
+    configure_named_inboxes(app, roots, ["Enabled", "Disabled"])
+    enabled, disabled = app.config["INBOXES"]
+    configure_named_inboxes(
+        app, roots, ["Enabled", "Disabled"], inbox_auto_match_id=enabled["id"],
+    )
+    assert [row["auto_match"] for row in app.config["INBOXES"]] == [True, False]
+    before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for root in roots for path in root.rglob("*.wav")
+    }
+    calls, active, maximum = [], 0, 0
+    lock = threading.Lock()
+    def provider(query, *, limit):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            calls.append(query["artist"])
+            time.sleep(.02)
+            return [exact_candidate(query, f"release-{query['artist']}")]
+        finally:
+            with lock:
+                active -= 1
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    client = app.test_client()
+
+    albums = client.get("/api/inbox/reviews").json["albums"]
+    deadline = time.monotonic() + 5
+    while app.config["INBOX_MATCH_RUNNING"] and time.monotonic() < deadline:
+        time.sleep(.01)
+    refreshed = client.get("/api/inbox/reviews").json["albums"]
+    by_source = {album["source_id"]: album for album in refreshed}
+    assert len({album["id"] for album in albums}) == 2
+    assert by_source[enabled["id"]]["candidate_status"] == "complete"
+    assert by_source[disabled["id"]]["candidate_status"] == "not-run"
+    assert calls == ["Enabled Artist"] and maximum == 1
+
+    manual = client.post("/api/inbox/candidates", json={"album_id": by_source[disabled["id"]]["id"]})
+    assert manual.status_code == 201 and calls == ["Enabled Artist", "Disabled Artist"]
+    client.get("/api/inbox/reviews")
+    assert calls == ["Enabled Artist", "Disabled Artist"]
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM metadata_candidates").fetchone()[0] == 2
+    assert before == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before}
+    assert list((tmp_path / "library").iterdir()) == []
+
+
+def test_large_multi_inbox_auto_match_batches_isolates_retries_and_never_mutates(tmp_path):
+    app = make_app(tmp_path)
+    roots = [tmp_path / "inbox", tmp_path / "inbox-two", tmp_path / "inbox-three"]
+    roots[1].mkdir(); roots[2].mkdir()
+    counts = [30, 15, 15]
+    for source_index, (root, count) in enumerate(zip(roots, counts)):
+        for index in range(count):
+            # Folder names intentionally collide across roots; source identity must not.
+            tagged_inbox_wav(
+                root / f"Shared {index:02d}" / "01 Song.wav",
+                artist=f"S{source_index}-Artist-{index:02d}", album=f"Album {index:02d}",
+            )
+    configure_named_inboxes(app, roots, ["Enabled A", "Enabled B", "Disabled"])
+    enabled_a, enabled_b, disabled = app.config["INBOXES"]
+    configure_named_inboxes(
+        app, roots, ["Enabled A", "Enabled B", "Disabled"],
+        inbox_auto_match_id=[enabled_a["id"], enabled_b["id"]],
+    )
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+              for root in roots for path in root.rglob("*") if path.is_file()}
+    first_started, release_first = threading.Event(), threading.Event()
+    calls, active, maximum, retry_errors = [], 0, 0, False
+    lock = threading.Lock()
+    def provider(query, *, limit):
+        nonlocal active, maximum
+        key = query["artist"]
+        with lock:
+            active += 1; maximum = max(maximum, active); calls.append(key)
+            call_number = len(calls)
+        try:
+            if call_number == 1:
+                first_started.set(); assert release_first.wait(5)
+            index = int(key.rsplit("-", 1)[1])
+            if index % 11 == 7:
+                return []
+            if index % 13 == 5 and not retry_errors:
+                raise ProviderError("deterministic retry case")
+            return [exact_candidate(query, f"release-{key}")]
+        finally:
+            with lock: active -= 1
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    client = app.test_client()
+    scanned = client.get("/api/inbox/reviews")
+    assert scanned.status_code == 200 and first_started.wait(2)
+    second_page = client.post("/api/inbox/scan", json={
+        "inbox_id":enabled_a["id"], "page":2, "refresh":False,
+    }).json["inboxes"][0]
+    assert sum(group["total_albums"] for group in scanned.json["inboxes"]) == 60
+    albums = scanned.json["albums"] + second_page["albums"]
+    assert len(albums) == 60 and len({album["id"] for album in albums}) == 60
+    disabled_album = next(album for album in albums if album["source_id"] == disabled["id"])
+    manual_responses = []
+    manual = threading.Thread(target=lambda: manual_responses.append(
+        app.test_client().post("/api/inbox/candidates", json={"album_id":disabled_album["id"]})
+    ))
+    manual.start(); release_first.set(); manual.join(10)
+    assert not manual.is_alive() and manual_responses[0].status_code == 201
+    deadline = time.monotonic() + 15
+    while app.config["INBOX_MATCH_RUNNING"] and time.monotonic() < deadline:
+        threading.Event().wait(.01)
+    assert app.config["INBOX_MATCH_RUNNING"] is False and maximum == 1
+    automatic_calls = [key for key in calls if not key.startswith("S2-")]
+    assert len(automatic_calls) == 45 and len(set(automatic_calls)) == 45
+    assert [key for key in calls if key.startswith("S2-")] == [disabled_album["artist"]]
+
+    reloaded = client.get("/api/inbox/reviews").json["albums"]
+    reloaded += client.post("/api/inbox/scan", json={
+        "inbox_id":enabled_a["id"], "page":2, "refresh":False,
+    }).json["inboxes"][0]["albums"]
+    assert len(calls) == 46
+    by_source = {source_id: [album for album in reloaded if album["source_id"] == source_id]
+                 for source_id in (enabled_a["id"], enabled_b["id"], disabled["id"])}
+    assert len(by_source[enabled_a["id"]]) == 30 and len(by_source[enabled_b["id"]]) == 15
+    assert all(album["candidate_status"] == "not-run" for album in by_source[disabled["id"]]
+               if album["id"] != disabled_album["id"])
+    failures = [album for album in reloaded if album["candidate_status"] == "error"]
+    failed_call_counts = {album["artist"]: calls.count(album["artist"]) for album in failures}
+    assert failures and set(failed_call_counts.values()) == {1}
+    retry_errors = True
+    retried = client.post("/api/inbox/candidates", json={"album_id":failures[0]["id"]})
+    assert retried.status_code == 201 and calls.count(failures[0]["artist"]) == 2
+    assert all(calls.count(album["artist"]) == 1 for album in failures[1:])
+
+    with sqlite3.connect(app.config["APP_DB"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM adoption_jobs WHERE kind NOT IN ('musicbrainz_candidates','inbox_inventory')").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM album_reviews WHERE state!='pending'").fetchone()[0] == 0
+    assert before == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before}
+    assert list((tmp_path / "library").iterdir()) == []
+
+
 def test_inbox_manual_match_uses_shared_candidate_and_never_auto_approves(tmp_path):
     app = make_app(tmp_path)
     tagged_inbox_wav(tmp_path / "inbox" / "Manual" / "01 Song.wav")
@@ -4966,7 +5181,7 @@ def test_inbox_auto_match_setting_defaults_off_and_only_schedules_lookup(tmp_pat
     inbox = app.config["INBOXES"][0]
     response = client.post("/settings", data={
         "inbox_id":[inbox["id"]], "inbox_name":[inbox["name"]], "inbox_path":[inbox["path"]],
-        "library_path":app.config["LIBRARY_PATH"], "inbox_auto_match":"1",
+        "library_path":app.config["LIBRARY_PATH"], "inbox_auto_match_id":inbox["id"],
     })
     assert response.status_code == 302 and app.config["INBOX_AUTO_MATCH"] is True
     client.get("/api/inbox/reviews")
@@ -5752,14 +5967,18 @@ def test_inbox_modal_contains_library_review_evidence_and_supported_duplicate_po
     client = make_app(tmp_path).test_client()
     inbox = client.get("/inbox").get_data(as_text=True)
     settings = client.get("/settings").get_data(as_text=True)
-    for evidence in (
-        "candidate-option", "candidate-confidence", "candidate-fact", "Artist", "Album", "Genre",
-        "Release year", "Release type / media", "Release region", "Local track coverage",
-        "Online track coverage", "View changed tracks", "Exact MusicBrainz release ID",
-        "duplicate", "Approve selection", "button-spinner", "Retry import",
-    ):
-        assert evidence in inbox
-    assert "candidate" in settings and "confidence" in settings and "track" in settings
+    assert 'src="/static/review-presentation.js"' in inbox
+    assert 'src="/static/review-presentation.js"' in settings
+    assert 'href="/static/review-presentation.css"' in inbox
+    assert 'href="/static/review-presentation.css"' in settings
+    assert 'id="candidate-list" class="candidate-list" role="radiogroup"' in inbox
+    assert 'id="library-import-modal-candidates" class="candidate-list" role="radiogroup"' in settings
+    assert "window.CratekeepReview.renderCandidates" in inbox
+    assert "window.CratekeepReview.renderCandidates" in settings
+    assert 'id="track-comparison-modal"' in inbox and 'id="track-comparison-modal"' in settings
+    assert "window.CratekeepReview.renderTrackRows" in inbox
+    assert "window.CratekeepReview.renderTrackRows" in settings
+    assert "function candidateOption" not in inbox
     assert '<option value="keep-both">Keep both' in inbox
     for unsupported in ('value="merge"', 'value="replace"', 'value="skip"'):
         assert unsupported not in inbox
@@ -5767,15 +5986,21 @@ def test_inbox_modal_contains_library_review_evidence_and_supported_duplicate_po
         assert f'id="{shell_control}"' in inbox
     assert "GitHub" in inbox and "Build SHA" in inbox
     assert 'id="inbox-success"' in inbox and "success.focus()" in inbox
-    assert "body:JSON.stringify({inbox_id:album.source_id})" in inbox
+    assert "await loadSource(card" in inbox
     assert "details.length-localMissing" not in inbox
-    assert "meets the initial auto-import indicator threshold" in inbox
-    assert "candidate-signals" in inbox and "candidate-signal" in inbox
-    for evidence in ("Position differs:", "Duration differs:", "Artist differs:"):
-        assert evidence in inbox
+    shared_module = (Path(__file__).parents[1] / "beets_mvp/static/review-presentation.js").read_text()
+    shared_css = (Path(__file__).parents[1] / "beets_mvp/static/review-presentation.css").read_text()
     for band in ("high", "medium", "low"):
-        assert f'.confidence-band[data-band="{band}"]' in inbox
-    assert "String(candidate.year||candidate.date||'').slice(0,4)" in inbox
+        assert f'.confidence-band[data-band="{band}"]' in shared_css
+    assert "const releaseYear" in shared_module
+    assert "setBusy(true,'Finding bounded MusicBrainz candidates…',owner)" in inbox
+    assert "setBusy(true,'Running Beets no-write preflight…',importButton)" in inbox
+    assert "importButton.setAttribute('aria-busy'" not in inbox
+    for shared_class in (
+        "candidate-option", "candidate-confidence", "candidate-signals", "candidate-fact",
+        "track-comparison-table", "track-change-button", "track-cell-changed", "track-explanation-row",
+    ):
+        assert shared_class in shared_module or shared_class in shared_css
 
 
 def test_semantic_button_tokens_meet_normal_contrast_and_pagination_is_four_control(tmp_path):

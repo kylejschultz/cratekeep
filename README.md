@@ -93,7 +93,7 @@ Execution verifies that the previewed files have not changed, then runs `beet im
 - `GET /api/browse?path=/userMedia` — list directories beneath the container's browse root
 - `GET /api/inbox` — legacy immediate selection list across named sources
 - `GET /api/inbox/reviews` — reconcile and list persisted reviewed Inbox albums, scoped by stable source ID and current root
-- `POST /api/inbox/scan` — explicitly reconcile all named Inbox snapshots
+- `POST /api/inbox/scan` — explicitly reconcile one named Inbox when `refresh` is true and return only the requested 25-album `page`; later pages reuse the persisted snapshot
 - `POST /api/inbox/candidates` — bounded manual MusicBrainz lookup for one `album_id`
 - `GET|PATCH /api/inbox/albums/<id>` — read or save candidate/As Is approval, skip, exceptions, and duplicate policy
 - `POST /api/inbox/albums/<id>/rematch` — exact MusicBrainz release UUID lookup through the shared provider/scorer
