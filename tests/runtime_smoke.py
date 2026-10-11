@@ -498,7 +498,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
 
         # Rapid navigation must leave the newest requested page rendered even if
         # the earlier request is aborted or completes after it.
-        page.evaluate("() => { loadFolderItems(2); loadFolderItems(5); }")
+        page.evaluate("() => { libraryFolders.load(2); libraryFolders.load(5); }")
         page.wait_for_function("total => document.getElementById('folder-page-total').textContent === `Page 5 of ${total}`", arg=total_pages)
         page.wait_for_timeout(250)
         assert page.locator("#folder-page-total").inner_text() == f"Page 5 of {total_pages}"
@@ -570,6 +570,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (3)"
         page.get_by_role("checkbox", name="Select folder Queue Error", exact=True).uncheck()
         page.get_by_text("2 folders selected", exact=False).wait_for()
+        page.get_by_text("Review exceptions (2)", exact=True).wait_for()
         assert page.locator("#library-import-review-exceptions").inner_text() == "Review exceptions (2)"
         page.locator("#library-import-review-last").click()
         page.wait_for_function("total => document.getElementById('folder-page-total').textContent === `Page ${total} of ${total}`", arg=total_pages)
@@ -593,25 +594,25 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.screenshot(path=evidence / "03-folder-bulk-import.png", full_page=True)
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/exceptions")) as first_album_info:
             page.locator("#library-import-review-exceptions").click()
-        page.locator("#library-import-modal:not([hidden])").wait_for()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
         first_payload = first_album_info.value.json()["albums"][0]
-        first_exception = page.locator("#library-import-modal-title").inner_text()
+        first_exception = page.locator("[data-review-title]").inner_text()
         page.get_by_role("button", name="Skip", exact=True).click()
-        page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_exception)
-        second_exception = page.locator("#library-import-modal-title").inner_text()
+        page.wait_for_function("title => document.querySelector('[data-review-title]').textContent !== title", arg=first_exception)
+        second_exception = page.locator("[data-review-title]").inner_text()
         assert second_exception != first_exception
-        page.locator("#library-import-modal-close").click()
-        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.locator("[data-review-close]").click()
+        page.locator("[data-review-modal]").wait_for(state="hidden")
 
         # Reopening starts a fresh run. A failed first import stays on the same
         # album; retry success advances using the already-loaded second payload.
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/exceptions")) as reopened_info:
             page.locator("#library-import-review-exceptions").click()
-        page.locator("#library-import-modal:not([hidden])").wait_for()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
         reopened_albums = reopened_info.value.json()["albums"]
         reopened_payload, next_payload = reopened_albums
         assert reopened_payload["id"] == first_payload["id"]
-        first_title = page.locator("#library-import-modal-title").inner_text()
+        first_title = page.locator("[data-review-title]").inner_text()
         execute_pattern = re.compile(r".*/api/library-import/albums/\d+/execute$")
         expected_failure["kind"] = "execute"
         page.route(execute_pattern, lambda route: route.fulfill(
@@ -619,11 +620,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             body=json.dumps({"error": "Deterministic sequential import failure", "code": "fixture_failure"}),
         ), times=1)
         with page.expect_response(lambda response: response.url.endswith("/execute")) as failed_sequence:
-            page.locator("#library-import-in-place").click()
+            page.locator("[data-review-execute]").click()
         assert failed_sequence.value.status == 502
         expected_failure["kind"] = None
-        assert page.locator("#library-import-modal-title").inner_text() == first_title
-        assert page.locator("#library-import-in-place").inner_text() == "Import"
+        assert page.locator("[data-review-title]").inner_text() == first_title
+        assert page.locator("[data-review-execute]").inner_text() == "Retry import"
 
         page.evaluate("""() => {
           const nativeFetch = window.fetch.bind(window);
@@ -633,11 +634,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
           };
         }""")
         with page.expect_response(lambda response: response.url.endswith("/execute")) as first_execute:
-            page.locator("#library-import-in-place").click()
-            assert page.locator("#library-import-in-place").is_disabled()
-            assert page.locator("#library-import-in-place").get_attribute("aria-busy") == "true"
-            assert page.locator("#library-import-in-place .button-spinner").is_visible()
-            page.locator("#library-import-in-place").click(force=True)
+            page.locator("[data-review-execute]").click()
+            assert page.locator("[data-review-execute]").is_disabled()
+            assert page.locator("[data-review-execute]").get_attribute("aria-busy") == "true"
+            assert page.locator("[data-review-execute] .button-spinner").is_visible()
+            page.locator("[data-review-execute]").click(force=True)
         first_body = first_execute.value.request.post_data_json
         sequential_proof.append({"album_id": reopened_payload["id"], "candidate_id": first_body["candidate_id"],
                                  "owned_candidate_ids": [candidate["id"] for candidate in reopened_payload["candidates"]]})
@@ -648,9 +649,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert len(sequential_pending["albums"]) == 1
         assert sequential_pending["albums"][0]["id"] == next_payload["id"]
         assert len(sequential_pending["albums"][0]["tracks"]) == 1
-        page.wait_for_function("title => document.getElementById('library-import-modal-title').textContent !== title", arg=first_title)
+        page.wait_for_function("title => document.querySelector('[data-review-title]').textContent !== title", arg=first_title)
         with page.expect_response(lambda response: response.url.endswith("/execute")) as second_execute:
-            page.locator("#library-import-in-place").click()
+            page.locator("[data-review-execute]").click()
         second_body = second_execute.value.request.post_data_json
         sequential_proof.append({"album_id": next_payload["id"], "candidate_id": second_body["candidate_id"],
                                  "owned_candidate_ids": [candidate["id"] for candidate in next_payload["candidates"]]})
@@ -660,7 +661,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             folder["path"] == "Queue Sequential"
             for folder in request_json(f"{base_url}/api/library-import/folders")["folders"]
         )
-        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.locator("[data-review-modal]").wait_for(state="hidden")
         assert "imported successfully" in page.locator("#library-import-success").inner_text()
         assert page.locator("#library-import-search").evaluate("element => document.activeElement === element")
         page.screenshot(path=evidence / "03-sequential-exceptions-complete.png", full_page=True)
@@ -680,11 +681,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         # raw MusicBrainz title or appending the unrelated "clean" note.
         deluxe_review = open_folder_album("Big Sean")
         deluxe_review.click(force=True)
-        page.locator("#library-import-modal:not([hidden])").wait_for()
-        page.locator("#library-import-open-mbid-search").click()
-        page.locator("#library-import-mbid").fill(DELUXE_RELEASE_ID)
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
+        page.locator("[data-review-open-mbid]").click()
+        page.locator("[data-review-mbid-input]").fill(DELUXE_RELEASE_ID)
         with page.expect_response(lambda response: response.url.endswith("/rematch")) as deluxe_rematch:
-            page.locator("#library-import-mbid-search").click()
+            page.locator("[data-review-mbid-submit]").click()
         assert deluxe_rematch.value.status == 200
         deluxe_payload = deluxe_rematch.value.json()
         deluxe_candidate = deluxe_payload["proposed_match"]
@@ -725,7 +726,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert preview_changes["title"] == {"from": "Blessings", "to": "Blessings feat. Drake"}
         assert preview_changes["artist"] == {"from": "Big Sean feat. Drake", "to": "Big Sean"}
         with page.expect_response(lambda response: response.url.endswith("/execute")) as deluxe_execute:
-            page.locator("#library-import-in-place").click()
+            page.locator("[data-review-execute]").click()
         assert deluxe_execute.value.status == 201
         deluxe_result = deluxe_execute.value.json()
         assert deluxe_result["items"][0]["changes"] == preview_changes
@@ -742,14 +743,14 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "execution_changes": deluxe_result["items"][0]["changes"],
             "file": {"album": deluxe_tags.album, "title": deluxe_tags.title, "artist": deluxe_tags.artist},
         }
-        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.locator("[data-review-modal]").wait_for(state="hidden")
         assert "BULLY - DELUXE" in page.locator("#library-import-success").inner_text()
 
         candidate_review = open_folder_album("Sidecar Artist")
         candidate_review.click(force=True)
-        page.locator("#library-import-modal:not([hidden])").wait_for()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
         selected_candidate = page.get_by_role("radio", checked=True)
-        assert "Sidecar Artist" in page.locator("#library-import-modal-candidates").inner_text()
+        assert "Sidecar Artist" in page.locator("[data-review-candidates]").inner_text()
         assert candidate_ids["sidecar"] > 0
         assert page.locator(".candidate-artwork").count() == 1
 
@@ -759,10 +760,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert "top canonical MusicBrainz release-group genre" not in picker.inner_text()
         assert picker.evaluate("element => getComputedStyle(element).borderTopStyle") == "none"
         page.screenshot(path=evidence / "04-mbid-picker-desktop-dark.png")
-        search_open = page.locator("#library-import-open-mbid-search")
+        search_open = page.locator("[data-review-open-mbid]")
         search_open.click()
-        mbid_modal = page.locator("#library-import-mbid-modal")
-        mbid_input = page.locator("#library-import-mbid")
+        mbid_modal = page.locator("[data-review-mbid-modal]")
+        mbid_input = page.locator("[data-review-mbid-input]")
         mbid_modal.wait_for(state="visible")
         assert mbid_input.evaluate("element => document.activeElement === element")
         assert page.locator(".album-modal-dialog").evaluate("element => element.inert")
@@ -770,19 +771,19 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
 
         # Transient typing and Cancel do not dirty the parent review.
         mbid_input.fill("transient text")
-        page.locator("#library-import-mbid-cancel").click()
+        mbid_modal.get_by_role("button", name="Cancel", exact=True).click()
         assert search_open.evaluate("element => document.activeElement === element")
         dialogs = []
         def record_dialog(dialog):
             dialogs.append(dialog.message)
             dialog.dismiss()
         page.on("dialog", record_dialog)
-        page.locator("#library-import-modal-close").click()
-        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.locator("[data-review-close]").click()
+        page.locator("[data-review-modal]").wait_for(state="hidden")
         page.remove_listener("dialog", record_dialog)
         assert dialogs == [], "cancelled MBID typing must not trigger the parent dirty-state prompt"
         candidate_review.click(force=True)
-        page.locator("#library-import-modal:not([hidden])").wait_for()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
         search_open.click(); mbid_modal.wait_for(state="visible")
         page.keyboard.press("Escape")
         mbid_modal.wait_for(state="hidden")
@@ -794,15 +795,15 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         # Focus wraps within the nested dialog, and active requests block every close path.
         search_open.click(); mbid_modal.wait_for(state="visible")
         page.keyboard.press("Shift+Tab")
-        assert page.locator("#library-import-mbid-search").evaluate("element => document.activeElement === element")
+        assert mbid_modal.get_by_role("button", name="Close MusicBrainz search").evaluate("element => document.activeElement === element")
         page.keyboard.press("Tab")
         assert mbid_input.evaluate("element => document.activeElement === element")
-        page.evaluate("document.getElementById('library-import-mbid-search').setAttribute('aria-busy', 'true')")
-        page.locator("#library-import-mbid-cancel").click()
+        page.evaluate("document.querySelector('[data-review-modal]').dataset.busy = 'true'")
+        mbid_modal.get_by_role("button", name="Cancel", exact=True).click()
         page.keyboard.press("Escape")
         mbid_modal.click(position={"x": 2, "y": 2})
         assert mbid_modal.is_visible(), "busy MBID search must block Cancel, Escape, and backdrop close"
-        page.evaluate("document.getElementById('library-import-mbid-search').setAttribute('aria-busy', 'false')")
+        page.evaluate("document.querySelector('[data-review-modal]').dataset.busy = 'false'")
 
         request_network_start = len(network)
         item_rows_before = request_json(f"{base_url}/api/items")
@@ -813,8 +814,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "path": str(tracks["sidecar"].resolve()),
         }
         mbid_input.fill("not-a-uuid")
-        page.locator("#library-import-mbid-search").click()
-        assert "canonical MusicBrainz release UUID" in page.locator("#library-import-mbid-status").inner_text()
+        page.locator("[data-review-mbid-submit]").click()
+        assert "canonical MusicBrainz release UUID" in page.locator("[data-review-mbid-status]").inner_text()
         assert len(network) == request_network_start, "invalid UUID must remain local"
 
         rematch_pattern = re.compile(r".*/api/library-import/albums/\d+/rematch$")
@@ -825,33 +826,33 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         mbid_input.fill(SEARCH_RELEASE_ID)
         expected_failure["kind"] = "rematch"
         with page.expect_response(lambda response: response.url.endswith("/rematch")) as failed_rematch:
-            page.locator("#library-import-mbid-search").click()
+            page.locator("[data-review-mbid-submit]").click()
         assert failed_rematch.value.status == 503
         expected_failure["kind"] = None
         assert mbid_modal.is_visible()
         assert mbid_input.is_enabled() and mbid_input.input_value() == SEARCH_RELEASE_ID
-        assert "could not be reached" in page.locator("#library-import-mbid-status").inner_text()
+        assert "fixture unavailable" in page.locator("[data-review-mbid-status]").inner_text()
 
-        candidate_options = page.locator("#library-import-modal-candidates [role='radio']")
+        candidate_options = page.locator("[data-review-candidates] [role='radio']")
         initial_option_count = candidate_options.count()
         with page.expect_response(lambda response: response.url.endswith("/rematch")) as new_rematch:
-            page.locator("#library-import-mbid-search").click()
+            page.locator("[data-review-mbid-submit]").click()
         assert new_rematch.value.status == 200
         new_payload = new_rematch.value.json()
         mbid_modal.wait_for(state="hidden")
-        assert page.locator("#library-import-modal").is_visible()
-        assert "added and selected" in page.locator("#library-import-modal-message").inner_text()
+        assert page.locator("[data-review-modal]").is_visible()
+        assert "added and selected" in page.locator("[data-review-status]").inner_text()
         assert candidate_options.count() == initial_option_count + 1
         selected_candidate = page.get_by_role("radio", checked=True)
         assert selected_candidate.evaluate("element => element.parentElement.open")
         assert new_payload["selected_candidate_id"] == new_payload["proposed_match"]["id"]
         assert sum(candidate["provider_id"] == SEARCH_RELEASE_ID for candidate in new_payload["candidates"]) == 1
-        assert page.locator("#library-import-in-place").inner_text() == "Import"
+        assert page.locator("[data-review-execute]").inner_text() == "Import in place"
 
         # Looking up an existing release moves/selects its row without duplication.
         search_open.click(); mbid_input.fill(EXISTING_SIDECAR_RELEASE_ID)
         with page.expect_response(lambda response: response.url.endswith("/rematch")) as existing_rematch:
-            page.locator("#library-import-mbid-search").click()
+            page.locator("[data-review-mbid-submit]").click()
         assert existing_rematch.value.status == 200
         existing_payload = existing_rematch.value.json()
         assert candidate_options.count() == initial_option_count + 1
@@ -881,35 +882,35 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator(".mbid-modal-dialog").evaluate(
             "element => element.scrollWidth <= element.clientWidth"
         ), "narrow MBID search must not overflow its dialog"
-        page.locator("#library-import-mbid-cancel").click()
+        mbid_modal.get_by_role("button", name="Cancel", exact=True).click()
         page.set_viewport_size({"width": 1440, "height": 1000})
 
         # Candidate and duplicate state share one guarded close path.
         page.get_by_role("radio", name=re.compile("As Is")).click()
         page.once("dialog", lambda dialog: dialog.dismiss())
-        page.locator("#library-import-modal").click(position={"x": 2, "y": 2})
-        assert page.locator("#library-import-modal").is_visible()
+        page.locator("[data-review-modal]").click(position={"x": 2, "y": 2})
+        assert page.locator("[data-review-modal]").is_visible()
         page.once("dialog", lambda dialog: dialog.accept())
         page.locator(".album-modal-dialog").focus()
         page.keyboard.press("Escape")
-        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.locator("[data-review-modal]").wait_for(state="hidden")
         assert candidate_review.evaluate("element => document.activeElement === element")
         candidate_review.click(force=True)
-        page.locator("#library-import-modal:not([hidden])").wait_for()
-        page.evaluate("document.getElementById('library-import-execution-result').dataset.busy = 'true'")
-        page.locator("#library-import-modal").click(position={"x": 2, "y": 2})
-        assert page.locator("#library-import-modal").is_visible(), "busy review must not close"
-        page.evaluate("document.getElementById('library-import-execution-result').dataset.busy = 'false'")
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
+        page.evaluate("document.querySelector('[data-review-modal]').dataset.busy = 'true'")
+        page.locator("[data-review-modal]").click(position={"x": 2, "y": 2})
+        assert page.locator("[data-review-modal]").is_visible(), "busy review must not close"
+        page.evaluate("document.querySelector('[data-review-modal]').dataset.busy = 'false'")
 
         # Close the clean modal before exercising persisted destination combinations.
-        page.locator("#library-import-modal-close").click()
+        page.locator("[data-review-close]").click()
 
         def import_candidate(name: str, *, has_art: bool, screenshot: str, mock_failure: bool = False) -> dict:
             page.goto(f"{base_url}/settings#library-import", wait_until="networkidle")
             page.locator("#settings-tab-library-import").click()
             review = open_folder_album(TRACKS[name].parts[0])
             review.click(force=True)
-            page.locator("#library-import-modal:not([hidden])").wait_for()
+            page.locator("[data-review-modal]:not([hidden])").wait_for()
             candidate = page.get_by_role("radio", name=re.compile(re.escape(TRACKS[name].parts[0] + " — "))).first
             if candidate.get_attribute("aria-checked") != "true":
                 candidate.click()
@@ -924,7 +925,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             if name == "feature_extra":
                 change_button = page.get_by_role("button", name=re.compile(r"View track changes \(1\)"))
                 change_button.click()
-                rows = page.locator("#track-comparison-rows tr:not(.track-explanation-row)")
+                rows = page.locator("[data-review-track-rows] tr:not(.track-explanation-row)")
                 assert rows.count() == 1
                 cells = rows.locator("td")
                 assert cells.count() == 5
@@ -949,7 +950,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                     "element => element.scrollWidth <= element.clientWidth"
                 ), "compact narrow track table should not require horizontal scrolling"
                 page.set_viewport_size({"width": 1440, "height": 1000})
-                page.locator("#track-comparison-close").click()
+                page.locator("[data-review-track-modal]").get_by_role("button", name="Close", exact=True).click()
             else:
                 page.screenshot(path=evidence / screenshot)
             request_network_start = len(network)
@@ -962,24 +963,24 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                                      "code": "artwork_fetch_failed"}),
                 ), times=1)
                 with page.expect_response(lambda response: response.url.endswith("/execute")) as failed_info:
-                    page.locator("#library-import-in-place").click()
+                    page.locator("[data-review-execute]").click()
                 assert failed_info.value.status == 502
                 page.wait_for_function(
-                    "document.getElementById('library-import-execution-result').textContent.includes('retry is available')"
+                    "document.querySelector('[data-review-status]').textContent.includes('retry is available')"
                 )
-                assert "retry is available" in page.locator("#library-import-execution-result").inner_text()
-                assert page.locator("#library-import-in-place").inner_text() == "Import"
-                assert page.locator("#library-import-modal").is_visible()
+                assert "retry is available" in page.locator("[data-review-status]").inner_text()
+                assert page.locator("[data-review-execute]").inner_text() == "Retry import"
+                assert page.locator("[data-review-modal]").is_visible()
                 expected_failure["kind"] = None
             with page.expect_response(lambda response: response.url.endswith("/execute")) as execute_info:
-                page.locator("#library-import-in-place").click()
+                page.locator("[data-review-execute]").click()
             assert execute_info.value.status in {200, 201}
             payload = execute_info.value.json()
             import_requests = [event for event in network[request_network_start:]
                                if "/api/library-import/albums/" in event["url"]]
             assert not any(event["url"].endswith("/preview") for event in import_requests)
             assert sum(event["url"].endswith("/execute") for event in import_requests) == (2 if mock_failure else 1)
-            page.locator("#library-import-modal").wait_for(state="hidden")
+            page.locator("[data-review-modal]").wait_for(state="hidden")
             assert TRACKS[name].parts[0] in page.locator("#library-import-success").inner_text()
             return payload
 
@@ -1031,11 +1032,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
 
         as_is_review = open_folder_album("As Is Artist")
         as_is_review.click(force=True)
-        page.locator("#library-import-modal:not([hidden])").wait_for()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
         with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.url.endswith("/execute")) as response_info:
-            page.locator("#library-import-in-place").click()
+            page.locator("[data-review-execute]").click()
         assert response_info.value.status in {200, 201}, response_info.value.status
-        page.locator("#library-import-modal").wait_for(state="hidden")
+        page.locator("[data-review-modal]").wait_for(state="hidden")
         assert "As Is Artist" in page.locator("#library-import-success").inner_text()
         page.screenshot(path=evidence / "11-as-is-direct-success.png", full_page=True)
 
@@ -1255,68 +1256,50 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "elements => elements.map(element => element.getAttribute('aria-expanded'))"
         ) == ["false", "false"]
         assert all("Shared Selection" not in card.inner_text() for card in cards.all())
+        scope_responses = []
         for index in range(cards.count()):
-            with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
+            source_id = cards.nth(index).get_attribute("data-inbox-id")
+            with page.expect_response(lambda response, source_id=source_id: response.url.endswith(f"/api/inbox/{source_id}/scopes")) as scope_info:
                 cards.nth(index).locator("[data-inbox-toggle]").click()
-            cards.nth(index).locator("[data-album-id]").first.wait_for()
-        assert cards.nth(0).locator("[data-album-id]").count() == 25
-        assert cards.nth(0).locator(".page-label").inner_text() == "Page 1 of 2"
-        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")) as second_page_response:
-            cards.nth(0).get_by_role("button", name="Next page").click()
-        cards.nth(0).locator(".page-label").filter(has_text="Page 2 of 2").wait_for()
-        assert cards.nth(0).locator("[data-album-id]").count() == 7
-        second_page_body = second_page_response.value.body()
-        inbox_page_metrics.update({"page_size":25,"page_2_dom_rows":7,"page_2_payload_bytes":len(second_page_body)})
-        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")) as first_page_response:
-            cards.nth(0).get_by_role("button", name="Previous page").click()
-        cards.nth(0).locator(".page-label").filter(has_text="Page 1 of 2").wait_for()
-        inbox_page_metrics.update({"page_1_dom_rows":cards.nth(0).locator("[data-album-id]").count(),
-                                   "page_1_payload_bytes":len(first_page_response.value.body()),"total_albums":32})
+            cards.nth(index).locator('[data-scope="Shared Selection"]').wait_for()
+            scope_responses.append(scope_info.value)
+        assert cards.nth(0).locator("[data-scope]").count() >= 31
+        assert cards.nth(1).locator("[data-scope]").count() >= 31
+        assert page.locator(".review-pagination").count() == 0
+        inbox_page_metrics.update({
+            "pagination_removed": True,
+            "first_inbox_scope_rows": cards.nth(0).locator("[data-scope]").count(),
+            "second_inbox_scope_rows": cards.nth(1).locator("[data-scope]").count(),
+            "scope_payload_bytes": [len(response.body()) for response in scope_responses],
+        })
+        for index in range(cards.count()):
+            card = cards.nth(index)
+            source_id = card.get_attribute("data-inbox-id")
+            card.get_by_role("checkbox", name="Select album folder Shared Selection", exact=True).check()
+            with page.expect_response(lambda response, source_id=source_id: response.url.endswith(f"/api/inbox/{source_id}/scopes/scan")):
+                card.get_by_role("button", name="Scan selected", exact=True).click()
+            card.locator('[data-scope="Shared Selection"] [data-status="needs-review"]').wait_for()
         assert all("Shared Selection" in card.inner_text() for card in cards.all())
         page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
 
-        first_button = cards.nth(0).locator('[data-album-id]').filter(
-            has_text="Shared Selection"
-        ).get_by_role("button", name="Review")
-        first_button.click()
-        page.locator("#review-status").wait_for(state="visible")
-        page.get_by_role("radio", name=re.compile("As Is")).click()
-        page.locator("#approve-review").click()
-        page.wait_for_function("document.querySelector('#import-review').disabled === false")
-        first_track = fixture_root / "inbox" / "Shared Selection" / "01 First Inbox.wav"
-        first_stat = first_track.stat()
-        os.utime(first_track, ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns + 1_000_000))
-        expected_failure["kind"] = "inbox-stale"
-        page.locator("#import-review").click()
-        page.wait_for_function("document.querySelector('#review-status').textContent.includes('changed')")
-        expected_failure["kind"] = None
-        assert page.locator("#review-modal").is_visible()
-        assert page.locator("#import-review").inner_text() == "Retry import"
-        page.locator("#cancel-review").click()
-        page.reload(wait_until="networkidle")
-        cards = page.locator("[data-inbox-id]")
-        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
-            cards.nth(0).locator("[data-inbox-toggle]").click()
-        cards.nth(0).locator("[data-album-id]").first.wait_for()
-        first_button = cards.nth(0).locator('[data-album-id]').filter(
-            has_text="Shared Selection"
-        ).get_by_role("button", name="Review")
-        first_button.click()
-        page.locator("#find-matches").click()
-        page.wait_for_function("document.querySelector('#find-matches').getAttribute('aria-busy') === 'true'")
-        assert page.locator("#import-review").get_attribute("aria-busy") == "false"
-        assert page.locator("#import-review .button-spinner").is_hidden()
-        page.wait_for_function("document.querySelectorAll('#candidate-list .candidate-option').length > 1")
-        candidate = page.locator("#candidate-list .candidate-option").first
+        first_scope = cards.nth(0).locator('[data-scope="Shared Selection"]')
+        first_scope.get_by_role("button", name="Review", exact=True).click()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
+        page.locator("[data-review-find]").click()
+        page.wait_for_function("document.querySelector('[data-review-find]').getAttribute('aria-busy') === 'true'")
+        assert page.locator("[data-review-execute]").get_attribute("aria-busy") == "false"
+        assert page.locator("[data-review-execute] .button-spinner").is_hidden()
+        page.wait_for_function("document.querySelectorAll('[data-review-candidates] .candidate-option').length > 0")
+        candidate = page.locator("[data-review-candidates] .candidate-option").first
         assert all(candidate.filter(has_text=label).count() for label in (
             "Artist", "Album", "Genre", "Release Year", "Release Type/media",
             "Release Region", "Local tracks found online", "Online tracks present locally",
         ))
         track_button = candidate.get_by_role("button", name=re.compile("View track changes"))
         track_button.click()
-        assert page.locator("#track-comparison-modal").is_visible()
-        assert page.locator("#track-comparison-rows tr:not(.track-explanation-row)").count() == 1
-        assert "Duration differs" in page.locator("#track-comparison-rows").inner_text()
+        assert page.locator("[data-review-track-modal]").is_visible()
+        assert page.locator("[data-review-track-rows] tr:not(.track-explanation-row)").count() == 1
+        assert "Duration differs" in page.locator("[data-review-track-rows]").inner_text()
         page.screenshot(path=evidence / "17-inbox-track-changes-desktop-light.png", full_page=True)
         page.keyboard.press("Escape")
         assert track_button.evaluate("element => document.activeElement === element")
@@ -1324,17 +1307,15 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.evaluate("localStorage.setItem('cratekeep-theme','dark');document.body.classList.add('dark-mode')")
         page.screenshot(path=evidence / "17-inbox-review-desktop-dark.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
-        assert page.locator("#review-modal .dialog").evaluate("element => element.scrollWidth <= element.clientWidth")
+        assert page.locator("[data-review-dialog]").evaluate("element => element.scrollWidth <= element.clientWidth")
         page.screenshot(path=evidence / "17-inbox-review-narrow-dark.png", full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
         candidate.locator("[role='radio']").click()
-        page.locator("#approve-review").click()
-        page.wait_for_function("document.querySelector('#import-review').disabled === false")
-        with page.expect_response(lambda response: (
-            "/api/inbox/albums/" in response.url and response.url.endswith("/execute")
-            and response.request.post_data_json == {}
-        )) as executed:
-            page.locator("#import-review").click()
+        page.locator("[data-review-approve]").click()
+        page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
+        first_track = fixture_root / "inbox" / "Shared Selection" / "01 First Inbox.wav"
+        with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.url.endswith("/execute") and response.status == 201) as executed:
+            page.locator("[data-review-execute]").click()
         assert executed.value.status == 201
         assert executed.value.request.post_data_json == {}
         first_result = executed.value.json()
@@ -1348,8 +1329,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             assert first_source_cover.read_bytes() == EXISTING_ARTWORK_JPEG
         assert first_result["artwork"]["sha256"] == hashlib.sha256(ARTWORK_JPEG).hexdigest()
         assert first_result["artwork"]["sidecar_sha256"] == hashlib.sha256(EXISTING_ARTWORK_JPEG).hexdigest()
-        page.wait_for_function("""() => ![...document.querySelectorAll('[data-inbox-id]')[0].querySelectorAll('[data-album-id]')]
-          .some(row => row.textContent.includes('Shared Selection'))""")
+        page.wait_for_function("""() => !document.querySelectorAll('[data-inbox-id]')[0]
+          .querySelector('[data-scope="Shared Selection"]')""")
         page.wait_for_function("document.activeElement === document.querySelector('#inbox-success')")
         inbox_review_proof.update({
             "candidate_destination": str(first_destination),
@@ -1362,8 +1343,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "success_focus": True,
         })
 
-        # Enable lookup-only automatic matching for the still-unmatched second
-        # source. It must populate candidates without approving or importing.
+        # Match-only automation runs only for the explicitly selected scope and
+        # never approves, imports, or mutates the sibling Inbox.
         provider_calls_before_auto = request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0)
         library_items_before_auto = request_json(f"{base_url}/api/items")
         page.goto(f"{base_url}/settings", wait_until="networkidle")
@@ -1373,12 +1354,14 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.goto(f"{base_url}/inbox", wait_until="networkidle")
         cards = page.locator("[data-inbox-id]")
         second_source_id = cards.nth(1).get_attribute("data-inbox-id")
-        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
+        with page.expect_response(lambda response: response.url.endswith(f"/api/inbox/{second_source_id}/scopes")):
             cards.nth(1).locator("[data-inbox-toggle]").click()
-        cards.nth(1).locator("[data-album-id]").first.wait_for()
+        second_card = cards.nth(1)
+        second_card.get_by_role("checkbox", name="Select album folder Shared Selection", exact=True).check()
+        with page.expect_response(lambda response: response.url.endswith(f"/api/inbox/{second_source_id}/scopes/scan")):
+            second_card.get_by_role("button", name="Scan selected", exact=True).click()
         page.wait_for_function("""async sourceId => {
-          const response = await fetch('/api/inbox/reviews');
-          const data = await response.json();
+          const data = await (await fetch('/api/inbox/reviews')).json();
           return data.albums.some(album => album.source_id === sourceId && album.candidate_status === 'complete');
         }""", arg=second_source_id, timeout=10000)
         provider_calls_after_auto = request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0)
@@ -1389,10 +1372,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert auto_album["decision"] == "pending" and auto_album["execution_status"] == "not-run"
         assert second_track.exists() and request_json(f"{base_url}/api/items") == library_items_before_auto
         page.reload(wait_until="networkidle")
-        page.wait_for_function("""async sourceId => {
-          const data = await (await fetch('/api/inbox/reviews')).json();
-          return data.albums.some(album => album.source_id === sourceId && album.candidate_status === 'complete');
-        }""", arg=second_source_id, timeout=10000)
+        cards = page.locator("[data-inbox-id]")
+        with page.expect_response(lambda response: response.url.endswith(f"/api/inbox/{second_source_id}/scopes")):
+            cards.nth(1).locator("[data-inbox-toggle]").click()
         assert request_json(f"{base_url}/__smoke/provider-calls")["calls"].get("Shared Selection", 0) == provider_calls_after_auto
         inbox_review_proof["auto_match"] = {
             "calls_before": provider_calls_before_auto, "calls_after": provider_calls_after_auto,
@@ -1402,35 +1384,25 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "source_present_before_approval": second_track.exists(),
             "library_unchanged_before_approval": True,
         }
-        cards = page.locator("[data-inbox-id]")
-        with page.expect_response(lambda response: response.url.endswith("/api/inbox/scan")):
-            cards.nth(1).locator("[data-inbox-toggle]").click()
-        cards.nth(1).locator("[data-album-id]").first.wait_for()
-        second_button = cards.nth(1).locator('[data-review]').first
-        second_button.click()
-        page.wait_for_function("document.querySelectorAll('#candidate-list .candidate-option').length > 1")
-        assert "pending" in page.locator("#review-status").inner_text()
-        page.get_by_role("radio", name=re.compile("As Is")).click()
-        page.locator("#approve-review").click()
-        page.wait_for_function("document.querySelector('#import-review').disabled === false")
-        with page.expect_response(lambda response: (
-            "/api/inbox/albums/" in response.url and response.url.endswith("/execute")
-            and response.request.post_data_json == {}
-        )) as as_is_executed:
-            page.locator("#import-review").click()
-        assert as_is_executed.value.status == 201
-        assert as_is_executed.value.request.post_data_json == {}
-        as_is_result = as_is_executed.value.json()
+        second_scope = cards.nth(1).locator('[data-scope="Shared Selection"]')
+        second_scope.get_by_role("button", name="Review", exact=True).click()
+        page.wait_for_function("document.querySelectorAll('[data-review-candidates] .candidate-option').length > 0")
+        page.locator("[data-review-candidates] .candidate-option").first.locator("[role='radio']").click()
+        page.locator("[data-review-approve]").click()
+        page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
+        with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.url.endswith("/execute") and response.status == 201) as second_executed:
+            page.locator("[data-review-execute]").click()
+        assert second_executed.value.status == 201
+        as_is_result = second_executed.value.json()
         second_destination = fixture_root / "library" / as_is_result["destinations"][0]
-        assert as_is_result["selection_mode"] == "as-is"
-        assert as_is_result["destinations"] == ["Second Inbox/Shared Selection/00 Second Inbox.wav"]
+        assert as_is_result["destinations"] == ["Second Inbox/Shared Selection/01 Second Inbox.wav"]
         assert second_destination.is_file() and not second_track.exists()
-        assert not MediaFile(str(second_destination)).images
+        assert MediaFile(str(second_destination)).images[0].data == ARTWORK_JPEG
         assert (second_destination.parent / "cover.jpg").read_bytes() == EXISTING_ARTWORK_JPEG
         second_source_cover = second_track.parent / "cover.jpg"
         if second_source_cover.exists():
             assert second_source_cover.read_bytes() == EXISTING_ARTWORK_JPEG
-        inbox_review_proof["as_is"] = {
+        inbox_review_proof["approved_second_inbox"] = {
             "destination": str(second_destination),
             "destination_relative": as_is_result["destinations"][0],
             "source_removed": not second_track.exists(),
@@ -1439,7 +1411,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "destination_sidecar_sha256": sha256(second_destination.parent / "cover.jpg"),
             "embedded_images": len(MediaFile(str(second_destination)).images or []),
         }
-        page.wait_for_function("document.querySelectorAll('[data-inbox-id]')[1].querySelectorAll('[data-album-id]').length === 0")
+        page.wait_for_function("""() => !document.querySelectorAll('[data-inbox-id]')[1]
+          .querySelector('[data-scope="Shared Selection"]')""")
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
         page.screenshot(path=evidence / "17-named-inboxes-after-import-mobile.png", full_page=True)

@@ -13,10 +13,13 @@
     const selected = new Set(), phases = new Map();
     let rows = [], summary = {available_album_count: 0, ready_album_count: 0, exception_count: 0}, page = 1, pages = 1, total = 0;
     let listRequest = null, listSequence = 0, summarySequence = 0, scanSequence = 0, destroyed = false, searchTimer = null, returnFocus = null;
+    const selectLabel = item => adapter.selectLabel ? adapter.selectLabel(item) : `Select ${noun} ${item.name}`;
+    selectAll.setAttribute('aria-label', adapter.selectAllLabel || `Select all ${noun}s`);
     if (storageKey) { try { JSON.parse(sessionStorage.getItem(storageKey) || '[]').forEach(value => selected.add(value)); } catch (_) {} }
     const save = () => { if (storageKey) try { sessionStorage.setItem(storageKey, JSON.stringify([...selected])); } catch (_) {} };
     const setStatus = (message, error = false) => { status.textContent = message || ''; status.classList.toggle('error-text', error); };
     const busy = (button, value) => { if (!button) return; button.setAttribute('aria-busy', String(value)); button.disabled = value; };
+    const countLabel = item => adapter.countLabel ? adapter.countLabel(item) : `${item.track_count || 0} tracks · ${item.album_count || 0} albums`;
     function updateControls() {
       const visible = rows.map(item => item.path), checked = visible.filter(path => selected.has(path)).length;
       selectAll.checked = visible.length > 0 && checked === visible.length; selectAll.indeterminate = checked > 0 && checked < visible.length;
@@ -28,12 +31,14 @@
       ['first','previous'].forEach(name => { const node = hook(root, name); if (node) node.disabled = page <= 1; });
       ['next','last'].forEach(name => { const node = hook(root, name); if (node) node.disabled = page >= pages; });
     }
-    async function openScope(item, button, body = null) {
+    async function openScope(item, button, body = null, countNode = null) {
       if (body && !body.hidden) { body.hidden = true; button.setAttribute('aria-expanded', 'false'); return; }
       if (body?.dataset.loaded === 'true') { body.hidden = false; button.setAttribute('aria-expanded', 'true'); return; }
       if (body) { body.hidden = false; button.setAttribute('aria-expanded', 'true'); body.textContent = 'Loading albums…'; }
       try {
         const data = await adapter.albums(item.path), albums = data.albums || [];
+        item.album_count = albums.length; item.track_count = data.items?.length ?? albums.reduce((count, album) => count + (album.tracks?.length || 0), 0);
+        if (countNode) countNode.textContent = countLabel(item);
         if (!body) { if (albums.length) await review.openSequence(albums, button); else setStatus('Scan this scope before review.'); return; }
         const children = albums.map(album => {
           const row = make('article', '', 'review-album-row'), identity = make('span', `${album.artist} — ${album.album}`, 'review-folder-identity');
@@ -48,20 +53,22 @@
     }
     function render() {
       const nodes = rows.map(item => {
-        const article = make('article', '', adapter.rowClass || 'scope-row'); article.dataset.scope = item.path;
+        const article = make('article', '', adapter.rowClass || 'scope-row'); article.dataset.scope = item.path; article.dataset.folderPath = item.path;
         const summaryRow = make('div', '', adapter.summaryClass || 'review-folder-summary');
-        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(item.path); checkbox.setAttribute('aria-label', `Select ${item.name}`);
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = adapter.checkboxClass || 'folder-workflow-select'; checkbox.checked = selected.has(item.path); checkbox.setAttribute('aria-label', selectLabel(item));
         checkbox.addEventListener('change', () => { checkbox.checked ? selected.add(item.path) : selected.delete(item.path); save(); render(); refreshSummary(); });
         let opener;
         if (adapter.expandRows) { opener = make('button', '', 'folder-expand'); opener.type = 'button'; opener.setAttribute('aria-expanded', 'false'); opener.setAttribute('aria-label', `Expand ${item.name}`); }
-        const identity = make('div', '', adapter.identityClass || 'scope-identity'); identity.append(make('strong', item.name || item.path), make('span', item.path === '.' ? 'Root-level loose audio' : `${item.track_count || 0} tracks · ${item.album_count || 0} albums`, 'metric'));
+        const identity = make('div', '', adapter.identityClass || 'scope-identity'); identity.append(make('strong', item.name || item.path, adapter.nameClass || 'folder-workflow-name'));
+        const count = make('span', item.path === '.' ? 'Root-level loose audio' : countLabel(item), adapter.countClass || 'metric');
         const current = phases.get(item.path), phase = typeof current === 'object' ? current.label : current;
-        const state = make('span', phase || item.status || 'Not scanned', adapter.statusClass || 'status-chip'); state.dataset.status = typeof current === 'object' ? current.status : (current || item.status || 'not-scanned'); state.setAttribute('aria-live', 'polite'); if (item.error || current?.title) state.title = current?.title || item.error;
+        const statusValue = typeof current === 'object' ? current.status : (current || item.status || 'not-scanned');
+        const state = make('span', phase || String(item.status || 'not-scanned').replaceAll('-', ' '), adapter.statusClass || 'status-chip'); state.dataset.status = statusValue; state.setAttribute('aria-live', 'polite'); state.setAttribute('aria-atomic', 'true'); if (item.error || current?.title) state.title = current?.title || item.error;
         const body = adapter.expandRows ? make('div', '', 'review-folder-contents') : null;
-        if (body) { body.hidden = true; opener.addEventListener('click', () => openScope(item, opener, body)); }
+        if (body) { body.hidden = true; opener.addEventListener('click', () => openScope(item, opener, body, count)); }
         const reviewButton = adapter.expandRows ? null : make('button', 'Review', 'button-quiet');
         if (reviewButton) { reviewButton.type = 'button'; reviewButton.disabled = !item.album_count; reviewButton.addEventListener('click', () => openScope(item, reviewButton)); }
-        summaryRow.append(checkbox); if (opener) summaryRow.append(opener); summaryRow.append(identity, state); if (reviewButton) summaryRow.append(reviewButton); article.append(summaryRow); if (body) article.append(body); return article;
+        summaryRow.append(checkbox); if (opener) summaryRow.append(opener); summaryRow.append(identity, count, state); if (reviewButton) summaryRow.append(reviewButton); article.append(summaryRow); if (body) article.append(body); return article;
       });
       replaceRows(list, nodes); if (!nodes.length) list.append(make('p', adapter.emptyMessage || `No ${noun}s found.`, 'empty')); updateControls();
     }
@@ -84,8 +91,8 @@
     }
     async function scan() {
       if (!selected.size || scanButton.getAttribute('aria-busy') === 'true') return; const sequence = ++scanSequence, scopes = [...selected]; setPhase(phases, scopes, 'Queued'); render(); busy(scanButton, true);
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); if (sequence !== scanSequence || destroyed) return; setPhase(phases, scopes, 'Scanning'); render();
-      try { const result = await adapter.scan(scopes); setPhase(phases, scopes, null); for (const error of result.errors || []) if (error.folder || error.scope) phases.set(error.folder || error.scope, {status:'error', label:'Error', title:error.error}); setStatus(adapter.scanMessage ? adapter.scanMessage(result) : `Scanned ${scopes.length} selected ${noun}s.`); await load(page, {announce:false}); }
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); if (sequence !== scanSequence || destroyed) return; setPhase(phases, scopes, {status:'Scanning', label:'Scanning…'}); render();
+      try { const result = await adapter.scan(scopes); setPhase(phases, scopes, null); for (const error of result.errors || []) if (error.folder || error.scope) phases.set(error.folder || error.scope, {status:'error', label:'Error', title:error.error}); if (adapter.announceScan !== false) setStatus(adapter.scanMessage ? adapter.scanMessage(result) : `Scanned ${scopes.length} selected ${noun}s.`); await load(page, {announce:false}); }
       catch (error) { setPhase(phases, scopes, {status:'error', label:'Error', title:error.message}); render(); setStatus(error.message, true); }
       finally { busy(scanButton, false); updateControls(); }
     }

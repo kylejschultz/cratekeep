@@ -59,7 +59,7 @@
       if (!force && !succeeded && album && snapshot() !== openingState && !window.confirm('Discard changes to this album review?')) return false;
       closeNested(trackModal, false); closeNested(mbidModal, false); root.hidden = true; document.body.classList.remove('modal-open'); transition += 1;
       if (!clearQueue && queue.length) { const next = queue.shift(); setTimeout(() => open(next, returnFocus), 0); return true; }
-      if (clearQueue) queue = []; const target = returnFocus; album = null; selected = null; if (restore && target?.isConnected && !target.disabled) target.focus(); return true;
+      if (clearQueue) queue = []; const target = returnFocus; album = null; selected = null; if (restore) { const focusTarget = target?.isConnected && !target.disabled ? target : adapter.focusFallback?.(); focusTarget?.focus(); } return true;
     }
     function advance() { if (queue.length) close({clearQueue: false, restore: false, force: true}); else close({clearQueue: false, force: true}); }
     function openNested(modal, trigger) { nestedReturnFocus = trigger; modal.hidden = false; dialog.inert = true; dialog.setAttribute('aria-hidden', 'true'); one(modal, modal === trackModal ? 'track-dialog' : 'mbid-input')?.focus(); }
@@ -72,7 +72,8 @@
       if (duplicate.status === 'ambiguous') return setStatus('Import is blocked because managed recording identity is ambiguous.', true);
       if (duplicate.status === 'possible' && !duplicateAction.value) return setStatus('Choose a duplicate decision before importing this album.', true);
       setBusy(true, labels.executing || 'Validating files and importing…', event.currentTarget);
-      try { const result = await adapter.execute(album, {candidate_id: selectedValue(selected), duplicate_action: duplicateAction.value || undefined, status: setStatus}); succeeded = true; await onSuccess({kind: 'execute', album, result}); advance(); } catch (error) { setStatus(adapter.errorMessage ? adapter.errorMessage(error) : error.message, true); one(root, 'execute').querySelector('.button-label').textContent = labels.retry || 'Retry import'; } finally { setBusy(false, '', event.currentTarget); }
+      let failed = false;
+      try { const result = await adapter.execute(album, {candidate_id: selectedValue(selected), duplicate_action: duplicateAction.value || undefined, status: setStatus}); succeeded = true; await onSuccess({kind: 'execute', album, result}); advance(); } catch (error) { failed = true; setStatus(adapter.errorMessage ? adapter.errorMessage(error) : error.message, true); } finally { setBusy(false, '', event.currentTarget); if (failed) one(root, 'execute').querySelector('.button-label').textContent = labels.retry || 'Retry import'; }
     });
     one(root, 'open-mbid').addEventListener('click', event => { one(root, 'mbid-status').textContent = ''; one(root, 'mbid-input').value = ''; openNested(mbidModal, event.currentTarget); });
     one(root, 'mbid-form').addEventListener('submit', async event => { event.preventDefault(); const input = one(root, 'mbid-input'), value = input.value.trim(), submit = one(root, 'mbid-submit'); if (!UUID.test(value)) { one(root, 'mbid-status').textContent = 'Enter a canonical MusicBrainz release UUID.'; input.focus(); return; } setBusy(true, 'Searching MusicBrainz for this release…', submit); try { album = await adapter.exact(album, value); selected = album.selected_candidate_id ?? album.candidates?.[0]?.id ?? null; render(); openingState = snapshot(); setBusy(false, '', submit); closeNested(mbidModal); setStatus('MusicBrainz release added and selected. No files were changed.'); } catch (error) { one(root, 'mbid-status').textContent = error.message; } finally { setBusy(false, '', submit); } });

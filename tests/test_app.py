@@ -693,7 +693,7 @@ def test_album_review_modal_uses_shared_presentation_and_accessible_shell(tmp_pa
     assert "presentation.renderTrackRows" in controller
     assert "dialog.inert = true" in controller and "nestedReturnFocus?.focus()" in controller
     assert "if (event.key === 'Escape')" in controller and "event.key !== 'Tab'" in controller
-    assert "target.focus()" in controller
+    assert "focusTarget?.focus()" in controller
     assert 'class="button-spinner" aria-hidden="true" hidden' in modal
     assert "library-import-queue" not in modal and "Confirm import" not in modal
 
@@ -4700,7 +4700,7 @@ def test_selected_scan_progress_is_bounded_to_visible_selected_folder_rows(tmp_p
 
     assert "const sequence = ++scanSequence, scopes = [...selected]" in scan_handler
     assert "setPhase(phases, scopes, 'Queued')" in scan_handler
-    assert "setPhase(phases, scopes, 'Scanning')" in scan_handler
+    assert "setPhase(phases, scopes, {status:'Scanning', label:'Scanning…'})" in scan_handler
     assert "busy(scanButton, true)" in scan_handler
     assert "await load(page, {announce:false})" in scan_handler
     assert "No files were changed" not in scan_handler
@@ -5028,6 +5028,7 @@ def test_inbox_ui_uses_per_source_bulk_folder_workflow_without_pagination(tmp_pa
     assert "data-folder-confirm" in html and "data-folder-confirm-dialog" in html
     assert "window.confirm" not in html
     assert "data-inbox-page" not in html and "review-pagination" not in html
+    assert "execute:async album=>" in html and "body:JSON.stringify({dry_run:true})" in html and "body:'{}'" in html
 
 
 def test_library_and_inbox_share_batched_folder_workflow_primitives(tmp_path):
@@ -5043,6 +5044,14 @@ def test_library_and_inbox_share_batched_folder_workflow_primitives(tmp_path):
             assert duplicate not in page
     assert module.count("function create(") == 1
     assert "async function scan()" in module and "async function exceptions()" in module
+    assert "adapter.selectLabel ? adapter.selectLabel(item) : `Select ${noun} ${item.name}`" in module
+    assert "adapter.selectAllLabel || `Select all ${noun}s`" in module
+    assert "selectAllLabel:'Select all folders on this page'" in settings
+    assert "item.path==='.'?'Select loose files scope':`Select album folder ${item.name}`" in inbox
+    assert "checkboxClass:'review-select'" in settings and "countClass:'review-folder-count'" in settings
+    assert "libraryFolders.load(2); libraryFolders.load(5);" in Path("tests/runtime_smoke.py").read_text()
+    assert "if (failed) one(root, 'execute').querySelector('.button-label').textContent" in Path("beets_mvp/static/review-workflow.js").read_text()
+    assert "focusFallback:()=>document.getElementById('library-import-search')" in settings
 
 
 def test_shell_remains_responsive_while_scoped_inbox_scan_is_held(tmp_path, monkeypatch):
