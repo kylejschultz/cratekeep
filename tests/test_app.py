@@ -755,6 +755,8 @@ def test_library_and_inbox_share_corrected_modal_controls_and_selection_save_pat
         assert "Current metadata" not in page
         assert "Approve selection" not in page
         assert "Exact MusicBrainz release ID" not in page
+    assert "Selecting metadata is explicit; matching alone never writes or moves files." in inbox
+    assert "Approval is always explicit; matching alone never writes or moves files." not in inbox
     assert "MusicBrainz release or release-group ID" in partial
     assert "data-review-current" not in partial and "data-review-approve" not in partial
     assert "async function selectDecision" in controller
