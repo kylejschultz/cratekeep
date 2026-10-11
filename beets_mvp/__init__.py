@@ -231,6 +231,99 @@ def create_app(test_config: dict | None = None) -> Flask:
             app, scan=refresh, inbox_ids={inbox_id} if inbox_id else None, page=page,
         ))
 
+    @app.get("/api/inbox/<inbox_id>/scopes")
+    def inbox_scopes(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            return jsonify(_inbox_scope_list(app, inbox))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="inbox_scope_unavailable"), 409
+
+    @app.get("/api/inbox/<inbox_id>/scopes/albums")
+    def inbox_scope_albums(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            scope = _validated_inbox_scope(inbox, request.args.get("scope", ""))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        album_ids = _inbox_scope_album_ids(app, inbox, [scope])
+        albums = [_with_readiness(album) for album in _album_review_payloads(
+            app, album_ids, root=str(Path(inbox["path"]).resolve()),
+            source_kind="inbox", source_id=inbox["id"],
+        )]
+        return jsonify(scope=scope, albums=albums)
+
+    @app.post("/api/inbox/<inbox_id>/scopes/scan")
+    def scan_inbox_scopes(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            scopes = _request_inbox_scopes(inbox)
+            inventory = _scan_inbox_inventory(app, inbox, scopes=scopes)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        album_ids = _inbox_scope_album_ids(app, inbox, scopes)
+        generated = {"errors": []}
+        if inbox.get("auto_match") and album_ids:
+            generated = _generate_musicbrainz_candidates(
+                app, len(album_ids), album_ids=album_ids,
+                root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"],
+            )
+        summary = _inbox_bulk_ready_summary(app, inbox, scopes)
+        return jsonify(inventory=inventory, **summary, errors=generated.get("errors", [])), (
+            207 if generated.get("errors") else 201
+        )
+
+    @app.post("/api/inbox/<inbox_id>/bulk/preview")
+    def preview_ready_inbox_imports(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            scopes = _request_inbox_scopes(inbox)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        return jsonify(_inbox_bulk_ready_summary(app, inbox, scopes))
+
+    @app.post("/api/inbox/<inbox_id>/bulk/exceptions")
+    def selected_inbox_exceptions(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            scopes = _request_inbox_scopes(inbox)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        album_ids = _inbox_scope_album_ids(app, inbox, scopes)
+        albums = [_with_readiness(album) for album in _album_review_payloads(
+            app, album_ids, root=str(Path(inbox["path"]).resolve()),
+            source_kind="inbox", source_id=inbox["id"],
+        )]
+        return jsonify(albums=[album for album in albums if not album["ready"]])
+
+    @app.post("/api/inbox/<inbox_id>/bulk/execute")
+    def execute_ready_inbox_imports(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or values.get("confirmed") is not True:
+            return jsonify(error="explicit confirmation is required", code="confirmation_required"), 400
+        try:
+            scopes = _request_inbox_scopes(inbox, values)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        try:
+            result = _execute_inbox_bulk_ready(app, inbox, scopes)
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        return jsonify(result), (207 if result["failed"] else 201)
+
     @app.post("/api/inbox/candidates")
     def generate_inbox_candidates():
         values = request.get_json(silent=True) or {}
@@ -4339,10 +4432,16 @@ def _inbox_destination_preflight(
     return destinations
 
 
-def _restore_inbox_sources(backups: list[tuple[Path, Path]]) -> tuple[int, int]:
+def _restore_inbox_sources(
+    backups: list[tuple[Path, Path]], *, restore_missing: bool = False,
+) -> tuple[int, int]:
     restored = moved = 0
     for source, backup in backups:
         if source.exists():
+            shutil.copy2(backup, source)
+            restored += 1
+        elif restore_missing:
+            source.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(backup, source)
             restored += 1
         else:
@@ -4754,10 +4853,74 @@ def _validate_inbox_album_scope(root: Path, source: Path, paths: list[Path]) -> 
         ) from exc
     if {str(path) for path in command_files} != {str(path) for path in paths}:
         raise LibraryImportExecutionError(
-            "The source selection contains audio from another review. Cratekeep cannot safely move only "
-            "part of this selection; place each album in its own immediate Inbox folder.",
+            "The reviewed album shares a non-root source folder with audio from another review. "
+            "Move this album into its own folder inside the configured Inbox and rescan.",
             code="source_contains_other_albums",
         )
+
+
+def _inbox_execution_selection(root: Path, source: Path, paths: list[Path]) -> str:
+    """Choose a source form that never exposes unrelated Inbox audio to Beets."""
+    try:
+        _validate_inbox_album_scope(root, source, paths)
+    except LibraryImportExecutionError as exc:
+        root_level = source == root and all(path.parent == root for path in paths)
+        if exc.code != "source_contains_other_albums" or not root_level:
+            raise
+        return "exact-file" if len(paths) == 1 else "staged-album"
+    return "exclusive-scope"
+
+
+def _stage_exact_inbox_album(directory: Path, paths: list[Path]) -> tuple[Path, list[Path]]:
+    """Build an album-shaped source containing only selected files.
+
+    Hard links keep this constant-space on the usual single-volume install. A
+    cross-device state directory falls back to copies without touching any
+    unreviewed source.
+    """
+    selection = directory / "selection"
+    selection.mkdir()
+    staged = []
+    for path in paths:
+        target = selection / path.name
+        if target.exists():
+            raise LibraryImportExecutionError(
+                f"Exact Inbox selection has duplicate filename {path.name}.", code="source_ambiguous"
+            )
+        try:
+            os.link(path, target, follow_symlinks=False)
+        except OSError:
+            shutil.copy2(path, target, follow_symlinks=False)
+        staged.append(target)
+    if {path.name for path in staged} != {path.name for path in paths}:
+        raise LibraryImportExecutionError(
+            "Exact Inbox selection could not be staged without changing its file set.",
+            code="source_ambiguous",
+        )
+    return selection, staged
+
+
+def _exact_inbox_source_identities(paths: list[Path]) -> list[tuple[Path, int, int, int, int]]:
+    """Capture regular-file identities around exact-album staging."""
+    identities = []
+    for path in paths:
+        current = path.lstat()
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise OSError(f"{path} is no longer a regular file")
+        identities.append((path, current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns))
+    return identities
+
+
+def _unlink_exact_inbox_sources(identities: list[tuple[Path, int, int, int, int]]) -> None:
+    """Remove only unchanged selected paths after a complete staging pass."""
+    for path, device, inode, size, modified in identities:
+        current = path.lstat()
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            device, inode, size, modified,
+        ):
+            raise OSError(f"{path} changed during exact selection staging")
+    for path, *_ in identities:
+        path.unlink()
 
 
 def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> dict | None:
@@ -4853,7 +5016,7 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
         raise LibraryImportExecutionError(message, code="source_ambiguous", job_id=job_id)
     source = root / next(iter(scopes))
     try:
-        _validate_inbox_album_scope(root, source, paths)
+        execution_selection = _inbox_execution_selection(root, source, paths)
     except LibraryImportExecutionError as exc:
         _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
         exc.job_id = job_id
@@ -4880,7 +5043,13 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 code="duplicate_policy_not_supported", job_id=job_id,
             )
     try:
-        preflight = _run_beets_import(app, source, pretend=True)
+        if execution_selection == "staged-album":
+            with tempfile.TemporaryDirectory(prefix="cratekeep-preflight-", dir=app.config["STATE_PATH"]) as staging:
+                preflight_source, _ = _stage_exact_inbox_album(Path(staging), paths)
+                preflight = _run_beets_import(app, preflight_source, pretend=True)
+        else:
+            preflight_source = paths[0] if execution_selection == "exact-file" else source
+            preflight = _run_beets_import(app, preflight_source, pretend=True)
     except (OSError, subprocess.TimeoutExpired) as exc:
         _persist_library_execution_failure(app, album_review_id, job_id, f"Beets preflight failed: {exc}", dry_run)
         raise LibraryImportExecutionError(
@@ -4903,7 +5072,7 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
         "id": job_id, "album_review_id": album_review_id, "status": "preview" if dry_run else "complete",
         "dry_run": dry_run, "selection_mode": "candidate" if candidate else "as-is",
         "files": len(paths), "source": next(iter(scopes)), "destinations": destinations,
-        "preflight_output": preflight_output,
+        "execution_selection": execution_selection, "preflight_output": preflight_output,
     }
     if dry_run:
         result["finished_at"] = _now()
@@ -4920,18 +5089,33 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
         # tag/artwork writes, or the moving import can mutate source media.
         try:
             paths = [_validate_inventory_file(root, row) for row in rows]
-            _validate_inbox_album_scope(root, source, paths)
+            current_selection = _inbox_execution_selection(root, source, paths)
+            if execution_selection == "exclusive-scope" and current_selection != execution_selection:
+                raise LibraryImportExecutionError(
+                    "The reviewed album's source folder gained unrelated audio after preflight.",
+                    code="source_contains_other_albums",
+                )
         except LibraryImportExecutionError as exc:
             _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
             exc.job_id = job_id
             raise
         source_cover = (source if source.is_dir() else source.parent) / "cover.jpg"
-        try:
-            source_sidecar = _read_inbox_source_sidecar(source_cover)
-        except LibraryImportExecutionError as exc:
-            _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
-            exc.job_id = job_id
-            raise
+        if execution_selection == "exclusive-scope":
+            try:
+                source_sidecar = _read_inbox_source_sidecar(source_cover)
+            except LibraryImportExecutionError as exc:
+                _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
+                exc.job_id = job_id
+                raise
+        else:
+            # A root-level cover can describe any active review in this shared
+            # scope. Leave it untouched instead of silently assigning it.
+            source_sidecar = None
+            if os.path.lexists(source_cover):
+                result["source_artwork"] = {
+                    "status": "ignored-shared-root",
+                    "message": "Shared Inbox root cover.jpg was left untouched.",
+                }
         with tempfile.TemporaryDirectory(prefix="cratekeep-inbox-", dir=app.config["STATE_PATH"]) as backup_dir:
             backup_root = Path(backup_dir)
             backups = []
@@ -4979,10 +5163,17 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                     f"Inbox metadata or artwork preparation failed: {exc}",
                     code="execution_failed", status=500, job_id=job_id,
                 ) from exc
+            restore_staged_sources = execution_selection == "staged-album"
+            execution_source = paths[0] if execution_selection == "exact-file" else source
+            staged_paths = paths
             try:
-                execution = _run_beets_import(app, source)
+                if restore_staged_sources:
+                    exact_identities = _exact_inbox_source_identities(paths)
+                    execution_source, staged_paths = _stage_exact_inbox_album(backup_root, paths)
+                    _unlink_exact_inbox_sources(exact_identities)
+                execution = _run_beets_import(app, execution_source)
             except Exception as exc:
-                restored, moved = _restore_inbox_sources(backups)
+                restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
                 message = f"Beets import could not complete: {exc}"
                 if moved:
                     message += f" {moved} file(s) were already moved by Beets and were not rolled back."
@@ -4994,7 +5185,7 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
             output = (execution.stdout + execution.stderr)[-12000:]
             result.update(returncode=execution.returncode, output=output)
             if execution.returncode != 0:
-                restored, moved = _restore_inbox_sources(backups)
+                restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
                 result.update(status="failed", restored_files=restored, already_moved_files=moved)
                 message = f"Beets import failed ({execution.returncode}): {output}"
                 if moved:
@@ -5002,9 +5193,10 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 _persist_inbox_execution_failure(app, album_review_id, job_id, message, result)
                 raise LibraryImportExecutionError(message, code="beets_import_failed", status=502, job_id=job_id)
             try:
-                result["items"] = _verify_inbox_move(app, paths, destinations)
+                verification_sources = staged_paths if restore_staged_sources else paths
+                result["items"] = _verify_inbox_move(app, verification_sources, destinations)
             except LibraryImportExecutionError as exc:
-                restored, moved = _restore_inbox_sources(backups)
+                restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
                 result.update(
                     restored_files=restored, already_moved_files=moved,
                     verification=getattr(exc, "diagnostics", {"expected": len(destinations)}),
@@ -5636,7 +5828,206 @@ def _inbox_tag_snapshot(path: Path) -> dict:
     return values
 
 
-def _scan_inbox_inventory(app: Flask, inbox: dict[str, str]) -> dict:
+def _validated_inbox_scope(inbox: dict[str, str], value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("scope is required")
+    scope = value.strip()
+    root = Path(inbox["path"]).resolve()
+    if scope == ".":
+        return scope
+    candidate = Path(scope)
+    if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+        raise ValueError("scope must be an immediate child of this Inbox")
+    path = root / candidate.name
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("Inbox scope does not exist") from exc
+    if path.is_symlink() or not resolved.is_dir() or resolved.parent != root:
+        raise ValueError("Inbox scope must be a non-symlinked immediate folder")
+    return candidate.name
+
+
+def _request_inbox_scopes(inbox: dict[str, str], values: dict | None = None) -> list[str]:
+    values = values if values is not None else request.get_json(silent=True)
+    if not isinstance(values, dict) or not isinstance(values.get("scopes"), list):
+        raise ValueError("scopes must be an array")
+    if not values["scopes"]:
+        raise ValueError("select at least one Inbox scope")
+    if len(values["scopes"]) > 1000:
+        raise ValueError("no more than 1000 Inbox scopes may be submitted")
+    scopes = []
+    for value in values["scopes"]:
+        scope = _validated_inbox_scope(inbox, value)
+        if scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _inbox_scope_album_ids(
+    app: Flask, inbox: dict[str, str], scopes: list[str], *, include_complete: bool = False,
+) -> list[int]:
+    root = str(Path(inbox["path"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT albums.id, albums.execution_status, inventory.relative_path
+                 FROM album_reviews AS albums
+                 JOIN album_review_tracks AS tracks ON tracks.album_review_id=albums.id
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE albums.root_path=? AND albums.source_kind='inbox' AND albums.source_id=?
+                  AND inventory.present=1 ORDER BY albums.id""",
+            (root, inbox["id"]),
+        ).fetchall()
+    wanted = set(scopes)
+    return list(dict.fromkeys(
+        row["id"] for row in rows if _scope_for_relative_path(row["relative_path"]) in wanted
+        and (include_complete or row["execution_status"] != "complete")
+    ))
+
+
+def _inbox_scope_list(app: Flask, inbox: dict[str, str]) -> dict:
+    configured = Path(inbox["path"])
+    if configured.is_symlink():
+        raise ValueError("Inbox root must not be a symlink.")
+    root = configured.resolve()
+    library_root = _validated_library_root(app)
+    if root == library_root or root in library_root.parents or library_root in root.parents:
+        raise ValueError("Inbox and Library roots overlap; choose separate, non-nested paths in Settings.")
+    if not root.is_dir():
+        raise ValueError("Configured Inbox path is not a directory.")
+    entries = list(root.iterdir())
+    scopes = sorted(
+        (entry.name for entry in entries if entry.is_dir() and not entry.is_symlink()),
+        key=lambda value: (value.casefold(), value),
+    )
+    if any(entry.is_file() and not entry.is_symlink() and entry.suffix.lower() in AUDIO_EXTENSIONS
+           for entry in entries):
+        scopes.insert(0, ".")
+    root_text = str(root)
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.relative_path, inventory.size_bytes, albums.id AS album_id,
+                      albums.execution_status, albums.execution_error, albums.candidate_status,
+                      albums.candidate_error, albums.state
+                 FROM library_inventory AS inventory
+                 LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id=inventory.id
+                 LEFT JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                WHERE inventory.source_kind='inbox' AND inventory.source_id=?
+                  AND inventory.root_path=? AND inventory.present=1""",
+            (inbox["id"], root_text),
+        ).fetchall()
+        scan_rows = db.execute(
+            """SELECT summary_json FROM adoption_jobs
+                WHERE root_path=? AND kind='inbox_inventory' AND status='complete'""", (root_text,),
+        ).fetchall()
+    scanned = set()
+    for row in scan_rows:
+        summary = json.loads(row["summary_json"] or "{}")
+        scanned.update(summary.get("scopes") or [])
+    by_scope = {scope: [] for scope in scopes}
+    for row in rows:
+        by_scope.setdefault(_scope_for_relative_path(row["relative_path"]), []).append(row)
+    records = []
+    for scope in scopes:
+        scoped = by_scope.get(scope, [])
+        # A completed import may intentionally leave a sidecar or now-empty
+        # directory behind. Once a scope has been inventoried, no active audio
+        # rows means it is complete rather than selectable queue work.
+        if scope in scanned and not scoped:
+            continue
+        album_ids = {row["album_id"] for row in scoped if row["album_id"] is not None
+                     and row["execution_status"] != "complete"}
+        errors = [row for row in scoped if row["album_id"] in album_ids and (
+            row["execution_status"] == "failed" or row["candidate_status"] == "error"
+        )]
+        complete = {row["album_id"] for row in scoped if row["album_id"] in album_ids
+                    and row["candidate_status"] == "complete" and not row["candidate_error"]}
+        # The lightweight row reports candidate lifecycle only. Strict "ready"
+        # remains the shared payload-level predicate used by preview/execution.
+        status = ("error" if errors else "matched" if complete and complete == album_ids
+                  else "needs-review" if album_ids else "scanned" if scope in scanned else "not-scanned")
+        records.append({
+            "path": scope, "name": "Loose files" if scope == "." else scope, "status": status,
+            "track_count": len(scoped), "album_count": len(album_ids),
+            "bytes": sum(row["size_bytes"] or 0 for row in scoped),
+            "error": next((row["execution_error"] or row["candidate_error"] for row in errors), ""),
+        })
+    return {"inbox_id": inbox["id"], "inbox_name": inbox["name"], "scopes": records,
+            "total": len(records)}
+
+
+def _inbox_bulk_ready_summary(app: Flask, inbox: dict[str, str], scopes: list[str]) -> dict:
+    album_ids = _inbox_scope_album_ids(app, inbox, scopes)
+    albums = [_with_readiness(album) for album in _album_review_payloads(
+        app, album_ids, root=str(Path(inbox["path"]).resolve()),
+        source_kind="inbox", source_id=inbox["id"],
+    )]
+    ready = [album for album in albums if album["ready"]]
+    exceptions = [album for album in albums if not album["ready"]]
+    return {
+        "inbox_id": inbox["id"], "selected_scope_count": len(scopes),
+        "available_album_count": len(albums), "ready_album_count": len(ready),
+        "track_count": sum(len(album["tracks"]) for album in ready),
+        "exception_count": len(exceptions),
+        "ready_albums": [{"id": album["id"], "artist": album["artist"],
+                          "album": album["album"], "tracks": len(album["tracks"])} for album in ready],
+        "exceptions": [{"id": album["id"], "artist": album["artist"], "album": album["album"],
+                        "reason": album["readiness_reason"]} for album in exceptions],
+    }
+
+
+def _execute_inbox_bulk_ready(app: Flask, inbox: dict[str, str], scopes: list[str]) -> dict:
+    summary = _inbox_bulk_ready_summary(app, inbox, scopes)
+    imported, failed = [], []
+    lock = app.config["INBOX_EXECUTION_LOCK"]
+    if not lock.acquire(blocking=False):
+        raise LibraryImportExecutionError(
+            "Another Inbox execution is already running; retry after it finishes.",
+            code="execution_in_progress", status=409,
+        )
+    try:
+        for album in summary["ready_albums"]:
+            try:
+                current = next(iter(_album_review_payloads(
+                    app, [album["id"]], root=str(Path(inbox["path"]).resolve()),
+                    source_kind="inbox", source_id=inbox["id"],
+                )), None)
+                ready, reason = _album_bulk_readiness(current or {})
+                if not ready:
+                    raise LibraryImportExecutionError(f"Album is no longer ready: {reason}", code="not_ready")
+                _update_album_review(
+                    app, album["id"], {"decision": "approved"},
+                    root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"],
+                )
+                _execute_inbox_album(app, album["id"], dry_run=True)
+                result = _execute_inbox_album(app, album["id"], dry_run=False)
+                imported.append({"album_review_id": album["id"], "artist": album["artist"],
+                                 "album": album["album"], "files": result["files"]})
+            except Exception as exc:
+                failed.append({"album_review_id": album["id"], "artist": album["artist"],
+                               "album": album["album"], "error": str(exc)})
+    finally:
+        lock.release()
+    return {"inbox_id": inbox["id"], "selected_scope_count": len(scopes),
+            "imported": imported, "skipped": summary["exceptions"], "failed": failed}
+
+
+def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, os.stat_result]]:
+    discovered = []
+    for scope in scopes:
+        if scope == ".":
+            discovered.extend(
+                (path.resolve(), path.stat()) for path in sorted(root.iterdir(), key=lambda item: item.name.casefold())
+                if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS
+            )
+        else:
+            discovered.extend(_library_audio_stats(root / scope))
+    return sorted(dict(discovered).items(), key=lambda item: str(item[0]).casefold())
+
+
+def _scan_inbox_inventory(
+    app: Flask, inbox: dict[str, str], *, scopes: list[str] | None = None,
+) -> dict:
     configured = Path(inbox["path"])
     if configured.is_symlink():
         raise ValueError("Inbox root must not be a symlink.")
@@ -5660,7 +6051,7 @@ def _scan_inbox_inventory(app: Flask, inbox: dict[str, str]) -> dict:
             )
         }
     try:
-        discovered = _library_audio_stats(root)
+        discovered = _library_audio_stats(root) if scopes is None else _inbox_scope_audio_stats(root, scopes)
     except OSError as exc:
         with _connect(app.config["APP_DB"]) as db:
             db.execute(
@@ -5669,14 +6060,26 @@ def _scan_inbox_inventory(app: Flask, inbox: dict[str, str]) -> dict:
             )
         raise ValueError(f"Unable to inventory inbox: {exc}") from exc
 
-    changed_ids = []
+    discovered_relatives = {path.relative_to(root).as_posix() for path, _ in discovered}
+    wanted = set(scopes or [])
+    changed_ids = [
+        row["id"] for relative, row in previous.items()
+        if row["present"] and relative not in discovered_relatives
+        and (scopes is None or _scope_for_relative_path(relative) in wanted)
+    ]
     total_bytes = 0
     with _connect(app.config["APP_DB"]) as db:
         # A stable source ID may be renamed, but a root change is a new snapshot.
-        db.execute(
-            "UPDATE library_inventory SET present=0 WHERE source_kind='inbox' AND source_id=?",
-            (inbox["id"],),
-        )
+        if scopes is None:
+            db.execute(
+                "UPDATE library_inventory SET present=0 WHERE source_kind='inbox' AND source_id=?",
+                (inbox["id"],),
+            )
+        else:
+            scoped_ids = [(row["id"],) for relative, row in previous.items()
+                          if _scope_for_relative_path(relative) in wanted]
+            if scoped_ids:
+                db.executemany("UPDATE library_inventory SET present=0 WHERE id=?", scoped_ids)
         for path, stat in discovered:
             relative = path.relative_to(root).as_posix()
             old = previous.get(relative)
@@ -5719,23 +6122,32 @@ def _scan_inbox_inventory(app: Flask, inbox: dict[str, str]) -> dict:
                             candidate_status='stale', candidate_error='Source files changed; refresh candidates.',
                             execution_status='not-run', execution_error='', updated_at=?
                       WHERE id IN (SELECT album_review_id FROM album_review_tracks
-                                    WHERE inventory_id IN ({placeholders}))""",
+                                    WHERE inventory_id IN ({placeholders}))
+                        AND execution_status NOT IN ('complete', 'artwork-pending')""",
                 (_now(), *changed_ids),
             )
         db.execute(
             "UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
-            (json.dumps({"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids)}), _now(), job_id),
+            (json.dumps({"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids),
+                         "scopes": scopes}), _now(), job_id),
         )
     _sync_inbox_album_reviews(app, inbox, root)
-    return {"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids)}
+    return {"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids),
+            "scopes": scopes}
 
 
 def _sync_inbox_album_reviews(app: Flask, inbox: dict[str, str], root: Path) -> None:
     with _connect(app.config["APP_DB"]) as db:
         rows = db.execute(
-            """SELECT inventory.id, inventory.relative_path, reviews.candidates_json
+            """SELECT inventory.id, inventory.relative_path, reviews.candidates_json,
+                      albums.id AS existing_album_id, albums.state AS existing_state,
+                      albums.candidate_status AS existing_candidate_status,
+                      albums.selected_candidate_id AS existing_candidate_id,
+                      albums.execution_status AS existing_execution_status
                  FROM library_inventory AS inventory
                  JOIN adoption_reviews AS reviews ON reviews.inventory_id=inventory.id
+                 LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id=inventory.id
+                 LEFT JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
                 WHERE inventory.source_kind='inbox' AND inventory.source_id=?
                   AND inventory.root_path=? AND inventory.present=1
                 ORDER BY inventory.relative_path COLLATE NOCASE""",
@@ -5759,10 +6171,22 @@ def _sync_inbox_album_reviews(app: Flask, inbox: dict[str, str], root: Path) -> 
         groups = {}
         for row in rows:
             snapshot = next(iter(json.loads(row["candidates_json"])), {})
-            parts = Path(row["relative_path"]).parts
-            scope = parts[0]
+            scope = _scope_for_relative_path(row["relative_path"])
+            # Older releases keyed each root-level file by its filename. Keep
+            # any review with user/provider evidence on that stable row rather
+            # than silently merging or discarding its decision during upgrade.
+            reviewed_legacy_root = scope == "." and row["existing_album_id"] is not None and (
+                row["existing_state"] != "pending"
+                or row["existing_candidate_status"] != "not-run"
+                or row["existing_candidate_id"] is not None
+                or row["existing_execution_status"] != "not-run"
+            )
+            if reviewed_legacy_root:
+                scope = Path(row["relative_path"]).name
             artist = _normalize_metadata(snapshot.get("albumartist") or snapshot.get("artist")) or "Unknown artist"
-            album = _normalize_metadata(snapshot.get("album")) or (scope if len(parts) > 1 else Path(scope).stem)
+            album = _normalize_metadata(snapshot.get("album")) or (
+                Path(row["relative_path"]).stem if scope == "." else scope
+            )
             key = (scope.casefold(), _metadata_key(artist), _metadata_key(album))
             groups.setdefault(key, {"scope": scope, "artist": artist, "album": album, "rows": []})["rows"].append(row)
         now = _now()
