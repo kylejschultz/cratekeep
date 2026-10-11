@@ -741,6 +741,91 @@ def test_review_presentation_has_one_renderer_and_one_common_stylesheet():
         assert selector not in inline_styles
 
 
+def test_library_and_inbox_share_corrected_modal_controls_and_selection_save_path(tmp_path):
+    client = make_app(tmp_path).test_client()
+    settings = client.get("/settings").get_data(as_text=True)
+    inbox = client.get("/inbox").get_data(as_text=True)
+    partial = Path("beets_mvp/templates/_review_workflow.html").read_text()
+    controller = Path("beets_mvp/static/review-workflow.js").read_text()
+
+    for page in (settings, inbox):
+        assert ">Find matches<" in page
+        assert ">Search by MBID<" in page
+        assert ">Import to Library<" in page
+        assert "Current metadata" not in page
+        assert "Approve selection" not in page
+        assert "Exact MusicBrainz release ID" not in page
+    assert "MusicBrainz release or release-group ID" in partial
+    assert "data-review-current" not in partial and "data-review-approve" not in partial
+    assert "async function selectDecision" in controller
+    assert "decision: 'approved', candidate_id: selectedValue(id)" in controller
+    assert "adapter.save(album" in controller
+    assert "As Is keeps current tags. Select this option to use current metadata." in Path(
+        "beets_mvp/static/review-presentation.js"
+    ).read_text()
+    assert "Explicit approval required." not in Path("beets_mvp/static/review-presentation.js").read_text()
+
+
+def test_inbox_duplicate_choice_after_selection_persists_before_execute(tmp_path, monkeypatch):
+    controller = Path("beets_mvp/static/review-workflow.js").read_text()
+    handler = controller[controller.index("async function persistDuplicateAction"):controller.index("function render()")]
+    assert "setBusy(true, 'Saving duplicate decision…', duplicateAction)" in handler
+    assert "decision: 'approved', candidate_id: selectedValue(selected), duplicate_action: next" in handler
+    assert "duplicateAction.value = previous; render(); setStatus(error.message, true)" in handler
+    assert "duplicateAction.addEventListener('change', persistDuplicateAction)" in controller
+
+    app = make_app(tmp_path)
+    source = tmp_path / "inbox" / "Incoming" / "01 Song.wav"
+    tagged_inbox_wav(source)
+    managed_path = tmp_path / "library" / "Managed" / "Old Album" / "01 Song.wav"
+    tagged_inbox_wav(managed_path, artist="Managed", album="Old Album")
+    library = Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+    managed = Item.from_path(managed_path); managed.mb_trackid = "recording-1"; library.add(managed)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": query["artist"], "album": query["album"],
+        "tracks": [{"title": "Song", "track_artist": "Artist", "position": 1,
+                    "medium_position": 1, "length_ms": 1000, "recording_id": "recording-1"}],
+    }]
+    client = app.test_client()
+    album = client.get("/api/inbox/reviews").json["albums"][0]
+    matched = client.post("/api/inbox/candidates", json={"album_id": album["id"]}).json["album"]
+    candidate_id = matched["candidates"][0]["id"]
+
+    selected = client.patch(f"/api/inbox/albums/{album['id']}", json={
+        "decision": "approved", "candidate_id": candidate_id,
+    })
+    assert selected.status_code == 200 and selected.json["duplicate_action"] is None
+    saved = client.patch(f"/api/inbox/albums/{album['id']}", json={
+        "decision": "approved", "candidate_id": candidate_id, "duplicate_action": "keep-both",
+    })
+    assert saved.status_code == 200 and saved.json["duplicate_action"] == "keep-both"
+
+    def run(current_app, selection, *, pretend=False):
+        if not pretend:
+            complete_mock_inbox_move(current_app, source)
+        return subprocess.CompletedProcess(["beet"], 0, "fixture success", "")
+
+    monkeypatch.setattr("beets_mvp._run_beets_import", run)
+    preview = client.post(f"/api/inbox/albums/{album['id']}/execute", json={"dry_run": True})
+    executed = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
+    assert preview.status_code == 200 and preview.json["status"] == "preview"
+    assert executed.status_code == 201 and executed.json["status"] == "complete"
+
+
+def test_shared_rows_button_gaps_and_pagination_alignment_contract(tmp_path):
+    client = make_app(tmp_path).test_client()
+    settings = client.get("/settings").get_data(as_text=True)
+    inbox = client.get("/inbox").get_data(as_text=True)
+    css = Path("beets_mvp/static/app-shell.css").read_text()
+
+    row_contract = "rowClass:'review-folder',summaryClass:'review-folder-summary',identityClass:'review-folder-identity'"
+    assert row_contract in settings and row_contract in inbox
+    assert "nameClass:'review-folder-path',countClass:'review-folder-count'" in settings
+    assert "nameClass:'review-folder-path',countClass:'review-folder-count'" in inbox
+    assert ".review-toolbar-actions,.review-footer-group,.browser-actions,.workflow-actions { gap:.5rem; }" in css
+    assert ".pagination .page-label,.review-pagination .page-label { display:flex; align-self:stretch; align-items:center;" in css
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared review helpers")
 def test_shared_track_evidence_identifies_only_material_changes():
     module = Path("beets_mvp/static/review-presentation.js").read_text()
@@ -3135,7 +3220,8 @@ def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
     })
 
     assert response.status_code == 200
-    assert response.json["selected_candidate_id"] == response.json["proposed_match"]["id"]
+    assert response.json["selected_candidate_id"] is None
+    assert response.json["decision"] == "pending"
     assert response.json["proposed_match"]["confidence"] == 1.0
     assert response.json["proposed_match"]["recommendation"] == "strong"
     assert response.json["proposed_match"]["selected_by_mbid"] is True
@@ -3148,6 +3234,41 @@ def test_musicbrainz_id_override_is_strict_and_uses_injected_provider(tmp_path):
     })
     assert response.status_code == 200
     assert calls[1][0]["musicbrainz_id"] == "aaaaaaaa-aaaa-8aaa-7aaa-aaaaaaaaaaaa"
+
+
+def test_release_group_mbid_returns_all_bounded_editions_without_selecting_one(tmp_path):
+    group_id = "123e4567-e89b-42d3-a456-426614174100"
+    release_ids = ["123e4567-e89b-42d3-a456-426614174101", "123e4567-e89b-42d3-a456-426614174102"]
+    calls = []
+    app = make_app(tmp_path)
+    def provider(query, *, limit):
+        calls.append((dict(query), limit))
+        if "musicbrainz_id" in query:
+            return []
+        return [{
+            "provider_id": release_id, "release_group_id": group_id,
+            "artist": "Artist", "album": "Album", "year": str(2020 + index),
+            "tracks": query["tracks"],
+        } for index, release_id in enumerate(release_ids, 1)]
+    app.config["MUSICBRAINZ_PROVIDER"] = provider
+    path = tmp_path / "library" / "Artist" / "Album" / "01 Song.mp3"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic")
+    client = app.test_client()
+    client.post("/api/library/inventory/preview")
+    album_id = client.get("/api/library-import/reviews").json["albums"][0]["id"]
+
+    response = client.post(
+        f"/api/library-import/albums/{album_id}/rematch", json={"musicbrainz_id": group_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json["decision"] == "pending"
+    assert response.json["selected_candidate_id"] is None
+    assert [candidate["provider_id"] for candidate in response.json["candidates"][:2]] == release_ids
+    assert all(candidate["retrieval"]["source"] == "release-group-id" for candidate in response.json["candidates"][:2])
+    assert calls[0][0]["musicbrainz_id"] == group_id and calls[0][1] == 1
+    assert calls[1][0]["musicbrainz_release_group_id"] == group_id and calls[1][1] == 10
 
 
 def test_rematch_distinguishes_invalid_id_missing_release_and_provider_failure(tmp_path):
@@ -3176,8 +3297,8 @@ def test_rematch_distinguishes_invalid_id_missing_release_and_provider_failure(t
     })
     assert missing.status_code == 404
     assert missing.json == {
-        "code": "release_not_found",
-        "error": "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
+        "code": "musicbrainz_id_not_found",
+        "error": "No MusicBrainz release or release group exists for that ID.",
         "retryable": False,
     }
 
@@ -3546,7 +3667,8 @@ def test_rematch_wrong_release_id_stays_selected_with_low_evidence_confidence(tm
 
     assert response.status_code == 200
     candidate = response.json["proposed_match"]
-    assert response.json["selected_candidate_id"] == candidate["id"]
+    assert response.json["selected_candidate_id"] is None
+    assert response.json["decision"] == "pending"
     assert candidate["provider_id"] == release_id
     assert candidate["artist"] == "Other Performer"
     assert candidate["retrieval"] == {"search_score": None, "source": "release-id"}
@@ -3828,7 +3950,7 @@ def test_library_import_operations_expose_visible_live_progress(tmp_path):
     assert b'.operation-status[data-busy="true"]::before' in html
     assert b"Scanning" in folders
     assert b"Finding bounded MusicBrainz candidates" in controller
-    assert b"Searching MusicBrainz for this release" in controller
+    assert b"Searching MusicBrainz by MBID" in controller
     assert b"Validating files, registering them, and applying approved metadata in place" in html
     assert b"setAttribute('aria-busy', String(value))" in controller
 
@@ -5047,7 +5169,9 @@ def test_library_and_inbox_share_batched_folder_workflow_primitives(tmp_path):
     assert "adapter.selectLabel ? adapter.selectLabel(item) : `Select ${noun} ${item.name}`" in module
     assert "adapter.selectAllLabel || `Select all ${noun}s`" in module
     assert "selectAllLabel:'Select all folders on this page'" in settings
-    assert "item.path==='.'?'Select loose files scope':`Select album folder ${item.name}`" in inbox
+    assert "item.path==='.'?'Select loose files folder':`Select album folder ${item.name}`" in inbox
+    assert "rowClass:'review-folder',summaryClass:'review-folder-summary'" in inbox
+    assert "rowClass:'review-folder',summaryClass:'review-folder-summary'" in settings
     assert "checkboxClass:'review-select'" in settings and "countClass:'review-folder-count'" in settings
     assert "libraryFolders.load(2); libraryFolders.load(5);" in Path("tests/runtime_smoke.py").read_text()
     assert "if (failed) one(root, 'execute').querySelector('.button-label').textContent" in Path("beets_mvp/static/review-workflow.js").read_text()
@@ -5607,24 +5731,50 @@ def test_inbox_execution_revalidates_after_preflight_and_audits_stale_source(tmp
     assert "changed after inventory preview" in job[1]
 
 
-def test_inbox_execution_blocks_a_source_folder_containing_another_album(tmp_path, monkeypatch):
+def test_inbox_shared_non_root_folder_imports_exact_review_and_preserves_sibling(tmp_path, monkeypatch):
+    import beets_mvp
     app = make_app(tmp_path)
     source = tmp_path / "inbox" / "Mixed"
     tagged_inbox_wav(source / "01 First.wav", album="First", title="First")
     tagged_inbox_wav(source / "01 Second.wav", album="Second", title="Second")
+    sidecar = source / "notes.txt"
+    sidecar.write_bytes(b"unrelated sidecar bytes")
+    cover = source / "cover.jpg"
+    cover.write_bytes(jpeg_bytes((19, 41, 73)))
+    first_path, second_path = source / "01 First.wav", source / "01 Second.wav"
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in (first_path, second_path, sidecar, cover)}
+    monkeypatch.setenv("PATH", f"{Path(os.sys.executable).parent}:{os.environ.get('PATH', '')}")
+    calls = []
+    real_run = beets_mvp._run_beets_import
+    def record_run(current_app, selection, *, pretend=False):
+        selection = Path(selection)
+        calls.append((selection, pretend, sorted(path.name for path in selection.rglob("*") if path.is_file())))
+        return real_run(current_app, selection, pretend=pretend)
+    monkeypatch.setattr("beets_mvp._run_beets_import", record_run)
     client = app.test_client()
     albums = client.get("/api/inbox/reviews").json["albums"]
     assert {album["album"] for album in albums} == {"First", "Second"}
     first = next(album for album in albums if album["album"] == "First")
+    second = next(album for album in albums if album["album"] == "Second")
     client.patch(
         f"/api/inbox/albums/{first['id']}", json={"decision":"approved", "candidate_id":None}
     )
-    monkeypatch.setattr("beets_mvp._run_beets_import", lambda *args, **kwargs: pytest.fail("Beets must not run"))
 
     response = client.post(f"/api/inbox/albums/{first['id']}/execute", json={})
-    assert response.status_code == 409
-    assert response.json["code"] == "source_contains_other_albums"
-    assert len(list(source.glob("*.wav"))) == 2
+
+    assert response.status_code == 201
+    assert response.json["execution_selection"] == "staged-album"
+    assert response.json["source_artwork"]["status"] == "ignored-shared-source"
+    assert len(calls) == 2 and all(selection != source for selection, _, _ in calls)
+    assert all(files == ["01 First.wav"] for _, _, files in calls)
+    assert not first_path.exists()
+    assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in (second_path, sidecar, cover)} == {
+        path: before[path] for path in (second_path, sidecar, cover)
+    }
+    remaining = client.get("/api/inbox/reviews").json["albums"]
+    sibling = next(album for album in remaining if album["id"] == second["id"])
+    assert sibling["execution_status"] != "complete"
+    assert sibling["tracks"][0]["path"] == "Mixed/01 Second.wav"
 
 
 def test_inbox_immediate_sibling_folders_import_independently_with_real_beets(tmp_path, monkeypatch):
@@ -5887,7 +6037,7 @@ def test_root_level_shared_sidecar_is_left_untouched_and_not_attached(tmp_path, 
     response = client.post(f"/api/inbox/albums/{album['id']}/execute", json={})
 
     assert response.status_code == 201
-    assert response.json["source_artwork"]["status"] == "ignored-shared-root"
+    assert response.json["source_artwork"]["status"] == "ignored-shared-source"
     assert cover.read_bytes() == artwork and second.read_bytes() == second_bytes
     destination = Path(response.json["items"][0]["path"])
     assert not (destination.parent / "cover.jpg").exists()

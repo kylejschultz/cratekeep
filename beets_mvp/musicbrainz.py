@@ -39,9 +39,16 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
     """Return canonical MusicBrainz release data for one album query."""
     limit = max(1, min(int(limit), 10))
     musicbrainz_id = query.get("musicbrainz_id")
+    release_group_id = query.get("musicbrainz_release_group_id")
     if musicbrainz_id:
         params = urllib.parse.urlencode({"inc": "artist-credits+recordings+release-groups", "fmt": "json"})
         url = f"https://musicbrainz.org/ws/2/release/{urllib.parse.quote(str(musicbrainz_id))}?{params}"
+    elif release_group_id:
+        params = urllib.parse.urlencode({
+            "release-group": str(release_group_id),
+            "inc": "artist-credits+recordings+release-groups", "fmt": "json", "limit": limit,
+        })
+        url = f"https://musicbrainz.org/ws/2/release/?{params}"
     else:
         terms = []
         if query.get("album"):
@@ -54,7 +61,7 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
     releases = [document] if musicbrainz_id and document.get("id") else document.get("releases", [])[:limit]
     # Search responses are retrieval records and generally omit recordings.
     # Resolve each bounded hit to its canonical release before matching.
-    if not musicbrainz_id:
+    if not musicbrainz_id and not release_group_id:
         detailed = []
         for release in releases:
             release_id = release.get("id")
@@ -70,7 +77,7 @@ def search_releases(query: dict, *, limit: int = 5, timeout: int = 10) -> list[d
     results = []
     artwork_documents: dict[tuple[str, str], dict | ProviderError] = {}
     for release in releases:
-        result = _normalize_release(release, exact=bool(musicbrainz_id))
+        result = _normalize_release(release, exact=bool(musicbrainz_id or release_group_id))
         if not result["provider_id"]:
             continue
         group_id = result.get("release_group_id")

@@ -383,7 +383,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         values = request.get_json(silent=True)
         mbid = values.get("musicbrainz_id") if isinstance(values, dict) and set(values) == {"musicbrainz_id"} else None
         if not isinstance(mbid, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(mbid):
-            return jsonify(error="Enter a canonical MusicBrainz release UUID.", code="invalid_musicbrainz_id"), 400
+            return jsonify(error="Enter a canonical MusicBrainz release or release-group UUID.", code="invalid_musicbrainz_id"), 400
         context = _inbox_album_context(app, album_review_id)
         if context is None:
             return jsonify(error="Inbox album review not found", code="album_review_not_found"), 404
@@ -393,7 +393,8 @@ def create_app(test_config: dict | None = None) -> Flask:
                 source_id=context["inbox"]["id"],
             )
         except ProviderError as exc:
-            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), (503 if exc.retryable else 502)
+            status = 404 if exc.code == "musicbrainz_id_not_found" else (503 if exc.retryable else 502)
+            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), status
         return jsonify(album)
 
     @app.post("/api/inbox/albums/<int:album_review_id>/execute")
@@ -701,13 +702,21 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.post("/api/library-import/candidates")
     def generate_library_import_candidates():
         _sync_album_reviews(app)
+        values = request.get_json(silent=True) or {}
         try:
-            limit = int((request.get_json(silent=True) or {}).get("limit", MAX_CANDIDATE_ALBUMS))
+            limit = int(values.get("limit", MAX_CANDIDATE_ALBUMS))
         except (TypeError, ValueError):
             return jsonify(error="limit must be an integer"), 400
         if not 1 <= limit <= MAX_CANDIDATE_ALBUMS:
             return jsonify(error=f"limit must be between 1 and {MAX_CANDIDATE_ALBUMS}"), 400
-        result = _generate_musicbrainz_candidates(app, limit)
+        album_id = values.get("album_id")
+        if album_id is not None and (not isinstance(album_id, int) or isinstance(album_id, bool)):
+            return jsonify(error="album_id must be an integer", code="invalid_request"), 400
+        if set(values) - {"limit", "album_id"}:
+            return jsonify(error="request may contain only limit and album_id", code="invalid_request"), 400
+        result = _generate_musicbrainz_candidates(
+            app, limit, album_ids=[album_id] if album_id is not None else None,
+        )
         return jsonify(result), (207 if result["errors"] else 201)
 
     @app.patch("/api/library-import/albums/<int:album_review_id>")
@@ -736,13 +745,13 @@ def create_app(test_config: dict | None = None) -> Flask:
         musicbrainz_id = values.get("musicbrainz_id")
         if not isinstance(musicbrainz_id, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(musicbrainz_id):
             return jsonify(
-                error="Enter a canonical MusicBrainz release UUID (for example, 123e4567-e89b-42d3-a456-426614174000).",
+                error="Enter a canonical MusicBrainz release or release-group UUID (for example, 123e4567-e89b-42d3-a456-426614174000).",
                 code="invalid_musicbrainz_id",
             ), 400
         try:
             item = _rematch_album_by_musicbrainz_id(app, album_review_id, musicbrainz_id.lower())
         except ProviderError as exc:
-            status = 404 if exc.code == "release_not_found" else (503 if exc.retryable else 502)
+            status = 404 if exc.code == "musicbrainz_id_not_found" else (503 if exc.retryable else 502)
             payload = {"error": str(exc), "code": exc.code, "retryable": exc.retryable}
             if exc.upstream_status is not None:
                 payload["upstream_status"] = exc.upstream_status
@@ -3904,55 +3913,87 @@ def _rematch_album_by_musicbrainz_id(
     if album is None:
         return None
     query = _album_query(app, album)
-    provider_query = {**query, "musicbrainz_id": musicbrainz_id}
-    raw = app.config["MUSICBRAINZ_PROVIDER"](provider_query, limit=1)
+    provider = app.config["MUSICBRAINZ_PROVIDER"]
+    release_error = None
+    try:
+        raw = provider({**query, "musicbrainz_id": musicbrainz_id}, limit=1)
+    except ProviderError as exc:
+        if exc.code != "release_not_found":
+            raise
+        release_error = exc
+        raw = []
     if not isinstance(raw, list):
         raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
-    if not raw:
-        raise ProviderError(
-            "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
-            code="release_not_found",
-        )
-    candidate = next(
-        (value for value in raw if isinstance(value, dict) and str(value.get("provider_id", "")).lower() == musicbrainz_id),
-        None,
-    )
-    if candidate is None:
-        raise ProviderError("MusicBrainz provider returned a different release ID", code="provider_invalid_response")
-    candidate = dict(candidate)
-    candidate["retrieval"] = {**(candidate.get("retrieval") or {}), "source": "release-id", "search_score": None}
+    exact_release = next((
+        value for value in raw
+        if isinstance(value, dict) and str(value.get("provider_id", "")).lower() == musicbrainz_id
+    ), None)
+    if exact_release is not None:
+        candidates = [dict(exact_release)]
+        retrieval_source = "release-id"
+    else:
+        group_raw = provider({**query, "musicbrainz_release_group_id": musicbrainz_id}, limit=10)
+        if not isinstance(group_raw, list):
+            raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+        candidates = [
+            dict(value) for value in group_raw
+            if isinstance(value, dict) and str(value.get("release_group_id", "")).lower() == musicbrainz_id
+            and MUSICBRAINZ_ID_PATTERN.fullmatch(str(value.get("provider_id", "")))
+        ]
+        retrieval_source = "release-group-id"
+        if not candidates:
+            if raw or group_raw:
+                raise ProviderError(
+                    "MusicBrainz provider returned identities unrelated to the requested MBID.",
+                    code="provider_invalid_response",
+                )
+            message = "No MusicBrainz release or release group exists for that ID."
+            if release_error is not None and release_error.retryable:
+                raise release_error
+            raise ProviderError(message, code="musicbrainz_id_not_found")
+    for candidate in candidates:
+        candidate["retrieval"] = {
+            **(candidate.get("retrieval") or {}), "source": retrieval_source, "search_score": None,
+        }
     now = _now()
     with _connect(app.config["APP_DB"]) as db:
-        db.execute("UPDATE metadata_candidates SET rank = rank + 1 WHERE album_review_id = ?", (album_review_id,))
-        existing = db.execute(
-            "SELECT id FROM metadata_candidates WHERE album_review_id = ? AND provider = 'musicbrainz' AND provider_id = ?",
-            (album_review_id, musicbrainz_id),
-        ).fetchone()
-        values = (
-            1, _candidate_confidence(query, _effective_candidate(app, candidate, query), exact_mbid=True), _normalize_metadata(candidate.get("artist")),
-            _normalize_metadata(candidate.get("album")), str(candidate.get("year")) if candidate.get("year") else None,
-            json.dumps(_candidate_diff(query, _effective_candidate(app, candidate, query)), sort_keys=True), json.dumps(candidate, sort_keys=True), now,
-        )
-        if existing:
-            candidate_id = existing["id"]
-            db.execute(
-                """UPDATE metadata_candidates SET rank = ?, confidence = ?, artist = ?, album = ?, year = ?,
-                          proposed_diff_json = ?, provider_data_json = ?, schema_version = ?, created_at = ?
-                    WHERE id = ?""",
-                (*values[:-1], CANDIDATE_SCHEMA_VERSION, values[-1], candidate_id),
-            )
-        else:
-            candidate_id = db.execute(
-                """INSERT INTO metadata_candidates(
-                       album_review_id, provider, provider_id, rank, confidence, artist, album, year,
-                       proposed_diff_json, provider_data_json, schema_version, created_at
-                   ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (album_review_id, musicbrainz_id, *values[:-1], CANDIDATE_SCHEMA_VERSION, values[-1]),
-            ).lastrowid
         db.execute(
-            """UPDATE album_reviews SET selected_candidate_id = ?, candidate_status = 'complete',
-                      candidate_error = '', updated_at = ? WHERE id = ?""",
-            (candidate_id, now, album_review_id),
+            "UPDATE metadata_candidates SET rank = rank + ? WHERE album_review_id = ?",
+            (len(candidates), album_review_id),
+        )
+        for rank, candidate in enumerate(candidates, 1):
+            provider_id = str(candidate["provider_id"]).lower()
+            existing = db.execute(
+                "SELECT id FROM metadata_candidates WHERE album_review_id = ? AND provider = 'musicbrainz' AND provider_id = ?",
+                (album_review_id, provider_id),
+            ).fetchone()
+            effective = _effective_candidate(app, candidate, query)
+            values = (
+                rank, _candidate_confidence(query, effective, exact_mbid=True),
+                _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
+                str(candidate.get("year")) if candidate.get("year") else None,
+                json.dumps(_candidate_diff(query, effective), sort_keys=True),
+                json.dumps(candidate, sort_keys=True), CANDIDATE_SCHEMA_VERSION, now,
+            )
+            if existing:
+                db.execute(
+                    """UPDATE metadata_candidates SET rank=?, confidence=?, artist=?, album=?, year=?,
+                              proposed_diff_json=?, provider_data_json=?, schema_version=?, created_at=? WHERE id=?""",
+                    (*values, existing["id"]),
+                )
+            else:
+                db.execute(
+                    """INSERT INTO metadata_candidates(
+                           album_review_id, provider, provider_id, rank, confidence, artist, album, year,
+                           proposed_diff_json, provider_data_json, schema_version, created_at
+                       ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (album_review_id, provider_id, *values),
+                )
+        db.execute(
+            """UPDATE album_reviews SET state='pending', selected_candidate_id=NULL,
+                      candidate_status='complete', candidate_error='', execution_status='not-run',
+                      execution_error='', last_execution_job_id=NULL, executed_at=NULL, updated_at=? WHERE id=?""",
+            (now, album_review_id),
         )
     return next(iter(_album_review_payloads(
         app, [album_review_id], root=root, source_kind=source_kind, source_id=source_id
@@ -4864,10 +4905,14 @@ def _inbox_execution_selection(root: Path, source: Path, paths: list[Path]) -> s
     try:
         _validate_inbox_album_scope(root, source, paths)
     except LibraryImportExecutionError as exc:
-        root_level = source == root and all(path.parent == root for path in paths)
-        if exc.code != "source_contains_other_albums" or not root_level:
+        if exc.code != "source_contains_other_albums":
             raise
-        return "exact-file" if len(paths) == 1 else "staged-album"
+        # A shared ordinary folder has the same ownership problem as loose
+        # files at the Inbox root.  Pass only the inventory-proven selection
+        # to Beets; multi-track selections retain album semantics by staging
+        # all selected files in one temporary album directory.
+        root_level_single = source == root and len(paths) == 1 and paths[0].parent == root
+        return "exact-file" if root_level_single else "staged-album"
     return "exclusive-scope"
 
 
@@ -5108,13 +5153,13 @@ def _execute_inbox_album(app: Flask, album_review_id: int, *, dry_run: bool) -> 
                 exc.job_id = job_id
                 raise
         else:
-            # A root-level cover can describe any active review in this shared
-            # scope. Leave it untouched instead of silently assigning it.
+            # A cover beside more than one reviewed album is not assignable.
+            # Leave it untouched instead of silently attaching it.
             source_sidecar = None
             if os.path.lexists(source_cover):
                 result["source_artwork"] = {
-                    "status": "ignored-shared-root",
-                    "message": "Shared Inbox root cover.jpg was left untouched.",
+                    "status": "ignored-shared-source",
+                    "message": "Shared Inbox source cover.jpg was left untouched.",
                 }
         with tempfile.TemporaryDirectory(prefix="cratekeep-inbox-", dir=app.config["STATE_PATH"]) as backup_dir:
             backup_root = Path(backup_dir)

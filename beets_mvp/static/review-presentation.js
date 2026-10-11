@@ -92,9 +92,10 @@
       name.textContent = value.is_as_is ? 'As Is — keep current metadata' : `${value.artist} — ${value.album}${year ? ` (${year})` : ''}`;
       const confidence = document.createElement('span'); confidence.className='candidate-confidence confidence-band'; const presentation = score(value.confidence);
       confidence.dataset.band = value.is_as_is ? 'as-is' : presentation.band; confidence.textContent = `${selected ? 'Selected · ' : ''}${value.is_as_is ? 'As Is' : presentation.label}`;
-      confidence.setAttribute('aria-label', value.is_as_is ? 'As Is keeps current tags. Explicit approval required.' : presentation.accessibleLabel);
+      confidence.setAttribute('aria-label', value.is_as_is ? 'As Is keeps current tags. Select this option to use current metadata.' : presentation.accessibleLabel);
       const signals = document.createElement('span'); signals.className='candidate-signals'; facts.forEach(fact => { const signal=document.createElement('span'); signal.className='candidate-signal'; signal.dataset.changed=String(fact.changed); signal.title=`${fact.label}: ${fact.value}`; signal.setAttribute('aria-label',signal.title); signal.append(icon(fact.kind)); signals.append(signal); });
       const toggle=document.createElement('span'); toggle.className='candidate-toggle'; toggle.setAttribute('aria-hidden','true');
+      summary.tabIndex = selected || (selectedId == null && index === 0) ? 0 : -1;
       summary.setAttribute('aria-label',`Option ${index + 1}: ${name.textContent}. ${confidence.textContent}. ${selected ? 'Selected' : 'Select'}. ${facts.map(fact => `${fact.label}: ${fact.value}`).join('. ')}. Toggle details.`); summary.append(marker,name,confidence,signals,toggle);
       const select = next => { onSelect(next); queueMicrotask(() => container.querySelector('[aria-checked="true"]')?.focus()); };
       summary.addEventListener('click', event => { if (!selected) { event.preventDefault(); select(value.id); } });

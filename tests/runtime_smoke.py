@@ -20,6 +20,7 @@ from pathlib import Path
 
 from mediafile import Image as MediaImage, ImageType, MediaFile
 from playwright.sync_api import Page, sync_playwright
+from PIL import Image as PillowImage
 from beets_mvp import _format_bytes
 
 from runtime_app import ARTWORK_JPEG, EXISTING_ARTWORK_JPEG
@@ -55,6 +56,7 @@ DELUXE_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174010"
 LIBRARY_MATCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174077"
 LIBRARY_MISMATCH_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174011"
 LIBRARY_NO_ART_RELEASE_ID = "123e4567-e89b-42d3-a456-426614174012"
+RELEASE_GROUP_ID = "123e4567-e89b-42d3-a456-426614174020"
 
 
 def request_json(url: str):
@@ -87,6 +89,14 @@ def write_wav(path: Path, seconds: int = 1) -> None:
 def make_fixture(root: Path) -> dict[str, Path]:
     (root / "inbox").mkdir(parents=True, exist_ok=True)
     write_wav(root / "inbox" / "Rollback Retained" / "01 Inbox.wav")
+    shared_folder = root / "inbox" / "Shared Ordinary"
+    for album, title, track_number in (("Shared Album A", "First", 1), ("Shared Album B", "Second", 2)):
+        track = shared_folder / f"{track_number:02d} {title}.wav"
+        write_wav(track)
+        tags = MediaFile(str(track)); tags.title = title; tags.artist = tags.albumartist = "Shared Artist"
+        tags.album = album; tags.track = track_number; tags.save()
+    (shared_folder / "notes.txt").write_bytes(b"shared ordinary unrelated bytes")
+    (shared_folder / "cover.jpg").write_bytes(EXISTING_ARTWORK_JPEG)
     for folder, artist in (("inbox", "First Inbox"), ("inbox-two", "Second Inbox")):
         track = root / folder / "Shared Selection" / f"01 {artist}.wav"
         write_wav(track)
@@ -342,6 +352,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
     inbox_review_proof: dict[str, object] = {}
     inbox_page_metrics: dict[str, object] = {}
     viewport_checks: dict[str, object] = {}
+    library_modal_contract: dict[str, object] = {}
     accidental = tracks["sidecar"].parent.parent / "Accidental Album" / "01 Wrong.wav"
     write_wav(accidental)
     accidental_tags = MediaFile(str(accidental))
@@ -483,12 +494,21 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         folder_page_timings_ms["direct_jump_page_1"] = round((time.perf_counter() - started) * 1000, 2)
         assert page.locator(".review-folder .review-select").first.is_checked()
         page.screenshot(path=evidence / "pagination-1-desktop.png", full_page=True)
+        def pagination_centers() -> list[float]:
+            boxes = [pagination.get_by_role("button").nth(index).bounding_box() for index in range(4)]
+            label_box = pagination.locator(".page-label").bounding_box()
+            assert label_box and all(boxes)
+            label_center = label_box["y"] + label_box["height"] / 2
+            return [abs((box["y"] + box["height"] / 2) - label_center) for box in boxes]
+        pagination = page.locator(".review-pagination")
+        assert max(pagination_centers()) <= 1
         page.set_viewport_size({"width": 390, "height": 844})
         page.screenshot(path=evidence / "pagination-narrow.png", full_page=True)
-        pagination = page.locator(".review-pagination")
         assert pagination.get_by_role("button").count() == 4
         assert [pagination.get_by_role("button").nth(index).inner_text() for index in range(4)] == ["«", "‹", "›", "»"]
         assert pagination.evaluate("element => element.scrollWidth <= element.clientWidth")
+        assert max(pagination_centers()) <= 1
+        viewport_checks["pagination_label_centered_desktop_and_narrow"] = True
         assert page.locator("html").evaluate(
             "element => element.scrollWidth <= element.clientWidth"
         ), "narrow folder queue must not create page-level horizontal overflow"
@@ -564,6 +584,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "unselected": unselected_status.inner_text(),
         }
         page.screenshot(path=evidence / "03-folder-inline-settled.png", full_page=True)
+        page.locator('.review-folder[data-folder-path="Queue Safe"] .review-folder-summary').screenshot(
+            path=evidence / "_row-library.png"
+        )
         assert all((sha256(tracks[name]), str(tracks[name].resolve()), tracks[name].stat().st_ino) == before
                    for name, before in queue_before.items()), "folder scan changed media bytes, path, or inode"
         assert page.locator("#library-import-ready").inner_text() == "Import ready (1)"
@@ -613,6 +636,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         reopened_payload, next_payload = reopened_albums
         assert reopened_payload["id"] == first_payload["id"]
         first_title = page.locator("[data-review-title]").inner_text()
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library-import/albums/" in response.url):
+            page.locator("[data-review-candidates] [role='radio']").first.click()
+        page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
         execute_pattern = re.compile(r".*/api/library-import/albums/\d+/execute$")
         expected_failure["kind"] = "execute"
         page.route(execute_pattern, lambda route: route.fulfill(
@@ -650,6 +676,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert sequential_pending["albums"][0]["id"] == next_payload["id"]
         assert len(sequential_pending["albums"][0]["tracks"]) == 1
         page.wait_for_function("title => document.querySelector('[data-review-title]').textContent !== title", arg=first_title)
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library-import/albums/" in response.url):
+            page.locator("[data-review-candidates] [role='radio']").first.click()
+        page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
         with page.expect_response(lambda response: response.url.endswith("/execute")) as second_execute:
             page.locator("[data-review-execute]").click()
         second_body = second_execute.value.request.post_data_json
@@ -693,6 +722,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert deluxe_candidate["release_disambiguation"] == "deluxe, clean"
         assert "album" not in deluxe_candidate["proposed_diff"]
         assert deluxe_candidate["recordings"][0]["title"] == "Blessings feat. Drake"
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library-import/albums/" in response.url):
+            page.get_by_role("radio", name=re.compile("Big Sean — BULLY - DELUXE")).click()
         facts = page.locator(".candidate-option[open] .candidate-fact")
         assert facts.filter(has_text="Album").locator("dd").first.inner_text() == "BULLY - DELUXE"
         assert facts.filter(has_text="MusicBrainz release note").locator("dd").inner_text() == "deluxe, clean"
@@ -705,6 +736,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert deluxe_raw["release_disambiguation"] == "deluxe, clean"
         page.evaluate("document.body.classList.remove('dark-mode')")
         page.screenshot(path=evidence / "04-deluxe-review-desktop-light.png", full_page=True)
+        library_modal_contract = page.locator("[data-review-dialog]").evaluate("""dialog => ({
+          controls:[...dialog.querySelectorAll('[data-review-find],[data-review-open-mbid],[data-review-cancel],[data-review-skip],[data-review-execute]')].map(node => node.textContent.trim()),
+          currentPanels:dialog.querySelectorAll('[data-review-current]').length,
+          approveControls:dialog.querySelectorAll('[data-review-approve]').length,
+          candidateGroups:dialog.querySelectorAll('[data-review-candidates][role="radiogroup"]').length,
+        })""")
         page.evaluate("document.body.classList.add('dark-mode')")
         page.screenshot(path=evidence / "04-deluxe-review-desktop-dark.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
@@ -815,7 +852,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         }
         mbid_input.fill("not-a-uuid")
         page.locator("[data-review-mbid-submit]").click()
-        assert "canonical MusicBrainz release UUID" in page.locator("[data-review-mbid-status]").inner_text()
+        assert "canonical MusicBrainz release or release-group UUID" in page.locator("[data-review-mbid-status]").inner_text()
         assert len(network) == request_network_start, "invalid UUID must remain local"
 
         rematch_pattern = re.compile(r".*/api/library-import/albums/\d+/rematch$")
@@ -841,13 +878,27 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         new_payload = new_rematch.value.json()
         mbid_modal.wait_for(state="hidden")
         assert page.locator("[data-review-modal]").is_visible()
-        assert "added and selected" in page.locator("[data-review-status]").inner_text()
+        assert "candidate choices added" in page.locator("[data-review-status]").inner_text()
         assert candidate_options.count() == initial_option_count + 1
-        selected_candidate = page.get_by_role("radio", checked=True)
-        assert selected_candidate.evaluate("element => element.parentElement.open")
-        assert new_payload["selected_candidate_id"] == new_payload["proposed_match"]["id"]
+        assert page.get_by_role("radio", checked=True).count() == 0
+        assert new_payload["selected_candidate_id"] is None
         assert sum(candidate["provider_id"] == SEARCH_RELEASE_ID for candidate in new_payload["candidates"]) == 1
-        assert page.locator("[data-review-execute]").inner_text() == "Import in place"
+        assert page.locator("[data-review-execute]").inner_text() == "Import to Library"
+
+        # A release-group MBID presents each bounded edition as a choice and
+        # never silently turns one edition into the review decision.
+        search_open.click(); mbid_input.fill(RELEASE_GROUP_ID)
+        with page.expect_response(lambda response: response.url.endswith("/rematch")) as group_rematch:
+            page.locator("[data-review-mbid-submit]").click()
+        assert group_rematch.value.status == 200
+        group_payload = group_rematch.value.json()
+        group_candidates = [candidate for candidate in group_payload["candidates"]
+                            if candidate["release_group_id"] == RELEASE_GROUP_ID]
+        assert len(group_candidates) == 2
+        assert {candidate["retrieval"]["source"] for candidate in group_candidates} == {"release-group-id"}
+        assert group_payload["selected_candidate_id"] is None
+        assert page.get_by_role("radio", checked=True).count() == 0
+        assert candidate_options.count() == initial_option_count + 3
 
         # Looking up an existing release moves/selects its row without duplication.
         search_open.click(); mbid_input.fill(EXISTING_SIDECAR_RELEASE_ID)
@@ -855,15 +906,15 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             page.locator("[data-review-mbid-submit]").click()
         assert existing_rematch.value.status == 200
         existing_payload = existing_rematch.value.json()
-        assert candidate_options.count() == initial_option_count + 1
+        assert candidate_options.count() == initial_option_count + 3
         assert sum(candidate["provider_id"] == EXISTING_SIDECAR_RELEASE_ID for candidate in existing_payload["candidates"]) == 1
         assert existing_payload["candidates"][0]["provider_id"] == EXISTING_SIDECAR_RELEASE_ID
-        assert existing_payload["selected_candidate_id"] == existing_payload["candidates"][0]["id"]
-        assert page.get_by_role("radio", checked=True).evaluate("element => element.parentElement.open")
+        assert existing_payload["selected_candidate_id"] is None
+        assert page.get_by_role("radio", checked=True).count() == 0
 
         search_requests = network[request_network_start:]
         assert not any(event["url"].endswith(("/preview", "/execute")) for event in search_requests)
-        assert sum(event["url"].endswith("/rematch") for event in search_requests) == 3
+        assert sum(event["url"].endswith("/rematch") for event in search_requests) == 4
         file_after = {
             "sha256": sha256(tracks["sidecar"]),
             "stat": (tracks["sidecar"].stat().st_size, tracks["sidecar"].stat().st_mtime_ns,
@@ -885,14 +936,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         mbid_modal.get_by_role("button", name="Cancel", exact=True).click()
         page.set_viewport_size({"width": 1440, "height": 1000})
 
-        # Candidate and duplicate state share one guarded close path.
-        page.get_by_role("radio", name=re.compile("As Is")).click()
-        page.once("dialog", lambda dialog: dialog.dismiss())
-        page.locator("[data-review-modal]").click(position={"x": 2, "y": 2})
-        assert page.locator("[data-review-modal]").is_visible()
-        page.once("dialog", lambda dialog: dialog.accept())
-        page.locator(".album-modal-dialog").focus()
-        page.keyboard.press("Escape")
+        # A selected candidate is persisted immediately, so closing is clean.
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library-import/albums/" in response.url):
+            page.get_by_role("radio", name=re.compile("As Is")).click()
+        page.locator(".album-modal-dialog").focus(); page.keyboard.press("Escape")
         page.locator("[data-review-modal]").wait_for(state="hidden")
         assert candidate_review.evaluate("element => document.activeElement === element")
         candidate_review.click(force=True)
@@ -913,7 +960,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             page.locator("[data-review-modal]:not([hidden])").wait_for()
             candidate = page.get_by_role("radio", name=re.compile(re.escape(TRACKS[name].parts[0] + " — "))).first
             if candidate.get_attribute("aria-checked") != "true":
-                candidate.click()
+                with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library-import/albums/" in response.url):
+                    candidate.click()
+            page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
             if has_art:
                 assert candidate.locator("xpath=..").locator(".candidate-artwork").count() == 1
             else:
@@ -1033,6 +1082,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         as_is_review = open_folder_album("As Is Artist")
         as_is_review.click(force=True)
         page.locator("[data-review-modal]:not([hidden])").wait_for()
+        if page.locator("[data-review-execute]").is_disabled():
+            with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library-import/albums/" in response.url):
+                page.get_by_role("radio", name=re.compile("As Is")).click()
         with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.url.endswith("/execute")) as response_info:
             page.locator("[data-review-execute]").click()
         assert response_info.value.status in {200, 201}, response_info.value.status
@@ -1280,11 +1332,27 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                 card.get_by_role("button", name="Scan selected", exact=True).click()
             card.locator('[data-scope="Shared Selection"] [data-status="needs-review"]').wait_for()
         assert all("Shared Selection" in card.inner_text() for card in cards.all())
+        cards.nth(0).locator('[data-scope="Shared Selection"] .review-folder-summary').screenshot(
+            path=evidence / "_row-inbox.png"
+        )
+        with PillowImage.open(evidence / "_row-library.png") as library_row, PillowImage.open(evidence / "_row-inbox.png") as inbox_row:
+            comparison = PillowImage.new("RGB", (library_row.width + inbox_row.width, max(library_row.height, inbox_row.height)), "white")
+            comparison.paste(library_row.convert("RGB"), (0, 0)); comparison.paste(inbox_row.convert("RGB"), (library_row.width, 0))
+            comparison.save(evidence / "17-library-inbox-rows-side-by-side.png")
         page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
 
         first_scope = cards.nth(0).locator('[data-scope="Shared Selection"]')
-        first_scope.get_by_role("button", name="Review", exact=True).click()
+        first_scope.get_by_role("button", name=re.compile("Expand Shared Selection")).click()
+        first_scope.locator(".review-album").click()
         page.locator("[data-review-modal]:not([hidden])").wait_for()
+        inbox_modal_contract = page.locator("[data-review-dialog]").evaluate("""dialog => ({
+          controls:[...dialog.querySelectorAll('[data-review-find],[data-review-open-mbid],[data-review-cancel],[data-review-skip],[data-review-execute]')].map(node => node.textContent.trim()),
+          currentPanels:dialog.querySelectorAll('[data-review-current]').length,
+          approveControls:dialog.querySelectorAll('[data-review-approve]').length,
+          candidateGroups:dialog.querySelectorAll('[data-review-candidates][role="radiogroup"]').length,
+        })""")
+        assert inbox_modal_contract == library_modal_contract
+        viewport_checks["library_inbox_modal_contract_identical"] = inbox_modal_contract
         page.locator("[data-review-find]").click()
         page.wait_for_function("document.querySelector('[data-review-find]').getAttribute('aria-busy') === 'true'")
         assert page.locator("[data-review-execute]").get_attribute("aria-busy") == "false"
@@ -1295,6 +1363,8 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "Artist", "Album", "Genre", "Release Year", "Release Type/media",
             "Release Region", "Local tracks found online", "Online tracks present locally",
         ))
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/inbox/albums/" in response.url):
+            candidate.locator("[role='radio']").click()
         track_button = candidate.get_by_role("button", name=re.compile("View track changes"))
         track_button.click()
         assert page.locator("[data-review-track-modal]").is_visible()
@@ -1310,8 +1380,6 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert page.locator("[data-review-dialog]").evaluate("element => element.scrollWidth <= element.clientWidth")
         page.screenshot(path=evidence / "17-inbox-review-narrow-dark.png", full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
-        candidate.locator("[role='radio']").click()
-        page.locator("[data-review-approve]").click()
         page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
         first_track = fixture_root / "inbox" / "Shared Selection" / "01 First Inbox.wav"
         with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.url.endswith("/execute") and response.status == 201) as executed:
@@ -1342,6 +1410,66 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "incoming_sidecar_retained": first_source_cover.is_file(),
             "success_focus": True,
         })
+
+        # Production shape: two album reviews share one ordinary non-root
+        # folder. Import A from isolated staging and prove every sibling byte
+        # plus review B remain intact and reviewable.
+        shared_folder = fixture_root / "inbox" / "Shared Ordinary"
+        shared_a = shared_folder / "01 First.wav"
+        shared_b = shared_folder / "02 Second.wav"
+        shared_notes = shared_folder / "notes.txt"
+        shared_cover = shared_folder / "cover.jpg"
+        shared_before = {str(path): sha256(path) for path in (shared_a, shared_b, shared_notes, shared_cover)}
+        cards = page.locator("[data-inbox-id]")
+        first_card = cards.nth(0)
+        first_card.get_by_role("checkbox", name="Select album folder Shared Ordinary", exact=True).check()
+        source_id = first_card.get_attribute("data-inbox-id")
+        with page.expect_response(lambda response: response.url.endswith(f"/api/inbox/{source_id}/scopes/scan")):
+            first_card.get_by_role("button", name="Scan selected", exact=True).click()
+        shared_scope = first_card.locator('[data-scope="Shared Ordinary"]')
+        shared_scope.locator('[data-status="needs-review"]').wait_for()
+        assert "2 albums · 2 tracks" in shared_scope.inner_text()
+        shared_scope.get_by_role("button", name=re.compile("Expand Shared Ordinary")).click()
+        page.screenshot(path=evidence / "17-shared-ordinary-before-import.png", full_page=True)
+        album_a_row = shared_scope.locator(".review-album-row").filter(has_text="Shared Album A")
+        album_a_row.locator(".review-album").click()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/inbox/albums/" in response.url):
+            page.get_by_role("radio", name=re.compile("As Is")).click()
+        with page.expect_response(lambda response: response.url.endswith("/execute") and response.status == 201) as shared_execute:
+            page.locator("[data-review-execute]").click()
+        shared_result = shared_execute.value.json()
+        assert shared_result["execution_selection"] == "staged-album"
+        assert shared_result["source_artwork"]["status"] == "ignored-shared-source"
+        assert not shared_a.exists()
+        shared_after = {str(path): sha256(path) for path in (shared_b, shared_notes, shared_cover)}
+        assert shared_after == {path: digest for path, digest in shared_before.items() if path != str(shared_a)}
+        remaining_shared = [album for album in request_json(f"{base_url}/api/inbox/reviews")["albums"]
+                            if album["album"] == "Shared Album B"]
+        assert len(remaining_shared) == 1 and remaining_shared[0]["execution_status"] != "complete"
+        page.reload(wait_until="networkidle")
+        cards = page.locator("[data-inbox-id]")
+        first_card = cards.nth(0)
+        with page.expect_response(lambda response: response.url.endswith(f"/api/inbox/{source_id}/scopes")):
+            first_card.locator("[data-inbox-toggle]").click()
+        shared_scope = first_card.locator('[data-scope="Shared Ordinary"]')
+        shared_scope.wait_for()
+        shared_scope.get_by_role("button", name=re.compile("Expand Shared Ordinary")).click()
+        album_b_row = shared_scope.locator(".review-album-row").filter(has_text="Shared Album B")
+        album_b_row.wait_for()
+        assert album_b_row.count() == 1
+        page.screenshot(path=evidence / "17-shared-ordinary-after-import.png", full_page=True)
+        album_b_row.locator(".review-album").click(); page.locator("[data-review-modal]:not([hidden])").wait_for()
+        page.screenshot(path=evidence / "17-shared-ordinary-review-b-after-a.png", full_page=True)
+        page.locator("[data-review-close]").click()
+        inbox_review_proof["shared_non_root_exact_staging"] = {
+            "execution_selection": shared_result["execution_selection"],
+            "source_contains_other_albums_error": False,
+            "sibling_sha256_before": shared_before[str(shared_b)],
+            "sibling_sha256_after": shared_after[str(shared_b)],
+            "sidecars_unchanged": all(shared_after[str(path)] == shared_before[str(path)] for path in (shared_notes, shared_cover)),
+            "review_b_remaining": True,
+        }
 
         # Match-only automation runs only for the explicitly selected scope and
         # never approves, imports, or mutates the sibling Inbox.
@@ -1385,10 +1513,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "library_unchanged_before_approval": True,
         }
         second_scope = cards.nth(1).locator('[data-scope="Shared Selection"]')
-        second_scope.get_by_role("button", name="Review", exact=True).click()
+        second_scope.get_by_role("button", name=re.compile("Expand Shared Selection")).click()
+        second_scope.locator(".review-album").click()
         page.wait_for_function("document.querySelectorAll('[data-review-candidates] .candidate-option').length > 0")
-        page.locator("[data-review-candidates] .candidate-option").first.locator("[role='radio']").click()
-        page.locator("[data-review-approve]").click()
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/inbox/albums/" in response.url):
+            page.locator("[data-review-candidates] .candidate-option").first.locator("[role='radio']").click()
         page.wait_for_function("document.querySelector('[data-review-execute]').disabled === false")
         with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.url.endswith("/execute") and response.status == 201) as second_executed:
             page.locator("[data-review-execute]").click()
@@ -1545,15 +1674,14 @@ def main() -> None:
     items = request_json(f"{args.base_url.rstrip('/')}/api/items")
     excluded_queue = {"queue_tied", "queue_lower", "queue_error", "queue_unselected"}
     registered_names = set(tracks) - excluded_queue
-    assert len(items) == len(registered_names) + 2
+    assert len(items) == len(registered_names) + 3
+    reported_paths = {Path(item["path"]) for item in items}
     by_path = {Path(item["path"]).name: item for item in items}
     for name in registered_names:
-        path = tracks[name]
         expected_app_path = app_library / TRACKS[name]
-        reported_path = Path(by_path[path.name]["path"])
-        assert reported_path.is_absolute()
-        assert reported_path.is_relative_to(app_library)
-        assert reported_path == expected_app_path
+        assert expected_app_path.is_absolute()
+        assert expected_app_path.is_relative_to(app_library)
+        assert expected_app_path in reported_paths
     managed_tags = MediaFile(str(tracks["as_is"]))
     assert (managed_tags.title, managed_tags.album, managed_tags.albumartist,
             managed_tags.genre, managed_tags.year) == (

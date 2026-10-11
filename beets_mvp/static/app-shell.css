@@ -67,8 +67,8 @@ button:disabled,.pagination [aria-disabled="true"] {
 .candidate-toggle::before { content:'\25be'; }
 .candidate-option:not([open]) .candidate-toggle { transform:rotate(-90deg); }
 .pagination,.review-pagination { display:flex; width:100%; align-items:center; justify-content:center!important; gap:.3rem!important; flex-wrap:nowrap; }
-.pagination a,.pagination [aria-disabled="true"],.review-pagination button { display:grid; place-items:center; min-width:2rem; min-height:2rem; padding:.2rem .4rem!important; border:0!important; border-radius:.3rem; text-decoration:none; background:var(--subtle); }
-.pagination .page-label { margin:0 .2rem; white-space:nowrap; }
+.pagination a,.pagination [aria-disabled="true"],.review-pagination button { display:grid; place-items:center; min-width:2rem; min-height:2rem; margin:0!important; padding:.2rem .4rem!important; border:0!important; border-radius:.3rem; text-decoration:none; background:var(--subtle); }
+.pagination .page-label,.review-pagination .page-label { display:flex; align-self:stretch; align-items:center; margin:0 .2rem; white-space:nowrap; line-height:1; }
 
 /* Shared flat hierarchy: surfaces group by spacing and separators; outlines are
    reserved for fields, selected/focused controls, warnings, and dialogs. */
@@ -109,6 +109,24 @@ body.setup-mode main { border:0!important; box-shadow:none!important; background
 .scope-list { background:var(--surface); }
 .scope-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto; align-items:center; gap:.7rem; padding:.6rem .8rem; }
 .scope-identity { display:grid; min-width:0; }
+.review-folder { background:transparent; }
+.review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto; gap:.55rem; align-items:center; padding:.4rem .6rem; }
+.review-folder-summary:hover { background:var(--active); }
+.review-folder-identity { min-width:0; }
+.review-folder-path { display:block; min-width:0; overflow-wrap:anywhere; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.folder-expand { width:1.8rem; min-width:1.8rem; height:1.8rem; margin:0; padding:0; border:0; background:transparent; color:var(--accent); }
+.folder-expand::before { content:'\25b8'; }
+.folder-expand[aria-expanded="true"]::before { content:'\25be'; }
+.review-folder-count { color:var(--muted); font-size:.76rem; white-space:nowrap; }
+.review-folder-contents { border-top:1px solid var(--soft); background:var(--page); }
+.review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.55rem; align-items:center; padding:.42rem .6rem; border-bottom:1px solid var(--soft); }
+.review-album-row:last-child { border-bottom:0; }
+.review-select { width:1rem; height:1rem; margin:0; }
+.review-album { display:grid; place-items:center; width:2rem; min-width:2rem; height:2rem; margin:0; padding:0; border:0; background:transparent; color:var(--accent); }
+.review-track-count { color:var(--muted); font-size:.7rem; font-weight:700; white-space:nowrap; }
+.review-toolbar-actions,.review-footer-group,.browser-actions,.workflow-actions { gap:.5rem; }
+.review-toolbar-actions,.review-footer-group { display:flex; flex-wrap:wrap; }
+.review-footer { justify-content:space-between; }
 .status-chip { padding:.15rem .45rem; border-radius:999px; background:var(--subtle); color:var(--muted); font-size:.72rem; text-transform:capitalize; }
 .status-chip[data-status="ready"],.status-pill[data-status="ready"] { background:var(--success); color:var(--text); }
 .status-chip[data-status="error"],.status-chip[data-status="Error"] { color:#8a1c28; background:#f8e3e5; }
@@ -175,6 +193,10 @@ button,.save-button { min-height:2.1rem; padding:.35rem .65rem; }
   .workflow-actions { display:grid; grid-template-columns:1fr; }
   .scope-row { grid-template-columns:auto minmax(0,1fr) auto; }
   .scope-row>button { grid-column:2 / -1; }
+  .review-folder-summary { grid-template-columns:auto auto minmax(0,1fr) auto; }
+  .review-folder-summary .review-folder-count:last-of-type { display:none; }
+  .review-footer { align-items:stretch; flex-direction:column-reverse; }
+  .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
 }
 @media (pointer:coarse) {
   :is(button,.nav-link,input,select,summary) { min-height:2.75rem; }

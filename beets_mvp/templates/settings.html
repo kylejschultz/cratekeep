@@ -412,7 +412,6 @@
     </section>
   </div>
   {% set review_prefix = 'shared-library' %}
-  {% set review_execution_label = 'Import in place' %}
   {% set review_duplicate_options = [('merge', 'Merge metadata into the managed track; keep both files in place'), ('replace', 'Replace the managed record with this file; do not move either file'), ('keep-both', 'Keep both as separate managed tracks'), ('skip', 'Skip the incoming duplicate')] %}
   {% set review_duplicate_help = 'Merge and replace require one unambiguous recording-ID match and a current, path-safe inventory snapshot.' %}
   {% include '_review_workflow.html' %}
@@ -668,8 +667,8 @@
     let libraryFolders;
     const libraryReview = window.CratekeepReviewWorkflow.create({
       root: document.querySelector('[data-review-modal]'),
-      labels:{execute:'Import in place', executing:'Validating files, registering them, and applying approved metadata in place…', retry:'Retry import', ready:'Choose metadata, then import in place. The server validates every file before writing.'},
-      adapter:{canApprove:false, requiresApproval:false, asIs:true, focusFallback:()=>document.getElementById('library-import-search'), load:id=>libraryApi(`/api/library-import/albums/${id}`), match:null, exact:(album,id)=>libraryApi(`/api/library-import/albums/${album.id}/rematch`,{method:'POST',body:JSON.stringify({musicbrainz_id:id})}), save:(album,payload)=>libraryApi(`/api/library-import/albums/${album.id}`,{method:'PATCH',body:JSON.stringify(payload)}), execute:(album,payload)=>libraryApi(`/api/library-import/albums/${album.id}/execute`,{method:'POST',body:JSON.stringify(payload)})},
+      labels:{execute:'Import to Library', executing:'Validating files, registering them, and applying approved metadata in place…', retry:'Retry import', ready:'Select metadata, then import. The server validates every file before writing.'},
+      adapter:{requiresApproval:true, asIs:true, focusFallback:()=>document.getElementById('library-import-search'), load:id=>libraryApi(`/api/library-import/albums/${id}`), match:album=>libraryApi('/api/library-import/candidates',{method:'POST',body:JSON.stringify({limit:1,album_id:album.id})}).then(()=>libraryApi(`/api/library-import/albums/${album.id}`)), exact:(album,id)=>libraryApi(`/api/library-import/albums/${album.id}/rematch`,{method:'POST',body:JSON.stringify({musicbrainz_id:id})}), save:(album,payload)=>libraryApi(`/api/library-import/albums/${album.id}`,{method:'PATCH',body:JSON.stringify(payload)}), execute:(album,payload)=>libraryApi(`/api/library-import/albums/${album.id}/execute`,{method:'POST',body:JSON.stringify(payload)})},
       onSuccess:async event=>{await libraryFolders?.load(1,{announce:false});const banner=document.getElementById('library-import-success');if(event.kind==='execute'){banner.textContent=`${event.album.artist} — ${event.album.album} imported successfully.`;banner.hidden=false;}}
     });
     libraryFolders = window.CratekeepFolderWorkflow.create({

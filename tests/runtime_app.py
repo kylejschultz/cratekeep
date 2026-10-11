@@ -53,6 +53,17 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
         album_key = str(query.get("album") or "")
         PROVIDER_CALLS[album_key] = PROVIDER_CALLS.get(album_key, 0) + 1
     release_id = query.get("musicbrainz_id")
+    release_group_id = query.get("musicbrainz_release_group_id")
+    if release_group_id:
+        assert limit == 10
+        return [{
+            "provider_id": f"123e4567-e89b-42d3-a456-42661417402{index}",
+            "release_group_id": release_group_id,
+            "artist": query["artist"], "album": f'{query["album"]} Edition {index}',
+            "year": str(2020 + index), "tracks": query.get("tracks", []),
+        } for index in (1, 2)]
+    if release_id == "123e4567-e89b-42d3-a456-426614174020":
+        return []
     if not release_id:
         if query["album"] in {"Safe Match", "Sequential First", "Sequential Second", "Provider Error"}:
             time.sleep(0.15)  # Keep inline scan state observable in the real-browser smoke.
