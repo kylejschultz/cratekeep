@@ -131,7 +131,7 @@ The Library import queue pages 25 literal top-level filesystem folders at a time
 |---|---|
 | `not scanned` | The literal folder has no current inventory snapshot. |
 | `ready` | At least one pending album passes the strict bulk-readiness predicate. |
-| `needs review` | Scanned albums exist but none is currently safe for bulk import. |
+| `tagged` | Scanned/tagged albums exist but none is currently safe for bulk import. |
 | `error` | Candidate lookup or an earlier execution failed for an album in the folder. |
 | `imported` | Every known album in the folder completed successfully. |
 

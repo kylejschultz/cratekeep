@@ -118,6 +118,15 @@ body.setup-mode main { border:0!important; box-shadow:none!important; background
 .folder-expand::before { content:'\25b8'; }
 .folder-expand[aria-expanded="true"]::before { content:'\25be'; }
 .review-folder-count { color:var(--muted); font-size:.76rem; white-space:nowrap; }
+.status-pill { display:inline-flex; align-items:center; min-height:1.25rem; padding:.14rem .42rem; border-radius:999px; font-size:.7rem; font-weight:700; line-height:1.35; white-space:nowrap; text-transform:capitalize; }
+.status-pill[data-status="ready"],.status-pill[data-status="imported"],.status-pill[data-status="matched"],.status-pill[data-status="queued"] { color:#163d29; background:#d9eee1; }
+.status-pill[data-status="needs-review"],.status-pill[data-status="needs-attention"] { color:#704600; background:#fff0c2; }
+.status-pill[data-status="error"] { color:#8a1c28; background:#f8e3e5; }
+.status-pill[data-status="scanning"] { color:#143f64; background:#dceefd; }
+body.dark-mode .status-pill[data-status="ready"],body.dark-mode .status-pill[data-status="imported"],body.dark-mode .status-pill[data-status="matched"],body.dark-mode .status-pill[data-status="queued"] { color:#e9fff0; background:#294337; }
+body.dark-mode .status-pill[data-status="needs-review"],body.dark-mode .status-pill[data-status="needs-attention"] { color:#ffe6aa; background:#533f1d; }
+body.dark-mode .status-pill[data-status="error"] { color:#ffd9dc; background:#55252b; }
+body.dark-mode .status-pill[data-status="scanning"] { color:#edf7ff; background:#294760; }
 .review-folder-contents { border-top:1px solid var(--soft); background:var(--page); }
 .review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:.55rem; align-items:center; padding:.42rem .6rem; border-bottom:1px solid var(--soft); }
 .review-album-row:last-child { border-bottom:0; }
