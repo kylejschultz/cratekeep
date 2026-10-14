@@ -820,12 +820,43 @@ def test_shared_rows_button_gaps_and_pagination_alignment_contract(tmp_path):
     inbox = client.get("/inbox").get_data(as_text=True)
     css = Path("beets_mvp/static/app-shell.css").read_text()
 
-    row_contract = "rowClass:'review-folder',summaryClass:'review-folder-summary',identityClass:'review-folder-identity'"
-    assert row_contract in settings and row_contract in inbox
-    assert "nameClass:'review-folder-path',countClass:'review-folder-count'" in settings
-    assert "nameClass:'review-folder-path',countClass:'review-folder-count'" in inbox
+    controller = Path("beets_mvp/static/folder-workflow.js").read_text()
+    for class_name in ("review-folder", "review-folder-summary", "review-folder-identity",
+                       "review-folder-path", "review-folder-count", "status-pill"):
+        assert class_name in controller
+    assert "rowClass:'review-folder'" not in settings + inbox
+    assert "statusClass:'status-pill'" not in settings + inbox
     assert ".review-toolbar-actions,.review-footer-group,.browser-actions,.workflow-actions { gap:.5rem; }" in css
     assert ".pagination .page-label,.review-pagination .page-label { display:flex; align-self:stretch; align-items:center;" in css
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared folder helpers")
+def test_shared_folder_status_and_progressive_loading_contract(tmp_path):
+    module = Path("beets_mvp/static/folder-workflow.js").read_text()
+    probe = """
+globalThis.window = globalThis;
+%s
+process.stdout.write(JSON.stringify([
+  window.CratekeepFolderWorkflow.statusLabel('needs-review'),
+  window.CratekeepFolderWorkflow.statusLabel('Needs attention'),
+  window.CratekeepFolderWorkflow.statusLabel('error'),
+]));
+""" % module
+    completed = subprocess.run([shutil.which("node"), "-"], input=probe, text=True, capture_output=True)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == ["Tagged", "Tagged", "error"]
+
+    settings = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    assert "progressivePages:true" in settings
+    assert "void hydratePages(result, context, query, filter)" in module
+    assert module.index("render();", module.index("async function load(")) < module.index(
+        "void hydratePages(result, context, query, filter)", module.index("async function load(")
+    ) < module.index("await refreshSummary();", module.index("async function load("))
+    assert "if (seen.has(item.path)) throw new Error" in module
+    assert "if (seen.size !== result.total) throw new Error" in module
+    assert "pageCache.get(targetPage)" in module
+    assert "preserveSelection = true" in module
+    assert ">Needs review<" not in settings and ">Tagged<" in settings
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared review helpers")
@@ -883,6 +914,7 @@ console.log(JSON.stringify(result));
 
 def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styles(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
+    shell_css = Path("beets_mvp/static/app-shell.css").read_text()
     shared_css = Path("beets_mvp/static/review-presentation.css").read_text()
     shared_js = Path("beets_mvp/static/review-presentation.js").read_text()
 
@@ -900,11 +932,12 @@ def test_library_inventory_pills_render_accessible_labels_and_contrast_safe_styl
         assert _contrast_ratio(foreground, background) >= 4.5
 
     status_palettes = [
-        ("#163d29", "#d9eee1"), ("#6d1620", "#f9dadd"),
-        ("#e9fff0", "#294337"), ("#fff0f1", "#5a3034"),
+        ("#163d29", "#d9eee1"), ("#704600", "#fff0c2"),
+        ("#8a1c28", "#f8e3e5"), ("#e9fff0", "#294337"),
+        ("#ffe6aa", "#533f1d"), ("#ffd9dc", "#55252b"),
     ]
     for foreground, background in status_palettes:
-        assert f"color:{foreground}; background:{background};" in html
+        assert f"color:{foreground}; background:{background};" in shell_css
         assert _contrast_ratio(foreground, background) >= 4.5
 
 
@@ -3694,10 +3727,11 @@ def test_library_import_review_markup_is_album_folder_first(tmp_path):
 
 def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").data
+    shell_css = Path("beets_mvp/static/app-shell.css").read_bytes()
 
     assert b".review-list { overflow:hidden;" in html
-    assert b".review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto;" in html
-    assert b".review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto auto;" in html
+    assert b".review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto;" in shell_css
+    assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in shell_css
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
     assert b"const article = make('article'" in folders
@@ -3739,7 +3773,7 @@ def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     assert b"review-source-metadata" not in html
     assert b"'review-track-count'" in folders
     assert b"renderTrackList" not in html
-    assert b"adapter.statusClass || 'status-chip'" in folders
+    assert b"adapter.statusClass || 'status-pill'" in folders
     assert b"Page ${page} of ${pages}" in folders
     assert b'aria-label="Previous page"' in html and b'aria-label="Next page"' in html
 
@@ -4826,7 +4860,7 @@ def test_selected_scan_progress_is_bounded_to_visible_selected_folder_rows(tmp_p
     assert "setPhase(phases, scopes, 'Queued')" in scan_handler
     assert "setPhase(phases, scopes, {status:'Scanning', label:'Scanning…'})" in scan_handler
     assert "busy(scanButton, true)" in scan_handler
-    assert "await load(page, {announce:false})" in scan_handler
+    assert "await load(page, {announce:false, refresh:true})" in scan_handler
     assert "No files were changed" not in scan_handler
     assert "state.setAttribute('aria-live', 'polite')" in scan_handler
     assert "phases.get(item.path)" in scan_handler
@@ -5172,9 +5206,10 @@ def test_library_and_inbox_share_batched_folder_workflow_primitives(tmp_path):
     assert "adapter.selectAllLabel || `Select all ${noun}s`" in module
     assert "selectAllLabel:'Select all folders on this page'" in settings
     assert "item.path==='.'?'Select loose files folder':`Select album folder ${item.name}`" in inbox
-    assert "rowClass:'review-folder',summaryClass:'review-folder-summary'" in inbox
-    assert "rowClass:'review-folder',summaryClass:'review-folder-summary'" in settings
-    assert "checkboxClass:'review-select'" in settings and "countClass:'review-folder-count'" in settings
+    assert "adapter.rowClass || 'review-folder'" in module
+    assert "adapter.summaryClass || 'review-folder-summary'" in module
+    assert "adapter.checkboxClass || 'review-select'" in module
+    assert "adapter.countClass || 'review-folder-count'" in module
     assert "libraryFolders.load(2); libraryFolders.load(5);" in Path("tests/runtime_smoke.py").read_text()
     assert "if (failed) one(root, 'execute').querySelector('.button-label').textContent" in Path("beets_mvp/static/review-workflow.js").read_text()
     assert "focusFallback:()=>document.getElementById('library-import-search')" in settings

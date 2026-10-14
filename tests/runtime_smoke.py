@@ -487,9 +487,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.locator(".review-folder .review-select").first.check()
         page.get_by_text("2 folders selected", exact=False).wait_for()
         started = time.perf_counter()
-        with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
-                                  and "page=1" in response.url):
-            page.locator("#library-import-review-first").click()
+        page.locator("#library-import-review-first").click()
         page.get_by_text(first_page_name, exact=True).wait_for()
         folder_page_timings_ms["direct_jump_page_1"] = round((time.perf_counter() - started) * 1000, 2)
         assert page.locator(".review-folder .review-select").first.is_checked()
@@ -572,7 +570,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         assert scan_info.value.status == 207
         page.wait_for_function("""() =>
           document.querySelector('.review-folder[data-folder-path="Queue Safe"] .status-pill')?.textContent === 'ready'
-          && document.querySelector('.review-folder[data-folder-path="Queue Sequential"] .status-pill')?.textContent === 'needs review'
+          && document.querySelector('.review-folder[data-folder-path="Queue Sequential"] .status-pill')?.textContent === 'Tagged'
           && document.querySelector('.review-folder[data-folder-path="Queue Error"] .status-pill')?.textContent === 'error'
         """)
         assert page.locator('.review-folder[data-folder-path="Queue Error"] .status-pill').get_attribute("title")
