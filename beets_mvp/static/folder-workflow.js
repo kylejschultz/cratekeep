@@ -67,7 +67,8 @@
         const count = make('span', item.path === '.' ? 'Root-level loose audio' : countLabel(item), adapter.countClass || 'review-folder-count');
         const current = phases.get(item.path), phase = typeof current === 'object' ? current.label : current;
         const statusValue = statusKey(typeof current === 'object' ? current.status : (current || item.status || 'not-scanned'));
-        const state = make('span', statusLabel(phase || item.status || 'not-scanned'), adapter.statusClass || 'status-pill'); state.dataset.status = statusValue; state.setAttribute('aria-live', 'polite'); state.setAttribute('aria-atomic', 'true'); if (item.error || current?.title) state.title = current?.title || item.error;
+        const errorReason = current?.title || item.error || '';
+        const state = make('span', statusLabel(phase || item.status || 'not-scanned'), adapter.statusClass || 'status-pill'); state.dataset.status = statusValue; state.setAttribute('aria-live', 'polite'); state.setAttribute('aria-atomic', 'true'); if (errorReason) { state.title = errorReason; const reason = make('span', `Error: ${errorReason}`, 'folder-error-reason'); reason.setAttribute('role', 'status'); identity.append(reason); }
         const body = adapter.expandRows ? make('div', '', 'review-folder-contents') : null;
         if (body) { body.hidden = true; opener.addEventListener('click', () => openScope(item, opener, body, count)); }
         const reviewButton = adapter.expandRows ? null : make('button', 'Review', 'button-quiet');

@@ -113,6 +113,8 @@ body.setup-mode main { border:0!important; box-shadow:none!important; background
 .review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto; gap:.55rem; align-items:center; padding:.4rem .6rem; }
 .review-folder-summary:hover { background:var(--active); }
 .review-folder-identity { min-width:0; }
+.folder-error-reason { display:block; margin-top:.12rem; color:#8a1c28; font-size:.72rem; overflow-wrap:anywhere; }
+body.dark-mode .folder-error-reason { color:#ffd9dc; }
 .review-folder-path { display:block; min-width:0; overflow-wrap:anywhere; font:650 .88rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .folder-expand { width:1.8rem; min-width:1.8rem; height:1.8rem; margin:0; padding:0; border:0; background:transparent; color:var(--accent); }
 .folder-expand::before { content:'\25b8'; }
@@ -141,6 +143,7 @@ body.dark-mode .status-pill[data-status="scanning"] { color:#edf7ff; background:
 .status-chip[data-status="error"],.status-chip[data-status="Error"] { color:#8a1c28; background:#f8e3e5; }
 body.dark-mode .status-chip[data-status="error"],body.dark-mode .status-chip[data-status="Error"] { color:#ffd9dc; background:#55252b; }
 body { font-size:14px; line-height:1.4; }
+.build-sha { display:block; min-width:0; max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .sidebar { width:11.75rem; padding:.7rem .6rem; }
 .content { margin-left:11.75rem; }
 .brand { gap:.5rem; padding:.1rem .35rem .65rem; }

@@ -574,6 +574,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
           && document.querySelector('.review-folder[data-folder-path="Queue Error"] .status-pill')?.textContent === 'error'
         """)
         assert page.locator('.review-folder[data-folder-path="Queue Error"] .status-pill').get_attribute("title")
+        assert "deterministic folder-queue provider error" in page.locator(
+            '.review-folder[data-folder-path="Queue Error"] .folder-error-reason'
+        ).inner_text()
+        assert page.locator(
+            '.review-folder[data-folder-path="Queue Sequential"] .folder-error-reason'
+        ).count() == 0
         assert page.locator("#library-import-review-status").inner_text() == review_status_before_scan
         inline_scan_state_proof["settled"] = {
             "safe": safe_status.inner_text(),

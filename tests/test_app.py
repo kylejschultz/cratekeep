@@ -110,6 +110,30 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     assert b'id="theme-toggle"' in page.data
     assert b'app-shell.css' in page.data
 
+
+def test_inbox_and_library_reuse_shell_and_bounded_build_identifier(tmp_path):
+    app = make_app(tmp_path)
+    app.config["BUILD_SHA"] = "432db32786a9372caeb2018b4367079efb438637"
+    client = app.test_client()
+    inbox = client.get("/inbox").get_data(as_text=True)
+    library = client.get("/library").get_data(as_text=True)
+
+    def shell(page):
+        value = page[page.index('<a class="skip-link"'):page.index('<main id="main-content">')]
+        return re.sub(r' aria-current="page"', '', value)
+
+    assert shell(inbox) == shell(library)
+    for page in (inbox, library):
+        assert "build 432db32" in page
+        assert "build 432db32786a9372caeb2018b4367079efb438637" not in page
+        assert 'class="mobile-header"' in page
+        assert 'aria-controls="sidebar"' in page
+        assert 'title="Build SHA"' in page
+    shared = Path("beets_mvp/templates/_app_shell.html").read_text()
+    assert "build {{ build_sha[:7] if build_sha else 'unknown' }}" in shared
+    assert "{{ sidebar('inbox', build_sha) }}" in Path("beets_mvp/templates/inbox.html").read_text()
+    assert "{{ sidebar('library', build_sha) }}" in Path("beets_mvp/templates/library.html").read_text()
+
 def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     monkeypatch.setattr("beets_mvp._inbox_review_summaries", lambda current_app: [{
@@ -4784,6 +4808,36 @@ def test_selected_scan_reports_partial_album_failure_without_losing_success(tmp_
     assert any(error.get("album_review_id") for error in response.json["errors"])
     summary = app.test_client().post("/api/library-import/bulk/preview", json={"folders": ["Selected"]}).json
     assert summary["ready_album_count"] == summary["exception_count"] == 1
+
+
+def test_folder_queue_distinguishes_pending_from_provider_error_with_reason(tmp_path):
+    pending_app = make_app(tmp_path / "pending-app")
+    tagged_wav(tmp_path / "pending-app" / "library" / "Pending Only" / "Album" / "01 Pending.wav",
+               artist="Pending Artist", album="Pending", title="Pending")
+    pending_app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: []
+    client = pending_app.test_client()
+    pending = client.post("/api/library-import/folders/scan", json={"folders": ["Pending Only"]})
+    assert pending.status_code == 201
+    pending_folder = client.get("/api/library-import/folders").json["folders"][0]
+    assert pending_folder["status"] == "needs-review"
+    assert pending_folder["error"] == ""
+
+    error_app = make_app(tmp_path / "error-app")
+    tagged_wav(tmp_path / "error-app" / "library" / "Provider Failure" / "Album" / "01 Failure.wav",
+               artist="Failure Artist", album="Failure", title="Failure")
+    def fail_provider(query, *, limit):
+        raise ProviderError("deterministic provider reason", code="fixture_failure")
+    error_app.config["MUSICBRAINZ_PROVIDER"] = fail_provider
+    error_client = error_app.test_client()
+    response = error_client.post("/api/library-import/folders/scan", json={"folders": ["Provider Failure"]})
+    assert response.status_code == 207
+    error_folder = error_client.get("/api/library-import/folders").json["folders"][0]
+    assert error_folder["status"] == "error"
+    assert "deterministic provider reason" in error_folder["error"]
+
+    controller = Path("beets_mvp/static/folder-workflow.js").read_text()
+    assert "folder-error-reason" in controller
+    assert "`Error: ${errorReason}`" in controller
 
 
 def test_library_import_active_queue_removes_completed_albums_but_retains_history_and_inbox(tmp_path):
