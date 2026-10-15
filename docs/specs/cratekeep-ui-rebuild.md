@@ -26,7 +26,8 @@ is `Matched`; a lower candidate is `Threshold`; only provider or execution
 failure is `Error`. Import is disabled for Pending and Error.
 
 The React review dialog uses the existing review APIs and keeps candidate and
-As Is selection, duplicate decisions, nested comparison evidence, explicit
+As Is selection, conditional duplicate decisions only for suspected managed
+duplicates, nested comparison evidence, explicit
 preflight/execution, retry feedback, cancellation, keyboard dismissal, and
 focusable modal semantics. As Is explicitly retains incoming/local metadata.
 The modal can run a bounded one-album `Match` or expose `Search MBID` for an

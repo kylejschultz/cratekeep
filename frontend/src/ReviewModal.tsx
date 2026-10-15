@@ -12,6 +12,11 @@ function candidates(album: Album): Candidate[] {
   return album.proposed_match && !values.some(row => row.id === album.proposed_match?.id) ? [album.proposed_match, ...values] : values;
 }
 
+function duplicatePreflight(album: Album, candidateId: Album["selected_candidate_id"]) {
+  const candidate = candidates(album).find(row => String(row.id) === String(candidateId));
+  return candidate?.duplicate_preflight || album.duplicate_preflight || { status: "clear" as const };
+}
+
 function albumPayload(response: Album | { album?: Album }) {
   return response && typeof response.album === "object" ? response.album : response as Album;
 }
@@ -94,7 +99,9 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
   const choose = async (candidateId: number | string | null) => {
     setBusy(true); setError("");
     try {
-      const response = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify({ decision: "approved", candidate_id: candidateId, duplicate_action: album.duplicate_action || undefined }) });
+      const duplicate = duplicatePreflight(album, candidateId);
+      const selection = { decision: "approved", candidate_id: candidateId, ...(duplicate.status === "possible" && album.duplicate_action ? { duplicate_action: album.duplicate_action } : {}) };
+      const response = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify(selection) });
       setAlbum(albumPayload(response)); setStatus(candidateId == null ? "As Is selected. Incoming/local metadata will be retained." : "Candidate selected. Review the comparison, then import explicitly.");
     } catch (reason) { setError(String((reason as Error).message)); } finally { setBusy(false); }
   };
@@ -119,17 +126,24 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
     } catch (reason) { setError((reason as Error).message); setStatus(""); } finally { setBusy(false); }
   };
   const execute = async () => {
+    const duplicate = duplicatePreflight(album, chosen);
+    if (duplicate.status === "ambiguous") { setError("Import is blocked because managed recording identity is ambiguous."); return; }
+    if (duplicate.status === "possible" && !album.duplicate_action) { setError("Choose a duplicate decision before importing this album."); return; }
+    const selection = { candidate_id: chosen ?? null, ...(duplicate.status === "possible" ? { duplicate_action: album.duplicate_action } : {}) };
     setBusy(true); setError(""); setStatus("Running preflight…");
     try {
-      const saved = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify({ decision: "approved", candidate_id: chosen, duplicate_action: album.duplicate_action || undefined }) });
-      setAlbum(albumPayload(saved));
-      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ dry_run: true }) });
+      if (source === "inbox") {
+        const saved = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify({ decision: "approved", ...selection }) });
+        setAlbum(albumPayload(saved));
+      }
+      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify(source === "library-import" ? { ...selection, dry_run: true } : { dry_run: true }) });
       setStatus("Preflight passed. Importing…");
-      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({}) });
+      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify(source === "library-import" ? selection : {}) });
       onComplete(result.message || `${album.album || album.name || "Album"} imported successfully.`);
     } catch (reason) { setError(`${(reason as Error).message} Retry is available.`); setStatus(""); setBusy(false); }
   };
   const chosen = album.selected_candidate_id;
+  const duplicate = duplicatePreflight(album, chosen);
   return <div className="modal" data-review-modal data-busy={busy} onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }}>
     <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="review-title" tabIndex={-1} ref={dialog} data-review-dialog>
       <header><div><p className="eyebrow">Album review</p><h2 id="review-title" data-review-title>{album.album || album.name || album.path || "Album"}</h2></div><button type="button" onClick={onClose} disabled={busy} aria-label="Close review" data-review-close>×</button></header>
@@ -140,7 +154,8 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
           <label className="candidate as-is"><input type="radio" name="candidate" checked={chosen == null && album.state === "approved"} disabled={busy} onChange={() => choose(null)}/><span><strong>As Is</strong><small>Retain incoming/local metadata unchanged; do not associate a MusicBrainz release.</small></span></label>
           {candidates(album).map(candidate => <CandidateCard key={candidate.id} album={album} candidate={candidate} chosen={chosen} busy={busy} choose={choose}/>) }
         </fieldset>
-        <label className="select-label">Duplicate decision<select value={album.duplicate_action || ""} onChange={event => setAlbum({ ...album, duplicate_action: event.target.value })}><option value="">Choose when required</option><option value="skip">Skip duplicate</option><option value="keep-both">Keep both</option><option value="merge">Merge</option><option value="replace">Replace</option></select></label>
+        {duplicate.status !== "clear" && <div className={`notice${duplicate.status === "ambiguous" ? " error" : ""}`} data-duplicate-warning><strong>{duplicate.message || (duplicate.status === "ambiguous" ? "Managed recording identity is ambiguous." : "This match may duplicate an existing library item.")}</strong></div>}
+        {duplicate.status === "possible" && <label className="select-label">Duplicate decision<select required value={album.duplicate_action || ""} onChange={event => { setAlbum({ ...album, duplicate_action: event.target.value }); setError(""); }}><option value="">Choose a decision</option><option value="skip">Skip duplicate</option><option value="keep-both">Keep both</option><option value="merge">Merge</option><option value="replace">Replace</option></select></label>}
         {status && <p className="notice" aria-live="polite" data-review-status>{status}</p>}{error && <p className="notice error" role="alert" data-review-status>{error}</p>}
       </div>
       <footer><button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button><button type="button" onClick={execute} disabled={busy || (chosen == null && album.state !== "approved")} aria-busy={busy} data-review-execute>{busy && <span className="spinner"/>}{error ? "Retry import" : "Import to Library"}</button></footer>

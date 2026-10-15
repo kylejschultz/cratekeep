@@ -104,4 +104,86 @@ describe("ReviewModal matching and evidence", () => {
     expect(await screen.findByRole("heading", { name: "Exact Edition" })).toBeInTheDocument();
     expect(screen.getByText("Exact MusicBrainz release loaded. Review it before importing.")).toBeInTheDocument();
   });
+
+  it("omits duplicate decisions for a normal import and keeps a real backend failure retryable", async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      requests.push({ url: String(input), body });
+      if (body.dry_run) return { ok: true, json: async () => ({ status: "preview" }) };
+      return { ok: false, status: 502, json: async () => ({ error: "Tag writer temporarily unavailable" }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ReviewModal source="library-import" onClose={() => undefined} onComplete={() => undefined} album={{ ...richAlbum, duplicate_preflight: { status: "clear" }, candidates: [{ ...richAlbum.candidates[0], duplicate_preflight: { status: "clear" } }] }}/>);
+
+    expect(screen.queryByLabelText("Duplicate decision")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Tag writer temporarily unavailable Retry is available.");
+    expect(screen.getByRole("button", { name: "Retry import" })).toBeEnabled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(requests).toEqual([
+      { url: "/api/library-import/albums/1/execute", body: { candidate_id: 2, dry_run: true } },
+      { url: "/api/library-import/albums/1/execute", body: { candidate_id: 2 } },
+    ]);
+  });
+
+  it("shows and requires a duplicate decision only for a suspected duplicate", async () => {
+    const onComplete = vi.fn();
+    const duplicateAlbum = {
+      ...richAlbum,
+      candidates: [{ ...richAlbum.candidates[0], duplicate_preflight: { status: "possible" as const, message: "One incoming file may already be managed." } }],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => ({
+      ok: true,
+      json: async () => JSON.parse(String(init?.body)).dry_run ? { status: "preview" } : { message: "Imported" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ReviewModal source="library-import" onClose={() => undefined} onComplete={onComplete} album={duplicateAlbum}/>);
+
+    const decision = screen.getByLabelText("Duplicate decision");
+    expect(decision).toBeRequired();
+    fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose a duplicate decision");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent.change(decision, { target: { value: "keep-both" } });
+    fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith("Imported"));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/library-import/albums/1/execute", expect.objectContaining({ body: JSON.stringify({ candidate_id: 2, duplicate_action: "keep-both", dry_run: true }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/library-import/albums/1/execute", expect.objectContaining({ body: JSON.stringify({ candidate_id: 2, duplicate_action: "keep-both" }) }));
+  });
+
+  it("blocks ambiguous managed identity without offering an inapplicable decision", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const ambiguous = { ...richAlbum, candidates: [{ ...richAlbum.candidates[0], duplicate_preflight: { status: "ambiguous" as const } }] };
+    render(<ReviewModal source="library-import" onClose={() => undefined} onComplete={() => undefined} album={ambiguous}/>);
+
+    expect(screen.queryByLabelText("Duplicate decision")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("managed recording identity is ambiguous");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps Inbox selection persistence separate from its execution-only payload", async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      requests.push({ url: String(input), body });
+      if (init?.method === "PATCH") return { ok: true, json: async () => ({ ...richAlbum, decision: "approved" }) };
+      return { ok: true, json: async () => body.dry_run ? { status: "preview" } : { message: "Inbox imported" } };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onComplete = vi.fn();
+    render(<ReviewModal source="inbox" onClose={() => undefined} onComplete={onComplete} album={richAlbum}/>);
+
+    fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
+    await waitFor(() => expect(onComplete).toHaveBeenCalledWith("Inbox imported"));
+    expect(requests).toEqual([
+      { url: "/api/inbox/albums/1", body: { decision: "approved", candidate_id: 2 } },
+      { url: "/api/inbox/albums/1/execute", body: { dry_run: true } },
+      { url: "/api/inbox/albums/1/execute", body: {} },
+    ]);
+  });
 });
