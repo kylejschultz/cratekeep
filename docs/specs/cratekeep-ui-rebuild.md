@@ -28,8 +28,11 @@ failure is `Error`. Import is disabled for Pending and Error.
 The React review dialog uses the existing review APIs and keeps candidate and
 As Is selection, duplicate decisions, nested comparison evidence, explicit
 preflight/execution, retry feedback, cancellation, keyboard dismissal, and
-focusable modal semantics. Library and Settings retain their existing backend
-mutation boundaries.
+focusable modal semantics. As Is explicitly retains incoming/local metadata.
+The modal can run a bounded one-album `Match` or expose `Search MBID` for an
+exact canonical MusicBrainz release UUID; both remain non-mutating review
+operations and keep provider or validation errors inside the dialog. Library
+and Settings retain their existing backend mutation boundaries.
 
 ## Queue follow-up behavior
 
@@ -37,14 +40,19 @@ The shared Inbox and Library Import queue fills the viewport with the active
 theme. Its toolbar actions are `Match Selected`, `Import`, `Review`, and
 `Refresh`: matching posts the selected scope names to the existing source
 scan route and refreshes both folder summaries and any expanded album rows.
-Each album overflow menu contains `Scan`, `Import`, and `Review`; album Scan
-explicitly scans its containing scope through that same bounded route. Import
-is menu-only, disabled for Pending/Error, and remains explicit and modal-backed
-for Matched/Threshold albums.
+The toolbar, affected folders, and their album rows expose a busy state while
+matching; duplicate actions are disabled and completion reports success or a
+visible error. Each album overflow menu contains `Match`, `Import`, and
+`Review`; album Match processes its containing scope through that same bounded
+route. Import is menu-only, disabled for Pending/Error, and remains explicit
+and modal-backed for Matched/Threshold albums.
 
-Candidate review shows track-level local filename/title and proposed metadata.
-Changed and unchanged indicators accompany a disclosure-based comparison so a
-match score never hides the evidence used for an import decision.
+Candidate review has no separate current-metadata panel. Each MusicBrainz row
+shows available artwork, score/year, release ID, release type/media/region,
+track availability, and colored changed/unchanged field indicators. Metadata
+and track comparisons are expandable and omit unavailable optional evidence
+without leaving broken placeholders, so a match score never hides the evidence
+used for an import decision.
 
 ## Build and evidence
 

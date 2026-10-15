@@ -16,7 +16,7 @@ export function Overview({ data }: { data: Record<string, any> }) {
 export function Inbox({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const inboxes = data.inboxes || [];
   const [selected, setSelected] = useState(inboxes[0]?.id || "");
-  return <><PageHeader eyebrow="Inbox" title="Incoming music">Scan, match, review, and explicitly import albums from a named source.</PageHeader>
+  return <><PageHeader eyebrow="Inbox" title="Incoming music">Match, review, and explicitly import albums from a named source.</PageHeader>
     {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{inboxes.map((inbox: any) => <button role="tab" aria-selected={selected === inbox.id} onClick={() => setSelected(inbox.id)} key={inbox.id}>{inbox.name}</button>)}</div>}
     {selected ? <Queue source="inbox" threshold={threshold} inboxId={selected}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
   </>;
@@ -91,4 +91,3 @@ export function Page({ boot }: { boot: Bootstrap }) {
   if (boot.page === "library") return <Library data={boot.data}/>;
   return <Settings data={boot.data} threshold={boot.threshold}/>;
 }
-
