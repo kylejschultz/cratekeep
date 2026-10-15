@@ -2257,6 +2257,36 @@ def test_enabled_ftintitle_does_not_transform_as_is_import(tmp_path):
     assert (tags.title, tags.artist, tags.albumartist) == ("Song", "Lead feat. Guest", "Lead")
 
 
+def test_normal_musicbrainz_import_submit_needs_no_duplicate_decision(tmp_path):
+    app = make_app(tmp_path)
+    path = tmp_path / "library" / "Artist" / "First Album" / "01 Song.wav"
+    write_wav(path)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [{
+        "provider_id": "release-1", "artist": query["artist"], "album": query["album"],
+        "tracks": [{"title": "Song", "position": 1, "recording_id": "new-recording-1"}],
+    }]
+    client = app.test_client()
+    assert client.post("/api/library/inventory/preview").status_code == 201
+    assert client.post("/api/library-import/candidates", json={}).status_code == 201
+    album = client.get("/api/library-import/reviews").json["albums"][0]
+    candidate = album["candidates"][0]
+    assert candidate["duplicate_preflight"]["status"] == "clear"
+
+    preview = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={
+        "dry_run": True, "candidate_id": candidate["id"],
+    })
+    assert preview.status_code == 200
+    assert preview.json["duplicates"] == 0
+    assert preview.json["duplicate_action"] is None
+
+    executed = client.post(f'/api/library-import/albums/{album["id"]}/execute', json={
+        "candidate_id": candidate["id"],
+    })
+    assert executed.status_code == 201
+    assert executed.json["duplicates"] == 0
+    assert executed.json["items"][0]["action"] == "register"
+
+
 @pytest.mark.parametrize("duplicate_action", [None, "skip", "keep-both", "merge", "replace"])
 def test_duplicate_decision_is_persisted_previewed_and_enforced(tmp_path, duplicate_action):
     app = make_app(tmp_path)

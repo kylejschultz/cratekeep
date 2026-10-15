@@ -31,6 +31,17 @@ export type Candidate = {
     proposed_position?: unknown;
     [key: string]: unknown;
   }>;
+  duplicate_preflight?: DuplicatePreflight;
+};
+
+export type DuplicatePreflight = {
+  status: "clear" | "possible" | "ambiguous";
+  message?: string;
+  warnings?: Array<{
+    incoming_path?: string;
+    managed_paths?: string[];
+    ambiguous?: boolean;
+  }>;
 };
 
 export type Album = {
@@ -53,6 +64,7 @@ export type Album = {
   execution_status?: string;
   execution_error?: string;
   duplicate_action?: string;
+  duplicate_preflight?: DuplicatePreflight;
   [key: string]: any;
 };
 
