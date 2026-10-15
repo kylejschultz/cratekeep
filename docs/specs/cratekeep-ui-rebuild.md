@@ -31,6 +31,21 @@ preflight/execution, retry feedback, cancellation, keyboard dismissal, and
 focusable modal semantics. Library and Settings retain their existing backend
 mutation boundaries.
 
+## Queue follow-up behavior
+
+The shared Inbox and Library Import queue fills the viewport with the active
+theme. Its toolbar actions are `Match Selected`, `Import`, `Review`, and
+`Refresh`: matching posts the selected scope names to the existing source
+scan route and refreshes both folder summaries and any expanded album rows.
+Each album overflow menu contains `Scan`, `Import`, and `Review`; album Scan
+explicitly scans its containing scope through that same bounded route. Import
+is menu-only, disabled for Pending/Error, and remains explicit and modal-backed
+for Matched/Threshold albums.
+
+Candidate review shows track-level local filename/title and proposed metadata.
+Changed and unchanged indicators accompany a disclosure-based comparison so a
+match score never hides the evidence used for an import decision.
+
 ## Build and evidence
 
 The frontend toolchain lives in `package.json`, `vite.config.ts`, and
@@ -56,4 +71,3 @@ Validation on the reconciled macOS development-node workspace:
   queue scanning, threshold-driven action availability, overflow actions, the
   review dialog, zero horizontal overflow, unchanged disposable media bytes,
   and zero page/console errors.
-

@@ -12,7 +12,16 @@ export type Candidate = {
   album?: string;
   year?: number | string;
   proposed_diff?: Record<string, { from?: unknown; to?: unknown }>;
-  track_details?: Array<Record<string, unknown>>;
+  track_details?: Array<{
+    status?: string;
+    local?: unknown;
+    proposed?: unknown;
+    local_artist?: unknown;
+    proposed_artist?: unknown;
+    local_position?: unknown;
+    proposed_position?: unknown;
+    [key: string]: unknown;
+  }>;
 };
 
 export type Album = {
@@ -49,4 +58,3 @@ export type QueueScope = {
   error?: string;
   [key: string]: any;
 };
-
