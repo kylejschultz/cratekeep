@@ -2,6 +2,7 @@
   "use strict";
   const hook = (root, name) => root.querySelector(`[data-folder-${name}]`);
   const make = (tag, text = '', className = '') => Object.assign(document.createElement(tag), {textContent: text, className});
+  let workflowSequence = 0;
   function selectionLabel(count, albumCount, singular = "folder") { return `${count} ${count === 1 ? singular : `${singular}s`} selected · ${albumCount} albums available`; }
   const statusKey = value => String(value || '').trim().toLowerCase().replaceAll('_', '-').replaceAll(' ', '-');
   function statusLabel(value) { return ['needs-review', 'needs-attention'].includes(statusKey(value)) ? 'Tagged' : String(value || '').replaceAll('-', ' '); }
@@ -12,7 +13,7 @@
     const list = hook(root, 'list'), status = hook(root, 'status'), selectAll = hook(root, 'select-all');
     const selection = hook(root, 'selection'), scanButton = hook(root, 'scan'), importButton = hook(root, 'import'), exceptionButton = hook(root, 'exceptions');
     const confirmModal = hook(root, 'confirm'), confirmSummary = hook(root, 'confirm-summary'), confirmApply = hook(root, 'confirm-apply');
-    const selected = new Set(), phases = new Map();
+    const selected = new Set(), phases = new Map(), workflowId = ++workflowSequence;
     let rows = [], summary = {available_album_count: 0, ready_album_count: 0, exception_count: 0}, page = 1, pages = 1, total = 0;
     let listRequest = null, hydrationRequest = null, listSequence = 0, hydrationSequence = 0, summarySequence = 0, scanSequence = 0, destroyed = false, searchTimer = null, returnFocus = null;
     let listContext = '', pageCache = new Map();
@@ -34,23 +35,64 @@
       ['first','previous'].forEach(name => { const node = hook(root, name); if (node) node.disabled = page <= 1; });
       ['next','last'].forEach(name => { const node = hook(root, name); if (node) node.disabled = page >= pages; });
     }
+    async function loadScope(item) {
+      if (item._loadedAlbums) return item._loadedAlbums;
+      const data = await adapter.albums(item.path), albums = data.albums || [];
+      item.album_count = albums.length;
+      item.track_count = data.items?.length ?? albums.reduce((count, album) => count + (album.tracks?.length || 0), 0);
+      item._loadedAlbums = albums;
+      return albums;
+    }
+    function confidenceLabel(album) {
+      if (album.highest_confidence === null || album.highest_confidence === undefined) return null;
+      const percent = Math.round(Number(album.highest_confidence) * 100);
+      const confidence = make('span', `${percent}%`, 'score-pill row-confidence');
+      confidence.dataset.confidence = percent >= 90 ? 'high' : (percent >= 75 ? 'medium' : 'low');
+      confidence.setAttribute('aria-label', `Match confidence ${percent}%`);
+      return confidence;
+    }
+    function albumTreeRow(album) {
+      const node = make('article', '', 'review-album-node');
+      const row = make('div', '', 'review-album-row');
+      const tracks = album.tracks || [];
+      const filesId = `scope-album-files-${album.id}`;
+      const expand = make('button', '', 'album-expand');
+      expand.type = 'button'; expand.setAttribute('aria-expanded', 'false'); expand.setAttribute('aria-controls', filesId);
+      expand.setAttribute('aria-label', `Expand files for ${album.album} by ${album.artist}`);
+      const identity = make('span', `${album.artist} — ${album.album}`, 'review-folder-identity');
+      const count = make('span', `${tracks.length} ${tracks.length === 1 ? 'file' : 'files'}`, 'review-track-count');
+      const rawStatus = album.ready ? 'Ready' : (album.decision || album.candidate_status || 'needs-review');
+      const state = make('span', statusLabel(rawStatus), 'status-pill'); state.dataset.status = statusKey(rawStatus);
+      const confidence = confidenceLabel(album);
+      const open = make('button', '↓', 'review-album row-import'); open.type = 'button';
+      open.setAttribute('aria-label', `Import ${album.album} by ${album.artist}`); open.title = 'Import';
+      open.addEventListener('click', () => review.open(album, open));
+      const files = make('ul', '', 'review-file-list'); files.id = filesId; files.hidden = true;
+      tracks.forEach(track => {
+        const entry = make('li', '', 'review-file-row');
+        const path = String(track.path || track.title || 'Untitled file');
+        const name = path.split('/').pop() || path;
+        entry.append(make('span', name, 'review-file-name'));
+        if (track.title && track.title !== name) entry.append(make('span', track.title, 'review-file-title'));
+        files.append(entry);
+      });
+      if (!tracks.length) files.append(make('li', 'No files in this album.', 'review-file-row empty'));
+      expand.addEventListener('click', () => {
+        const opening = expand.getAttribute('aria-expanded') !== 'true';
+        expand.setAttribute('aria-expanded', String(opening)); files.hidden = !opening;
+      });
+      row.append(expand, identity, count, state); if (confidence) row.append(confidence); row.append(open);
+      node.append(row, files); return node;
+    }
     async function openScope(item, button, body = null, countNode = null) {
       if (body && !body.hidden) { body.hidden = true; button.setAttribute('aria-expanded', 'false'); return; }
       if (body?.dataset.loaded === 'true') { body.hidden = false; button.setAttribute('aria-expanded', 'true'); return; }
       if (body) { body.hidden = false; button.setAttribute('aria-expanded', 'true'); body.textContent = 'Loading albums…'; }
       try {
-        const data = await adapter.albums(item.path), albums = data.albums || [];
-        item.album_count = albums.length; item.track_count = data.items?.length ?? albums.reduce((count, album) => count + (album.tracks?.length || 0), 0);
+        const albums = await loadScope(item);
         if (countNode) countNode.textContent = countLabel(item);
         if (!body) { if (albums.length) await review.openSequence(albums, button); else setStatus('Scan this scope before review.'); return; }
-        const children = albums.map(album => {
-          const row = make('article', '', 'review-album-row'), identity = make('span', `${album.artist} — ${album.album}`, 'review-folder-identity');
-          const count = make('span', `${album.tracks?.length || 0} ${(album.tracks?.length || 0) === 1 ? 'track' : 'tracks'}`, 'review-track-count');
-          const rawStatus = album.ready ? 'Ready' : (album.decision || album.candidate_status || 'needs-review');
-          const state = make('span', statusLabel(rawStatus), 'status-pill'); state.dataset.status = statusKey(rawStatus);
-          const open = make('button', '↗', 'review-album'); open.type = 'button'; open.setAttribute('aria-label', `Review ${album.album} by ${album.artist}`); open.addEventListener('click', () => review.open(album, open));
-          row.append(identity, count, state, open); return row;
-        });
+        const children = albums.map(albumTreeRow);
         if (!children.length) children.push(make('p', 'No reviewable albums in this folder.'));
         replaceRows(body, children); body.dataset.loaded = 'true';
       } catch (error) { if (body) body.textContent = error.message; else setStatus(error.message, true); }
@@ -61,20 +103,21 @@
         const summaryRow = make('div', '', adapter.summaryClass || 'review-folder-summary');
         const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = adapter.checkboxClass || 'review-select'; checkbox.checked = selected.has(item.path); checkbox.setAttribute('aria-label', selectLabel(item));
         checkbox.addEventListener('change', () => { checkbox.checked ? selected.add(item.path) : selected.delete(item.path); save(); render(); refreshSummary(); });
-        let opener;
         const directImport = adapter.expandRows && item.album_count === 1;
         summaryRow.classList.toggle('single-album', directImport);
-        if (adapter.expandRows && !directImport) { opener = make('button', '', 'folder-expand'); opener.type = 'button'; opener.setAttribute('aria-expanded', 'false'); opener.setAttribute('aria-label', `Expand ${item.name}`); }
+        let opener;
+        if (adapter.expandRows) { opener = make('button', '', 'folder-expand'); opener.type = 'button'; opener.setAttribute('aria-expanded', 'false'); opener.setAttribute('aria-label', `Expand ${item.name}`); opener.setAttribute('aria-controls', `scope-${workflowId}-contents-${encodeURIComponent(item.path).replaceAll('%', '-')}`); }
         const identity = make('div', '', adapter.identityClass || 'review-folder-identity'); identity.append(make('strong', item.name || item.path, adapter.nameClass || 'review-folder-path'));
         const count = make('span', item.path === '.' ? 'Root-level loose audio' : countLabel(item), adapter.countClass || 'review-folder-count');
         const current = phases.get(item.path), phase = typeof current === 'object' ? current.label : current;
         const statusValue = statusKey(typeof current === 'object' ? current.status : (current || item.status || 'not-scanned'));
         const errorReason = current?.title || item.error || '';
         const state = make('span', statusLabel(phase || item.status || 'not-scanned'), adapter.statusClass || 'status-pill'); state.dataset.status = statusValue; state.setAttribute('aria-live', 'polite'); state.setAttribute('aria-atomic', 'true'); if (statusValue === 'error' && errorReason) { state.title = errorReason; state.setAttribute('aria-label', `Error: ${errorReason}`); }
-        const body = adapter.expandRows && !directImport ? make('div', '', 'review-folder-contents') : null;
+        const body = adapter.expandRows ? make('div', '', 'review-folder-contents') : null;
+        if (body) body.id = opener.getAttribute('aria-controls');
         if (body) { body.hidden = true; opener.addEventListener('click', () => openScope(item, opener, body, count)); }
-        const reviewButton = directImport ? make('button', 'Import', 'folder-import button-primary') : (adapter.expandRows ? null : make('button', 'Review', 'button-quiet'));
-        if (reviewButton) { reviewButton.type = 'button'; reviewButton.disabled = !item.album_count; reviewButton.addEventListener('click', () => openScope(item, reviewButton)); }
+        const reviewButton = directImport ? make('button', '↓', 'folder-import row-import button-primary') : (adapter.expandRows ? null : make('button', 'Review', 'button-quiet'));
+        if (reviewButton) { reviewButton.type = 'button'; reviewButton.disabled = !item.album_count; reviewButton.setAttribute('aria-label', directImport ? `Import ${item.name}` : `Review ${item.name}`); reviewButton.title = directImport ? 'Import' : 'Review'; reviewButton.addEventListener('click', () => openScope(item, reviewButton)); }
         summaryRow.append(checkbox); if (opener) summaryRow.append(opener); summaryRow.append(identity, count, state); if (reviewButton) summaryRow.append(reviewButton); article.append(summaryRow); if (body) article.append(body); return article;
       });
       replaceRows(list, nodes); if (!nodes.length) list.append(make('p', adapter.emptyMessage || `No ${noun}s found.`, 'empty')); updateControls();

@@ -3752,7 +3752,8 @@ def test_library_import_review_markup_is_album_folder_first(tmp_path):
 
     assert b"document.createElement('details')" in shared
     assert b"document.createElement('summary')" in shared
-    assert b"review-folder" in html and b"review-album" in html
+    assert b'data-folder-list' in html and b'src="/static/folder-workflow.js"' in html
+    assert b"review-folder" in folders and b"review-album-node" in folders
     assert b"CratekeepFolderWorkflow.create" in html
     assert b"adapter.albums(item.path)" in folders
     assert b"review.open(album, open)" in folders
@@ -3764,13 +3765,13 @@ def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_pat
     shell_css = Path("beets_mvp/static/app-shell.css").read_bytes()
 
     assert b".review-list { overflow:hidden;" in html
-    assert b".review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto;" in shell_css
-    assert b".review-album-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto;" in shell_css
+    assert b".review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto auto;" in shell_css
+    assert b".review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto;" in shell_css
     assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
     folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
     assert b"const article = make('article'" in folders
-    assert b"const open = make('button', '\xe2\x86\x97'" in folders
-    assert b"open.setAttribute('aria-label', `Review ${album.album} by ${album.artist}`)" in folders
+    assert b"const open = make('button', '\xe2\x86\x93'" in folders
+    assert b"open.setAttribute('aria-label', `Import ${album.album} by ${album.artist}`)" in folders
 
 
 def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
@@ -3812,10 +3813,12 @@ def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
     assert b'aria-label="Previous page"' in html and b'aria-label="Next page"' in html
 
 
-def test_album_folder_line_carries_review_status_score_without_track_expansion(tmp_path):
+def test_album_folder_line_separates_status_score_and_file_expansion(tmp_path):
     folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
 
-    assert b"row.append(identity, count, state, open)" in folders
+    assert b"row.append(expand, identity, count, state)" in folders
+    assert b"if (confidence) row.append(confidence)" in folders
+    assert b"files.hidden = !opening" in folders
     assert b"review.open(album, open)" in folders
     assert b"renderTrackList" not in folders
 
@@ -4854,14 +4857,23 @@ def test_folder_queue_distinguishes_pending_from_provider_error_with_reason(tmp_
     assert "state.setAttribute('aria-label', `Error: ${errorReason}`)" in controller
 
 
-def test_single_album_folder_uses_direct_import_while_multi_album_folder_expands():
+def test_folder_rows_keep_expand_tree_and_accessible_direct_import_contract():
     controller = Path("beets_mvp/static/folder-workflow.js").read_text()
+    stylesheet = Path("beets_mvp/static/app-shell.css").read_text()
 
     assert "const directImport = adapter.expandRows && item.album_count === 1" in controller
     assert "summaryRow.classList.toggle('single-album', directImport)" in controller
-    assert "adapter.expandRows && !directImport" in controller
-    assert "make('button', 'Import', 'folder-import button-primary')" in controller
+    assert "if (adapter.expandRows) { opener = make('button', '', 'folder-expand')" in controller
+    assert "make('button', '\u2193', 'folder-import row-import button-primary')" in controller
+    assert "`Import ${item.name}`" in controller
     assert "openScope(item, reviewButton)" in controller
+    assert "const children = albums.map(albumTreeRow)" in controller
+    assert "`Expand files for ${album.album} by ${album.artist}`" in controller
+    assert "`Import ${album.album} by ${album.artist}`" in controller
+    assert "track.path || track.title || 'Untitled file'" in controller
+    assert "Match confidence ${percent}%" in controller
+    assert '.review-file-list[hidden] { display:none; }' in stylesheet
+    assert '.row-confidence[data-confidence="high"]' in stylesheet
 
 
 def test_library_import_active_queue_removes_completed_albums_but_retains_history_and_inbox(tmp_path):
