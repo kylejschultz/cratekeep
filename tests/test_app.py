@@ -5255,6 +5255,7 @@ def test_inbox_bulk_execute_revalidates_and_runs_only_ready_selected_scope(tmp_p
 
 def test_inbox_ui_uses_per_source_bulk_folder_workflow_without_pagination(tmp_path):
     html = make_app(tmp_path).test_client().get("/inbox").get_data(as_text=True)
+    assert ".inbox-grid,.scope-list{grid-template-columns:minmax(0,1fr)}" in html
     for label in ("Select all", "Scan selected", "Import ready (0)", "Review exceptions (0)"):
         assert label in html
     assert "data-folder-select-all" in html and "data-folder-list" in html
