@@ -133,6 +133,16 @@ def test_inbox_and_library_reuse_shell_and_bounded_build_identifier(tmp_path):
     assert "build {{ build_sha[:7] if build_sha else 'unknown' }}" in shared
     assert "{{ sidebar('inbox', build_sha) }}" in Path("beets_mvp/templates/inbox.html").read_text()
     assert "{{ sidebar('library', build_sha) }}" in Path("beets_mvp/templates/library.html").read_text()
+    for template in ("inbox.html", "library.html"):
+        source = Path("beets_mvp/templates", template).read_text()
+        local_css = source.split("<style>", 1)[1].split("</style>", 1)[0]
+        for selector in (
+            ".sidebar", ".brand", ".nav-list", ".nav-link", ".nav-icon",
+            ".sidebar-footer", ".theme-toggle", ".utility-link", ".build-sha",
+            ".collapse-button", ".content", ".mobile-header", ".menu-button",
+            ".scrim", ".skip-link", "sidebar-collapsed", "sidebar-open",
+        ):
+            assert selector not in local_css, f"{template} overrides shared shell selector {selector}"
 
 def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, monkeypatch):
     app = make_app(tmp_path)
@@ -4836,8 +4846,22 @@ def test_folder_queue_distinguishes_pending_from_provider_error_with_reason(tmp_
     assert "deterministic provider reason" in error_folder["error"]
 
     controller = Path("beets_mvp/static/folder-workflow.js").read_text()
-    assert "folder-error-reason" in controller
-    assert "`Error: ${errorReason}`" in controller
+    stylesheet = Path("beets_mvp/static/app-shell.css").read_text()
+    assert "folder-error-reason" not in controller
+    assert "folder-error-reason" not in stylesheet
+    assert "statusValue === 'error' && errorReason" in controller
+    assert "state.title = errorReason" in controller
+    assert "state.setAttribute('aria-label', `Error: ${errorReason}`)" in controller
+
+
+def test_single_album_folder_uses_direct_import_while_multi_album_folder_expands():
+    controller = Path("beets_mvp/static/folder-workflow.js").read_text()
+
+    assert "const directImport = adapter.expandRows && item.album_count === 1" in controller
+    assert "summaryRow.classList.toggle('single-album', directImport)" in controller
+    assert "adapter.expandRows && !directImport" in controller
+    assert "make('button', 'Import', 'folder-import button-primary')" in controller
+    assert "openScope(item, reviewButton)" in controller
 
 
 def test_library_import_active_queue_removes_completed_albums_but_retains_history_and_inbox(tmp_path):
@@ -5231,6 +5255,7 @@ def test_inbox_bulk_execute_revalidates_and_runs_only_ready_selected_scope(tmp_p
 
 def test_inbox_ui_uses_per_source_bulk_folder_workflow_without_pagination(tmp_path):
     html = make_app(tmp_path).test_client().get("/inbox").get_data(as_text=True)
+    assert ".inbox-grid,.scope-list{grid-template-columns:minmax(0,1fr)}" in html
     for label in ("Select all", "Scan selected", "Import ready (0)", "Review exceptions (0)"):
         assert label in html
     assert "data-folder-select-all" in html and "data-folder-list" in html

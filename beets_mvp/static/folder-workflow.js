@@ -62,16 +62,18 @@
         const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = adapter.checkboxClass || 'review-select'; checkbox.checked = selected.has(item.path); checkbox.setAttribute('aria-label', selectLabel(item));
         checkbox.addEventListener('change', () => { checkbox.checked ? selected.add(item.path) : selected.delete(item.path); save(); render(); refreshSummary(); });
         let opener;
-        if (adapter.expandRows) { opener = make('button', '', 'folder-expand'); opener.type = 'button'; opener.setAttribute('aria-expanded', 'false'); opener.setAttribute('aria-label', `Expand ${item.name}`); }
+        const directImport = adapter.expandRows && item.album_count === 1;
+        summaryRow.classList.toggle('single-album', directImport);
+        if (adapter.expandRows && !directImport) { opener = make('button', '', 'folder-expand'); opener.type = 'button'; opener.setAttribute('aria-expanded', 'false'); opener.setAttribute('aria-label', `Expand ${item.name}`); }
         const identity = make('div', '', adapter.identityClass || 'review-folder-identity'); identity.append(make('strong', item.name || item.path, adapter.nameClass || 'review-folder-path'));
         const count = make('span', item.path === '.' ? 'Root-level loose audio' : countLabel(item), adapter.countClass || 'review-folder-count');
         const current = phases.get(item.path), phase = typeof current === 'object' ? current.label : current;
         const statusValue = statusKey(typeof current === 'object' ? current.status : (current || item.status || 'not-scanned'));
         const errorReason = current?.title || item.error || '';
-        const state = make('span', statusLabel(phase || item.status || 'not-scanned'), adapter.statusClass || 'status-pill'); state.dataset.status = statusValue; state.setAttribute('aria-live', 'polite'); state.setAttribute('aria-atomic', 'true'); if (errorReason) { state.title = errorReason; const reason = make('span', `Error: ${errorReason}`, 'folder-error-reason'); reason.setAttribute('role', 'status'); identity.append(reason); }
-        const body = adapter.expandRows ? make('div', '', 'review-folder-contents') : null;
+        const state = make('span', statusLabel(phase || item.status || 'not-scanned'), adapter.statusClass || 'status-pill'); state.dataset.status = statusValue; state.setAttribute('aria-live', 'polite'); state.setAttribute('aria-atomic', 'true'); if (statusValue === 'error' && errorReason) { state.title = errorReason; state.setAttribute('aria-label', `Error: ${errorReason}`); }
+        const body = adapter.expandRows && !directImport ? make('div', '', 'review-folder-contents') : null;
         if (body) { body.hidden = true; opener.addEventListener('click', () => openScope(item, opener, body, count)); }
-        const reviewButton = adapter.expandRows ? null : make('button', 'Review', 'button-quiet');
+        const reviewButton = directImport ? make('button', 'Import', 'folder-import button-primary') : (adapter.expandRows ? null : make('button', 'Review', 'button-quiet'));
         if (reviewButton) { reviewButton.type = 'button'; reviewButton.disabled = !item.album_count; reviewButton.addEventListener('click', () => openScope(item, reviewButton)); }
         summaryRow.append(checkbox); if (opener) summaryRow.append(opener); summaryRow.append(identity, count, state); if (reviewButton) summaryRow.append(reviewButton); article.append(summaryRow); if (body) article.append(body); return article;
       });
