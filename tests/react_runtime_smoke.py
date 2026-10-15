@@ -73,27 +73,57 @@ def main() -> None:
             page.get_by_role("heading", name=heading).wait_for()
             assert page.get_by_role("navigation", name="Primary navigation").get_by_role("link").count() == 5
             desktop_ok = page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+            desktop_fill = page.locator(".app-content").evaluate("node => node.getBoundingClientRect().height >= innerHeight")
             page.set_viewport_size({"width": 390, "height": 844})
             mobile_ok = page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+            mobile_fill = page.locator(".app-content").evaluate("node => node.getBoundingClientRect().height >= innerHeight")
             page.screenshot(path=args.evidence_dir / f"{index:02d}-{path.strip('/') or 'overview'}-mobile.png", full_page=True)
             page.set_viewport_size({"width": 1440, "height": 1000})
-            route_results[path] = {"heading": heading, "desktop_no_overflow": desktop_ok, "mobile_no_overflow": mobile_ok}
+            route_results[path] = {"heading": heading, "desktop_no_overflow": desktop_ok, "mobile_no_overflow": mobile_ok,
+                                   "desktop_theme_fill": desktop_fill, "mobile_theme_fill": mobile_fill}
             assert desktop_ok and mobile_ok, f"horizontal overflow on {path}"
+            assert desktop_fill and mobile_fill, f"viewport theme does not fill {path}"
+
+        page.goto(base + "/inbox", wait_until="networkidle")
+        assert page.get_by_role("button", name="Match Selected").is_disabled()
+        page.get_by_role("checkbox", name="Select folder Inbox Ready").check()
+        with page.expect_response(lambda response: response.url.endswith("/scopes/scan")) as inbox_scan:
+            page.get_by_role("button", name="Match Selected").click()
+        assert inbox_scan.value.ok
+        page.get_by_role("button", name="Expand folder Inbox Ready").click()
+        inbox_album = page.locator(".album-node").filter(has_text="Inbox Ready")
+        inbox_album.wait_for()
+        inbox_album.get_by_role("button", name=re.compile("Actions for")).click()
+        assert inbox_album.get_by_role("menuitem").all_inner_texts() == ["Scan", "Import", "Review"]
+        with page.expect_response(lambda response: response.url.endswith("/scopes/scan")) as inbox_album_scan:
+            inbox_album.get_by_role("menuitem", name="Scan").click()
+        assert inbox_album_scan.value.ok
 
         page.goto(base + "/library-import", wait_until="networkidle")
+        assert page.locator(".toolbar-actions button").all_inner_texts() == ["Match Selected", "Import", "Review", "Refresh"]
         page.get_by_role("checkbox", name="Select folder Library Ready").check()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")):
-            page.get_by_role("button", name="Scan selected").click()
+            page.get_by_role("button", name="Match Selected").click()
         page.get_by_role("button", name="Expand folder Library Ready").click()
         album = page.locator(".album-node").filter(has_text="Library Ready")
         album.wait_for()
         assert album.locator(".status").inner_text() in {"Matched", "Threshold"}
-        assert album.get_by_role("button", name=re.compile("Import")).first.is_enabled()
+        assert album.locator(".compact-import").count() == 0
         album.get_by_role("button", name=re.compile("Actions for")).click()
-        assert album.get_by_role("menuitem").all_inner_texts() == ["Import", "Review"]
+        assert album.get_by_role("menuitem").all_inner_texts() == ["Scan", "Import", "Review"]
+        assert album.get_by_role("menuitem", name="Import").is_enabled()
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as album_scan:
+            album.get_by_role("menuitem", name="Scan").click()
+        assert album_scan.value.ok
+        album = page.locator(".album-node").filter(has_text="Library Ready")
+        album.get_by_role("button", name=re.compile("Actions for")).click()
         album.get_by_role("menuitem", name="Review").click()
         page.locator("[data-review-modal]").wait_for()
         assert page.locator("[data-review-candidates]").is_visible()
+        page.get_by_text(re.compile(r"Compare tracks \(\d+\)")).first.click()
+        assert page.locator(".track-evidence-row").count() > 0
+        assert page.locator(".track-evidence-row [role=cell]").first.is_visible()
+        assert page.locator(".change-indicator").first.is_visible()
         page.locator("[data-review-close]").click()
         page.locator("[data-review-modal]").wait_for(state="detached")
         page.screenshot(path=args.evidence_dir / "06-library-import-queue.png", full_page=True)
@@ -107,7 +137,8 @@ def main() -> None:
         "source_identity": {"commit_at_run": args.source_commit, "tree_at_run": args.source_tree,
                             "definition": args.source_set_definition},
         "browser_version": browser_version, "routes": route_results,
-        "threshold": 90, "queue_review_modal": True,
+        "threshold": 90, "inbox_scope_scan": True, "album_scope_scan": True,
+        "queue_review_modal": True, "review_track_evidence": True,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }
@@ -124,4 +155,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
