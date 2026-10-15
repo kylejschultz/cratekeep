@@ -94,9 +94,9 @@ def main() -> None:
         inbox_album = page.locator(".album-node").filter(has_text="Inbox Ready")
         inbox_album.wait_for()
         inbox_album.get_by_role("button", name=re.compile("Actions for")).click()
-        assert inbox_album.get_by_role("menuitem").all_inner_texts() == ["Scan", "Import", "Review"]
+        assert inbox_album.get_by_role("menuitem").all_inner_texts() == ["Match", "Import", "Review"]
         with page.expect_response(lambda response: response.url.endswith("/scopes/scan")) as inbox_album_scan:
-            inbox_album.get_by_role("menuitem", name="Scan").click()
+            inbox_album.get_by_role("menuitem", name="Match").click()
         assert inbox_album_scan.value.ok
 
         page.goto(base + "/library-import", wait_until="networkidle")
@@ -110,20 +110,47 @@ def main() -> None:
         assert album.locator(".status").inner_text() in {"Matched", "Threshold"}
         assert album.locator(".compact-import").count() == 0
         album.get_by_role("button", name=re.compile("Actions for")).click()
-        assert album.get_by_role("menuitem").all_inner_texts() == ["Scan", "Import", "Review"]
+        assert album.get_by_role("menuitem").all_inner_texts() == ["Match", "Import", "Review"]
         assert album.get_by_role("menuitem", name="Import").is_enabled()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as album_scan:
-            album.get_by_role("menuitem", name="Scan").click()
+            album.get_by_role("menuitem", name="Match").click()
         assert album_scan.value.ok
         album = page.locator(".album-node").filter(has_text="Library Ready")
         album.get_by_role("button", name=re.compile("Actions for")).click()
         album.get_by_role("menuitem", name="Review").click()
         page.locator("[data-review-modal]").wait_for()
         assert page.locator("[data-review-candidates]").is_visible()
+        assert page.get_by_role("heading", name="Current metadata").count() == 0
+        assert page.get_by_role("button", name="Match", exact=True).is_visible()
+        page.get_by_role("button", name="Search MBID").click()
+        page.get_by_label("MusicBrainz release UUID").fill("not-a-uuid")
+        page.get_by_role("button", name="Search exact release").click()
+        assert "canonical MusicBrainz release UUID" in page.get_by_role("alert").inner_text()
+        page.get_by_label("MusicBrainz release UUID").fill("123e4567-e89b-42d3-a456-426614174002")
+        with page.expect_response(lambda response: response.url.endswith("/rematch")) as mbid_match:
+            page.get_by_role("button", name="Search exact release").click()
+        assert mbid_match.value.ok
+        mbid_payload = mbid_match.value.json()
+        assert any(candidate.get("artwork_url") for candidate in mbid_payload.get("candidates", [])), mbid_payload
+        page.locator(".candidate-artwork").first.wait_for()
+        assert page.get_by_text("123e4567-e89b-42d3-a456-426614174002").is_visible()
+        assert page.locator(".candidate-fact").count() >= 8
         page.get_by_text(re.compile(r"Compare tracks \(\d+\)")).first.click()
         assert page.locator(".track-evidence-row").count() > 0
         assert page.locator(".track-evidence-row [role=cell]").first.is_visible()
         assert page.locator(".change-indicator").first.is_visible()
+        assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        page.screenshot(path=args.evidence_dir / "06-review-modal-desktop.png", full_page=True)
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.screenshot(path=args.evidence_dir / "07-review-modal-narrow.png", full_page=True)
+        narrow_modal_ok = page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        if not narrow_modal_ok:
+            offenders = page.locator("body").evaluate("""node => [...node.querySelectorAll('*')]
+              .filter(item => item.getBoundingClientRect().right > innerWidth + 1)
+              .map(item => ({tag: item.tagName, className: item.className, right: item.getBoundingClientRect().right, scrollWidth: item.scrollWidth}))
+              .slice(0, 12)""")
+            raise AssertionError({"narrow_modal_overflow": offenders})
+        page.set_viewport_size({"width": 1440, "height": 1000})
         page.locator("[data-review-close]").click()
         page.locator("[data-review-modal]").wait_for(state="detached")
         page.screenshot(path=args.evidence_dir / "06-library-import-queue.png", full_page=True)
@@ -137,8 +164,9 @@ def main() -> None:
         "source_identity": {"commit_at_run": args.source_commit, "tree_at_run": args.source_tree,
                             "definition": args.source_set_definition},
         "browser_version": browser_version, "routes": route_results,
-        "threshold": 90, "inbox_scope_scan": True, "album_scope_scan": True,
-        "queue_review_modal": True, "review_track_evidence": True,
+        "threshold": 90, "inbox_scope_match": True, "album_scope_match": True,
+        "queue_review_modal": True, "review_mbid_search": True, "review_rich_candidate": True,
+        "review_track_evidence": True,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

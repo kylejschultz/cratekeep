@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Queue } from "./Queue";
 import { albumStatus } from "./status";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("albumStatus", () => {
   it("uses the persisted threshold without conflating candidate absence and failure", () => {
@@ -14,9 +14,11 @@ describe("albumStatus", () => {
   });
 });
 
-describe("Queue scan workflow", () => {
-  it("posts Inbox scopes, refreshes expanded albums, and keeps album actions in the menu", async () => {
+describe("Queue match workflow", () => {
+  it("posts Inbox scopes, exposes busy rows, refreshes albums, and uses Match wording", async () => {
     let albumLoads = 0;
+    let releaseMatch: (() => void) | undefined;
+    let matchCalls = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/scopes") && !init?.method) return { ok: true, json: async () => ({ scopes: [{ path: "Album", name: "Album", album_count: 1, file_count: 1 }] }) };
@@ -24,7 +26,11 @@ describe("Queue scan workflow", () => {
         albumLoads += 1;
         return { ok: true, json: async () => ({ albums: [{ id: 7, album: "Matched Album", artist: "Artist", candidates: [{ id: 8, confidence: .98 }] }] }) };
       }
-      if (url.endsWith("/scopes/scan")) return { ok: true, json: async () => ({ inventory: { scopes: ["Album"] } }) };
+      if (url.endsWith("/scopes/scan")) {
+        matchCalls += 1;
+        await new Promise<void>(resolve => { releaseMatch = resolve; });
+        return { ok: true, json: async () => ({ inventory: { scopes: ["Album"] } }) };
+      }
       throw new Error(`Unexpected request: ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -39,15 +45,38 @@ describe("Queue scan workflow", () => {
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Select folder Album" }));
     fireEvent.click(screen.getByRole("button", { name: "Match Selected" }));
+    expect(screen.getByRole("button", { name: "Matching…" })).toBeDisabled();
+    expect(screen.getByText("Album").closest(".folder-node")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "Import" })).toBeDisabled();
+    releaseMatch?.();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/inbox/inbox-one/scopes/scan", expect.objectContaining({ method: "POST", body: JSON.stringify({ scopes: ["Album"] }) })));
     await waitFor(() => expect(albumLoads).toBeGreaterThanOrEqual(2));
+    expect(await screen.findByText("1 folder matched.")).toBeInTheDocument();
 
     const row = screen.getByText("Matched Album").closest(".album-node") as HTMLElement;
     fireEvent.click(within(row).getByRole("button", { name: "Actions for Matched Album" }));
-    expect(within(row).getAllByRole("menuitem").map(item => item.textContent)).toEqual(["Scan", "Import", "Review"]);
+    expect(within(row).getAllByRole("menuitem").map(item => item.textContent)).toEqual(["Match", "Import", "Review"]);
     expect(within(row).getByRole("menuitem", { name: "Import" })).toBeEnabled();
-    fireEvent.click(within(row).getByRole("menuitem", { name: "Scan" }));
-    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/scopes/scan"))).toHaveLength(2));
+    fireEvent.click(within(row).getByRole("menuitem", { name: "Match" }));
+    expect(within(row).getByRole("menuitem", { name: "Matching…" })).toBeDisabled();
+    expect(row).toHaveAttribute("aria-busy", "true");
+    releaseMatch?.();
+    await waitFor(() => expect(matchCalls).toBe(2));
     await waitFor(() => expect(albumLoads).toBeGreaterThanOrEqual(3));
+    expect(screen.queryByText("Scan")).not.toBeInTheDocument();
+  });
+
+  it("reports match errors and restores actions for retry", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/folders")) return { ok: true, json: async () => ({ folders: [{ path: "Failure", name: "Failure" }] }) };
+      return { ok: false, status: 503, json: async () => ({ error: "provider unavailable" }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Queue source="library-import" threshold={90}/>);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select folder Failure" }));
+    fireEvent.click(screen.getByRole("button", { name: "Match Selected" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Match failed: provider unavailable");
+    expect(screen.getByRole("button", { name: "Match Selected" })).toBeEnabled();
   });
 });

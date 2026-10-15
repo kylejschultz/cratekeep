@@ -66,7 +66,7 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
         return []
     if not release_id:
         if query["album"] in {"Safe Match", "Sequential First", "Sequential Second", "Provider Error"}:
-            time.sleep(0.15)  # Keep inline scan state observable in the real-browser smoke.
+            time.sleep(0.15)  # Keep inline matching state observable in the real-browser smoke.
         if query["album"] == "Provider Error":
             raise ProviderError("deterministic folder-queue provider error", code="fixture_error")
         base = {

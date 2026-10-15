@@ -14,7 +14,7 @@ function FileRow({ file }: { file: Record<string, any> }) {
   return <li className="file-row"><span>{name}</span><span>{type} · {formatBytes(file.size ?? file.bytes)}</span></li>;
 }
 
-function AlbumRow({ album, threshold, scanning, onScan, onReview }: { album: Album; threshold: number; scanning: boolean; onScan: () => Promise<void>; onReview: (album: Album) => void }) {
+function AlbumRow({ album, threshold, matching, busy, onMatch, onReview }: { album: Album; threshold: number; matching: boolean; busy: boolean; onMatch: () => Promise<void>; onReview: (album: Album) => void }) {
   const [expanded, setExpanded] = useState(false);
   const [menu, setMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -22,20 +22,20 @@ function AlbumRow({ album, threshold, scanning, onScan, onReview }: { album: Alb
   const canImport = state.key === "matched" || state.key === "threshold";
   const files = album.files || album.tracks || [];
   useEffect(() => { const close = (event: MouseEvent) => { if (!menuRef.current?.contains(event.target as Node)) setMenu(false); }; addEventListener("mousedown", close); return () => removeEventListener("mousedown", close); }, []);
-  return <li className="album-node" data-album-id={album.id}>
+  return <li className={`album-node${matching ? " is-matching" : ""}`} data-album-id={album.id} aria-busy={matching}>
     <div className="album-row">
       <button className="expand" type="button" aria-expanded={expanded} aria-label={`${expanded ? "Collapse" : "Expand"} ${album.album || album.name || "album"}`} onClick={() => setExpanded(value => !value)}>{expanded ? "⌄" : "›"}</button>
       <div className="row-identity"><strong>{album.album || album.name || album.relative_path || "Untitled album"}</strong><small>{album.albumartist || album.artist || album.path || "Unknown artist"}</small></div>
       <span className="row-count">{album.track_count ?? album.file_count ?? files.length} tracks</span>
-      <span className={`status ${state.key}`} title={state.key === "error" ? album.execution_error || album.candidate_error : undefined}>{state.label}</span>
+      <span className={`status ${matching ? "pending" : state.key}`} title={state.key === "error" ? album.execution_error || album.candidate_error : undefined}>{matching ? "Matching…" : state.label}</span>
       <span className="match">{state.score == null ? "—" : `${Math.round(state.score)}%`}</span>
-      <div className="overflow" ref={menuRef}><button type="button" aria-haspopup="menu" aria-expanded={menu} aria-label={`Actions for ${album.album || album.name || "album"}`} onClick={() => setMenu(value => !value)}>•••</button>{menu && <div role="menu"><button role="menuitem" type="button" disabled={scanning} title="Scan the containing folder" onClick={() => { setMenu(false); void onScan(); }}>Scan</button><button role="menuitem" type="button" disabled={!canImport} onClick={() => onReview(album)}>Import</button><button role="menuitem" type="button" onClick={() => onReview(album)}>Review</button></div>}</div>
+      <div className="overflow" ref={menuRef}><button type="button" aria-haspopup="menu" aria-expanded={menu} aria-label={`Actions for ${album.album || album.name || "album"}`} onClick={() => setMenu(value => !value)}>•••</button>{menu && <div role="menu"><button role="menuitem" type="button" disabled={busy} title="Match albums in the containing folder" onClick={() => { void onMatch(); }}>{matching && <span className="spinner"/>}{matching ? "Matching…" : "Match"}</button><button role="menuitem" type="button" disabled={busy || !canImport} onClick={() => onReview(album)}>Import</button><button role="menuitem" type="button" disabled={busy} onClick={() => onReview(album)}>Review</button></div>}</div>
     </div>
-    {expanded && <ul className="file-list">{files.length ? files.map((file, index) => <FileRow key={file.id || file.path || index} file={file}/>) : <li className="empty-inline">No file detail is available until this album is scanned.</li>}</ul>}
+    {expanded && <ul className="file-list">{files.length ? files.map((file, index) => <FileRow key={file.id || file.path || index} file={file}/>) : <li className="empty-inline">No file detail is available until this album is matched.</li>}</ul>}
   </li>;
 }
 
-function ScopeRow({ scope, source, threshold, inboxId, selected, scanning, refreshVersion, onSelect, onScan, onReview }: { scope: QueueScope; source: Source; threshold: number; inboxId?: string; selected: boolean; scanning: boolean; refreshVersion: number; onSelect: (value: boolean) => void; onScan: (scope: string) => Promise<void>; onReview: (album: Album) => void }) {
+function ScopeRow({ scope, source, threshold, inboxId, selected, matching, busy, refreshVersion, onSelect, onMatch, onReview }: { scope: QueueScope; source: Source; threshold: number; inboxId?: string; selected: boolean; matching: boolean; busy: boolean; refreshVersion: number; onSelect: (value: boolean) => void; onMatch: (scope: string) => Promise<void>; onReview: (album: Album) => void }) {
   const [expanded, setExpanded] = useState(false);
   const [albums, setAlbums] = useState<Album[]>([]);
   const [loading, setLoading] = useState(false);
@@ -58,9 +58,9 @@ function ScopeRow({ scope, source, threshold, inboxId, selected, scanning, refre
     const next = !expanded; setExpanded(next);
     if (next && !albums.length) void loadAlbums();
   };
-  return <li className="folder-node">
+  return <li className={`folder-node${matching ? " is-matching" : ""}`} aria-busy={matching}>
     <div className="folder-row"><input type="checkbox" checked={selected} onChange={event => onSelect(event.target.checked)} aria-label={`Select folder ${name}`}/><button className="expand" type="button" onClick={expand} aria-expanded={expanded} aria-label={`${expanded ? "Collapse" : "Expand"} folder ${name}`}>{expanded ? "⌄" : "›"}</button><div className="row-identity"><strong>{name}</strong><small>{scope.path && scope.path !== name ? scope.path : "Folder"}</small></div><span className="row-count">{scope.album_count ?? scope.albums ?? 0} albums · {scope.file_count ?? scope.files ?? 0} files</span></div>
-    {expanded && <div className="scope-children">{loading ? <p className="loading">Loading albums…</p> : error ? <Notice kind="error">{error}</Notice> : albums.length ? <ul className="album-list">{albums.map(album => <AlbumRow key={album.id} album={album} threshold={threshold} scanning={scanning} onScan={() => onScan(scopeValue)} onReview={onReview}/>)}</ul> : <p className="empty-inline">No albums in this folder.</p>}</div>}
+    {expanded && <div className="scope-children">{loading ? <p className="loading">Loading albums…</p> : error ? <Notice kind="error">{error}</Notice> : albums.length ? <ul className="album-list">{albums.map(album => <AlbumRow key={album.id} album={album} threshold={threshold} matching={matching} busy={busy} onMatch={() => onMatch(scopeValue)} onReview={onReview}/>)}</ul> : <p className="empty-inline">No albums in this folder.</p>}</div>}
   </li>;
 }
 
@@ -72,6 +72,7 @@ export function Queue({ source, threshold, inboxId }: QueueProps) {
   const [success, setSuccess] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
+  const [matchingScopes, setMatchingScopes] = useState<Set<string>>(new Set());
   const [refreshVersion, setRefreshVersion] = useState(0);
   const load = useCallback(async () => {
     setLoading(true); setError("");
@@ -82,18 +83,18 @@ export function Queue({ source, threshold, inboxId }: QueueProps) {
     } catch (reason) { setError((reason as Error).message); } finally { setLoading(false); }
   }, [source, inboxId]);
   useEffect(() => { void load(); }, [load]);
-  const scanScopes = async (values: string[]) => {
+  const matchScopes = async (values: string[]) => {
     if (!values.length) return;
-    setScanning(true); setError("");
+    setScanning(true); setMatchingScopes(new Set(values)); setError(""); setSuccess("");
     try {
       const url = source === "inbox" ? `/api/inbox/${encodeURIComponent(inboxId || "")}/scopes/scan` : "/api/library-import/folders/scan";
       await api(url, { method: "POST", body: JSON.stringify(source === "inbox" ? { scopes: values } : { folders: values }) });
-      setSuccess(`${values.length} selected folder${values.length === 1 ? "" : "s"} scanned.`);
       await load();
       setRefreshVersion(version => version + 1);
-    } catch (reason) { setError((reason as Error).message); } finally { setScanning(false); }
+      setSuccess(`${values.length} folder${values.length === 1 ? "" : "s"} matched.`);
+    } catch (reason) { setError(`Match failed: ${(reason as Error).message}`); } finally { setScanning(false); setMatchingScopes(new Set()); }
   };
-  const scan = () => scanScopes([...selected]);
+  const match = () => matchScopes([...selected]);
   const refresh = async () => {
     await load();
     setRefreshVersion(version => version + 1);
@@ -124,8 +125,8 @@ export function Queue({ source, threshold, inboxId }: QueueProps) {
   };
   return <section className="queue">
     {success && <Notice kind="success">{success}</Notice>}
-    <div className="queue-toolbar"><div><strong>{scopes.length} folders</strong><small>{selected.size ? `${selected.size} selected` : "Folder → album → file"}</small></div><div className="toolbar-actions"><button type="button" onClick={scan} disabled={!selected.size || scanning}>Match Selected</button><button type="button" onClick={importReady} disabled={!selected.size || scanning}>Import</button><button className="secondary" type="button" onClick={reviewExceptions} disabled={!selected.size || scanning}>Review</button><button className="secondary" type="button" onClick={refresh} disabled={loading}>Refresh</button></div></div>
-    {loading && !scopes.length ? <p className="loading">Loading queue…</p> : error ? <Notice kind="error">{error}</Notice> : scopes.length ? <ul className="folder-list">{scopes.map((scope, index) => { const value = String(scope.path || scope.folder || scope.name || ""); return <ScopeRow key={scope.id || value || index} scope={scope} source={source} threshold={threshold} inboxId={inboxId} selected={selected.has(value)} scanning={scanning} refreshVersion={refreshVersion} onSelect={checked => setSelected(current => { const next = new Set(current); if (checked) next.add(value); else next.delete(value); return next; })} onScan={async value => { await scanScopes([value]); }} onReview={setReview}/>; })}</ul> : <div className="empty-state"><strong>Queue is clear</strong><p>No folders are waiting for review.</p></div>}
+    <div className="queue-toolbar"><div><strong>{scopes.length} folders</strong><small>{selected.size ? `${selected.size} selected` : "Folder → album → file"}</small></div><div className="toolbar-actions"><button type="button" onClick={match} disabled={!selected.size || scanning} aria-busy={scanning && matchingScopes.size > 0}>{scanning && matchingScopes.size > 0 && <span className="spinner"/>}{scanning && matchingScopes.size > 0 ? "Matching…" : "Match Selected"}</button><button type="button" onClick={importReady} disabled={!selected.size || scanning}>Import</button><button className="secondary" type="button" onClick={reviewExceptions} disabled={!selected.size || scanning}>Review</button><button className="secondary" type="button" onClick={refresh} disabled={loading || scanning}>Refresh</button></div></div>
+    {loading && !scopes.length ? <p className="loading">Loading queue…</p> : error ? <Notice kind="error">{error}</Notice> : scopes.length ? <ul className="folder-list">{scopes.map((scope, index) => { const value = String(scope.path || scope.folder || scope.name || ""); return <ScopeRow key={scope.id || value || index} scope={scope} source={source} threshold={threshold} inboxId={inboxId} selected={selected.has(value)} matching={matchingScopes.has(value)} busy={scanning} refreshVersion={refreshVersion} onSelect={checked => setSelected(current => { const next = new Set(current); if (checked) next.add(value); else next.delete(value); return next; })} onMatch={async scopeValue => { await matchScopes([scopeValue]); }} onReview={setReview}/>; })}</ul> : <div className="empty-state"><strong>Queue is clear</strong><p>No folders are waiting for review.</p></div>}
     {review && <ReviewModal album={review} source={source} onClose={() => setReview(null)} onComplete={message => { setReview(null); setSuccess(message); void load(); }}/>} 
   </section>;
 }

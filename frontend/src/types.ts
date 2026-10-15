@@ -11,6 +11,15 @@ export type Candidate = {
   artist?: string;
   album?: string;
   year?: number | string;
+  provider_id?: string;
+  genre?: string;
+  release_type?: string;
+  country?: string;
+  artwork_url?: string;
+  media?: Array<string | { format?: string; [key: string]: unknown }>;
+  recordings?: Array<Record<string, unknown>>;
+  matched_track_count?: number;
+  unmatched_track_count?: number;
   proposed_diff?: Record<string, { from?: unknown; to?: unknown }>;
   track_details?: Array<{
     status?: string;
