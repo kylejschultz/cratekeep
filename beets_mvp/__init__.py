@@ -32,7 +32,7 @@ from beetsplug.ftintitle import (
     find_feat_part,
     split_on_feat,
 )
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Flask, abort, flash, get_flashed_messages, jsonify, redirect, render_template, request, send_file, url_for
 from mediafile import Image as MediaImage, ImageType, MediaFile, UnreadableFileError
 from PIL import Image as PillowImage, UnidentifiedImageError
 
@@ -48,8 +48,9 @@ MAX_LEGACY_ALBUM_PROMOTIONS = 100
 MAX_LEGACY_PROMOTION_ITEMS = 2000
 SETTING_KEYS = (
     "inboxes_json", "inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art",
-    "art_sidecar", "art_embed", "art_replace", "inbox_auto_match",
+    "art_sidecar", "art_embed", "art_replace", "inbox_auto_match", "match_threshold",
 )
+DEFAULT_MATCH_THRESHOLD = 90
 MAX_ARTWORK_BYTES = 10 * 1024 * 1024
 MAX_ARTWORK_PIXELS = 40_000_000
 MAX_MANAGED_ARTWORK_PREVIEWS = 8
@@ -155,13 +156,15 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/")
     def index():
-        return render_template("index.html", build_sha=app.config["BUILD_SHA"], **_overview_data(app))
+        return _render_ui(app, "overview", "Overview", _overview_data(app))
 
     @app.get("/inbox")
     def inbox_page():
-        return render_template(
-            "inbox.html", build_sha=app.config["BUILD_SHA"], inboxes=_inbox_review_summaries(app)
-        )
+        return _render_ui(app, "inbox", "Inbox", {"inboxes": _inbox_review_summaries(app)})
+
+    @app.get("/library-import")
+    def library_import_page():
+        return _render_ui(app, "library-import", "Library Import", {})
 
     @app.get("/library")
     def library_page():
@@ -169,10 +172,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             page = int(request.args.get("page", "1"))
         except ValueError:
             page = 1
-        return render_template(
-            "library.html",
-            build_sha=app.config["BUILD_SHA"],
-            **_library_page_data(
+        return _render_ui(
+            app, "library", "Library",
+            _library_page_data(
                 app, request.args.get("q", ""), request.args.get("sort", "artist"),
                 request.args.get("order", "asc"), request.args.get("artist", ""),
                 request.args.get("album", ""), page,
@@ -1405,6 +1407,7 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         ART_EMBED=settings.get("art_embed", "") == "1",
         ART_REPLACE=settings.get("art_replace", "") == "1",
         INBOX_AUTO_MATCH=any(inbox.get("auto_match", False) for inbox in inboxes),
+        MATCH_THRESHOLD=_match_threshold(settings),
     )
     app.config["SETUP_COMPLETE"] = bool(inboxes and app.config["LIBRARY_PATH"])
     app.config["LIBRARY_ROOT_ERROR"] = (
@@ -1443,6 +1446,27 @@ def _validated_library_root(app: Flask) -> Path:
     if not root.is_dir():
         raise ValueError("Library root must be a directory.")
     return root
+
+
+def _match_threshold(settings: dict[str, str]) -> int:
+    try:
+        value = int(settings.get("match_threshold", DEFAULT_MATCH_THRESHOLD))
+    except (TypeError, ValueError):
+        return DEFAULT_MATCH_THRESHOLD
+    return value if 1 <= value <= 100 else DEFAULT_MATCH_THRESHOLD
+
+
+def _render_ui(app: Flask, page: str, title: str, data: dict):
+    return render_template(
+        "app.html",
+        title=title,
+        bootstrap={
+            "page": page,
+            "buildSha": app.config["BUILD_SHA"],
+            "threshold": app.config.get("MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD),
+            "data": data,
+        },
+    )
 
 
 def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "general", page: str = "settings"):
@@ -1514,6 +1538,15 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
         if rescan_url and (parsed_rescan_url.scheme not in {"http", "https"} or not parsed_rescan_url.netloc):
             errors.append("Navidrome rescan URL must be a complete http or https URL.")
 
+        threshold_text = request.form.get("match_threshold", str(_match_threshold(current))).strip()
+        try:
+            threshold = int(threshold_text)
+            if not 1 <= threshold <= 100:
+                raise ValueError
+        except ValueError:
+            threshold = _match_threshold(current)
+            errors.append("Match threshold must be a whole number from 1 to 100.")
+
         token = request.form.get("navidrome_token", "")
         if not token and current.get("navidrome_token") and not request.form.get("clear_navidrome_token"):
             token = current["navidrome_token"]
@@ -1533,6 +1566,7 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             # Retained only as a downgrade/migration breadcrumb. Runtime
             # behavior is exclusively controlled by each inbox JSON row.
             "inbox_auto_match": "1" if any(row["auto_match"] for row in inboxes) else "",
+            "match_threshold": str(threshold),
         }
         submitted_config = request.form.get("beets_config", config_text)
         submitted_ftintitle = {
@@ -1592,20 +1626,24 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
     display_inboxes = _settings_inboxes(current) or [{
         "id": "", "name": "Inbox", "path": defaults["inbox_path"],
     }]
-    return render_template(
-        "settings.html",
-        first_run=first_run,
-        settings=current,
-        inboxes=display_inboxes,
-        default_inbox=defaults["inbox_path"],
-        default_library=defaults["library_path"],
-        has_token=bool(current.get("navidrome_token")),
-        beets_config=config_text,
-        ftintitle=ftintitle,
-        build_sha=app.config["BUILD_SHA"],
-        active_tab=active_tab,
-        page=page,
-    )
+    if first_run:
+        return render_template(
+            "settings.html", first_run=True, settings=current, inboxes=display_inboxes,
+            default_inbox=defaults["inbox_path"], default_library=defaults["library_path"],
+            has_token=bool(current.get("navidrome_token")), beets_config=config_text,
+            ftintitle=ftintitle, build_sha=app.config["BUILD_SHA"], active_tab=active_tab, page=page,
+        )
+    return _render_ui(app, "settings", "Settings", {
+        "settings": current,
+        "inboxes": display_inboxes,
+        "default_inbox": defaults["inbox_path"],
+        "default_library": defaults["library_path"],
+        "has_token": bool(current.get("navidrome_token")),
+        "beets_config": config_text,
+        "ftintitle": ftintitle,
+        "active_tab": active_tab,
+        "flashes": get_flashed_messages(with_categories=True),
+    })
 
 
 def _default_paths() -> dict[str, str]:

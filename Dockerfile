@@ -12,6 +12,7 @@ COPY beets_mvp ./beets_mvp
 
 RUN useradd --create-home --uid 10001 app \
     && mkdir -p /data/inbox /data/library /data/config \
+    && chmod -R a+rX /app \
     && chown -R app:app /data /app
 USER app
 

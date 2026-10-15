@@ -1,0 +1,52 @@
+export type Bootstrap = {
+  page: "overview" | "inbox" | "library-import" | "library" | "settings";
+  buildSha: string;
+  threshold: number;
+  data: Record<string, any>;
+};
+
+export type Candidate = {
+  id: number | string;
+  confidence?: number;
+  artist?: string;
+  album?: string;
+  year?: number | string;
+  proposed_diff?: Record<string, { from?: unknown; to?: unknown }>;
+  track_details?: Array<Record<string, unknown>>;
+};
+
+export type Album = {
+  id: number;
+  name?: string;
+  album?: string;
+  artist?: string;
+  albumartist?: string;
+  path?: string;
+  relative_path?: string;
+  file_count?: number;
+  track_count?: number;
+  files?: Array<Record<string, any>>;
+  tracks?: Array<Record<string, any>>;
+  candidates?: Candidate[];
+  proposed_match?: Candidate | null;
+  selected_candidate_id?: number | string | null;
+  candidate_status?: string;
+  candidate_error?: string;
+  execution_status?: string;
+  execution_error?: string;
+  duplicate_action?: string;
+  [key: string]: any;
+};
+
+export type QueueScope = {
+  id?: string;
+  name?: string;
+  path?: string;
+  folder?: string;
+  album_count?: number;
+  file_count?: number;
+  status?: string;
+  error?: string;
+  [key: string]: any;
+};
+
