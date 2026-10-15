@@ -394,7 +394,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                                       and f"q={folder_name}" in urllib.parse.unquote_plus(response.url)):
                 search.fill(folder_name)
             row = page.locator(f'.review-folder[data-folder-path="{folder_name}"]')
-            direct = row.get_by_role("button", name="Import", exact=True)
+            direct = row.locator(".folder-import")
             if direct.count():
                 direct.wait_for()
                 return direct
@@ -537,9 +537,9 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             page.get_by_role("checkbox", name=f"Select folder {folder_name}", exact=True).check()
         page.get_by_text("3 folders selected", exact=False).wait_for()
         review_status_before_scan = page.locator("#library-import-review-status").inner_text()
-        safe_status = page.locator('.review-folder[data-folder-path="Queue Safe"] .status-pill')
-        sequential_status = page.locator('.review-folder[data-folder-path="Queue Sequential"] .status-pill')
-        unselected_status = page.locator('.review-folder[data-folder-path="Queue Unselected"] .status-pill')
+        safe_status = page.locator('.review-folder[data-folder-path="Queue Safe"] .review-folder-summary>.status-pill')
+        sequential_status = page.locator('.review-folder[data-folder-path="Queue Sequential"] .review-folder-summary>.status-pill')
+        unselected_status = page.locator('.review-folder[data-folder-path="Queue Unselected"] .review-folder-summary>.status-pill')
         unselected_status_before = unselected_status.inner_text()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")) as scan_info:
             # Dispatch synchronously so the intentionally brief queued render is
@@ -588,13 +588,36 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         ).get_attribute("title") is None
         safe_row = page.locator('.review-folder[data-folder-path="Queue Safe"]')
         sequential_row = page.locator('.review-folder[data-folder-path="Queue Sequential"]')
-        assert safe_row.get_by_role("button", name="Import", exact=True).count() == 1
-        assert safe_row.locator('.folder-expand').count() == 0
-        assert sequential_row.get_by_role("button", name="Import", exact=True).count() == 0
+        assert safe_row.get_by_role("button", name="Import Queue Safe", exact=True).count() == 1
+        assert safe_row.locator('.folder-expand').count() == 1
+        assert sequential_row.locator(".folder-import").count() == 0
         assert sequential_row.get_by_role("button", name="Expand Queue Sequential", exact=True).count() == 1
-        with page.expect_response(lambda response: "/api/library-import/folders/albums" in response.url) as direct_info:
-            safe_row.get_by_role("button", name="Import", exact=True).click()
-        assert direct_info.value.status == 200
+        with page.expect_response(lambda response: "/api/library-import/folders/albums" in response.url):
+            safe_row.get_by_role("button", name="Expand Queue Safe", exact=True).click()
+        safe_album = safe_row.locator(".review-album-row")
+        assert safe_album.get_by_label("Match confidence 100%", exact=True).inner_text() == "100%"
+        assert safe_album.locator('[data-status="ready"]').inner_text().lower() == "ready"
+        assert safe_row.locator(".review-file-list").is_hidden()
+        safe_album.get_by_role("button", name=re.compile("Expand files for Safe Match")).click()
+        assert safe_row.locator(".review-file-name").inner_text() == "01 Safe.wav"
+        page.set_viewport_size({"width": 390, "height": 844})
+        tree_overflow = page.locator("html").evaluate("""element => ({
+          clientWidth:element.clientWidth,
+          scrollWidth:element.scrollWidth,
+          offenders:[...document.querySelectorAll('*')].filter(node => {
+            const box=node.getBoundingClientRect();
+            return box.right > element.clientWidth + 1 || node.scrollWidth > node.clientWidth + 1;
+          }).slice(0,12).map(node => ({
+            tag:node.tagName, className:node.className, id:node.id,
+            clientWidth:node.clientWidth, scrollWidth:node.scrollWidth,
+            right:Math.round(node.getBoundingClientRect().right),
+          })),
+        })""")
+        assert tree_overflow["scrollWidth"] <= tree_overflow["clientWidth"], tree_overflow
+        page.screenshot(path=evidence / "03-library-row-tree-narrow.png", full_page=True)
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        safe_row.get_by_role("button", name="Expand Queue Safe", exact=True).click()
+        safe_row.get_by_role("button", name="Import Queue Safe", exact=True).click()
         page.locator("[data-review-modal]:not([hidden])").wait_for()
         assert "Import" in page.locator("[data-review-execute]").inner_text()
         page.locator("[data-review-close]").click()
@@ -1365,7 +1388,16 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
 
         first_scope = cards.nth(0).locator('[data-scope="Shared Selection"]')
-        first_scope.get_by_role("button", name="Import", exact=True).click()
+        first_scope.get_by_role("button", name="Expand Shared Selection", exact=True).click()
+        first_scope.locator(".review-album-row").wait_for()
+        assert first_scope.locator(".review-album-row .status-pill").inner_text().lower() == "pending"
+        first_scope.get_by_role("button", name=re.compile("Expand files for Shared Selection")).click()
+        assert first_scope.locator(".review-file-name").inner_text() == "01 First Inbox.wav"
+        page.set_viewport_size({"width": 390, "height": 844})
+        assert page.locator("html").evaluate("element => element.scrollWidth <= element.clientWidth")
+        page.screenshot(path=evidence / "17-inbox-row-tree-narrow.png", full_page=True)
+        page.set_viewport_size({"width": 1440, "height": 1000})
+        first_scope.locator(".folder-import").click()
         page.locator("[data-review-modal]:not([hidden])").wait_for()
         inbox_modal_contract = page.locator("[data-review-dialog]").evaluate("""dialog => ({
           controls:[...dialog.querySelectorAll('[data-review-find],[data-review-open-mbid],[data-review-cancel],[data-review-skip],[data-review-execute]')].map(node => node.textContent.trim()),
@@ -1476,10 +1508,10 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             first_card.locator("[data-inbox-toggle]").click()
         shared_scope = first_card.locator('[data-scope="Shared Ordinary"]')
         shared_scope.wait_for()
-        assert shared_scope.get_by_role("button", name="Import", exact=True).count() == 1
-        assert shared_scope.locator(".folder-expand").count() == 0
+        assert shared_scope.get_by_role("button", name="Import Shared Ordinary", exact=True).count() == 1
+        assert shared_scope.locator(".folder-expand").count() == 1
         page.screenshot(path=evidence / "17-shared-ordinary-after-import.png", full_page=True)
-        shared_scope.get_by_role("button", name="Import", exact=True).click()
+        shared_scope.get_by_role("button", name="Import Shared Ordinary", exact=True).click()
         page.locator("[data-review-modal]:not([hidden])").wait_for()
         assert "Shared Album B" in page.locator("[data-review-title]").inner_text()
         page.screenshot(path=evidence / "17-shared-ordinary-review-b-after-a.png", full_page=True)
@@ -1535,7 +1567,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "library_unchanged_before_approval": True,
         }
         second_scope = cards.nth(1).locator('[data-scope="Shared Selection"]')
-        second_scope.get_by_role("button", name="Import", exact=True).click()
+        second_scope.locator(".folder-import").click()
         page.wait_for_function("document.querySelectorAll('[data-review-candidates] .candidate-option').length > 0")
         with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/inbox/albums/" in response.url):
             page.locator("[data-review-candidates] .candidate-option").first.locator("[role='radio']").click()
