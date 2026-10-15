@@ -393,6 +393,11 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             with page.expect_response(lambda response: "/api/library-import/folders?" in response.url
                                       and f"q={folder_name}" in urllib.parse.unquote_plus(response.url)):
                 search.fill(folder_name)
+            row = page.locator(f'.review-folder[data-folder-path="{folder_name}"]')
+            direct = row.get_by_role("button", name="Import", exact=True)
+            if direct.count():
+                direct.wait_for()
+                return direct
             expand = page.get_by_role("button", name=f"Expand {folder_name}")
             expand.wait_for()
             expand.click()
@@ -575,11 +580,25 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         """)
         assert page.locator('.review-folder[data-folder-path="Queue Error"] .status-pill').get_attribute("title")
         assert "deterministic folder-queue provider error" in page.locator(
-            '.review-folder[data-folder-path="Queue Error"] .folder-error-reason'
-        ).inner_text()
+            '.review-folder[data-folder-path="Queue Error"] .status-pill'
+        ).get_attribute("aria-label")
+        assert page.locator('.folder-error-reason').count() == 0
         assert page.locator(
-            '.review-folder[data-folder-path="Queue Sequential"] .folder-error-reason'
-        ).count() == 0
+            '.review-folder[data-folder-path="Queue Sequential"] .status-pill'
+        ).get_attribute("title") is None
+        safe_row = page.locator('.review-folder[data-folder-path="Queue Safe"]')
+        sequential_row = page.locator('.review-folder[data-folder-path="Queue Sequential"]')
+        assert safe_row.get_by_role("button", name="Import", exact=True).count() == 1
+        assert safe_row.locator('.folder-expand').count() == 0
+        assert sequential_row.get_by_role("button", name="Import", exact=True).count() == 0
+        assert sequential_row.get_by_role("button", name="Expand Queue Sequential", exact=True).count() == 1
+        with page.expect_response(lambda response: "/api/library-import/folders/albums" in response.url) as direct_info:
+            safe_row.get_by_role("button", name="Import", exact=True).click()
+        assert direct_info.value.status == 200
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
+        assert "Import" in page.locator("[data-review-execute]").inner_text()
+        page.locator("[data-review-close]").click()
+        page.locator("[data-review-modal]").wait_for(state="hidden")
         assert page.locator("#library-import-review-status").inner_text() == review_status_before_scan
         inline_scan_state_proof["settled"] = {
             "safe": safe_status.inner_text(),
@@ -1346,8 +1365,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.screenshot(path=evidence / "17-named-inboxes-before-import.png", full_page=True)
 
         first_scope = cards.nth(0).locator('[data-scope="Shared Selection"]')
-        first_scope.get_by_role("button", name=re.compile("Expand Shared Selection")).click()
-        first_scope.locator(".review-album").click()
+        first_scope.get_by_role("button", name="Import", exact=True).click()
         page.locator("[data-review-modal]:not([hidden])").wait_for()
         inbox_modal_contract = page.locator("[data-review-dialog]").evaluate("""dialog => ({
           controls:[...dialog.querySelectorAll('[data-review-find],[data-review-open-mbid],[data-review-cancel],[data-review-skip],[data-review-execute]')].map(node => node.textContent.trim()),
@@ -1458,12 +1476,12 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             first_card.locator("[data-inbox-toggle]").click()
         shared_scope = first_card.locator('[data-scope="Shared Ordinary"]')
         shared_scope.wait_for()
-        shared_scope.get_by_role("button", name=re.compile("Expand Shared Ordinary")).click()
-        album_b_row = shared_scope.locator(".review-album-row").filter(has_text="Shared Album B")
-        album_b_row.wait_for()
-        assert album_b_row.count() == 1
+        assert shared_scope.get_by_role("button", name="Import", exact=True).count() == 1
+        assert shared_scope.locator(".folder-expand").count() == 0
         page.screenshot(path=evidence / "17-shared-ordinary-after-import.png", full_page=True)
-        album_b_row.locator(".review-album").click(); page.locator("[data-review-modal]:not([hidden])").wait_for()
+        shared_scope.get_by_role("button", name="Import", exact=True).click()
+        page.locator("[data-review-modal]:not([hidden])").wait_for()
+        assert "Shared Album B" in page.locator("[data-review-title]").inner_text()
         page.screenshot(path=evidence / "17-shared-ordinary-review-b-after-a.png", full_page=True)
         page.locator("[data-review-close]").click()
         inbox_review_proof["shared_non_root_exact_staging"] = {
@@ -1517,8 +1535,7 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
             "library_unchanged_before_approval": True,
         }
         second_scope = cards.nth(1).locator('[data-scope="Shared Selection"]')
-        second_scope.get_by_role("button", name=re.compile("Expand Shared Selection")).click()
-        second_scope.locator(".review-album").click()
+        second_scope.get_by_role("button", name="Import", exact=True).click()
         page.wait_for_function("document.querySelectorAll('[data-review-candidates] .candidate-option').length > 0")
         with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/inbox/albums/" in response.url):
             page.locator("[data-review-candidates] .candidate-option").first.locator("[role='radio']").click()
@@ -1547,7 +1564,13 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
         page.wait_for_function("""() => !document.querySelectorAll('[data-inbox-id]')[1]
           .querySelector('[data-scope="Shared Selection"]')""")
         page.set_viewport_size({"width": 390, "height": 844})
-        assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+        mobile_overflow = page.locator("body").evaluate("""body => ({
+          scrollWidth:body.scrollWidth, clientWidth:body.clientWidth,
+          elements:[...document.querySelectorAll('*')].filter(node => {
+            const box=node.getBoundingClientRect(); return box.right > body.clientWidth + 1;
+          }).slice(0,10).map(node => ({tag:node.tagName, className:node.className, right:node.getBoundingClientRect().right}))
+        })""")
+        assert mobile_overflow["scrollWidth"] <= mobile_overflow["clientWidth"], mobile_overflow
         page.screenshot(path=evidence / "17-named-inboxes-after-import-mobile.png", full_page=True)
         viewport_checks["named_inboxes_picker_persistence_scoped_retry_success"] = True
 
@@ -1592,6 +1615,23 @@ def run_browser(base_url: str, state_path: Path, evidence: Path, tracks: dict[st
                 assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
                 page.screenshot(path=evidence / f"18-{name}-desktop-{mode}.png")
             palette_proof[mode] = expected_tokens
+        page.set_viewport_size({"width": 390, "height": 844})
+        narrow_shell = None
+        for name, path in {"inbox": "/inbox", "library": "/library"}.items():
+            page.goto(f"{base_url}{path}", wait_until="networkidle")
+            geometry = page.evaluate("""() => {
+              const sidebar = document.getElementById('sidebar');
+              const nav = sidebar.querySelector('.nav-link');
+              const mobile = document.querySelector('.mobile-header');
+              return {sidebarWidth:sidebar.getBoundingClientRect().width,
+                      sidebarPadding:getComputedStyle(sidebar).padding,
+                      navFont:getComputedStyle(nav).font,
+                      navPadding:getComputedStyle(nav).padding,
+                      mobileHeight:mobile.getBoundingClientRect().height,
+                      mobilePadding:getComputedStyle(mobile).padding};
+            }""")
+            narrow_shell = narrow_shell or geometry
+            assert geometry == narrow_shell, f"narrow shared shell drifted on {name}: {geometry}"
         page.set_viewport_size({"width": 390, "height": 844})
         for name, path in primary_pages.items():
             page.evaluate("localStorage.setItem('cratekeep-theme','dark')")
