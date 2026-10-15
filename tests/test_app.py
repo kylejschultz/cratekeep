@@ -46,6 +46,13 @@ def make_app(tmp_path: Path):
     return app
 
 
+def ui_bootstrap(response):
+    html = response.get_data(as_text=True)
+    match = re.search(r"window\.__CRATEKEEP_BOOTSTRAP__=(.*?);</script>", html, re.DOTALL)
+    assert match, "React bootstrap payload is missing"
+    return json.loads(match.group(1))
+
+
 def write_wav(path: Path, seconds: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as audio:
@@ -71,19 +78,52 @@ def test_health_and_empty_lists(tmp_path):
     assert app.config["BEETS_CONFIG"] == str(tmp_path / "config" / "config.yaml")
 
 
+def test_react_routes_and_match_threshold_default_validation_and_persistence(tmp_path):
+    app = make_app(tmp_path)
+    client = app.test_client()
+    for path, page in (("/", "overview"), ("/inbox", "inbox"),
+                       ("/library-import", "library-import"), ("/library", "library"),
+                       ("/settings", "settings")):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert ui_bootstrap(response)["page"] == page
+        assert ui_bootstrap(response)["threshold"] == 90
+
+    inbox = app.config["INBOXES"][0]
+    values = {
+        "inbox_id": [inbox["id"]], "inbox_name": [inbox["name"]],
+        "inbox_path": [inbox["path"]], "library_path": app.config["LIBRARY_PATH"],
+        "beets_config": Path(app.config["BEETS_CONFIG"]).read_text(),
+    }
+    invalid = client.post("/settings", data={**values, "match_threshold": "101"})
+    assert invalid.status_code == 200
+    assert app.config["MATCH_THRESHOLD"] == 90
+    assert any("whole number from 1 to 100" in message
+               for _, message in ui_bootstrap(invalid)["data"]["flashes"])
+
+    assert client.post("/settings", data={**values, "match_threshold": "87"}).status_code == 302
+    restarted = create_app({
+        "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": app.config["STATE_PATH"],
+        "BROWSE_ROOTS": [str(tmp_path)],
+    })
+    assert restarted.config["MATCH_THRESHOLD"] == 87
+    assert ui_bootstrap(restarted.test_client().get("/settings"))["threshold"] == 87
+
+
 def test_container_smoke_forwards_every_required_runtime_option():
     repo_root = Path(__file__).resolve().parent.parent
-    runtime = (repo_root / "tests/runtime_smoke.py").read_text(encoding="utf-8")
+    runtime = (repo_root / "tests/react_runtime_smoke.py").read_text(encoding="utf-8")
     wrapper = (repo_root / "tests/container_smoke.sh").read_text(encoding="utf-8")
     required = set(re.findall(
         r'parser\.add_argument\(\s*["\'](?P<option>--[a-z0-9-]+)["\'][^)]*required=True',
         runtime,
     ))
-    invocation = wrapper.split('"$python_bin" tests/runtime_smoke.py', 1)[1]
+    invocation = wrapper.split('"$python_bin" tests/react_runtime_smoke.py', 1)[1]
 
     assert required == {
         "--fixture-root", "--state-path", "--evidence-dir",
         "--source-commit", "--source-tree", "--source-set-definition",
+        "--app-inbox", "--app-library",
     }
     assert required <= set(re.findall(r"--[a-z0-9-]+", invocation))
     assert '--source-commit "$source_commit"' in invocation
@@ -96,19 +136,13 @@ def test_index_renders_app_shell_navigation_and_sections(tmp_path):
     page = make_app(tmp_path).test_client().get("/")
 
     assert page.status_code == 200
-    assert b'id="sidebar"' in page.data
-    assert b'aria-label="Primary navigation"' in page.data
-    assert b'href="/"' in page.data
-    assert b'href="/inbox"' in page.data
-    assert b'href="/library"' in page.data
-    assert b'href="/settings"' in page.data
-    assert b'id="overview-title"' in page.data
-    assert b'id="inbox-title"' in page.data
-    assert b'id="recent-title"' in page.data
-    assert b'No managed albums yet' in page.data
-    assert b'src="/static/cratekeep-logo.png"' in page.data
-    assert b'id="theme-toggle"' in page.data
-    assert b'app-shell.css' in page.data
+    assert ui_bootstrap(page)["page"] == "overview"
+    assert b'id="root"' in page.data
+    assert b'src="/static/ui/cratekeep.js"' in page.data
+    assert b'href="/static/ui/cratekeep.css"' in page.data
+    source = Path("frontend/src/Shell.tsx").read_text()
+    for href in ('"/"', '"/inbox"', '"/library-import"', '"/library"', '"/settings"'):
+        assert href in source
 
 
 def test_inbox_and_library_reuse_shell_and_bounded_build_identifier(tmp_path):
@@ -118,31 +152,14 @@ def test_inbox_and_library_reuse_shell_and_bounded_build_identifier(tmp_path):
     inbox = client.get("/inbox").get_data(as_text=True)
     library = client.get("/library").get_data(as_text=True)
 
-    def shell(page):
-        value = page[page.index('<a class="skip-link"'):page.index('<main id="main-content">')]
-        return re.sub(r' aria-current="page"', '', value)
-
-    assert shell(inbox) == shell(library)
     for page in (inbox, library):
-        assert "build 432db32" in page
+        assert '"buildSha": "432db32786a9372caeb2018b4367079efb438637"' in page
         assert "build 432db32786a9372caeb2018b4367079efb438637" not in page
-        assert 'class="mobile-header"' in page
-        assert 'aria-controls="sidebar"' in page
-        assert 'title="Build SHA"' in page
-    shared = Path("beets_mvp/templates/_app_shell.html").read_text()
-    assert "build {{ build_sha[:7] if build_sha else 'unknown' }}" in shared
-    assert "{{ sidebar('inbox', build_sha) }}" in Path("beets_mvp/templates/inbox.html").read_text()
-    assert "{{ sidebar('library', build_sha) }}" in Path("beets_mvp/templates/library.html").read_text()
-    for template in ("inbox.html", "library.html"):
-        source = Path("beets_mvp/templates", template).read_text()
-        local_css = source.split("<style>", 1)[1].split("</style>", 1)[0]
-        for selector in (
-            ".sidebar", ".brand", ".nav-list", ".nav-link", ".nav-icon",
-            ".sidebar-footer", ".theme-toggle", ".utility-link", ".build-sha",
-            ".collapse-button", ".content", ".mobile-header", ".menu-button",
-            ".scrim", ".skip-link", "sidebar-collapsed", "sidebar-open",
-        ):
-            assert selector not in local_css, f"{template} overrides shared shell selector {selector}"
+        assert '/static/ui/cratekeep.js' in page
+    assert ui_bootstrap(client.get("/inbox"))["page"] == "inbox"
+    assert ui_bootstrap(client.get("/library"))["page"] == "library"
+    shared = Path("frontend/src/Shell.tsx").read_text()
+    assert "buildSha.slice(0, 7)" in shared and "mobile-header" in shared
 
 def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, monkeypatch):
     app = make_app(tmp_path)
@@ -160,9 +177,10 @@ def test_index_is_bounded_status_and_recent_albums_without_edit_forms(tmp_path, 
     page = app.test_client().get("/")
 
     assert b"Downloads" in page.data and b"Example album" in page.data
-    assert b"Open Inbox" in page.data and b"Open Library" in page.data
+    boot = ui_bootstrap(page)
+    assert boot["data"]["inbox_summaries"][0]["name"] == "Downloads"
+    assert boot["data"]["recent_albums"][0]["album"] == "Example album"
     assert b'action="/api/items/' not in page.data
-    assert b"Save changes" not in page.data
 
 
 def test_overview_uses_persisted_inbox_totals_when_source_becomes_unavailable(tmp_path):
@@ -171,10 +189,10 @@ def test_overview_uses_persisted_inbox_totals_when_source_becomes_unavailable(tm
     client = app.test_client()
     assert len(client.get("/api/inbox/reviews").json["albums"]) == 1
     (tmp_path / "inbox").rename(tmp_path / "inbox-unavailable")
-    page = client.get("/").get_data(as_text=True)
-    assert "Once Readable" not in page
-    assert "1 file" in page
-    assert "one or more source totals are unavailable" not in page
+    data = ui_bootstrap(client.get("/"))["data"]
+    assert "Once Readable" not in json.dumps(data)
+    assert data["inbox_file_count"] == 1
+    assert data["inbox_totals_stale"] is False
 
 def test_format_bytes_handles_megabytes_zero_and_unknown():
     assert _format_bytes(5 * 1024**2) == "5.0 MB"
@@ -2513,39 +2531,28 @@ def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch)
     client = app.test_client()
     page = client.get("/library")
     assert page.status_code == 200
-    assert b'aria-current="page"' in page.data
-    assert b"<span>Tracks</span><strong>4</strong>" in page.data
-    assert b"<span>Albums</span><strong>2</strong>" in page.data
-    assert b"<span>Artists</span><strong>2</strong>" in page.data
-    assert b"<span>Library size</span><strong>\xe2\x80\x94</strong>" in page.data
+    boot = ui_bootstrap(page)
+    assert boot["page"] == "library"
+    assert boot["data"]["summary"] == {"tracks": 4, "albums": 2, "artists": 2, "bytes": None}
     assert len(discoveries) == 2
-    assert b"Top artists" in page.data and b"Recently added albums" in page.data
-    assert b'name="q" type="search"' in page.data
-    assert b'name="sort"' in page.data and b'name="order"' in page.data
-    browse = page.data.split(b'id="browse-title"', 1)[1]
-    assert b"Browse albums" in page.data
-    assert b"Alpha Song" not in browse and b"Beta Song" not in browse
+    assert all("tracks" not in album for album in boot["data"]["albums"])
     assert b'action="/api/items/' not in page.data
-    assert f'data-album-id="{first_album.id}"'.encode() in page.data
-    assert f'data-album-id="{shared_album.id}"'.encode() in page.data
-    assert b'data-album-cover' in page.data and b'/artwork' in page.data
-    assert b'id="choose-artwork"' in page.data and b'id="refresh-artwork"' in page.data
+    assert {album["id"] for album in boot["data"]["albums"]} == {first_album.id, shared_album.id}
 
     filtered = client.get("/library?q=artist+b&sort=album&order=desc")
-    browse = filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Shared" in browse and b'data-album-title>First<' not in browse
-    assert b'option value="album" selected' in filtered.data
-    assert b'option value="desc" selected' in filtered.data
+    filtered_data = ui_bootstrap(filtered)["data"]
+    assert [album["album"] for album in filtered_data["albums"]] == ["Shared"]
+    assert filtered_data["sort"] == "album" and filtered_data["order"] == "desc"
 
     artist_filtered = client.get("/library?q=song&sort=album&order=desc&artist=Artist+A")
-    artist_browse = artist_filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"First" in artist_browse and b"Shared" not in artist_browse
-    assert b'name="artist" value="Artist A"' in artist_filtered.data
+    artist_data = ui_bootstrap(artist_filtered)["data"]
+    assert [album["album"] for album in artist_data["albums"]] == ["First"]
+    assert artist_data["artist_filter"] == "Artist A"
 
     album_filtered = client.get("/library?sort=album&order=asc&album=Shared")
-    album_browse = album_filtered.data.split(b'id="browse-title"', 1)[1]
-    assert b"Shared" in album_browse and b'data-album-title>First<' not in album_browse
-    assert b'name="album" value="Shared"' in album_filtered.data
+    album_data = ui_bootstrap(album_filtered)["data"]
+    assert [album["album"] for album in album_data["albums"]] == ["Shared"]
+    assert album_data["album_filter"] == "Shared"
 
     detail = client.get(f"/api/library/albums/{first_album.id}")
     assert detail.status_code == 200
@@ -2589,7 +2596,8 @@ def test_large_library_landing_file_work_is_bounded_to_visible_album_page(tmp_pa
     page = app.test_client().get("/library")
 
     assert page.status_code == 200
-    assert b"Showing 1\xe2\x80\x9325 of 80 matching albums" in page.data
+    data = ui_bootstrap(page)["data"]
+    assert (data["first_result"], data["last_result"], data["matching_albums"]) == (1, 25, 80)
     assert len(set(audio_stats)) <= 30
     assert len(audio_stats) <= 150
 
@@ -3051,17 +3059,13 @@ def test_library_album_pagination_clamps_and_has_no_gaps(tmp_path):
     first = client.get("/library?sort=album&order=asc")
     second = client.get("/library?sort=album&order=asc&page=2")
     clamped = client.get("/library?sort=album&order=asc&page=999")
-    first_ids = re.findall(rb'data-album-id="(\d+)"', first.data)
-    second_ids = re.findall(rb'data-album-id="(\d+)"', second.data)
-    # Recently-added controls repeat five IDs outside Browse; isolate its section.
-    first_browse = first.data.split(b'id="browse-title"', 1)[1]
-    second_browse = second.data.split(b'id="browse-title"', 1)[1]
-    first_ids = re.findall(rb'class="album-card open-album" type="button" data-album-id="(\d+)"', first_browse)
-    second_ids = re.findall(rb'class="album-card open-album" type="button" data-album-id="(\d+)"', second_browse)
+    first_data, second_data, clamped_data = (ui_bootstrap(response)["data"] for response in (first, second, clamped))
+    first_ids = [album["id"] for album in first_data["albums"]]
+    second_ids = [album["id"] for album in second_data["albums"]]
     assert len(first_ids) == 25 and len(second_ids) == 1
     assert len(set(first_ids + second_ids)) == 26
-    assert b"Page 2 of 2" in clamped.data
-    assert b"Hidden Song" not in first_browse
+    assert (clamped_data["page"], clamped_data["page_count"]) == (2, 2)
+    assert "Hidden Song" not in json.dumps(first_data["albums"])
 
 
 def test_library_import_promotes_wholly_ungrouped_tracks_to_stable_beets_album(tmp_path):
@@ -3080,7 +3084,7 @@ def test_library_import_promotes_wholly_ungrouped_tracks_to_stable_beets_album(t
     albums = list(library.albums())
     assert len(albums) == 1
     assert [item.id for item in albums[0].items()] == [executed.json["items"][0]["beets_item_id"]]
-    assert f'data-album-id="{albums[0].id}"'.encode() in client.get("/library").data
+    assert albums[0].id in [row["id"] for row in ui_bootstrap(client.get("/library"))["data"]["albums"]]
 
 
 def test_library_promotes_pre_feature_complete_review_without_touching_files(tmp_path, monkeypatch):
@@ -3135,7 +3139,7 @@ def test_library_promotes_pre_feature_complete_review_without_touching_files(tmp
     albums = list(library.albums())
     assert len(albums) == 1
     assert sorted(item.id for item in albums[0].items()) == sorted(item.id for item in items)
-    assert first.data.count(b'class="album-card open-album"') == 1
+    assert len(ui_bootstrap(first)["data"]["albums"]) == 1
     detail = client.get(f"/api/library/albums/{albums[0].id}")
     assert detail.status_code == 200
     assert [track["title"] for track in detail.json["tracks"]] == ["First", "Second"]
@@ -3168,9 +3172,9 @@ def test_legacy_fallback_keeps_same_title_editions_in_separate_directories(tmp_p
     assert page.status_code == 200
     assert len(albums) == 2
     assert sorted(len(list(album.items())) for album in albums) == [1, 2]
-    assert page.data.count(b'class="album-card open-album"') == 2
+    assert len(ui_bootstrap(page)["data"]["albums"]) == 2
     assert sorted(Path(item.path.decode()).resolve() for item in library.items()) == sorted(original_paths)
-    assert app.test_client().get("/library").data.count(b'class="album-card open-album"') == 2
+    assert len(ui_bootstrap(app.test_client().get("/library"))["data"]["albums"]) == 2
     assert len(list(library.albums())) == 2
 
 
@@ -4352,10 +4356,8 @@ def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
     assert restarted.config["ART_SIDECAR"] is True
     assert restarted.config["ART_EMBED"] is True
     assert restarted.config["ART_REPLACE"] is True
-    assert b'name="fetch_art" type="checkbox" value="1" checked' in restarted_page.data
-    assert b'name="art_sidecar" type="checkbox" value="1" checked' in restarted_page.data
-    assert b'name="art_embed" type="checkbox" value="1" checked' in restarted_page.data
-    assert b'name="art_replace" type="checkbox" value="1" checked' in restarted_page.data
+    persisted = ui_bootstrap(restarted_page)["data"]["settings"]
+    assert all(persisted[key] == "1" for key in ("fetch_art", "art_sidecar", "art_embed", "art_replace"))
 
 
 @pytest.mark.parametrize("plugins", ["ftintitle lastgenre", ["ftintitle", "lastgenre"]])
@@ -4376,10 +4378,10 @@ def test_ftintitle_existing_plugin_forms_hydrate_and_preserve_advanced_config(tm
         "TESTING": True, "SECRET_KEY": "test", "STATE_PATH": str(tmp_path / "config"),
         "BROWSE_ROOTS": [str(tmp_path)],
     })
-    page = restarted.test_client().get("/settings").get_data(as_text=True)
-    assert 'name="ftintitle_enabled" type="checkbox" value="1" checked' in page
-    assert 'value="(feat. {0})"' in page
-    assert 'name="ftintitle_keep_in_artist" type="checkbox" value="1" checked' in page
+    settings_data = ui_bootstrap(restarted.test_client().get("/settings"))["data"]
+    assert settings_data["ftintitle"]["enabled"] is True
+    assert settings_data["ftintitle"]["format"] == "(feat. {0})"
+    assert settings_data["ftintitle"]["keep_in_artist"] is True
 
     response = restarted.test_client().post("/settings", data={
         "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
@@ -4407,9 +4409,10 @@ def test_ftintitle_disable_and_invalid_format_are_safe(tmp_path):
         "ftintitle_enabled": "1", "ftintitle_format": "feat.", "beets_config": source,
     })
     assert invalid.status_code == 200
-    assert b"FtInTitle format must include the guest" in invalid.data
-    assert b'value="feat."' in invalid.data
-    assert "custom_words: [guest]" in invalid.get_data(as_text=True)
+    invalid_data = ui_bootstrap(invalid)["data"]
+    assert any("FtInTitle format must include the guest" in message for _, message in invalid_data["flashes"])
+    assert invalid_data["ftintitle"]["format"] == "feat."
+    assert "custom_words: [guest]" in invalid_data["beets_config"]
 
     invalid_list = client.post("/settings", data={
         "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
@@ -4417,7 +4420,8 @@ def test_ftintitle_disable_and_invalid_format_are_safe(tmp_path):
         "beets_config": config_path.read_text() + "ftintitle:\n  custom_words: guest\n",
     })
     assert invalid_list.status_code == 200
-    assert b"ftintitle custom_words setting must be a list" in invalid_list.data
+    assert any("ftintitle custom_words setting must be a list" in message
+               for _, message in ui_bootstrap(invalid_list)["data"]["flashes"])
 
     enabled = client.post("/settings", data={
         "inbox_path": str(tmp_path / "inbox"), "library_path": str(tmp_path / "library"),
@@ -4590,12 +4594,11 @@ def test_setup_and_settings_routes_have_distinct_lifecycle_pages(tmp_path):
 
     settings_page = client.get("/settings")
     assert settings_page.status_code == 200
-    assert b'<form method="post" action="/settings">' in settings_page.data
+    assert ui_bootstrap(settings_page)["page"] == "settings"
 
     inbox_page = client.get("/inbox")
     assert inbox_page.status_code == 200
-    assert b'<form method="post" action="/settings">' not in inbox_page.data
-    assert b'id="inbox-grid"' in inbox_page.data
+    assert ui_bootstrap(inbox_page)["page"] == "inbox"
     assert client.post("/inbox").status_code == 405
 
 
@@ -5350,7 +5353,7 @@ def test_overview_never_scans_or_calls_provider_while_inbox_scan_is_held(tmp_pat
     elapsed = time.monotonic() - began
     release.set(); worker.join(5)
     assert overview.status_code == 200 and elapsed < .5
-    assert b'id="sidebar"' in overview.data
+    assert ui_bootstrap(overview)["page"] == "overview"
 
 
 def test_large_inbox_scan_serializes_only_requested_25_album_page(tmp_path):

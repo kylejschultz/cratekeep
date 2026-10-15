@@ -48,7 +48,7 @@ until "$python_bin" -c "import urllib.request; urllib.request.urlopen('$base_url
   sleep 1
 done
 
-PYTHONPATH="$repo_root:$repo_root/tests${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" tests/runtime_smoke.py \
+PYTHONPATH="$repo_root:$repo_root/tests${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" tests/react_runtime_smoke.py \
   --base-url "$base_url" \
   --fixture-root "$fixture_root/fixtures" \
   --app-inbox /fixtures/inbox \
