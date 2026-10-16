@@ -84,6 +84,13 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
                 "mbid": base["provider_id"],
                 "thumbnail_url": f"https://coverartarchive.org/release/{base['provider_id']}/front-250",
             }
+        if query["album"] == "Bulk Ready":
+            base["provider_id"] = "123e4567-e89b-42d3-a456-426614174025"
+            base["artwork"] = {
+                "available": True, "source": "cover-art-archive", "entity": "release",
+                "mbid": base["provider_id"],
+                "thumbnail_url": f"https://coverartarchive.org/release/{base['provider_id']}/front-250",
+            }
         if query["album"] == "Tied Match":
             return [base, {**base, "provider_id": "queue-release-2"}]
         if query["album"] == "Lower Match":

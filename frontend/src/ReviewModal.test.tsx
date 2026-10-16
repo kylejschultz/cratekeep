@@ -24,6 +24,19 @@ const richAlbum = {
 };
 
 describe("ReviewModal matching and evidence", () => {
+  it("opens only the selected candidate and keeps As Is last", () => {
+    const album = { ...richAlbum, candidates: [
+      { ...richAlbum.candidates[0], id: 3, album: "Lower candidate", confidence: .75 },
+      richAlbum.candidates[0],
+    ] };
+    render(<ReviewModal source="library-import" onClose={() => undefined} onComplete={() => undefined} album={album}/>);
+    expect(document.querySelectorAll(".candidate-expanded")).toHaveLength(1);
+    expect(document.querySelector(".candidate-list article:last-child")).toHaveClass("as-is");
+    fireEvent.click(screen.getByRole("button", { name: /Lower candidate/ }));
+    expect(document.querySelectorAll(".candidate-expanded")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /Lower candidate/ })).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("removes the current panel and shows As Is plus rich, expandable candidate evidence", () => {
     render(<ReviewModal source="library-import" onClose={() => undefined} onComplete={() => undefined} album={richAlbum}/>);
 

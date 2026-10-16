@@ -63,15 +63,16 @@ function TrackEvidence({ album, candidate }: { album: Album; candidate: Candidat
   </details>;
 }
 
-function CandidateCard({ album, candidate, chosen, busy, choose }: { album: Album; candidate: Candidate; chosen: Album["selected_candidate_id"]; busy: boolean; choose: (id: Candidate["id"]) => void }) {
+function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExpand }: { album: Album; candidate: Candidate; chosen: Album["selected_candidate_id"]; expanded: boolean; busy: boolean; choose: (id: Candidate["id"]) => void; onExpand: () => void }) {
   const [artFailed, setArtFailed] = useState(false);
   const diff = candidate.proposed_diff || {};
   const localCount = album.track_count ?? album.file_count ?? album.tracks?.length ?? album.files?.length;
   const onlineCount = candidate.recordings?.length ?? candidate.track_details?.filter(item => item.proposed != null).length;
   const releaseFormat = [candidate.release_type, mediaText(candidate)].filter(value => value && value !== "Not available").join(" · ");
+  const changed = Object.keys(diff).filter(key => Boolean(diff[key])).map(key => key.replaceAll("_", " "));
   return <article className={`candidate-card${String(chosen) === String(candidate.id) ? " selected" : ""}`}>
-    <label className="candidate-heading"><input type="radio" name="candidate" checked={String(chosen) === String(candidate.id)} disabled={busy} onChange={() => choose(candidate.id)}/><span className="candidate-artwork">{candidate.artwork_url && !artFailed ? <img src={candidate.artwork_url} alt="" onError={() => setArtFailed(true)}/> : <span aria-hidden="true">♫</span>}</span><span className="candidate-title"><strong>{candidate.artist || album.artist || "Unknown"} — {candidate.album || album.album || "Untitled"}</strong><small>{candidate.confidence == null ? "Candidate" : `${Math.round(candidate.confidence * 100)}% match`}{candidate.year ? ` · ${candidate.year}` : ""}</small>{candidate.provider_id && <code title={candidate.provider_id}>{candidate.provider_id}</code>}</span></label>
-    <div className="candidate-facts">
+    <div className="candidate-heading"><label><input type="radio" name="candidate" checked={String(chosen) === String(candidate.id)} disabled={busy} onChange={() => { choose(candidate.id); if (!expanded) onExpand(); }}/><span className="sr-only">Select {candidate.album || album.album || "candidate"}</span></label><span className="candidate-artwork">{candidate.artwork_url && !artFailed ? <img src={candidate.artwork_url} alt="" onError={() => setArtFailed(true)}/> : <span aria-hidden="true">♫</span>}</span><button className="candidate-summary" type="button" aria-expanded={expanded} onClick={onExpand}><span className="candidate-title"><strong>{candidate.artist || album.artist || "Unknown"} — {candidate.album || album.album || "Untitled"}</strong><small>{candidate.confidence == null ? "Candidate" : `${Math.round(candidate.confidence * 100)}% match`}{candidate.year ? ` · ${candidate.year}` : ""}</small>{candidate.provider_id && <code title={candidate.provider_id}>{candidate.provider_id}</code>}</span><span className="candidate-change-icons" aria-label={changed.length ? `Changes: ${changed.join(", ")}` : "No album field changes"}>{changed.length ? changed.map(key => <span title={`${key} changed`} key={key}>↻</span>) : <span title="No album field changes">✓</span>}</span><span aria-hidden="true">{expanded ? "⌃" : "⌄"}</span></button></div>
+    {expanded && <div className="candidate-expanded"><div className="candidate-facts">
       <Fact label="Artist" value={candidate.artist} changed={Boolean(diff.artist)}/>
       <Fact label="Album" value={candidate.album} changed={Boolean(diff.album)}/>
       {(candidate.genre || diff.genre) && <Fact label="Genre" value={candidate.genre} changed={Boolean(diff.genre)}/>}
@@ -82,7 +83,7 @@ function CandidateCard({ album, candidate, chosen, busy, choose }: { album: Albu
       {onlineCount != null && <Fact label="Online tracks present locally" value={`${candidate.matched_track_count ?? 0} of ${onlineCount}`} changed={Boolean(candidate.unmatched_track_count)}/>}
     </div>
     {Object.keys(diff).length > 0 && <details className="metadata-comparison"><summary>Compare metadata</summary><dl>{Object.entries(diff).map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{text(value.from, "—")} → {text(value.to, "—")}</dd></div>)}</dl></details>}
-    <TrackEvidence album={album} candidate={candidate}/>
+    <TrackEvidence album={album} candidate={candidate}/></div>}
   </article>;
 }
 
@@ -93,6 +94,9 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
   const [error, setError] = useState("");
   const [mbidOpen, setMbidOpen] = useState(false);
   const [mbid, setMbid] = useState("");
+  const initialCandidates = candidates(seed);
+  const initialExpanded = seed.selected_candidate_id ?? [...initialCandidates].sort((a, b) => (b.confidence ?? -1) - (a.confidence ?? -1))[0]?.id ?? "as-is";
+  const [expanded, setExpanded] = useState<number | string | null>(initialExpanded);
   const dialog = useRef<HTMLDivElement>(null);
   const base = source === "inbox" ? "/api/inbox/albums" : "/api/library-import/albums";
   useEffect(() => { dialog.current?.focus(); const handler = (event: KeyboardEvent) => { if (event.key === "Escape" && !busy) onClose(); }; addEventListener("keydown", handler); return () => removeEventListener("keydown", handler); }, [busy, onClose]);
@@ -112,7 +116,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
       const endpoint = source === "inbox" ? "/api/inbox/candidates" : "/api/library-import/candidates";
       await api(endpoint, { method: "POST", body: JSON.stringify({ album_id: album.id, ...(source === "library-import" ? { limit: 1 } : {}) }) });
       const refreshed = await api<Album>(`${base}/${album.id}`);
-      setAlbum(refreshed); setStatus("Match complete. Review the refreshed candidates.");
+      setAlbum(refreshed); setExpanded(refreshed.selected_candidate_id ?? candidates(refreshed)[0]?.id ?? "as-is"); setStatus("Match complete. Review the refreshed candidates.");
     } catch (reason) { setError(`Match failed: ${(reason as Error).message}`); setStatus(""); } finally { setBusy(false); }
   };
   const searchMbid = async (event: FormEvent) => {
@@ -122,7 +126,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
     setBusy(true); setError(""); setStatus("Searching MusicBrainz by release ID…");
     try {
       const response = await api<any>(`${base}/${album.id}/rematch`, { method: "POST", body: JSON.stringify({ musicbrainz_id: value.toLowerCase() }) });
-      setAlbum(albumPayload(response)); setStatus("Exact MusicBrainz release loaded. Review it before importing."); setMbidOpen(false);
+      const refreshed = albumPayload(response); setAlbum(refreshed); setExpanded(refreshed.selected_candidate_id ?? candidates(refreshed)[0]?.id ?? "as-is"); setStatus("Exact MusicBrainz release loaded. Review it before importing."); setMbidOpen(false);
     } catch (reason) { setError((reason as Error).message); setStatus(""); } finally { setBusy(false); }
   };
   const execute = async () => {
@@ -151,8 +155,8 @@ export function ReviewModal({ album: seed, source, onClose, onComplete }: Props)
         <div className="review-tools"><button type="button" onClick={() => void match()} disabled={busy}>{busy && !mbidOpen && <span className="spinner"/>}Match</button><button className="secondary" type="button" onClick={() => { setMbidOpen(value => !value); setError(""); }} disabled={busy} aria-expanded={mbidOpen}>Search MBID</button></div>
         {mbidOpen && <form className="mbid-search" onSubmit={searchMbid}><label>MusicBrainz release UUID<input value={mbid} onChange={event => setMbid(event.target.value)} placeholder="123e4567-e89b-42d3-a456-426614174000" disabled={busy} autoFocus/></label><button type="submit" disabled={busy}>Search exact release</button></form>}
         <fieldset className="candidate-list" data-review-candidates><legend>Metadata choice</legend>
-          <label className="candidate as-is"><input type="radio" name="candidate" checked={chosen == null && album.state === "approved"} disabled={busy} onChange={() => choose(null)}/><span><strong>As Is</strong><small>Retain incoming/local metadata unchanged; do not associate a MusicBrainz release.</small></span></label>
-          {candidates(album).map(candidate => <CandidateCard key={candidate.id} album={album} candidate={candidate} chosen={chosen} busy={busy} choose={choose}/>) }
+          {candidates(album).map(candidate => <CandidateCard key={candidate.id} album={album} candidate={candidate} chosen={chosen} expanded={String(expanded) === String(candidate.id)} busy={busy} choose={choose} onExpand={() => setExpanded(current => String(current) === String(candidate.id) ? null : candidate.id)}/>) }
+          <article className={`candidate-card as-is${chosen == null && album.state === "approved" ? " selected" : ""}`}><div className="candidate-heading"><label><input type="radio" name="candidate" checked={chosen == null && album.state === "approved"} disabled={busy} onChange={() => { choose(null); setExpanded("as-is"); }}/><span className="sr-only">Select As Is</span></label><span className="candidate-artwork" aria-hidden="true">♫</span><button className="candidate-summary" type="button" aria-expanded={expanded === "as-is"} onClick={() => setExpanded(current => current === "as-is" ? null : "as-is")}><span className="candidate-title"><strong>As Is</strong><small>Retain incoming/local metadata unchanged</small></span><span className="candidate-change-icons" aria-label="No MusicBrainz association">—</span><span aria-hidden="true">{expanded === "as-is" ? "⌃" : "⌄"}</span></button></div>{expanded === "as-is" && <p className="as-is-detail">Do not associate a MusicBrainz release.</p>}</article>
         </fieldset>
         {duplicate.status !== "clear" && <div className={`notice${duplicate.status === "ambiguous" ? " error" : ""}`} data-duplicate-warning><strong>{duplicate.message || (duplicate.status === "ambiguous" ? "Managed recording identity is ambiguous." : "This match may duplicate an existing library item.")}</strong></div>}
         {duplicate.status === "possible" && <label className="select-label">Duplicate decision<select required value={album.duplicate_action || ""} onChange={event => { setAlbum({ ...album, duplicate_action: event.target.value }); setError(""); }}><option value="">Choose a decision</option><option value="skip">Skip duplicate</option><option value="keep-both">Keep both</option><option value="merge">Merge</option><option value="replace">Replace</option></select></label>}
