@@ -239,7 +239,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         if inbox is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 404
         try:
-            return jsonify(_inbox_scope_list(app, inbox))
+            page = int(request.args.get("page", "1"))
+            if page < 1:
+                raise ValueError("page must be one or greater")
+            return jsonify(_inbox_scope_list(app, inbox, page=page))
         except ValueError as exc:
             return jsonify(error=str(exc), code="inbox_scope_unavailable"), 409
 
@@ -253,7 +256,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         except ValueError as exc:
             return jsonify(error=str(exc), code="invalid_request"), 400
         album_ids = _inbox_scope_album_ids(app, inbox, [scope])
-        albums = [_with_readiness(album) for album in _album_review_payloads(
+        albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(
             app, album_ids, root=str(Path(inbox["path"]).resolve()),
             source_kind="inbox", source_id=inbox["id"],
         )]
@@ -286,23 +289,26 @@ def create_app(test_config: dict | None = None) -> Flask:
         inbox = _configured_inbox(app, inbox_id)
         if inbox is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
         try:
-            scopes = _request_inbox_scopes(inbox)
+            scopes = _request_inbox_scopes(inbox, values)
+            album_ids = _request_selected_album_ids(values, _inbox_scope_album_ids(app, inbox, scopes))
         except ValueError as exc:
             return jsonify(error=str(exc), code="invalid_request"), 400
-        return jsonify(_inbox_bulk_ready_summary(app, inbox, scopes))
+        return jsonify(_inbox_bulk_ready_summary(app, inbox, scopes, album_ids=album_ids))
 
     @app.post("/api/inbox/<inbox_id>/bulk/exceptions")
     def selected_inbox_exceptions(inbox_id: str):
         inbox = _configured_inbox(app, inbox_id)
         if inbox is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
         try:
-            scopes = _request_inbox_scopes(inbox)
+            scopes = _request_inbox_scopes(inbox, values)
+            album_ids = _request_selected_album_ids(values, _inbox_scope_album_ids(app, inbox, scopes))
         except ValueError as exc:
             return jsonify(error=str(exc), code="invalid_request"), 400
-        album_ids = _inbox_scope_album_ids(app, inbox, scopes)
-        albums = [_with_readiness(album) for album in _album_review_payloads(
+        albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(
             app, album_ids, root=str(Path(inbox["path"]).resolve()),
             source_kind="inbox", source_id=inbox["id"],
         )]
@@ -318,10 +324,11 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify(error="explicit confirmation is required", code="confirmation_required"), 400
         try:
             scopes = _request_inbox_scopes(inbox, values)
+            album_ids = _request_selected_album_ids(values, _inbox_scope_album_ids(app, inbox, scopes))
         except ValueError as exc:
             return jsonify(error=str(exc), code="invalid_request"), 400
         try:
-            result = _execute_inbox_bulk_ready(app, inbox, scopes)
+            result = _execute_inbox_bulk_ready(app, inbox, scopes, album_ids=album_ids)
         except LibraryImportExecutionError as exc:
             return jsonify(error=str(exc), code=exc.code), exc.status
         return jsonify(result), (207 if result["failed"] else 201)
@@ -362,7 +369,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             app, [album_review_id], root=context["root"], source_kind="inbox",
             source_id=context["inbox"]["id"],
         )), None)
-        return jsonify(_with_readiness(album)) if album else (jsonify(
+        return jsonify(_with_readiness(album, app.config["MATCH_THRESHOLD"])) if album else (jsonify(
             error="Inbox album review not found", code="album_review_not_found"
         ), 404)
 
@@ -659,7 +666,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         album_ids = _album_ids_for_scopes(app, [scope], include_complete=False)
         items = _library_import_review_items(app, album_ids)
         albums = _album_review_payloads(app, album_ids)
-        return jsonify(folder=scope, items=items, albums=[_with_readiness(album) for album in albums],
+        return jsonify(folder=scope, items=items,
+                       albums=[_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in albums],
                        reconciliation=reconciliation["folders"][0])
 
     @app.post("/api/library-import/folders/scan")
@@ -673,20 +681,23 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/api/library-import/bulk/preview")
     def preview_ready_library_imports():
+        values = request.get_json(silent=True)
         try:
-            scopes = _request_folder_scopes(app)
+            scopes = _request_folder_scopes(app, values)
+            album_ids = _request_selected_album_ids(values, _album_ids_for_scopes(app, scopes, include_complete=False))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
-        return jsonify(_bulk_ready_summary(app, scopes))
+        return jsonify(_bulk_ready_summary(app, scopes, album_ids=album_ids))
 
     @app.post("/api/library-import/bulk/exceptions")
     def selected_library_import_exceptions():
+        values = request.get_json(silent=True)
         try:
-            scopes = _request_folder_scopes(app)
+            scopes = _request_folder_scopes(app, values)
+            album_ids = _request_selected_album_ids(values, _album_ids_for_scopes(app, scopes, include_complete=False))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
-        album_ids = _album_ids_for_scopes(app, scopes, include_complete=False)
-        albums = [_with_readiness(album) for album in _album_review_payloads(app, album_ids)]
+        albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(app, album_ids)]
         return jsonify(albums=[album for album in albums if not album["ready"]])
 
     @app.post("/api/library-import/bulk/execute")
@@ -696,9 +707,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify(error="explicit confirmation is required", code="confirmation_required"), 400
         try:
             scopes = _request_folder_scopes(app, values)
+            album_ids = _request_selected_album_ids(values, _album_ids_for_scopes(app, scopes, include_complete=False))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
-        result = _execute_bulk_ready(app, scopes)
+        result = _execute_bulk_ready(app, scopes, album_ids=album_ids)
         return jsonify(result), (207 if result["failed"] else 201)
 
     @app.post("/api/library-import/candidates")
@@ -737,7 +749,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         item = next(iter(_album_review_payloads(app, [album_review_id])), None)
         if item is None:
             return jsonify(error="Album review not found", code="album_review_not_found"), 404
-        return jsonify(_with_readiness(item))
+        return jsonify(_with_readiness(item, app.config["MATCH_THRESHOLD"]))
 
     @app.post("/api/library-import/albums/<int:album_review_id>/rematch")
     def rematch_library_import_album(album_review_id: int):
@@ -2868,7 +2880,7 @@ def _literal_folder_scopes(root: Path) -> list[str]:
     return scopes
 
 
-def _album_bulk_readiness(album: dict) -> tuple[bool, str]:
+def _album_bulk_readiness(album: dict, threshold: int = 100) -> tuple[bool, str]:
     """Central exact/current/safe predicate used by queue display and execution."""
     if album.get("execution_status") == "complete":
         return False, "already imported"
@@ -2882,8 +2894,9 @@ def _album_bulk_readiness(album: dict) -> tuple[bool, str]:
     candidate = next((item for item in album.get("candidates", []) if item.get("id") == selected_id), None)
     if candidate is None:
         return False, "no candidate is selected"
-    if candidate.get("confidence") != 1.0:
-        return False, "selected candidate is not an exact 100% match"
+    confidence = candidate.get("confidence")
+    if not isinstance(confidence, (int, float)) or confidence * 100 < threshold:
+        return False, f"selected candidate is below the {threshold}% match threshold"
     alternatives = [item for item in album.get("candidates", []) if item.get("id") != selected_id]
     if any(item.get("confidence") == candidate["confidence"] for item in alternatives):
         return False, "best candidate is tied"
@@ -2904,9 +2917,32 @@ def _album_bulk_readiness(album: dict) -> tuple[bool, str]:
     return True, "exact, current, conflict-free match"
 
 
-def _with_readiness(album: dict) -> dict:
-    ready, reason = _album_bulk_readiness(album)
+def _with_readiness(album: dict, threshold: int = 100) -> dict:
+    ready, reason = _album_bulk_readiness(album, threshold)
     return {**album, "ready": ready, "readiness_reason": reason}
+
+
+def _request_selected_album_ids(values: dict | None, allowed_ids: list[int]) -> list[int]:
+    """Limit a bulk operation to checked albums while enforcing scope ownership."""
+    if not isinstance(values, dict):
+        return allowed_ids
+    field = "album_ids" if "album_ids" in values else "excluded_album_ids" if "excluded_album_ids" in values else None
+    if field is None:
+        return allowed_ids
+    raw_ids = values.get(field)
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError(f"{field} must be a non-empty array")
+    if len(raw_ids) > 5000:
+        raise ValueError("no more than 5000 albums may be submitted at once")
+    selected = []
+    for value in raw_ids:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field} must contain only integers")
+        if value not in selected:
+            selected.append(value)
+    if not set(selected).issubset(allowed_ids):
+        raise ValueError("selected albums must belong to the selected scopes")
+    return selected if field == "album_ids" else [album_id for album_id in allowed_ids if album_id not in selected]
 
 
 def _album_ids_for_scopes(app: Flask, scopes: list[str], *, include_complete: bool) -> list[int]:
@@ -3031,7 +3067,10 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
         if status in {"ready", "needs-review"}:
             readiness_ids = sorted({album_id for record in unresolved for album_id in record["_readiness_ids"]})
             ready_ids = {
-                album["id"] for album in map(_with_readiness, _album_review_payloads(app, readiness_ids))
+                album["id"] for album in (
+                    _with_readiness(item, app.config["MATCH_THRESHOLD"])
+                    for item in _album_review_payloads(app, readiness_ids)
+                )
                 if album["ready"]
             }
             for record in unresolved:
@@ -3049,7 +3088,10 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
         unresolved = [record for record in page_records if record["status"] is None]
         readiness_ids = sorted({album_id for record in unresolved for album_id in record["_readiness_ids"]})
         ready_ids = {
-            album["id"] for album in map(_with_readiness, _album_review_payloads(app, readiness_ids))
+            album["id"] for album in (
+                _with_readiness(item, app.config["MATCH_THRESHOLD"])
+                for item in _album_review_payloads(app, readiness_ids)
+            )
             if album["ready"]
         }
         for record in unresolved:
@@ -3224,9 +3266,10 @@ def _scan_folder_scopes(app: Flask, scopes: list[str]) -> dict:
             "selected_folder_count": len(scopes), "scanned_folder_count": len(successful)}
 
 
-def _bulk_ready_summary(app: Flask, scopes: list[str]) -> dict:
-    album_ids = _album_ids_for_scopes(app, scopes, include_complete=False)
-    albums = [_with_readiness(album) for album in _album_review_payloads(app, album_ids)]
+def _bulk_ready_summary(app: Flask, scopes: list[str], *, album_ids: list[int] | None = None) -> dict:
+    album_ids = album_ids if album_ids is not None else _album_ids_for_scopes(app, scopes, include_complete=False)
+    albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"])
+              for album in _album_review_payloads(app, album_ids)]
     ready = [album for album in albums if album["ready"]]
     excluded = [album for album in albums if not album["ready"]]
     return {"selected_folder_count": len(scopes), "available_album_count": len(albums),
@@ -3238,13 +3281,13 @@ def _bulk_ready_summary(app: Flask, scopes: list[str]) -> dict:
                             "reason": album["readiness_reason"]} for album in excluded]}
 
 
-def _execute_bulk_ready(app: Flask, scopes: list[str]) -> dict:
-    summary = _bulk_ready_summary(app, scopes)
+def _execute_bulk_ready(app: Flask, scopes: list[str], *, album_ids: list[int] | None = None) -> dict:
+    summary = _bulk_ready_summary(app, scopes, album_ids=album_ids)
     imported, failed = [], []
     for album in summary["ready_albums"]:
         try:
             current = next(iter(_album_review_payloads(app, [album["id"]])), None)
-            ready, reason = _album_bulk_readiness(current or {})
+            ready, reason = _album_bulk_readiness(current or {}, app.config["MATCH_THRESHOLD"])
             if not ready:
                 raise LibraryImportExecutionError(f"Album is no longer ready: {reason}", code="not_ready")
             _update_album_review(app, album["id"], {"decision": "approved"})
@@ -5968,7 +6011,7 @@ def _inbox_scope_album_ids(
     ))
 
 
-def _inbox_scope_list(app: Flask, inbox: dict[str, str]) -> dict:
+def _inbox_scope_list(app: Flask, inbox: dict[str, str], *, page: int = 1) -> dict:
     configured = Path(inbox["path"])
     if configured.is_symlink():
         raise ValueError("Inbox root must not be a symlink.")
@@ -6035,13 +6078,20 @@ def _inbox_scope_list(app: Flask, inbox: dict[str, str]) -> dict:
             "bytes": sum(row["size_bytes"] or 0 for row in scoped),
             "error": next((row["execution_error"] or row["candidate_error"] for row in errors), ""),
         })
-    return {"inbox_id": inbox["id"], "inbox_name": inbox["name"], "scopes": records,
-            "total": len(records)}
+    total = len(records)
+    page_count = max(1, math.ceil(total / FOLDER_PAGE_SIZE))
+    page = min(page, page_count)
+    start = (page - 1) * FOLDER_PAGE_SIZE
+    return {"inbox_id": inbox["id"], "inbox_name": inbox["name"],
+            "scopes": records[start:start + FOLDER_PAGE_SIZE], "total": total,
+            "page": page, "page_count": page_count, "limit": FOLDER_PAGE_SIZE}
 
 
-def _inbox_bulk_ready_summary(app: Flask, inbox: dict[str, str], scopes: list[str]) -> dict:
-    album_ids = _inbox_scope_album_ids(app, inbox, scopes)
-    albums = [_with_readiness(album) for album in _album_review_payloads(
+def _inbox_bulk_ready_summary(
+    app: Flask, inbox: dict[str, str], scopes: list[str], *, album_ids: list[int] | None = None,
+) -> dict:
+    album_ids = album_ids if album_ids is not None else _inbox_scope_album_ids(app, inbox, scopes)
+    albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(
         app, album_ids, root=str(Path(inbox["path"]).resolve()),
         source_kind="inbox", source_id=inbox["id"],
     )]
@@ -6059,8 +6109,10 @@ def _inbox_bulk_ready_summary(app: Flask, inbox: dict[str, str], scopes: list[st
     }
 
 
-def _execute_inbox_bulk_ready(app: Flask, inbox: dict[str, str], scopes: list[str]) -> dict:
-    summary = _inbox_bulk_ready_summary(app, inbox, scopes)
+def _execute_inbox_bulk_ready(
+    app: Flask, inbox: dict[str, str], scopes: list[str], *, album_ids: list[int] | None = None,
+) -> dict:
+    summary = _inbox_bulk_ready_summary(app, inbox, scopes, album_ids=album_ids)
     imported, failed = [], []
     lock = app.config["INBOX_EXECUTION_LOCK"]
     if not lock.acquire(blocking=False):
@@ -6075,7 +6127,7 @@ def _execute_inbox_bulk_ready(app: Flask, inbox: dict[str, str], scopes: list[st
                     app, [album["id"]], root=str(Path(inbox["path"]).resolve()),
                     source_kind="inbox", source_id=inbox["id"],
                 )), None)
-                ready, reason = _album_bulk_readiness(current or {})
+                ready, reason = _album_bulk_readiness(current or {}, app.config["MATCH_THRESHOLD"])
                 if not ready:
                     raise LibraryImportExecutionError(f"Album is no longer ready: {reason}", code="not_ready")
                 _update_album_review(

@@ -15,6 +15,31 @@ describe("albumStatus", () => {
 });
 
 describe("Queue match workflow", () => {
+  it("paginates scopes, retains selection, and exposes album-level mixed selection", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/library-import/folders") return { ok: true, json: async () => ({ folders: [{ path: "First", name: "First", album_count: 2 }], page: 1, page_count: 2, total: 26 }) };
+      if (url === "/api/library-import/folders?page=2") return { ok: true, json: async () => ({ folders: [{ path: "Last", name: "Last", album_count: 1 }], page: 2, page_count: 2, total: 26 }) };
+      if (url.includes("folders/albums?folder=First")) return { ok: true, json: async () => ({ albums: [{ id: 1, album: "One" }, { id: 2, album: "Two" }] }) };
+      if (url === "/api/library-import/bulk/exceptions" && init?.method === "POST") return { ok: true, json: async () => ({ albums: [] }) };
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Queue source="library-import" threshold={90}/>);
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select folder First" }));
+    fireEvent.click(screen.getByRole("button", { name: "Expand folder First" }));
+    const albumTwo = await screen.findByRole("checkbox", { name: "Select album Two" });
+    expect(albumTwo).toBeChecked();
+    fireEvent.click(albumTwo);
+    expect(screen.getByRole("checkbox", { name: "Select folder First" })).toBePartiallyChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(await screen.findByText("Page 2 of 2")).toBeInTheDocument();
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/library-import/bulk/exceptions", expect.objectContaining({ body: JSON.stringify({ folders: ["First"], excluded_album_ids: [2] }) })));
+  });
+
   it("posts Inbox scopes, exposes busy rows, refreshes albums, and uses Match wording", async () => {
     let albumLoads = 0;
     let releaseMatch: (() => void) | undefined;

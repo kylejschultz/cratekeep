@@ -1,7 +1,8 @@
 """Browser smoke for the React single-cutover UI.
 
-The smoke uses disposable WAV fixtures and metadata-only scans. It never
-executes an import or contacts a real metadata provider.
+The smoke uses disposable WAV fixtures, a deterministic provider, and one
+confirmed Library adoption. It never contacts a real metadata provider or
+touches non-fixture media.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import platform
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 import wave
@@ -37,6 +39,20 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def wait_for_library_fixtures(base: str) -> None:
+    """Wait until the container's bind mount exposes every library fixture."""
+    deadline = time.monotonic() + 20
+    latest = None
+    while time.monotonic() < deadline:
+        with urllib.request.urlopen(f"{base}/api/library-import/folders?page=2", timeout=5) as response:
+            latest = json.load(response)
+        paths = {folder["path"] for folder in latest.get("folders", [])}
+        if latest.get("total") == 27 and paths == {"Bulk Ready", "Library Ready"}:
+            return
+        time.sleep(0.1)
+    raise AssertionError({"library fixtures did not become ready": latest})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8788")
@@ -53,8 +69,13 @@ def main() -> None:
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     inbox_track = args.fixture_root / "inbox" / "Inbox Ready" / "01 Song.wav"
     library_track = args.fixture_root / "library" / "Library Ready" / "01 Song.wav"
-    write_wav(inbox_track); write_wav(library_track)
-    before = {"inbox": sha256(inbox_track), "library": sha256(library_track)}
+    library_bulk_track = args.fixture_root / "library" / "Bulk Ready" / "01 Song.wav"
+    write_wav(inbox_track); write_wav(library_track); write_wav(library_bulk_track)
+    for index in range(25):
+        (args.fixture_root / "inbox" / f"A Scope {index:02d}").mkdir(parents=True)
+        (args.fixture_root / "library" / f"A Scope {index:02d}").mkdir(parents=True)
+    before = {"inbox": sha256(inbox_track), "library": sha256(library_track),
+              "library_bulk": sha256(library_bulk_track)}
     post_form(f"{base}/setup", {"inbox_path": args.app_inbox, "library_path": args.app_library, "match_threshold": "90"})
 
     page_errors: list[str] = []
@@ -84,8 +105,35 @@ def main() -> None:
             assert desktop_ok and mobile_ok, f"horizontal overflow on {path}"
             assert desktop_fill and mobile_fill, f"viewport theme does not fill {path}"
 
+        page.goto(base + "/settings", wait_until="networkidle")
+        page.get_by_role("button", name="Help: Inboxes").wait_for()
+        page.get_by_role("tab", name="Matching").click()
+        page.get_by_label("Matched threshold (%)").fill("50")
+        page.get_by_role("tab", name="Metadata").click()
+        page.get_by_label("Fetch Cover Art Archive artwork").check()
+        page.get_by_label("Save cover.jpg sidecars").check()
+        with page.expect_navigation(wait_until="networkidle"):
+            page.get_by_role("button", name="Save settings").click()
+        page.goto(base + "/settings", wait_until="networkidle")
+        page.get_by_role("tab", name="Metadata").click()
+        assert page.get_by_label("Fetch Cover Art Archive artwork").is_checked()
+        assert page.get_by_label("Save cover.jpg sidecars").is_checked()
+        page.get_by_role("tab", name="Matching").click()
+        assert page.get_by_label("Matched threshold (%)").input_value() == "50"
+        assert page.get_by_label(re.compile("Automatically find matches for")).count() == 1
+
         page.goto(base + "/inbox", wait_until="networkidle")
         assert page.get_by_role("button", name="Match Selected").is_disabled()
+        assert page.get_by_text("Page 1 of 2").is_visible()
+        page.locator(".folder-node input[type=checkbox]").first.check()
+        page.get_by_role("button", name="Next").click()
+        page.get_by_text("Page 2 of 2").wait_for()
+        assert "1 selected" in page.locator(".queue-toolbar small").inner_text()
+        page.get_by_role("button", name="Previous").click()
+        page.get_by_text("Page 1 of 2").wait_for()
+        page.locator(".folder-node input[type=checkbox]").first.uncheck()
+        page.get_by_role("button", name="Next").click()
+        page.get_by_text("Page 2 of 2").wait_for()
         page.get_by_role("checkbox", name="Select folder Inbox Ready").check()
         with page.expect_response(lambda response: response.url.endswith("/scopes/scan")) as inbox_scan:
             page.get_by_role("button", name="Match Selected").click()
@@ -101,6 +149,16 @@ def main() -> None:
 
         page.goto(base + "/library-import", wait_until="networkidle")
         assert page.locator(".toolbar-actions button").all_inner_texts() == ["Match Selected", "Import", "Review", "Refresh"]
+        assert page.get_by_text("Page 1 of 2").is_visible()
+        page.locator(".folder-node input[type=checkbox]").first.check()
+        page.get_by_role("button", name="Next").click()
+        page.get_by_text("Page 2 of 2").wait_for()
+        assert "1 selected" in page.locator(".queue-toolbar small").inner_text()
+        page.get_by_role("button", name="Previous").click()
+        page.get_by_text("Page 1 of 2").wait_for()
+        page.locator(".folder-node input[type=checkbox]").first.uncheck()
+        page.get_by_role("button", name="Next").click()
+        page.get_by_text("Page 2 of 2").wait_for()
         page.get_by_role("checkbox", name="Select folder Library Ready").check()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")):
             page.get_by_role("button", name="Match Selected").click()
@@ -132,6 +190,11 @@ def main() -> None:
         assert mbid_match.value.ok
         mbid_payload = mbid_match.value.json()
         assert any(candidate.get("artwork_url") for candidate in mbid_payload.get("candidates", [])), mbid_payload
+        candidate_choice = page.locator("[data-review-candidates] input[type=radio]").first
+        if not candidate_choice.is_checked():
+            with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.request.method == "PATCH") as candidate_selection:
+                candidate_choice.click()
+            assert candidate_selection.value.ok, candidate_selection.value.json()
         page.locator(".candidate-artwork").first.wait_for()
         assert page.get_by_text("123e4567-e89b-42d3-a456-426614174002").is_visible()
         assert page.locator(".candidate-fact").count() >= 8
@@ -153,20 +216,53 @@ def main() -> None:
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.locator("[data-review-close]").click()
         page.locator("[data-review-modal]").wait_for(state="detached")
-        page.screenshot(path=args.evidence_dir / "06-library-import-queue.png", full_page=True)
+        wait_for_library_fixtures(base)
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders?page=2")):
+            page.get_by_role("button", name="Refresh").click()
+        page.get_by_role("checkbox", name="Select folder Library Ready").uncheck()
+        page.get_by_role("checkbox", name="Select folder Bulk Ready").check()
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")):
+            page.get_by_role("button", name="Match Selected").click()
+        page.once("dialog", lambda dialog: dialog.accept())
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/execute")) as bulk_import:
+            with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
+                page.locator(".toolbar-actions").get_by_role("button", name="Import", exact=True).click()
+        preview_payload = bulk_preview.value.json()
+        assert preview_payload.get("ready_album_count") == 1, preview_payload
+        bulk_payload = bulk_import.value.json()
+        assert len(bulk_payload.get("imported", [])) == 1, bulk_payload
+        page.get_by_text(re.compile(r"1 albums? imported")).wait_for()
+
+        page.goto(base + "/library", wait_until="networkidle")
+        managed_album = page.locator(".album-card").filter(has_text="Bulk Ready")
+        managed_album.wait_for()
+        managed_album.click()
+        page.get_by_role("dialog").wait_for()
+        page.locator(".album-detail-art img").wait_for()
+        assert page.get_by_role("button", name="Edit").is_visible()
+        assert page.get_by_label("Upload replacement").count() == 0
+        page.get_by_role("button", name="Edit").click()
+        assert page.get_by_label("Upload replacement").is_visible()
+        page.get_by_role("button", name="Cancel changes").click()
+        assert page.get_by_label("Upload replacement").count() == 0
+        assert page.get_by_role("heading", name="MusicBrainz rematch").is_visible()
+        page.screenshot(path=args.evidence_dir / "08-managed-album-read-only.png", full_page=True)
         browser_version = browser.version
         browser.close()
 
-    after = {"inbox": sha256(inbox_track), "library": sha256(library_track)}
-    assert before == after, "metadata-only UI smoke changed fixture bytes"
+    after = {"inbox": sha256(inbox_track), "library": sha256(library_track),
+             "library_bulk": sha256(library_bulk_track)}
+    assert before["inbox"] == after["inbox"], "Library adoption changed the Inbox fixture"
     assert not page_errors and not console_errors, {"page_errors": page_errors, "console_errors": console_errors}
     result = {
         "source_identity": {"commit_at_run": args.source_commit, "tree_at_run": args.source_tree,
                             "definition": args.source_set_definition},
         "browser_version": browser_version, "routes": route_results,
-        "threshold": 90, "inbox_scope_match": True, "album_scope_match": True,
+        "threshold": 50, "inbox_scope_match": True, "album_scope_match": True,
+        "inbox_and_library_pagination_selection": True,
         "queue_review_modal": True, "review_mbid_search": True, "review_rich_candidate": True,
-        "review_track_evidence": True,
+        "review_track_evidence": True, "confirmed_bulk_import": True,
+        "settings_persistence": True, "managed_album_read_only_edit": True,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

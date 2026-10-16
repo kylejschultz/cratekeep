@@ -4550,7 +4550,8 @@ def test_projection_recheck_never_weakens_strict_readiness():
             "track_details": [{"status": "matched", "local": "Song", "proposed": "Song"}],
         }],
     }
-    assert _album_bulk_readiness(album) == (False, "selected candidate is not an exact 100% match")
+    assert _album_bulk_readiness(album) == (False, "selected candidate is below the 100% match threshold")
+    assert _album_bulk_readiness(album, 90)[0]
 
 
 def test_existing_fetch_art_setting_migrates_to_sidecar_only_defaults(tmp_path):
@@ -5041,6 +5042,32 @@ def test_bulk_import_requires_confirmation_revalidates_and_isolates_failures(tmp
         assert db.execute("SELECT COUNT(*) FROM album_reviews WHERE execution_status='complete'").fetchone()[0] == 1
 
 
+def test_bulk_import_honors_album_level_exclusions(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    app.config["MATCH_THRESHOLD"] = 90
+    root = tmp_path / "library"
+    for album in ("First", "Second"):
+        tagged_wav(root / "Selected" / album / f"01 {album}.wav", artist="Artist", album=album, title=album)
+    app.config["MUSICBRAINZ_PROVIDER"] = lambda query, *, limit: [exact_candidate(query, query["album"])]
+    client = app.test_client()
+    assert client.post("/api/library-import/folders/scan", json={"folders": ["Selected"]}).status_code == 201
+    preview = client.post("/api/library-import/bulk/preview", json={"folders": ["Selected"]}).json
+    assert preview["ready_album_count"] == 2
+    excluded_id = preview["ready_albums"][0]["id"]
+    calls = []
+    monkeypatch.setattr("beets_mvp._execute_library_import_album", lambda current_app, album_id, *, dry_run: (
+        calls.append((album_id, dry_run)) or {"files": 1, "status": "complete"}
+    ))
+
+    result = client.post("/api/library-import/bulk/execute", json={
+        "folders": ["Selected"], "excluded_album_ids": [excluded_id], "confirmed": True,
+    })
+
+    assert result.status_code == 201
+    assert len(result.json["imported"]) == 1
+    assert all(album_id != excluded_id for album_id, _ in calls)
+
+
 def test_folder_queue_ui_has_persistent_selection_lazy_expansion_and_accessible_confirmation(tmp_path):
     html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
     for control in ("library-import-search", "library-import-filter", "folder-select-page",
@@ -5187,7 +5214,7 @@ def test_inbox_landing_is_collapsed_and_never_scans_until_named_section_expands(
     assert b"data-inbox-page" not in page.data
 
 
-def test_inbox_expansion_is_one_lightweight_unpaginated_320_scope_response(tmp_path, monkeypatch):
+def test_inbox_scope_pages_are_lightweight_and_bounded_for_320_scopes(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     for index in range(320):
         (tmp_path / "inbox" / f"Album {index:03d}").mkdir(parents=True)
@@ -5198,7 +5225,11 @@ def test_inbox_expansion_is_one_lightweight_unpaginated_320_scope_response(tmp_p
     response = app.test_client().get(f"/api/inbox/{inbox_id}/scopes")
 
     assert response.status_code == 200
-    assert response.json["total"] == len(response.json["scopes"]) == 320
+    assert response.json["total"] == 320
+    assert response.json["page"] == 1 and response.json["page_count"] == 13
+    assert len(response.json["scopes"]) == response.json["limit"] == 25
+    final = app.test_client().get(f"/api/inbox/{inbox_id}/scopes?page=13").json
+    assert final["page"] == 13 and len(final["scopes"]) == 20
     assert response.json["scopes"][0]["name"] == "Album 000"
     assert all("albums" not in scope for scope in response.json["scopes"])
     assert len(response.data) < 60_000
