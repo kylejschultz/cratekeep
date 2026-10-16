@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 import wave
@@ -36,6 +37,20 @@ def post_form(url: str, values: dict) -> None:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def wait_for_library_fixtures(base: str) -> None:
+    """Wait until the container's bind mount exposes every library fixture."""
+    deadline = time.monotonic() + 20
+    latest = None
+    while time.monotonic() < deadline:
+        with urllib.request.urlopen(f"{base}/api/library-import/folders?page=2", timeout=5) as response:
+            latest = json.load(response)
+        paths = {folder["path"] for folder in latest.get("folders", [])}
+        if latest.get("total") == 27 and paths == {"Bulk Ready", "Library Ready"}:
+            return
+        time.sleep(0.1)
+    raise AssertionError({"library fixtures did not become ready": latest})
 
 
 def main() -> None:
@@ -201,6 +216,9 @@ def main() -> None:
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.locator("[data-review-close]").click()
         page.locator("[data-review-modal]").wait_for(state="detached")
+        wait_for_library_fixtures(base)
+        with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders?page=2")):
+            page.get_by_role("button", name="Refresh").click()
         page.get_by_role("checkbox", name="Select folder Library Ready").uncheck()
         page.get_by_role("checkbox", name="Select folder Bulk Ready").check()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/folders/scan")):
@@ -220,7 +238,7 @@ def main() -> None:
         managed_album.wait_for()
         managed_album.click()
         page.get_by_role("dialog").wait_for()
-        assert page.locator(".album-detail-art img").is_visible()
+        page.locator(".album-detail-art img").wait_for()
         assert page.get_by_role("button", name="Edit").is_visible()
         assert page.get_by_label("Upload replacement").count() == 0
         page.get_by_role("button", name="Edit").click()
