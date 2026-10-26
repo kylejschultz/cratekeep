@@ -17,6 +17,11 @@ WORKFLOW = Path(__file__).parents[1] / '.github/workflows/release-source.yml'
     ('release-please--branches--release', 'someone/cratekeep', 'kylejschultz', ['autorelease: pending'], False),
     ('release-please--branches--release', 'kylejschultz/cratekeep', 'someone', ['autorelease: pending'], False),
     ('release-please--branches--release', 'kylejschultz/cratekeep', 'kylejschultz', [], False),
+    ('release-please--branches--release--components--cratekeep', 'kylejschultz/cratekeep', 'kylejschultz', ['autorelease: pending'], True),
+    ('release-please--branches--release--components--cratekeep', 'someone/cratekeep', 'kylejschultz', ['autorelease: pending'], False),
+    ('release-please--branches--release--components--cratekeep', 'kylejschultz/cratekeep', 'someone', ['autorelease: pending'], False),
+    ('release-please--branches--release--components--cratekeep', 'kylejschultz/cratekeep', 'kylejschultz', [], False),
+    ('release-please--branches--release--components--other', 'kylejschultz/cratekeep', 'kylejschultz', ['autorelease: pending'], False),
 ])
 def test_release_source(branch, repository, author, labels, allowed):
     script = yaml.safe_load(WORKFLOW.read_text())['jobs']['source']['steps'][0]['with']['script']
