@@ -76,7 +76,7 @@ docker run -d \
 
 ### Unraid
 
-Community Applications approval is pending.
+Available in Unraid Community Applications.
 
 ## Getting started
 
