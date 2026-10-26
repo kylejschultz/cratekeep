@@ -1,0 +1,28 @@
+name: Release PR source
+
+on:
+  pull_request:
+    branches: [release]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Release source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const ownRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const sameRepo = pr.head.repo?.full_name === ownRepo;
+            const promotion = pr.head.ref === 'dev';
+            const releasePR = pr.head.ref === 'release-please--branches--release'
+              && pr.user.login === context.repo.owner
+              && pr.labels.some(label => label.name === 'autorelease: pending');
+            if (!sameRepo || (!promotion && !releasePR)) {
+              core.setFailed('Release PRs must come from this repository’s dev branch or its owner-authored Release Please branch.');
+            }
