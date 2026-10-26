@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "package-name": "cratekeep",
+      "initial-version": "1.0.0",
+      "include-component-in-tag": false
+    }
+  }
+}
