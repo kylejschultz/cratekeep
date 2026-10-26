@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ 'Set up' if first_run else ('Inbox' if page == 'inbox' else 'Settings') }} · Cratekeep</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      --page: #e7e9ec;
+      --surface: #fdfdfd;
+      --sidebar: #f7f7f8;
+      --active: #e8eaed;
+      --text: #20252b;
+      --muted: #687078;
+      --border: #d8dce1;
+      --accent: #475569;
+      --accent-hover: #334155;
+      --focus: #64748b;
+      --success: #e8f3ec;
+      --error: #f7dddd;
+      --overlay: rgb(12 27 38 / 68%);
+      --modal-surface: #f7f8f8;
+      --modal-panel: #fff;
+      --modal-border: #cbd3d8;
+      --modal-subtle: #edf1f3;
+      --modal-accent: #4f7185;
+      --modal-accent-hover: #3f6073;
+      --soft: #dde1e5; --side-text:#343a40; --side-muted:#7b838b;
+    }
+    body.dark-mode { color-scheme:dark; --page:#20252b; --surface:#2b3138; --text:#edf1f4; --muted:#aeb8c1; --border:#4b5661; --soft:#3e4852; --accent:#9db7c9; --accent-hover:#b6ccda; --focus:#b9d6e7; --success:#294337; --error:#5a3034; --sidebar:#252b31; --side-text:#e8edf1; --side-muted:#9da8b1; --active:#37414a; --modal-surface:#2b3138; --modal-panel:#343b43; --modal-border:#4b5661; --modal-subtle:#343b43; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--text); background: var(--page); font: 16px/1.5 var(--font-sans); }
+    body.setup-mode { max-width: 720px; margin: 2rem auto; padding: 1.5rem; }
+    main { padding: clamp(1.25rem, 4vw, 2.5rem); border: 1px solid var(--border); border-radius: .75rem; background: var(--surface); box-shadow: 0 .35rem 1.5rem rgb(32 56 72 / 10%); }
+    .logo { display: block; width: 112px; height: auto; margin: 0 auto 1rem; }
+    h1 { margin-top: 0; color: var(--accent); }
+    label { display: block; font-weight: 600; margin-top: 1.25rem; }
+    input[type=text], input[type=password], input[type=url], select, textarea { width: 100%; margin-top: .35rem; padding: .65rem; color: var(--text); border: 1px solid var(--border); border-radius: .3rem; background: var(--surface); font: inherit; }
+    .path-picker { display: flex; gap: .5rem; margin-top: .35rem; }
+    .path-picker input { flex: 1; margin-top: 0; }
+    .inbox-list { display:grid; gap:.7rem; margin-top:.55rem; }
+    .inbox-row { display:grid; grid-template-columns:minmax(8rem,.7fr) minmax(12rem,1.5fr) auto auto; gap:.5rem; align-items:end; padding:.7rem; border:1px solid var(--border); border-radius:.4rem; }
+    .inbox-row label { min-width:0; margin:0; }
+    .inbox-row input { margin-top:.25rem; }
+    .inbox-row button { margin:0; white-space:nowrap; }
+    .remove-inbox { color:var(--text); border-color:var(--border); background:var(--surface); }
+    .remove-inbox:hover { color:#fff; background:#8f1d14; }
+    .add-inbox { margin-top:.7rem; }
+    small { display: block; margin-top: .3rem; color: var(--muted); }
+    button { margin-top: 1.5rem; padding: .65rem 1rem; color: var(--button-secondary-text); border: 1px solid var(--button-secondary-border); border-radius: .3rem; background: var(--button-secondary-bg); cursor: pointer; }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    .path-picker button, .browser button { margin-top: 0; }
+    a { color: var(--accent); }
+    :is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+    .flash { padding: .75rem; border-radius: .3rem; background: var(--success); }
+    .error { background: var(--error); }
+    .browser[hidden] { display: none; }
+    .browser { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 1rem; background: var(--overlay); }
+    .browser-dialog { display: flex; flex-direction: column; width: min(760px, 100%); max-height: min(720px, calc(100vh - 2rem)); overflow: hidden; border: 1px solid var(--modal-border); border-radius: .7rem; background: var(--modal-surface); box-shadow: 0 1.25rem 4rem rgb(5 20 30 / 28%); }
+    .browser-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.25rem; border-bottom: 1px solid var(--modal-border); background: var(--modal-surface); color: var(--text); }
+    .browser-header h2 { margin: 0; font-size: 1.15rem; }
+    .browser-close { min-width: 2.25rem; padding: .25rem .55rem; border-color: transparent; background: transparent; color: inherit; font-size: 1.4rem; line-height: 1; }
+    .browser-close:hover { background: var(--modal-subtle); color: var(--text); }
+    .browser-body { min-height: 0; overflow: auto; padding: 1rem 1.25rem; }
+    .browser-body button:not(.directory-row) { border-color: var(--modal-accent); background: var(--modal-accent); }
+    .browser-body button:not(.directory-row):hover { background: var(--modal-accent-hover); }
+    .browser-up-row { margin: .2rem 0 .75rem; }
+    .browser-up-row button { margin: 0; }
+    .browser-path-form { display: flex; gap: .5rem; margin-top: .75rem; }
+    .browser-path-form input { flex: 1; min-width: 0; margin: 0; }
+    .browser-path-form button { margin: 0; }
+    .breadcrumbs { display: flex; align-items: center; flex-wrap: wrap; gap: .15rem; min-height: 2.25rem; margin: 0; }
+    .browser-body .breadcrumb { margin: 0; padding: .2rem .35rem; border-color: transparent; background: transparent; color: var(--modal-accent); }
+    .browser-body .breadcrumb:hover { background: var(--modal-subtle); color: var(--modal-accent-hover); }
+    .breadcrumb-separator { color: var(--muted); }
+    .browser-search { margin: 0 0 .65rem; }
+    .directory-list { min-height: 15rem; overflow-y: auto; border: 1px solid var(--modal-border); border-radius: .4rem; background: var(--modal-panel); }
+    .directory-row { display: grid; grid-template-columns: 1.75rem 1fr auto; align-items: center; width: 100%; margin: 0; padding: .7rem .85rem; border: 0; border-bottom: 1px solid var(--modal-border); border-radius: 0; background: transparent; color: var(--text); text-align: left; }
+    .directory-row:last-child { border-bottom: 0; }
+    .directory-row:hover, .directory-row:focus-visible { background: var(--modal-subtle); color: var(--text); }
+    .directory-row[aria-selected="true"] { background: color-mix(in srgb, var(--modal-accent) 12%, var(--modal-panel)); }
+    .folder-icon { color: var(--modal-accent); font-size: 1.1rem; }
+    .directory-open { color: var(--muted); font-size: .85rem; }
+    .browser-status { min-height: 1.5rem; margin: .5rem 0 0; color: var(--muted); }
+    .browser-status.error-text { color: #a52b35; }
+    .browser-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: .5rem; margin: 0; padding: .85rem 1.25rem; border-top: 1px solid var(--modal-border); background: var(--modal-subtle); }
+    .browser-actions button:not(.secondary) { border-color: var(--modal-accent); background: var(--modal-accent); }
+    .browser-actions button:not(.secondary):hover { background: var(--modal-accent-hover); }
+    .browser-actions .secondary { border-color: var(--modal-border); background: var(--modal-panel); color: var(--text); }
+    .browser-actions .secondary:hover { background: var(--modal-surface); }
+    body.modal-open { overflow: hidden; }
+    .skip-link { position:fixed; z-index:20; top:.5rem; left:.5rem; padding:.55rem .8rem; background:var(--surface); transform:translateY(-150%); }
+    .skip-link:focus { transform:translateY(0); }
+    .sidebar { position:fixed; z-index:10; inset:0 auto 0 0; display:flex; flex-direction:column; width:13.5rem; padding:1rem .8rem; color:var(--side-text); background:var(--sidebar); border-right:1px solid var(--soft); transition:width .2s,transform .2s; }
+    .collapse-button { position:absolute; top:5.5rem; right:-.8rem; display:grid; place-items:center; width:1.6rem; height:1.6rem; min-height:0; margin:0; padding:0; border:1px solid var(--soft); border-radius:50%; color:var(--side-muted); background:var(--sidebar); }
+    .brand { display:flex; align-items:center; gap:.65rem; padding:.15rem .4rem 1rem; border-bottom:1px solid var(--soft); }
+    .brand img,.mobile-header img { width:2rem; height:2rem; object-fit:contain; }
+    .brand-copy { overflow:hidden; white-space:nowrap; }
+    .brand-name { display:block; font-size:1.05rem; font-weight:750; }
+    .brand-tagline { display:block; color:var(--side-muted); font-size:.75rem; }
+    .nav-list { display:grid; gap:.2rem; margin:1rem 0; padding:0; list-style:none; }
+    .nav-link { display:flex; align-items:center; gap:.7rem; min-height:2.35rem; padding:.45rem .65rem; border-radius:.3rem; color:var(--side-text); text-decoration:none; white-space:nowrap; font-size:.9rem; }
+    .nav-link:hover,.nav-link[aria-current=page] { background:var(--active); }
+    .nav-icon { flex:0 0 1.35rem; text-align:center; }.nav-label { overflow:hidden; }
+    .sidebar-footer { display:grid; gap:.7rem; margin-top:auto; padding:.8rem .15rem 0; border-top:1px solid var(--soft); }
+    .utility-link,.theme-toggle { display:flex; align-items:center; gap:.55rem; color:var(--side-muted); font-size:.78rem; }
+    .utility-link { text-decoration:none; }.theme-toggle { justify-content:space-between; }
+    .theme-toggle button { width:2rem; height:1.5rem; margin:0; padding:0; border:1px solid var(--soft); border-radius:999px; color:var(--side-text); background:var(--active); }
+    .build-sha { overflow:hidden; color:var(--side-muted); font:.7rem ui-monospace,SFMono-Regular,Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+    .content { min-width:0; margin-left:13.5rem; transition:margin-left .2s; }.mobile-header { display:none; }
+    .content main { width:min(1180px,100%); margin:0 auto; padding:clamp(1.25rem,3vw,2.25rem); border:0; border-radius:0; background:transparent; box-shadow:none; }
+    .scrim { display:none; }
+    body.sidebar-collapsed .sidebar { width:5rem; } body.sidebar-collapsed .content { margin-left:5rem; }
+    body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+    body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:center; padding-inline:0; }
+    .page-head { margin-bottom:1.25rem; }
+    .page-head h1 { margin:0; color:var(--text); font-size:1.65rem; }
+    .page-head p { margin:.3rem 0 0; color:var(--muted); }
+    .settings-tabs { display:flex; gap:.25rem; margin:0 0 1rem; border-bottom:1px solid var(--border); }
+    .settings-tab { margin:0 0 -1px; padding:.65rem 1rem; border:1px solid transparent; border-bottom-color:var(--border); border-radius:.35rem .35rem 0 0; background:transparent; color:var(--muted); font-weight:650; }
+    .settings-tab:hover { background:var(--active); color:var(--text); }
+    .settings-tab[aria-selected="true"] { border-color:var(--border); border-bottom-color:var(--surface); background:var(--surface); color:var(--text); }
+    .settings-panel[hidden] { display:none; }
+    .settings-section { margin-top:1rem; padding:1.25rem; border:1px solid var(--border); border-radius:.45rem; background:var(--surface); box-shadow:0 1px 2px rgb(15 23 42 / 4%); }
+    .settings-section h2 { margin:0; font-size:1rem; }
+    .settings-section > p { margin:.25rem 0 0; color:var(--muted); font-size:.9rem; }
+    textarea { min-height:19rem; resize:vertical; font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .check-label { display:flex; align-items:flex-start; gap:.55rem; font-weight:500; }
+    .inventory-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin-top:1rem; }
+    .inventory-summary span { padding:.65rem; border:1px solid var(--border); border-radius:.3rem; background:var(--page); font-size:.85rem; }
+    .import-actions { display:flex; flex-wrap:wrap; gap:.6rem; margin-top:1rem; }
+    .import-actions button { margin:0; }
+    .operation-status { min-height:1.5rem; margin:.65rem 0 0; color:var(--muted); }
+    .operation-status[data-busy="true"] { display:flex; align-items:center; gap:.5rem; color:var(--text); font-weight:650; }
+    .operation-status[data-busy="true"]::before { width:.75rem; height:.75rem; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; content:""; animation:operation-spin .7s linear infinite; }
+    @keyframes operation-spin { to { transform:rotate(360deg); } }
+    @media (prefers-reduced-motion:reduce) { .operation-status[data-busy="true"]::before { animation-duration:1.8s; } }
+    .review-list { overflow:hidden; margin-top:.75rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); }
+    .folder-tools { display:grid; grid-template-columns:minmax(12rem,1fr) minmax(9rem,auto); gap:.55rem; margin-top:.75rem; }
+    .folder-tools input,.folder-tools select { margin:0; }
+    .review-bulk-actions { position:sticky; bottom:.5rem; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-top:.75rem; padding:.5rem .65rem; border:1px solid var(--border); border-radius:.4rem; background:var(--surface); box-shadow:0 2px 10px rgba(0,0,0,.12); }
+    .review-bulk-actions label { display:flex; align-items:center; gap:.45rem; margin:0; font-size:.8rem; }
+    .review-bulk-actions button { margin:0; }
+    .review-folder .review-folder { margin-left:1rem; border-left:1px solid var(--border); }
+    .selection-summary { color:var(--muted); font-size:.8rem; }
+    .selection-actions { display:flex; flex-wrap:wrap; gap:.4rem; }
+    .selection-actions button { padding:.42rem .6rem; font-size:.78rem; }
+    .page-jump { display:flex; align-items:center; gap:.35rem; }
+    .page-jump input { width:4.5rem; margin:0; padding:.38rem; }
+    .duplicate-row-warning { color:#8f1d14; font-size:.72rem; font-weight:800; white-space:nowrap; }
+    .duplicate-warning { border-color:#b54708; color:#5f3300; background:#fff4d5; }
+    .duplicate-warning[hidden] { display:none; }
+    .duplicate-warning h3 { color:#8f3d00; }
+    .duplicate-warning ul { margin:.4rem 0 0; padding-left:1.2rem; font: .76rem/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    body.dark-mode .duplicate-warning { color:#ffe7b2; background:#563b18; }
+    .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    .album-modal-dialog { width:min(920px,100%); }
+    .album-modal-dialog .browser-header { padding:.8rem 1rem; }
+    .album-modal-dialog .browser-body { padding:.8rem 1rem; }
+    .album-modal-section { margin-bottom:.7rem; padding:.7rem; border:1px solid var(--modal-border); border-radius:.4rem; background:var(--modal-panel); }
+    .album-modal-section h3 { margin:0 0 .45rem; font-size:.88rem; }
+    .import-success { margin:.65rem 0; padding:.62rem .75rem; border:1px solid #397052; border-radius:.4rem; color:#163d29; background:#d9eee1; font-weight:650; }
+    body.dark-mode .import-success { border-color:#78a68a; color:#e9fff0; background:#294337; }
+    .button-spinner { display:inline-block; width:.9rem; height:.9rem; margin-right:.4rem; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; vertical-align:-.12rem; animation:button-spin .7s linear infinite; }
+    .button-spinner[hidden] { display:none; }
+    @keyframes button-spin { to { transform:rotate(360deg); } }
+    .candidate-picker { margin-bottom:.7rem; }
+    .candidate-picker-header { display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.45rem; }
+    .candidate-picker-header h3 { margin:0; font-size:.82rem; }
+    .candidate-picker-header button { flex:0 0 auto; margin:0; padding:.38rem .62rem; border-color:var(--modal-border); background:var(--modal-panel); color:var(--text); font-size:.76rem; }
+    .candidate-picker-header button:hover { background:var(--modal-subtle); color:var(--text); }
+    .track-modal { z-index:12; padding:clamp(.4rem,2vw,1rem); background:rgb(8 19 26 / 50%); }
+    .track-modal-dialog { width:min(800px,100%); max-height:min(620px,calc(100vh - 2rem)); }
+    .mbid-modal-dialog { width:min(460px,100%); }
+    .mbid-search-form label { margin:0; }
+    .mbid-search-form input { margin:0; }
+    .mbid-search-form .browser-status { margin-bottom:0; }
+    .review-footer { position:sticky; bottom:0; justify-content:space-between; flex-wrap:nowrap; padding:.7rem 1rem; }
+    .review-footer-group { display:flex; flex-wrap:wrap; gap:.5rem; }
+    .review-footer button { margin:0; padding:.55rem .8rem; }
+    .browser-actions .approve-button { min-width:6.5rem; font-weight:750; }
+    @media (max-width: 760px) {
+      .sidebar { width:min(18rem,86vw); transform:translateX(-105%); box-shadow:.5rem 0 2rem rgb(0 0 0 / 25%); }
+      .content,body.sidebar-collapsed .content { margin-left:0; }
+      .mobile-header { position:sticky; z-index:8; top:0; display:flex; align-items:center; gap:.7rem; padding:.55rem 1rem; border-bottom:1px solid var(--soft); background:var(--surface); }
+      .menu-button { width:2.5rem; height:2.5rem; margin:0; padding:0; border:1px solid var(--border); border-radius:.35rem; color:var(--text); background:var(--surface); }
+      .collapse-button { display:none; } body.sidebar-open .sidebar { transform:translateX(0); }
+      body.sidebar-collapsed :is(.brand-copy,.nav-label) { position:static; width:auto; height:auto; overflow:visible; clip-path:none; }
+      body.sidebar-collapsed .brand,body.sidebar-collapsed .nav-link { justify-content:flex-start; padding-inline:.75rem; }
+      .scrim { position:fixed; z-index:9; inset:0; margin:0; border:0; border-radius:0; background:rgb(8 19 26 / 62%); } body.sidebar-open .scrim { display:block; }
+    }
+    @media (max-width: 520px) {
+      .folder-tools { grid-template-columns:1fr; }
+      .review-bulk-actions { align-items:stretch; flex-direction:column; }
+      .selection-actions { display:grid; grid-template-columns:1fr 1fr; width:100%; }
+      body { margin: 0; padding: .75rem; }
+      body:not(.setup-mode) { padding:0; } .content main { padding:1rem; }
+      .path-picker { align-items: stretch; flex-direction: column; }
+      .inbox-row { grid-template-columns:minmax(0,1fr) auto; }
+      .inbox-row label { grid-column:1 / -1; }
+      .browser { padding: .4rem; }
+      .browser-dialog { max-height: calc(100vh - .8rem); }
+      .browser-path-form { align-items: stretch; flex-direction: column; }
+      .directory-list { min-height: 11rem; }
+      .duplicate-row-warning { display:none; }
+      .review-footer { align-items:stretch; flex-direction:column-reverse; }
+      .review-footer-group { display:grid; grid-template-columns:1fr 1fr; }
+      .review-footer button { width:100%; }
+    }
+  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app-shell.css') }}">
+  {% if not first_run %}<link rel="stylesheet" href="{{ url_for('static', filename='review-presentation.css') }}">{% endif %}
+</head>
+<body{% if first_run %} class="setup-mode"{% endif %}>
+{% if not first_run %}
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<aside class="sidebar" id="sidebar" aria-label="Application sidebar">
+  <div class="brand"><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><div class="brand-copy"><span class="brand-name">Cratekeep</span><span class="brand-tagline">Music library manager</span></div></div>
+  <nav aria-label="Primary navigation"><ul class="nav-list">
+    <li><a class="nav-link" href="{{ url_for('index') }}"><span class="nav-icon" aria-hidden="true">⌂</span><span class="nav-label">Overview</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('inbox_page') }}"{% if page == 'inbox' %} aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">↓</span><span class="nav-label">Inbox</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('library_page') }}"><span class="nav-icon" aria-hidden="true">♫</span><span class="nav-label">Library</span></a></li>
+    <li><a class="nav-link" href="{{ url_for('settings') }}"{% if page == 'settings' %} aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">⚙</span><span class="nav-label">Settings</span></a></li>
+  </ul></nav>
+  <div class="sidebar-footer"><div class="theme-toggle"><span>Dark mode</span><button id="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false">☾</button></div><a class="utility-link" href="https://github.com/kylejschultz/cratekeep" target="_blank" rel="noreferrer"><span aria-hidden="true">↗</span><span class="nav-label">GitHub</span></a><span class="build-sha" title="Build SHA">build {{ build_sha[:7] if build_sha else 'unknown' }}</span></div>
+  <button class="collapse-button" id="collapse-sidebar" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Collapse sidebar" title="Collapse sidebar"><span class="collapse-icon" aria-hidden="true">‹</span></button>
+</aside>
+<button class="scrim" id="sidebar-scrim" type="button" aria-label="Close navigation" tabindex="-1"></button>
+<div class="content"><header class="mobile-header"><button class="menu-button" id="open-sidebar" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">☰</button><img src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt=""><strong>Cratekeep</strong></header>
+{% endif %}
+<main id="main-content">
+  {% if first_run %}
+    <img class="logo" src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt="Cratekeep">
+    <h1>Set up Cratekeep</h1>
+    <p>Choose the inbox and library folders for this installation. You can fine-tune integrations later from the in-app Settings page.</p>
+  {% else %}
+    <header class="page-head"><h1>{{ 'Inbox' if page == 'inbox' else 'Settings' }}</h1><p>{{ 'Review pending library selections and apply approved albums.' if page == 'inbox' else 'Manage storage, integrations, and the active beets configuration.' }}</p></header>
+  {% endif %}
+  {% for category, message in get_flashed_messages(with_categories=true) %}<p class="flash {{ category }}">{{ message }}</p>{% endfor %}
+  <form method="post" action="{{ url_for('setup') if first_run else url_for('settings') }}">
+    {% if not first_run %}
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="settings-tab" id="settings-tab-general" type="button" role="tab" aria-selected="true" aria-controls="settings-panel-general" tabindex="0" data-settings-tab="general">General</button>
+      <button class="settings-tab" id="settings-tab-metadata" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-metadata" tabindex="-1" data-settings-tab="metadata">Metadata</button>
+      <button class="settings-tab" id="settings-tab-library-import" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-library-import" tabindex="-1" data-settings-tab="library-import">Library import</button>
+    </div>
+    <div class="settings-panel" id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" data-settings-panel="general">
+    {% endif %}
+    <section class="settings-section" aria-labelledby="storage-title">
+      {% if not first_run %}<h2 id="storage-title">Storage</h2><p>Container paths used for incoming and organized music.</p>{% endif %}
+      <fieldset>
+        <legend>Inbox sources</legend>
+        <small>Name each separately mounted source and choose its container-visible path.</small>
+        <div id="inbox-list" class="inbox-list">
+          {% for inbox in inboxes %}
+          <div class="inbox-row" data-inbox-row>
+            <input name="inbox_id" type="hidden" value="{{ inbox.id }}">
+            <label for="inbox-name-{{ loop.index }}">Name<input id="inbox-name-{{ loop.index }}" name="inbox_name" type="text" required value="{{ inbox.name }}"></label>
+            <label for="inbox-path-{{ loop.index }}">Filesystem path<input id="inbox-path-{{ loop.index }}" name="inbox_path" type="text" required value="{{ inbox.path }}"></label>
+            <label class="check-label" for="inbox-auto-match-{{ loop.index }}"><input id="inbox-auto-match-{{ loop.index }}" name="inbox_auto_match_id" type="checkbox" value="{{ inbox.id }}"{% if inbox.auto_match %} checked{% endif %}{% if not inbox.id %} disabled{% endif %}> Auto-match with MusicBrainz</label>
+            <button type="button" data-open-picker="inbox-path-{{ loop.index }}">Browse</button>
+            <button type="button" class="remove-inbox" data-remove-inbox>Remove<span class="visually-hidden"> {{ inbox.name }}</span></button>
+          </div>
+          {% endfor %}
+        </div>
+        <button id="add-inbox" class="add-inbox" type="button">Add inbox</button>
+        <template id="inbox-row-template"><div class="inbox-row" data-inbox-row><input name="inbox_id" type="hidden" value=""><label>Name<input name="inbox_name" type="text" required></label><label>Filesystem path<input name="inbox_path" type="text" required></label><label class="check-label"><input name="inbox_auto_match_id" type="checkbox" value="" disabled> Auto-match with MusicBrainz <small>(save this inbox first)</small></label><button type="button" data-open-picker>Browse</button><button type="button" class="remove-inbox" data-remove-inbox>Remove</button></div></template>
+      </fieldset>
+      <label>Library path
+        <div class="path-picker"><input id="library_path" name="library_path" type="text" required value="{{ settings.get('library_path', default_library) }}"><button type="button" data-open-picker="library_path">Browse</button></div>
+      </label><small>Destination folder for the managed music library.</small>
+      <small>Candidate lookup only: this never approves a match, writes tags, moves files, or imports music.</small>
+    </section>
+    <section class="settings-section" aria-labelledby="navidrome-title">
+      <h2 id="navidrome-title">Navidrome</h2><p>Optional rescan integration.</p>
+      <label>Rescan URL<input name="navidrome_rescan_url" type="url" value="{{ settings.get('navidrome_rescan_url', '') }}" placeholder="http://navidrome:4533/api/scan"></label><small>Complete URL that accepts a POST request.</small>
+      <label>Bearer token<input name="navidrome_token" type="password" value="" autocomplete="new-password"></label>
+      {% if has_token %}<small>A token is saved. Leave blank to keep it.</small><label class="check-label"><input name="clear_navidrome_token" type="checkbox" value="1"> Clear the saved token</label>{% else %}<small>Optional token sent to the rescan URL.</small>{% endif %}
+    </section>
+    {% if not first_run %}
+    </div>
+    <div class="settings-panel" id="settings-panel-metadata" role="tabpanel" aria-labelledby="settings-tab-metadata" data-settings-panel="metadata" hidden>
+    <section class="settings-section" aria-labelledby="artwork-title">
+      <h2 id="artwork-title">Artwork</h2><p>Artwork fetching is opt-in. Cratekeep uses the selected MusicBrainz release: exact-release Cover Art Archive front art first, then release-group front art only when exact art is unavailable.</p>
+      <label class="check-label"><input name="fetch_art" type="checkbox" value="1"{% if settings.get('fetch_art') == '1' %} checked{% endif %}> Fetch selected candidate artwork during import</label>
+      <label class="check-label"><input name="art_sidecar" type="checkbox" value="1"{% if settings.get('art_sidecar', '1') == '1' %} checked{% endif %}> Save JPEG sidecar as <code>cover.jpg</code> in each imported album folder</label>
+      <label class="check-label"><input name="art_embed" type="checkbox" value="1"{% if settings.get('art_embed') == '1' %} checked{% endif %}> Embed artwork in imported music files</label>
+      <label class="check-label"><input name="art_replace" type="checkbox" value="1"{% if settings.get('art_replace') == '1' %} checked{% endif %}> Replace existing sidecar and embedded artwork</label>
+      <small>Sidecar and embedding are independent. Existing <code>cover.jpg</code> files and embedded art are preserved unless replacement is enabled. Missing candidate art is a visible no-op and never removes existing art.</small>
+    </section>
+    <section class="settings-section" aria-labelledby="plugins-title">
+      <h2 id="plugins-title">Featured artists</h2>
+      <p>FtInTitle moves a trailing featured-artist credit from the track artist into the title before a Library candidate is reviewed.</p>
+      <label class="check-label"><input id="ftintitle_enabled" name="ftintitle_enabled" type="checkbox" value="1"{% if ftintitle.enabled %} checked{% endif %}> Move featured artists into track titles (FtInTitle)</label>
+      <div id="ftintitle-options"{% if not ftintitle.enabled %} hidden{% endif %}>
+        <label for="ftintitle_format">Feature format</label>
+        <input id="ftintitle_format" name="ftintitle_format" type="text" value="{{ ftintitle.format }}" placeholder="feat. {0}">
+        <small>Use <code>{}</code> or <code>{0}</code> for the guest artist. Parentheses or brackets in this format are preserved.</small>
+        <label class="check-label"><input name="ftintitle_keep_in_artist" type="checkbox" value="1"{% if ftintitle.keep_in_artist %} checked{% endif %}> Keep featured artists in the track artist field</label>
+        <input name="ftintitle_preserve_album_artist" type="hidden" value="1">
+        <label class="check-label"><input type="checkbox" checked disabled> Preserve album artist (skip matching track credits)</label>
+        <small>The release <code>albumartist</code> field is always retained. This option controls whether tracks whose artist exactly equals that release artist are left unchanged.</small>
+      </div>
+      <small><code>fetchart</code> and <code>ftintitle</code> are explicitly integrated into reviewed Library imports. Other YAML plugins may work in the beets Inbox CLI, but are not guaranteed in Library import.</small>
+    </section>
+    <section class="settings-section" aria-labelledby="beets-title">
+      <h2 id="beets-title">Beets configuration</h2>
+      <p>Edit advanced options in the generated <code>config.yaml</code>. Library/database paths, core import safety settings, and the fetchart/FtInTitle plugin states are managed by the form and will be normalized when saved.</p>
+      <label for="beets_config">YAML configuration</label>
+      <textarea id="beets_config" name="beets_config" spellcheck="false">{{ beets_config }}</textarea>
+    </section>
+    </div>
+    <div class="settings-panel" id="settings-panel-library-import" role="tabpanel" aria-labelledby="settings-tab-library-import" data-settings-panel="library-import" hidden>
+    <section class="settings-section" aria-labelledby="library-import-title" data-library-folder-workflow>
+      <h2 id="library-import-title">Folder import queue</h2>
+      <p>Select literal folders beneath the configured library root. Scanning only inventories and matches selected scopes; it never imports or changes media.</p>
+      <div class="folder-tools">
+        <label for="library-import-search" class="visually-hidden">Search folders and album metadata</label>
+        <input id="library-import-search" type="search" placeholder="Search folders, paths, albums, or artists" data-folder-search>
+        <label for="library-import-filter" class="visually-hidden">Filter folder status</label>
+        <select id="library-import-filter" data-folder-filter><option value="all">Active queue</option><option value="not-scanned">Not scanned</option><option value="ready">Ready</option><option value="needs-review">Tagged</option><option value="error">Error</option></select>
+      </div>
+      <p id="library-import-review-status" class="operation-status" role="status" aria-live="polite" data-folder-status>Loading folders…</p>
+      <p id="library-import-success" class="import-success" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+      <label for="folder-select-page"><input id="folder-select-page" type="checkbox" data-folder-select-all> Select this page</label>
+      <div id="library-import-review-list" class="review-list" data-folder-list></div>
+      <nav class="review-pagination" aria-label="Library folder pages">
+        <button id="library-import-review-first" class="secondary" type="button" aria-label="First page" title="First" data-folder-first disabled>«</button>
+        <button id="folder-page-previous" class="secondary" type="button" aria-label="Previous page" title="Previous" data-folder-previous disabled>‹</button>
+        <span id="folder-page-total" class="page-label" aria-live="polite" data-folder-page-label>Page 1 of 1</span>
+        <button id="folder-page-next" class="secondary" type="button" aria-label="Next page" title="Next" data-folder-next disabled>›</button>
+        <button id="library-import-review-last" class="secondary" type="button" aria-label="Last page" title="Last" data-folder-last disabled>»</button>
+      </nav>
+      <div class="review-bulk-actions" aria-label="Selected folder actions"><span id="library-import-selection-summary" class="selection-summary" data-folder-selection>0 folders selected · 0 albums available</span><div class="selection-actions"><button id="library-import-scan-selected" type="button" data-folder-scan disabled>Scan selected</button><button id="library-import-ready" type="button" data-folder-import disabled>Import ready (0)</button><button id="library-import-review-exceptions" class="secondary" type="button" data-folder-exceptions disabled>Review exceptions (0)</button></div></div>
+      <div hidden aria-hidden="true"><button id="inventory-preview" type="button"></button><button id="candidate-generate" type="button"></button><small id="candidate-generate-help"></small><p id="inventory-status"></p><div id="inventory-summary"></div><input id="library-import-select-all" type="checkbox"><button id="library-import-review-selected" type="button"></button><button id="library-import-review-previous" type="button"></button><span id="library-import-review-page"></span><button id="library-import-review-next" type="button"></button></div>
+    </section>
+    </div>
+    {% endif %}
+    <button type="submit">{{ 'Finish setup' if first_run else 'Save settings' }}</button>
+    {% if not first_run %}<a href="{{ url_for('index') }}">Cancel</a>{% endif %}
+  </form>
+  <div id="browser" class="browser" hidden>
+    <section class="browser-dialog" role="dialog" aria-modal="true" aria-labelledby="browser-title" tabindex="-1">
+      <header class="browser-header">
+        <h2 id="browser-title">Select a directory</h2>
+        <button type="button" class="browser-close" id="browser-close-icon" aria-label="Close directory browser">&times;</button>
+      </header>
+      <div class="browser-body">
+        <nav id="browser-breadcrumbs" class="breadcrumbs" aria-label="Current directory breadcrumbs"></nav>
+        <div class="browser-up-row">
+          <button type="button" id="browser-up" aria-label="Go to parent directory">&#8593; Up</button>
+        </div>
+        <form id="browser-path-form" class="browser-path-form">
+          <input id="browser-path" type="text" aria-label="Current directory path" autocomplete="off" spellcheck="false">
+          <button type="submit">Go</button>
+        </form>
+        <input id="browser-search" class="browser-search" type="search" placeholder="Filter directories" aria-label="Filter directories" autocomplete="off">
+        <div id="browser-entries" class="directory-list" role="listbox" aria-label="Directories" tabindex="-1"></div>
+        <p id="browser-status" class="browser-status" aria-live="polite"></p>
+      </div>
+      <footer class="browser-actions">
+        <button type="button" class="secondary" id="browser-close">Cancel</button>
+        <button type="button" id="browser-choose">Choose this folder</button>
+      </footer>
+    </section>
+  </div>
+  {% if not first_run %}
+  <div id="library-import-confirm-modal" class="browser" data-folder-confirm hidden>
+    <section class="browser-dialog" role="dialog" aria-modal="true" aria-labelledby="library-import-confirm-title" aria-describedby="library-import-confirm-summary" tabindex="-1" data-folder-confirm-dialog>
+      <header class="browser-header"><h2 id="library-import-confirm-title">Import ready albums?</h2></header>
+      <div class="browser-body"><p id="library-import-confirm-summary" data-folder-confirm-summary></p><p>Only albums that still pass exact-match and file-safety checks will be imported. Exceptions remain for review.</p></div>
+      <footer class="browser-actions"><button id="library-import-confirm-cancel" class="secondary" type="button" data-folder-confirm-close>Cancel</button><button id="library-import-confirm" type="button" data-folder-confirm-apply>Confirm import</button></footer>
+    </section>
+  </div>
+  {% set review_prefix = 'shared-library' %}
+  {% set review_duplicate_options = [('merge', 'Merge metadata into the managed track; keep both files in place'), ('replace', 'Replace the managed record with this file; do not move either file'), ('keep-both', 'Keep both as separate managed tracks'), ('skip', 'Skip the incoming duplicate')] %}
+  {% set review_duplicate_help = 'Merge and replace require one unambiguous recording-ID match and a current, path-safe inventory snapshot.' %}
+  {% include '_review_workflow.html' %}
+  {% endif %}
+</main>
+{% if not first_run %}</div><script src="{{ url_for('static', filename='review-presentation.js') }}"></script><script src="{{ url_for('static', filename='review-workflow.js') }}"></script><script src="{{ url_for('static', filename='folder-workflow.js') }}"></script>{% endif %}
+  <script>
+    async function readApiResponse(response, fallbackMessage, {acceptedStatuses = [], deferHttpError = false} = {}) {
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      const body = await response.text();
+      let data;
+      try {
+        data = body ? JSON.parse(body) : {};
+      } catch (_) {
+        const status = response.status ? `HTTP ${response.status}` : 'an unknown HTTP status';
+        const kind = contentType.includes('html') || /^\s*</.test(body) ? 'HTML' : 'a non-JSON response';
+        throw new Error(`${fallbackMessage} (${status}). The server returned ${kind}; check the proxy route and application logs.`);
+      }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error(`${fallbackMessage} (HTTP ${response.status}). The server returned an invalid JSON payload.`);
+      }
+      if (!response.ok && !acceptedStatuses.includes(response.status) && !deferHttpError) {
+        throw new Error(data.error || data.description || `${fallbackMessage} (HTTP ${response.status}).`);
+      }
+      return data;
+    }
+
+    const browser = document.getElementById('browser');
+    const dialog = browser.querySelector('.browser-dialog');
+    const browserPath = document.getElementById('browser-path');
+    const breadcrumbs = document.getElementById('browser-breadcrumbs');
+    const entries = document.getElementById('browser-entries');
+    const search = document.getElementById('browser-search');
+    const status = document.getElementById('browser-status');
+    let targetInput, currentPath = '', parentPath = null, activeRoot = null, directoryEntries = [], selectedPath = null, returnFocus = null;
+
+    const settingsTabs = [...document.querySelectorAll('[data-settings-tab]')];
+    const settingsPanels = [...document.querySelectorAll('[data-settings-panel]')];
+    function selectSettingsTab(name, moveFocus = false) {
+      const selected = settingsTabs.find(tab => tab.dataset.settingsTab === name) || settingsTabs[0];
+      if (!selected) return;
+      settingsTabs.forEach(tab => {
+        const active = tab === selected;
+        tab.setAttribute('aria-selected', String(active));
+        tab.tabIndex = active ? 0 : -1;
+      });
+      settingsPanels.forEach(panel => { panel.hidden = panel.dataset.settingsPanel !== selected.dataset.settingsTab; });
+      if (moveFocus) selected.focus();
+      const hash = '#' + selected.dataset.settingsTab;
+      if (window.location.hash !== hash) history.replaceState(null, '', hash);
+    }
+    settingsTabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => selectSettingsTab(tab.dataset.settingsTab));
+      tab.addEventListener('keydown', event => {
+        let nextIndex;
+        if (event.key === 'ArrowRight') nextIndex = (index + 1) % settingsTabs.length;
+        else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + settingsTabs.length) % settingsTabs.length;
+        else if (event.key === 'Home') nextIndex = 0;
+        else if (event.key === 'End') nextIndex = settingsTabs.length - 1;
+        else return;
+        event.preventDefault();
+        selectSettingsTab(settingsTabs[nextIndex].dataset.settingsTab, true);
+      });
+    });
+    if (settingsTabs.length) {
+      const hashTab = window.location.hash.slice(1);
+      selectSettingsTab(settingsTabs.some(tab => tab.dataset.settingsTab === hashTab) ? hashTab : {{ active_tab|tojson }});
+      window.addEventListener('hashchange', () => selectSettingsTab(window.location.hash.slice(1)));
+    }
+    const ftintitleEnabled = document.getElementById('ftintitle_enabled');
+    const ftintitleOptions = document.getElementById('ftintitle-options');
+    if (ftintitleEnabled && ftintitleOptions) {
+      const syncFtInTitle = () => { ftintitleOptions.hidden = !ftintitleEnabled.checked; };
+      ftintitleEnabled.addEventListener('change', syncFtInTitle);
+      syncFtInTitle();
+    }
+
+    function setStatus(message, isError = false) {
+      status.textContent = message;
+      status.classList.toggle('error-text', isError);
+    }
+
+    function renderBreadcrumbs() {
+      breadcrumbs.replaceChildren();
+      if (!activeRoot) return;
+      const relative = currentPath.slice(activeRoot.path.length).split('/').filter(Boolean);
+      const parts = [{ name: activeRoot.name || activeRoot.path, path: activeRoot.path }];
+      relative.forEach((name, index) => parts.push({
+        name,
+        path: activeRoot.path.replace(/\/$/, '') + '/' + relative.slice(0, index + 1).join('/'),
+      }));
+      parts.forEach((part, index) => {
+        if (index) {
+          const separator = document.createElement('span');
+          separator.className = 'breadcrumb-separator';
+          separator.setAttribute('aria-hidden', 'true');
+          separator.textContent = '/';
+          breadcrumbs.append(separator);
+        }
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'breadcrumb';
+        button.textContent = part.name;
+        button.setAttribute('aria-label', 'Open ' + part.path);
+        button.addEventListener('click', () => loadDirectory(part.path));
+        breadcrumbs.append(button);
+      });
+    }
+
+    function renderEntries() {
+      const query = search.value.trim().toLocaleLowerCase();
+      const visible = directoryEntries.filter(item => item.name.toLocaleLowerCase().includes(query));
+      entries.replaceChildren();
+      visible.forEach(item => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'directory-row';
+        row.dataset.path = item.path;
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', String(selectedPath === item.path));
+        const icon = document.createElement('span');
+        icon.className = 'folder-icon';
+        icon.setAttribute('aria-hidden', 'true');
+        icon.textContent = '\uD83D\uDCC1';
+        const name = document.createElement('span');
+        name.textContent = item.name;
+        const hint = document.createElement('span');
+        hint.className = 'directory-open';
+        hint.textContent = 'Open';
+        row.append(icon, name, hint);
+        row.addEventListener('click', () => {
+          selectedPath = item.path;
+          entries.querySelectorAll('.directory-row').forEach(candidate => candidate.setAttribute('aria-selected', String(candidate === row)));
+        });
+        row.addEventListener('dblclick', () => loadDirectory(item.path));
+        row.addEventListener('keydown', event => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            loadDirectory(item.path);
+          }
+        });
+        entries.append(row);
+      });
+      setStatus(visible.length ? `${visible.length} ${visible.length === 1 ? 'directory' : 'directories'}` : 'No matching directories.');
+    }
+
+    async function loadDirectory(path = '', allowFallback = true) {
+      setStatus('Loading directories…');
+      try {
+        const response = await fetch('/api/browse?path=' + encodeURIComponent(path));
+        if (!response.ok) {
+          if (path && allowFallback) return loadDirectory('', false);
+        }
+        const data = await readApiResponse(response, 'Unable to load mounted directories');
+        currentPath = data.path;
+        parentPath = data.parent;
+        directoryEntries = data.entries;
+        selectedPath = null;
+        browserPath.value = currentPath;
+        activeRoot = data.roots.find(root => currentPath === root.path || currentPath.startsWith(root.path.replace(/\/$/, '') + '/')) || data.roots[0];
+        document.getElementById('browser-up').disabled = !parentPath;
+        search.value = '';
+        renderBreadcrumbs();
+        renderEntries();
+      } catch (error) {
+        directoryEntries = [];
+        entries.replaceChildren();
+        setStatus(error.message || 'Unable to load directories.', true);
+      }
+    }
+
+    function closeBrowser() {
+      browser.hidden = true;
+      document.body.classList.remove('modal-open');
+      if (returnFocus) returnFocus.focus();
+    }
+
+    function openBrowser(button) {
+      targetInput = document.getElementById(button.dataset.openPicker);
+      returnFocus = button;
+      browser.hidden = false;
+      document.body.classList.add('modal-open');
+      dialog.focus();
+      loadDirectory(targetInput.value || '');
+    }
+
+    const inboxList = document.getElementById('inbox-list');
+    let inboxRowCounter = inboxList.querySelectorAll('[data-inbox-row]').length;
+    function syncRemoveButtons() {
+      const buttons = inboxList.querySelectorAll('[data-remove-inbox]');
+      buttons.forEach(button => { button.disabled = buttons.length === 1; });
+    }
+    inboxList.addEventListener('click', event => {
+      const picker = event.target.closest('[data-open-picker]');
+      if (picker) { openBrowser(picker); return; }
+      const remove = event.target.closest('[data-remove-inbox]');
+      if (!remove || inboxList.querySelectorAll('[data-inbox-row]').length === 1) return;
+      const row = remove.closest('[data-inbox-row]');
+      const nextFocus = row.previousElementSibling?.querySelector('[data-remove-inbox]') || row.nextElementSibling?.querySelector('[data-remove-inbox]');
+      row.remove();
+      syncRemoveButtons();
+      (nextFocus || document.getElementById('add-inbox')).focus();
+    });
+    document.getElementById('add-inbox').addEventListener('click', event => {
+      inboxRowCounter += 1;
+      const row = document.getElementById('inbox-row-template').content.firstElementChild.cloneNode(true);
+      const nameId = `inbox-name-new-${inboxRowCounter}`;
+      const pathId = `inbox-path-new-${inboxRowCounter}`;
+      const nameInput = row.querySelector('[name="inbox_name"]');
+      const pathInput = row.querySelector('[name="inbox_path"]');
+      nameInput.id = nameId; nameInput.closest('label').htmlFor = nameId;
+      pathInput.id = pathId; pathInput.closest('label').htmlFor = pathId;
+      row.querySelector('[data-open-picker]').dataset.openPicker = pathId;
+      inboxList.append(row);
+      syncRemoveButtons();
+      row.querySelector('[name="inbox_name"]').focus();
+    });
+    document.querySelectorAll('[data-open-picker]:not(#inbox-list [data-open-picker])').forEach(button => button.addEventListener('click', () => openBrowser(button)));
+    syncRemoveButtons();
+    document.getElementById('browser-path-form').addEventListener('submit', event => {
+      event.preventDefault();
+      loadDirectory(browserPath.value, false);
+    });
+    search.addEventListener('input', renderEntries);
+    document.getElementById('browser-up').addEventListener('click', () => { if (parentPath) loadDirectory(parentPath); });
+    document.getElementById('browser-choose').addEventListener('click', () => {
+      if (targetInput) targetInput.value = currentPath;
+      closeBrowser();
+    });
+    document.getElementById('browser-close').addEventListener('click', closeBrowser);
+    document.getElementById('browser-close-icon').addEventListener('click', closeBrowser);
+    browser.addEventListener('mousedown', event => { if (event.target === browser) closeBrowser(); });
+    browser.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeBrowser();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = [...dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])')];
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+
+    {% if not first_run %}
+    const libraryApi = async (url, options = {}) => {
+      const response = await fetch(url, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
+      return readApiResponse(response, options.fallback || 'Library import request failed');
+    };
+    let libraryFolders;
+    const libraryReview = window.CratekeepReviewWorkflow.create({
+      root: document.querySelector('[data-review-modal]'),
+      labels:{execute:'Import to Library', executing:'Validating files, registering them, and applying approved metadata in place…', retry:'Retry import', ready:'Select metadata, then import. The server validates every file before writing.'},
+      adapter:{requiresApproval:true, asIs:true, focusFallback:()=>document.getElementById('library-import-search'), load:id=>libraryApi(`/api/library-import/albums/${id}`), match:album=>libraryApi('/api/library-import/candidates',{method:'POST',body:JSON.stringify({limit:1,album_id:album.id})}).then(()=>libraryApi(`/api/library-import/albums/${album.id}`)), exact:(album,id)=>libraryApi(`/api/library-import/albums/${album.id}/rematch`,{method:'POST',body:JSON.stringify({musicbrainz_id:id})}), save:(album,payload)=>libraryApi(`/api/library-import/albums/${album.id}`,{method:'PATCH',body:JSON.stringify(payload)}), execute:(album,payload)=>libraryApi(`/api/library-import/albums/${album.id}/execute`,{method:'POST',body:JSON.stringify(payload)})},
+      onSuccess:async event=>{await libraryFolders?.load(1,{announce:false,refresh:true});const banner=document.getElementById('library-import-success');if(event.kind==='execute'){banner.textContent=`${event.album.artist} — ${event.album.album} imported successfully.`;banner.hidden=false;}}
+    });
+    libraryFolders = window.CratekeepFolderWorkflow.create({
+      root:document, review:libraryReview, storageKey:'cratekeep-folder-selection:' + {{ build_sha|tojson }}, selectPage:true, progressivePages:true,
+      adapter:{expandRows:true,announceScan:false,countLabel:item=>`${item.album_count} albums · ${item.track_count} tracks`,selectAllLabel:'Select all folders on this page',
+        list:async({page,query,status,signal})=>{const params=new URLSearchParams({page:String(page),q:query,status});const data=await libraryApi(`/api/library-import/folders?${params}`,{signal});return{items:data.folders,page:data.page,page_count:data.page_count,total:data.total};},
+        albums:folder=>libraryApi(`/api/library-import/folders/albums?folder=${encodeURIComponent(folder)}`),
+        preview:folders=>libraryApi('/api/library-import/bulk/preview',{method:'POST',body:JSON.stringify({folders})}),
+        scan:folders=>libraryApi('/api/library-import/folders/scan',{method:'POST',body:JSON.stringify({folders})}),
+        exceptions:folders=>libraryApi('/api/library-import/bulk/exceptions',{method:'POST',body:JSON.stringify({folders})}),
+        execute:folders=>libraryApi('/api/library-import/bulk/execute',{method:'POST',body:JSON.stringify({folders,confirmed:true})}),
+        confirmMessage:value=>`${value.selected_folder_count} folders · ${value.ready_album_count} ready albums · ${value.track_count} files/tracks · ${value.exception_count} excluded exceptions.`
+      }
+    });
+    {% endif %}
+
+    {% if not first_run %}
+    (() => {
+      const body = document.body;
+      const sidebar = document.getElementById('sidebar');
+      const collapseButton = document.getElementById('collapse-sidebar');
+      const openButton = document.getElementById('open-sidebar');
+      const scrim = document.getElementById('sidebar-scrim');
+      const themeButton = document.getElementById('theme-toggle');
+      const mobileQuery = window.matchMedia('(max-width: 760px)');
+      let lastFocused = null;
+      if (localStorage.getItem('cratekeep-theme') === 'dark') {
+        body.classList.add('dark-mode'); themeButton.setAttribute('aria-pressed', 'true'); themeButton.textContent = '☀';
+      }
+      if (localStorage.getItem('cratekeep-sidebar') === 'collapsed') {
+        body.classList.add('sidebar-collapsed'); collapseButton.setAttribute('aria-expanded', 'false');
+      }
+      function closeMobileSidebar() {
+        body.classList.remove('sidebar-open'); openButton.setAttribute('aria-expanded', 'false'); scrim.tabIndex = -1;
+        if (lastFocused) lastFocused.focus();
+      }
+      collapseButton.addEventListener('click', () => {
+        const collapsed = body.classList.toggle('sidebar-collapsed');
+        collapseButton.setAttribute('aria-expanded', String(!collapsed));
+        localStorage.setItem('cratekeep-sidebar', collapsed ? 'collapsed' : 'expanded');
+      });
+      themeButton.addEventListener('click', () => {
+        const dark = body.classList.toggle('dark-mode'); themeButton.setAttribute('aria-pressed', String(dark));
+        themeButton.textContent = dark ? '☀' : '☾'; localStorage.setItem('cratekeep-theme', dark ? 'dark' : 'light');
+      });
+      openButton.addEventListener('click', () => {
+        lastFocused = openButton; body.classList.add('sidebar-open'); openButton.setAttribute('aria-expanded', 'true');
+        scrim.tabIndex = 0; sidebar.querySelector('a').focus();
+      });
+      scrim.addEventListener('click', closeMobileSidebar);
+      document.addEventListener('keydown', event => { if (event.key === 'Escape' && body.classList.contains('sidebar-open')) closeMobileSidebar(); });
+      mobileQuery.addEventListener('change', event => { if (!event.matches) closeMobileSidebar(); });
+    })();
+    {% endif %}
+  </script>
+</body>
+</html>

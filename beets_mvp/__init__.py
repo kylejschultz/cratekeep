@@ -1,0 +1,7464 @@
+from __future__ import annotations
+
+import json
+import hashlib
+from io import BytesIO
+import math
+import os
+import secrets
+import sqlite3
+import stat
+import subprocess
+import re
+import shutil
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+from beets import config as beets_config
+from beets.library import Item, Library
+from beets.importer import Action, ImportTask
+from beetsplug.ftintitle import (
+    DEFAULT_BRACKET_KEYWORDS,
+    FtInTitlePlugin,
+    contains_feat,
+    find_feat_part,
+    split_on_feat,
+)
+from flask import Flask, abort, flash, g, get_flashed_messages, jsonify, redirect, render_template, request, send_file, url_for
+from mediafile import Image as MediaImage, ImageType, MediaFile, UnreadableFileError
+from PIL import Image as PillowImage, UnidentifiedImageError
+
+from .musicbrainz import MusicBrainzClient, ProviderError, search_releases
+from .matching import score_release
+from . import match_diagnostics
+from .duplicates import duplicate_matches
+
+AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
+EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
+ALBUM_EDITABLE_FIELDS = {"album", "albumartist", "genre", "year"}
+INTEGER_FIELDS = {"year", "track", "disc"}
+LIBRARY_ALBUM_PAGE_SIZE = 25
+MAX_LEGACY_ALBUM_PROMOTIONS = 100
+MAX_LEGACY_PROMOTION_ITEMS = 2000
+SETTING_KEYS = (
+    "inboxes_json", "inbox_path", "library_path", "navidrome_rescan_url", "navidrome_token", "fetch_art",
+    "art_sidecar", "art_embed", "art_replace", "inbox_auto_match", "match_threshold", "toast_duration_seconds", "analytics_enabled",
+)
+DEFAULT_MATCH_THRESHOLD = 90
+MAX_ARTWORK_BYTES = 10 * 1024 * 1024
+MAX_ARTWORK_PIXELS = 40_000_000
+MAX_MANAGED_ARTWORK_PREVIEWS = 8
+MANAGED_ARTWORK_PREVIEW_TTL = 15 * 60
+TRUSTED_ARTWORK_HOSTS = {"coverartarchive.org", "archive.org"}
+MAX_BEETS_CONFIG_BYTES = 128 * 1024
+MAX_INVENTORY_SAMPLE = 50
+MAX_LIBRARY_IMPORT_ALBUMS = 50
+MAX_CANDIDATE_ALBUMS = 25
+MAX_INBOX_AUTO_MATCH_PENDING = 100
+MAX_CANDIDATES_PER_ALBUM = 5
+FOLDER_PAGE_SIZE = 25
+CANDIDATE_SCHEMA_VERSION = 5
+# Bump only when persisted evidence can no longer be interpreted safely.
+MIN_SUPPORTED_CANDIDATE_SCHEMA_VERSION = 5
+LIBRARY_IMPORT_DECISIONS = {"approved", "rejected", "skipped"}
+DUPLICATE_ACTIONS = {"merge", "replace", "keep-both", "skip", "keep-existing"}
+DEFAULT_BEETS_PATHS = {
+    "default": "$albumartist/$album/$track $title",
+    "singleton": "Non-Album/$artist/$title",
+    "comp": "Compilations/$album/$track $title",
+}
+MUSICBRAINZ_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+FTINTITLE_DEFAULTS = {
+    "enabled": False,
+    "format": "feat. {0}",
+    "keep_in_artist": False,
+    "preserve_album_artist": True,
+    "drop": False,
+    "auto": True,
+    "custom_words": [],
+    "bracket_keywords": list(DEFAULT_BRACKET_KEYWORDS),
+    "projection_requires_recheck": False,
+}
+_LEGACY_ALBUM_PROMOTION_LOCK = threading.Lock()
+
+
+class LibraryImportExecutionError(RuntimeError):
+    def __init__(self, message: str, *, code: str, status: int = 409, job_id: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.job_id = job_id
+
+
+class ManagedMutationError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "mutation_failed", status: int = 500) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def create_app(test_config: dict | None = None) -> Flask:
+    app = Flask(__name__)
+    app.add_template_filter(_format_bytes, "format_bytes")
+    app.config.from_mapping(
+        APP_VERSION=os.getenv("APP_VERSION", "development"),
+        BUILD_SHA=os.getenv("BUILD_SHA", os.getenv("GITHUB_SHA", "unknown")),
+        BEACON_DEV=os.getenv("BEACON_DEV", "").lower() == "true",
+        DISCORD_URL="https://discord.gg/QgkUzqa2Mw",
+        SECRET_KEY=os.getenv("SECRET_KEY", ""),
+        STATE_PATH=os.getenv("STATE_PATH", str(Path.cwd() / "data/config")),
+        MUSICBRAINZ_PROVIDER=search_releases,
+        ARTWORK_FETCHER=_fetch_and_normalize_artwork,
+    )
+    if test_config:
+        app.config.update(test_config)
+
+    state_path = Path(app.config["STATE_PATH"])
+    state_path.mkdir(parents=True, exist_ok=True)
+    if not app.config["SECRET_KEY"]:
+        app.config["SECRET_KEY"] = _load_or_create_secret_key(state_path / "secret.key")
+    if app.config["MUSICBRAINZ_PROVIDER"] is search_releases:
+        app.config["MUSICBRAINZ_PROVIDER"] = MusicBrainzClient(state_path / "metadata-cache.sqlite3")
+    app.config["BEETS_DB"] = str(state_path / "library.db")
+    app.config["APP_DB"] = str(state_path / "app.db")
+    app.config["BEETS_CONFIG"] = str(state_path / "config.yaml")
+    app.config["MANAGED_ARTWORK_PREVIEWS"] = {}
+    app.config["MANAGED_ARTWORK_PREVIEW_LOCK"] = threading.RLock()
+    app.config["INBOX_MATCH_LOCK"] = threading.Lock()
+    app.config["INBOX_CANDIDATE_LOCK"] = threading.Lock()
+    app.config["INBOX_MATCH_PENDING"] = set()
+    app.config["INBOX_MATCH_RUNNING"] = False
+    app.config["INBOX_EXECUTION_LOCK"] = threading.Lock()
+    _init_db(app.config["APP_DB"])
+    _apply_settings(app, _load_settings(app.config["APP_DB"]))
+
+    @app.before_request
+    def require_setup():
+        if app.config["SETUP_COMPLETE"] or request.endpoint in {"setup", "settings", "browse", "healthz", "static"}:
+            return None
+        if request.path.startswith("/api/"):
+            return jsonify(error="setup is required", setup=url_for("setup")), 503
+        return redirect(url_for("setup"))
+
+    @app.route("/setup", methods=("GET", "POST"))
+    def setup():
+        if app.config["SETUP_COMPLETE"]:
+            return redirect(url_for("settings"))
+        return _settings_response(app, first_run=True)
+
+    @app.route("/settings", methods=("GET", "POST"))
+    def settings():
+        if not app.config["SETUP_COMPLETE"]:
+            return redirect(url_for("setup"))
+        return _settings_response(app, first_run=False)
+
+    @app.get("/")
+    def index():
+        return _render_ui(app, "overview", "Overview", _overview_data(app))
+
+    @app.get("/inbox")
+    def inbox_page():
+        return _render_ui(app, "inbox", "Inbox", {"inboxes": _inbox_review_summaries(app)})
+
+    @app.get("/library-import")
+    def library_import_page():
+        return _render_ui(app, "library-import", "Library Import", {})
+
+    @app.get("/library")
+    def library_page():
+        try:
+            page = int(request.args.get("page", "1"))
+        except ValueError:
+            page = 1
+        return _render_ui(
+            app, "library", "Library",
+            _library_page_data(
+                app, request.args.get("q", ""), request.args.get("sort", "artist" if request.args.get("view") == "artists" else "recent"),
+                request.args.get("order", ""), request.args.get("artist", ""),
+                request.args.get("album", ""), page, view=request.args.get("view", "albums"),
+            ),
+        )
+
+    @app.get("/healthz")
+    def healthz():
+        return jsonify(status="ok")
+
+    @app.get("/api/browse")
+    def browse():
+        requested = request.args.get("path", "")
+        roots = _browse_roots(app)
+        try:
+            directory = _safe_browse_path(app, requested, roots)
+        except ValueError as exc:
+            abort(400, str(exc))
+        entries = []
+        for entry in sorted(directory.iterdir(), key=lambda item: (not item.is_dir(), item.name.casefold())):
+            if entry.is_dir() and not entry.is_symlink():
+                entries.append({"name": entry.name, "path": str(entry)})
+        parent = _browse_parent(directory, roots)
+        return jsonify(
+            path=str(directory),
+            parent=parent,
+            entries=entries,
+            roots=[{"name": root.name or str(root), "path": str(root)} for root in roots],
+        )
+
+    @app.get("/api/inbox")
+    def inbox():
+        return jsonify(_inbox_candidates(app))
+
+    @app.get("/api/inbox/reviews")
+    def inbox_reviews():
+        groups = _inbox_review_groups(app)
+        return jsonify(inboxes=groups, albums=[album for group in groups for album in group["albums"]])
+
+    @app.post("/api/inbox/scan")
+    def scan_inbox_reviews():
+        values = request.get_json(silent=True) or {}
+        if not isinstance(values, dict) or set(values) - {"inbox_id", "page", "refresh"}:
+            return jsonify(error="request may contain only inbox_id, page, and refresh", code="invalid_request"), 400
+        inbox_id = values.get("inbox_id")
+        if inbox_id is not None and _configured_inbox(app, inbox_id) is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 400
+        try:
+            page = max(1, int(values.get("page", 1)))
+        except (TypeError, ValueError):
+            return jsonify(error="page must be an integer", code="invalid_request"), 400
+        refresh = values.get("refresh", page == 1)
+        if not isinstance(refresh, bool):
+            return jsonify(error="refresh must be a boolean", code="invalid_request"), 400
+        return jsonify(inboxes=_inbox_review_groups(
+            app, scan=refresh, inbox_ids={inbox_id} if inbox_id else None, page=page,
+        ))
+
+    @app.get("/api/inbox/<inbox_id>/queue")
+    def inbox_album_queue(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        return album_queue_response("inbox", inbox["id"], str(Path(inbox["path"]).resolve()))
+
+    @app.get("/api/library-import/queue")
+    def library_album_queue():
+        try:
+            root = _validated_library_root(app)
+        except (OSError, ValueError) as exc:
+            return jsonify(error=str(exc), code="inventory_unavailable"), 409
+        return album_queue_response("library", "", str(root))
+
+    def album_queue_response(source_kind: str, source_id: str, root: str):
+        try:
+            page = int(request.args.get("page", "1"))
+            if page < 1:
+                raise ValueError("page must be positive")
+            status = request.args.get("status", "all")
+            allowed_statuses = {"all", "unreviewed", "pending", "matched", "perfect", "duplicates"} | ({"imported"} if source_kind == "inbox" else set())
+            if status not in allowed_statuses:
+                raise ValueError("unsupported queue filter")
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        query = request.args.get("q", "").strip().casefold()
+        # Read persisted groups only. Refresh is the explicit disk reconciliation
+        # boundary; loading/paging/searching never triggers provider work.
+        where = """root_path=? AND source_kind=? AND
+            (execution_status!='complete' OR EXISTS (SELECT 1 FROM inbox_copy_imports receipt WHERE receipt.album_review_id=album_reviews.id AND receipt.status='imported'))
+            AND state NOT IN ('rejected','skipped') AND EXISTS
+            (SELECT 1 FROM album_review_tracks WHERE album_review_id=album_reviews.id)"""
+        params = [root, source_kind]
+        if source_kind == "inbox":
+            where += " AND source_id=?"
+            params.append(source_id)
+        else:
+            where += """ AND EXISTS (SELECT 1 FROM album_review_tracks AS tracks
+                JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE tracks.album_review_id=album_reviews.id AND inventory.present=1
+                  AND inventory.beets_item_id IS NULL)"""
+        if status == "unreviewed":
+            where += " AND state!='approved'"
+        with _connect(app.config["APP_DB"]) as db:
+            # SQLite lower() is ASCII-only; apply Unicode casefold to inexpensive
+            # identity rows before fetching at most 25 full review payloads.
+            rows = db.execute(f"SELECT id, artist, album FROM album_reviews WHERE {where} ORDER BY artist_key, album_key, id", params).fetchall()
+        ids = [row["id"] for row in rows if not query or query in f"{row['artist']} {row['album']}".casefold()]
+        if status in {"perfect", "duplicates", "pending", "matched", "imported"}:
+            filtered = []
+            # Recompute from persisted evidence in bounded batches, before pagination.
+            # No disk scan or MusicBrainz request is needed for these filters.
+            for start in range(0, len(ids), 100):
+                for album in _album_review_payloads(app, ids[start:start+100], root=root, source_kind=source_kind, source_id=source_id if source_kind == "inbox" else None):
+                    duplicate = album.get("duplicate_preflight", {}).get("status") != "clear"
+                    if status in {"pending", "matched", "imported"}:
+                        matches = _queue_match_state(album) == status
+                    elif status == "duplicates":
+                        matches = duplicate
+                    else:
+                        choice, _ = _selected_library_choice(album)
+                        candidate = next((row for row in album["candidates"] if choice and row["id"] == choice["candidate_id"]), None)
+                        matches = bool(candidate and candidate["confidence"] == 1.0 and not duplicate
+                                       and not candidate["track_count_mismatch"] and not candidate["hard_mismatches"]
+                                       and not candidate["unmatched_track_count"]
+                                       and all(track["exception"] is None for track in album["tracks"]))
+                    if matches:
+                        filtered.append(album["id"])
+            ids = filtered
+        total = len(ids)
+        pages = max(1, (total + 24) // 25)
+        page = min(page, pages)
+        albums = _album_review_payloads(app, ids[(page-1)*25:page*25], root=root,
+                                        source_kind=source_kind, source_id=source_id if source_kind == "inbox" else None)
+        return jsonify(albums=[_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in albums],
+                       total=total, page=page, page_count=pages, page_size=25)
+
+    @app.post("/api/library-import/queue/refresh")
+    def refresh_library_album_queue():
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or values:
+            return jsonify(error="request must be an empty object", code="invalid_request"), 400
+        try:
+            root = _validated_library_root(app)
+            scopes = _literal_folder_scopes(root)
+            result = _scan_folder_scopes(app, scopes, match_candidates=False, unmanaged_only=True)
+            active_scopes = set(scopes)
+            # Entire removed folders no longer occur in the filesystem's scope
+            # list. Reconcile their persisted rows too, without following links
+            # or changing completed jobs/media.
+            with _connect(app.config["APP_DB"]) as db:
+                rows = db.execute(
+                    "SELECT id, relative_path FROM library_inventory WHERE root_path=? AND source_kind='library' AND present=1",
+                    (str(root),),
+                ).fetchall()
+                removed = [row for row in rows if _scope_for_relative_path(row["relative_path"]) not in active_scopes]
+                db.executemany("UPDATE library_inventory SET present=0 WHERE id=?", [(row["id"],) for row in removed])
+            if removed:
+                _sync_album_reviews(app, scopes=sorted({_scope_for_relative_path(row["relative_path"]) for row in removed}))
+            return jsonify(result)
+        except (OSError, ValueError) as exc:
+            return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+
+    @app.get("/api/inbox/<inbox_id>/scopes")
+    def inbox_scopes(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            page = int(request.args.get("page", "1"))
+            if page < 1:
+                raise ValueError("page must be one or greater")
+            return jsonify(_inbox_scope_list(app, inbox, page=page))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="inbox_scope_unavailable"), 409
+
+    @app.post("/api/inbox/<inbox_id>/scopes/refresh")
+    def refresh_inbox_scopes(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or values:
+            return jsonify(error="request must be an empty object", code="invalid_request"), 400
+        locks = []
+        for lock in (app.config["INBOX_CANDIDATE_LOCK"], app.config["INBOX_EXECUTION_LOCK"]):
+            if not lock.acquire(blocking=False):
+                for held in reversed(locks):
+                    held.release()
+                return jsonify(error="Inbox matching or import is running; refresh after it finishes.", code="inbox_busy"), 409
+            locks.append(lock)
+        try:
+            inventory = _scan_inbox_inventory(app, inbox)
+            cleanup = _cleanup_inbox_directories(app, inbox)
+            with _connect(app.config["APP_DB"]) as db:
+                active = sorted({_scope_for_relative_path(row["relative_path"]) for row in db.execute(
+                    "SELECT relative_path FROM library_inventory WHERE source_kind='inbox' AND source_id=? AND root_path=? AND present=1",
+                    (inbox["id"], str(Path(inbox["path"]).resolve())),
+                )})
+            return jsonify(inventory=inventory, cleanup=cleanup, active_scopes=active)
+        except (OSError, ValueError) as exc:
+            return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+    @app.get("/api/inbox/<inbox_id>/scopes/albums")
+    def inbox_scope_albums(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            scope = _validated_inbox_scope(inbox, request.args.get("scope", ""))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        try:
+            _refresh_inbox_scope_inventory(app, inbox, [scope])
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+        album_ids = _inbox_scope_album_ids(app, inbox, [scope])
+        albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(
+            app, album_ids, root=str(Path(inbox["path"]).resolve()),
+            source_kind="inbox", source_id=inbox["id"],
+        )]
+        return jsonify(scope=scope, albums=albums)
+
+    @app.post("/api/inbox/<inbox_id>/scopes/scan")
+    def scan_inbox_scopes(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        try:
+            scopes = _request_inbox_scopes(inbox)
+            inventory = _scan_inbox_inventory(app, inbox, scopes=scopes)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        album_ids = _inbox_scope_album_ids(app, inbox, scopes)
+        generated = {"errors": []}
+        if album_ids:
+            generated = _generate_musicbrainz_candidates(
+                app, len(album_ids), album_ids=album_ids,
+                root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"],
+            )
+        summary = _inbox_bulk_ready_summary(app, inbox, scopes)
+        return jsonify(inventory=inventory, matching=generated, **summary, errors=generated.get("errors", [])), (
+            207 if generated.get("errors") else 201
+        )
+
+    @app.post("/api/inbox/<inbox_id>/bulk/preview")
+    def preview_ready_inbox_imports(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
+        try:
+            if isinstance(values, dict) and values.get("mode") == "selected" and not values.get("album_ids"):
+                raise ValueError("Select album IDs before importing.")
+            scopes = _request_inbox_scopes(inbox, values)
+            album_ids = _request_selected_album_ids(values, _inbox_scope_album_ids(app, inbox, scopes))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        if values.get("mode") == "selected":
+            return jsonify(_inbox_selected_summary(app, inbox, album_ids))
+        return jsonify(_inbox_bulk_ready_summary(app, inbox, scopes, album_ids=album_ids))
+
+    @app.post("/api/inbox/<inbox_id>/bulk/exceptions")
+    def selected_inbox_exceptions(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
+        try:
+            scopes = _request_inbox_scopes(inbox, values)
+            album_ids = _request_selected_album_ids(values, _inbox_scope_album_ids(app, inbox, scopes))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(
+            app, album_ids, root=str(Path(inbox["path"]).resolve()),
+            source_kind="inbox", source_id=inbox["id"],
+        )]
+        return jsonify(albums=[album for album in albums if not album["ready"]])
+
+    @app.post("/api/inbox/<inbox_id>/bulk/execute")
+    def execute_ready_inbox_imports(inbox_id: str):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or values.get("confirmed") is not True:
+            return jsonify(error="explicit confirmation is required", code="confirmation_required"), 400
+        try:
+            if isinstance(values, dict) and values.get("mode") == "selected" and not values.get("album_ids"):
+                raise ValueError("Select album IDs before importing.")
+            scopes = _request_inbox_scopes(inbox, values)
+            album_ids = _request_selected_album_ids(values, _inbox_scope_album_ids(app, inbox, scopes))
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        try:
+            result = (_execute_inbox_selected(app, inbox, album_ids) if values.get("mode") == "selected"
+                      else _execute_inbox_bulk_ready(app, inbox, scopes, album_ids=album_ids))
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        return jsonify(result), (207 if result["failed"] else 201)
+
+    @app.post("/api/inbox/candidates")
+    def generate_inbox_candidates():
+        values = request.get_json(silent=True) or {}
+        try:
+            album_id = int(values.get("album_id"))
+        except (TypeError, ValueError):
+            return jsonify(error="album_id must be an integer", code="invalid_request"), 400
+        if "reuse_current" in values and not isinstance(values["reuse_current"], bool):
+            return jsonify(error="reuse_current must be boolean", code="invalid_request"), 400
+        context = _inbox_album_context(app, album_id)
+        if context is None:
+            return jsonify(error="Inbox album review not found", code="album_review_not_found"), 404
+        with app.config["INBOX_CANDIDATE_LOCK"]:
+            try:
+                _refresh_review_inventory(app, album_id, root=context["root"], source_kind="inbox", source_id=context["inbox"]["id"])
+            except ValueError as exc:
+                return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+            with _connect(app.config["APP_DB"]) as db:
+                current_status = db.execute(
+                    "SELECT candidate_status FROM album_reviews WHERE id=?", (album_id,)
+                ).fetchone()["candidate_status"]
+            if ((values.get("reuse_current") is True and _has_current_match(app, album_id, root=context["root"], source_kind="inbox", source_id=context["inbox"]["id"]))
+                    or (context["candidate_status"] in {"not-run", "stale", "running"} and current_status == "complete")):
+                match_diagnostics.emit("matching.reused", source="inbox", review_id=album_id, operation="saved-evidence")
+                result = {"job_id": None, "generated": 0, "errors": [], "already_matched": True}
+            else:
+                result = _generate_musicbrainz_candidates(
+                    app, 1, album_ids=[album_id], root=context["root"],
+                    source_kind="inbox", source_id=context["inbox"]["id"],
+                )
+        album = next(iter(_album_review_payloads(
+            app, [album_id], root=context["root"], source_kind="inbox", source_id=context["inbox"]["id"]
+        )), None)
+        return jsonify(result=result, album=album), (207 if result["errors"] else 201)
+
+    @app.get("/api/inbox/albums/<int:album_review_id>")
+    def inbox_album_review(album_review_id: int):
+        context = _inbox_album_context(app, album_review_id)
+        if context is None:
+            return jsonify(error="Inbox album review not found", code="album_review_not_found"), 404
+        album = next(iter(_album_review_payloads(
+            app, [album_review_id], root=context["root"], source_kind="inbox",
+            source_id=context["inbox"]["id"],
+        )), None)
+        return jsonify(_with_readiness(album, app.config["MATCH_THRESHOLD"])) if album else (jsonify(
+            error="Inbox album review not found", code="album_review_not_found"
+        ), 404)
+
+    @app.patch("/api/inbox/albums/<int:album_review_id>")
+    def update_inbox_album_review(album_review_id: int):
+        context = _inbox_album_context(app, album_review_id)
+        if context is None:
+            return jsonify(error="Inbox album review not found", code="album_review_not_found"), 404
+        try:
+            album = _update_album_review(
+                app, album_review_id, request.get_json(silent=True) or {}, root=context["root"],
+                source_kind="inbox", source_id=context["inbox"]["id"],
+            )
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        return jsonify(album)
+
+    @app.post("/api/inbox/albums/<int:album_review_id>/rematch")
+    def rematch_inbox_album(album_review_id: int):
+        values = request.get_json(silent=True)
+        mbid = values.get("musicbrainz_id") if isinstance(values, dict) and set(values) == {"musicbrainz_id"} else None
+        if not isinstance(mbid, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(mbid):
+            return jsonify(error="Enter a canonical MusicBrainz release or release-group UUID.", code="invalid_musicbrainz_id"), 400
+        context = _inbox_album_context(app, album_review_id)
+        if context is None:
+            return jsonify(error="Inbox album review not found", code="album_review_not_found"), 404
+        try:
+            album = _rematch_album_by_musicbrainz_id(
+                app, album_review_id, mbid.lower(), root=context["root"], source_kind="inbox",
+                source_id=context["inbox"]["id"],
+            )
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+        except ProviderError as exc:
+            status = 404 if exc.code == "musicbrainz_id_not_found" else (503 if exc.retryable else 502)
+            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), status
+        return jsonify(album)
+
+    @app.post("/api/inbox/albums/<int:album_review_id>/execute")
+    def execute_inbox_album(album_review_id: int):
+        values = request.get_json(silent=True) or {}
+        if not isinstance(values, dict) or set(values) - {"dry_run", "skip_artwork"} or any(
+            not isinstance(values.get(key, False), bool) for key in ("dry_run", "skip_artwork")
+        ):
+            return jsonify(error="request may contain only boolean dry_run and skip_artwork", code="invalid_request"), 400
+        lock = app.config["INBOX_EXECUTION_LOCK"]
+        if not lock.acquire(blocking=False):
+            return jsonify(
+                error="Another Inbox execution is already running; retry after it finishes.",
+                code="execution_in_progress",
+            ), 409
+        try:
+            try:
+                result = _execute_inbox_album(
+                    app, album_review_id, dry_run=values.get("dry_run", False),
+                    skip_artwork=values.get("skip_artwork", False),
+                )
+            except LibraryImportExecutionError as exc:
+                return jsonify(error=str(exc), code=exc.code, job_id=exc.job_id), exc.status
+        finally:
+            lock.release()
+        if result is None:
+            return jsonify(error="Inbox album review not found", code="album_review_not_found"), 404
+        return jsonify(result), (201 if result["status"] == "complete" and not result.get("already_complete") else 200)
+
+    @app.get("/api/items")
+    def items():
+        return jsonify(_items(app))
+
+    @app.get("/api/library/albums/<int:album_id>")
+    def managed_album(album_id: int):
+        _promote_legacy_managed_albums(app)
+        album = _managed_album_payload(app, album_id)
+        if album is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(album)
+
+    @app.get("/api/library/albums/<int:album_id>/artwork")
+    def managed_album_artwork(album_id: int):
+        album = _library(app).get_album(album_id)
+        if album is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        try:
+            artwork = _managed_album_artwork_bytes(app, _album_items(album))
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if artwork is None:
+            return jsonify(error="This album has no sidecar or embedded front artwork.",
+                           code="artwork_not_found"), 404
+        return send_file(BytesIO(artwork[0]), mimetype="image/jpeg", max_age=0,
+                         download_name="cover.jpg", conditional=False)
+
+    @app.post("/api/library/albums/<int:album_id>/artwork/upload-preview")
+    def preview_managed_artwork_upload(album_id: int):
+        uploaded = request.files.get("artwork")
+        expected = request.form.get("expected_fingerprint", "")
+        if uploaded is None or not expected:
+            return jsonify(error="artwork and expected_fingerprint are required",
+                           code="invalid_request"), 400
+        try:
+            payload = uploaded.stream.read(MAX_ARTWORK_BYTES + 1)
+            jpeg = _normalize_artwork_bytes(payload)
+            result = _create_managed_artwork_preview(
+                app, album_id, expected, jpeg, source="upload",
+                message="Upload validated. Review the preview, then choose Replace artwork.",
+            )
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code), 400
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result), 201
+
+    @app.post("/api/library/albums/<int:album_id>/artwork/refresh-preview")
+    def preview_managed_artwork_refresh(album_id: int):
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or set(values) != {"expected_fingerprint"}:
+            return jsonify(error="request must contain only expected_fingerprint",
+                           code="invalid_request"), 400
+        try:
+            result = _preview_managed_artwork_refresh(
+                app, album_id, values.get("expected_fingerprint")
+            )
+        except ProviderError as exc:
+            status = 404 if exc.code == "release_not_found" else (503 if exc.retryable else 502)
+            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), status
+        except (ManagedMutationError, LibraryImportExecutionError) as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except (OSError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "artwork provider failed", code="provider_error"), 502
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result), 201
+
+    @app.get("/api/library/albums/<int:album_id>/artwork/previews/<preview_id>")
+    def managed_artwork_preview_image(album_id: int, preview_id: str):
+        preview = _get_managed_artwork_preview(app, album_id, preview_id)
+        if preview is None:
+            return jsonify(error="Artwork preview expired. Choose artwork again.",
+                           code="preview_expired"), 404
+        return send_file(BytesIO(preview["jpeg"]), mimetype="image/jpeg", max_age=0,
+                         download_name="preview.jpg", conditional=False)
+
+    @app.post("/api/library/albums/<int:album_id>/artwork/apply")
+    def apply_managed_artwork(album_id: int):
+        values = request.get_json(silent=True)
+        if (not isinstance(values, dict) or set(values) != {"preview_id", "expected_fingerprint"}
+                or not isinstance(values.get("preview_id"), str)
+                or not isinstance(values.get("expected_fingerprint"), str)):
+            return jsonify(error="request must contain only preview_id and expected_fingerprint",
+                           code="invalid_request"), 400
+        try:
+            result = _apply_managed_artwork_preview(
+                app, album_id, values["preview_id"], values["expected_fingerprint"]
+            )
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
+
+    @app.patch("/api/library/albums/<int:album_id>")
+    def edit_managed_album(album_id: int):
+        values = request.get_json(silent=True)
+        try:
+            fields, expected = _validated_managed_edit(values, ALBUM_EDITABLE_FIELDS)
+            result = _edit_managed_album(app, album_id, fields, expected)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
+
+    @app.patch("/api/library/albums/<int:album_id>/tracks/<int:item_id>")
+    def edit_managed_album_track(album_id: int, item_id: int):
+        values = request.get_json(silent=True)
+        try:
+            fields, expected = _validated_managed_edit(values, EDITABLE_FIELDS)
+            result = _edit_managed_track(app, album_id, item_id, fields, expected)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        if result is False:
+            return jsonify(error="Track does not belong to this album", code="track_not_in_album"), 404
+        return jsonify(result)
+
+    @app.post("/api/library/albums/<int:album_id>/rematch/preview")
+    def preview_managed_album_rematch(album_id: int):
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or set(values) != {"musicbrainz_id", "expected_fingerprint"}:
+            return jsonify(error="request must contain only musicbrainz_id and expected_fingerprint",
+                           code="invalid_request"), 400
+        mbid = values.get("musicbrainz_id")
+        expected = values.get("expected_fingerprint")
+        if not isinstance(mbid, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(mbid):
+            return jsonify(error="Enter a canonical MusicBrainz release UUID.",
+                           code="invalid_musicbrainz_id"), 400
+        if not isinstance(expected, str) or not expected:
+            return jsonify(error="expected_fingerprint is required", code="invalid_request"), 400
+        try:
+            result = _preview_managed_rematch(app, album_id, mbid.lower(), expected)
+        except ProviderError as exc:
+            status = 404 if exc.code == "release_not_found" else (503 if exc.retryable else 502)
+            return jsonify(error=str(exc), code=exc.code, retryable=exc.retryable), status
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        except (OSError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "candidate provider failed", code="provider_error",
+                           retryable=False), 502
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result), 201
+
+    @app.post("/api/library/albums/<int:album_id>/rematch/apply")
+    def apply_managed_album_rematch(album_id: int):
+        values = request.get_json(silent=True)
+        if (not isinstance(values, dict) or set(values) != {"preview_id", "expected_fingerprint"}
+                or not isinstance(values.get("preview_id"), str)
+                or not isinstance(values.get("expected_fingerprint"), str)):
+            return jsonify(error="request must contain only preview_id and expected_fingerprint",
+                           code="invalid_request"), 400
+        try:
+            result = _apply_managed_rematch(
+                app, album_id, values["preview_id"], values["expected_fingerprint"]
+            )
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
+
+    @app.post("/api/library/inventory/preview")
+    def preview_library_inventory():
+        try:
+            summary = _preview_library_inventory(app)
+            _sync_album_reviews(app)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(summary), 201
+
+    @app.get("/api/library/inventory")
+    def latest_library_inventory():
+        summary = _latest_inventory_summary(app)
+        if summary is None:
+            return jsonify(error="no library inventory has been run"), 404
+        return jsonify(summary)
+
+    @app.get("/api/library-import/reviews")
+    def library_import_reviews():
+        try:
+            limit = int(request.args.get("limit", "25"))
+            offset = int(request.args.get("offset", "0"))
+        except ValueError:
+            return jsonify(error="limit and offset must be integers"), 400
+        if not 1 <= limit <= MAX_LIBRARY_IMPORT_ALBUMS:
+            return jsonify(error=f"limit must be between 1 and {MAX_LIBRARY_IMPORT_ALBUMS}"), 400
+        if offset < 0:
+            return jsonify(error="offset must be zero or greater"), 400
+        album_ids, has_more, total_albums = _library_import_review_album_page(app, limit, offset)
+        items = _library_import_review_items(app, album_ids)
+        return jsonify(items=items, groups=_group_library_import_review_items(items),
+                       albums=_album_review_payloads(app, album_ids), limit=limit, offset=offset,
+                       album_count=len(album_ids), total_albums=total_albums, has_more=has_more,
+                       next_offset=(offset + len(album_ids)) if has_more else None)
+
+    @app.get("/api/library-import/folders")
+    def library_import_folders():
+        try:
+            page = int(request.args.get("page", "1"))
+        except ValueError:
+            return jsonify(error="page must be an integer"), 400
+        if page < 1:
+            return jsonify(error="page must be one or greater"), 400
+        status = request.args.get("status", "all").strip().lower()
+        query = request.args.get("q", "").strip()
+        try:
+            result = _folder_queue_page(app, page=page, query=query, status=status)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(result)
+
+    @app.get("/api/library-import/folders/albums")
+    def library_import_folder_albums():
+        try:
+            scope = _validated_folder_scope(app, request.args.get("folder", ""))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        # Expansion is the bounded reconciliation boundary for a folder-first
+        # page load. Stat-identical scopes stop before tag/provider work.
+        reconciliation = _scan_folder_scopes(app, [scope])
+        folder_error = next((error for error in reconciliation["errors"] if error.get("folder") == scope), None)
+        if folder_error:
+            return jsonify(error=folder_error["error"],
+                           code="folder_reconciliation_failed"), 409
+        album_ids = _album_ids_for_scopes(app, [scope], include_complete=False)
+        items = _library_import_review_items(app, album_ids)
+        albums = _album_review_payloads(app, album_ids)
+        return jsonify(folder=scope, items=items,
+                       albums=[_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in albums],
+                       reconciliation=reconciliation["folders"][0])
+
+    @app.post("/api/library-import/folders/scan")
+    def scan_library_import_folders():
+        try:
+            scopes = _request_folder_scopes(app)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        result = _scan_folder_scopes(app, scopes)
+        return jsonify(result), (207 if result["errors"] else 201)
+
+    @app.post("/api/library-import/bulk/preview")
+    def preview_ready_library_imports():
+        values = request.get_json(silent=True)
+        try:
+            scopes = _request_folder_scopes(app, values)
+            if values.get("mode") == "selected" and not values.get("album_ids"):
+                raise ValueError("Import selected requires explicit album_ids")
+            album_ids = _request_selected_album_ids(values, _album_ids_for_scopes(app, scopes, include_complete=False))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(_bulk_selected_library_summary(app, scopes, album_ids) if values.get("mode") == "selected"
+                       else _bulk_ready_summary(app, scopes, album_ids=album_ids))
+
+    @app.post("/api/library-import/bulk/exceptions")
+    def selected_library_import_exceptions():
+        values = request.get_json(silent=True)
+        try:
+            scopes = _request_folder_scopes(app, values)
+            if values.get("mode") == "selected" and not values.get("album_ids"):
+                raise ValueError("Import selected requires explicit album_ids")
+            album_ids = _request_selected_album_ids(values, _album_ids_for_scopes(app, scopes, include_complete=False))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(app, album_ids)]
+        return jsonify(albums=[album for album in albums if not album["ready"]])
+
+    @app.post("/api/library-import/bulk/execute")
+    def execute_ready_library_imports():
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or values.get("confirmed") is not True:
+            return jsonify(error="explicit confirmation is required", code="confirmation_required"), 400
+        try:
+            scopes = _request_folder_scopes(app, values)
+            if values.get("mode") == "selected" and not values.get("album_ids"):
+                raise ValueError("Import selected requires explicit album_ids")
+            album_ids = _request_selected_album_ids(values, _album_ids_for_scopes(app, scopes, include_complete=False))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        result = (_execute_bulk_selected_library(app, scopes, album_ids) if values.get("mode") == "selected"
+                  else _execute_bulk_ready(app, scopes, album_ids=album_ids))
+        return jsonify(result), (207 if result["failed"] else 201)
+
+    @app.post("/api/library-import/candidates")
+    def generate_library_import_candidates():
+        _sync_album_reviews(app)
+        values = request.get_json(silent=True) or {}
+        try:
+            limit = int(values.get("limit", MAX_CANDIDATE_ALBUMS))
+        except (TypeError, ValueError):
+            return jsonify(error="limit must be an integer"), 400
+        if not 1 <= limit <= MAX_CANDIDATE_ALBUMS:
+            return jsonify(error=f"limit must be between 1 and {MAX_CANDIDATE_ALBUMS}"), 400
+        album_id = values.get("album_id")
+        if album_id is not None and (not isinstance(album_id, int) or isinstance(album_id, bool)):
+            return jsonify(error="album_id must be an integer", code="invalid_request"), 400
+        if set(values) - {"limit", "album_id", "reuse_current"}:
+            return jsonify(error="request may contain only limit, album_id and reuse_current", code="invalid_request"), 400
+        if "reuse_current" in values and (not isinstance(values["reuse_current"], bool) or album_id is None):
+            return jsonify(error="reuse_current requires boolean value and album_id", code="invalid_request"), 400
+        if album_id is not None:
+            try:
+                _refresh_review_inventory(app, album_id)
+            except ValueError as exc:
+                return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+        if values.get("reuse_current") is True and _has_current_match(app, album_id):
+            match_diagnostics.emit("matching.reused", source="library", review_id=album_id, operation="saved-evidence")
+            result = {"id": None, "albums": 1, "candidates": 0, "errors": [], "already_matched": True}
+        else:
+            result = _generate_musicbrainz_candidates(
+                app, limit, album_ids=[album_id] if album_id is not None else None,
+            )
+        if album_id is not None:
+            result["album"] = next(iter(_album_review_payloads(app, [album_id])), None)
+        return jsonify(result), (207 if result["errors"] else 201)
+
+    @app.patch("/api/library-import/albums/<int:album_review_id>")
+    def update_library_import_album_review(album_review_id: int):
+        values = request.get_json(silent=True) or {}
+        try:
+            item = _update_album_review(app, album_review_id, values)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        if item is None:
+            abort(404)
+        return jsonify(item)
+
+    @app.get("/api/library-import/albums/<int:album_review_id>")
+    def library_import_album_review(album_review_id: int):
+        item = next(iter(_album_review_payloads(app, [album_review_id])), None)
+        if item is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        return jsonify(_with_readiness(item, app.config["MATCH_THRESHOLD"]))
+
+    @app.post("/api/library-import/albums/<int:album_review_id>/rematch")
+    def rematch_library_import_album(album_review_id: int):
+        values = request.get_json(silent=True)
+        if not isinstance(values, dict) or set(values) != {"musicbrainz_id"}:
+            return jsonify(error="request must contain only musicbrainz_id", code="invalid_request"), 400
+        musicbrainz_id = values.get("musicbrainz_id")
+        if not isinstance(musicbrainz_id, str) or not MUSICBRAINZ_ID_PATTERN.fullmatch(musicbrainz_id):
+            return jsonify(
+                error="Enter a canonical MusicBrainz release or release-group UUID (for example, 123e4567-e89b-42d3-a456-426614174000).",
+                code="invalid_musicbrainz_id",
+            ), 400
+        try:
+            item = _rematch_album_by_musicbrainz_id(app, album_review_id, musicbrainz_id.lower())
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
+        except ProviderError as exc:
+            status = 404 if exc.code == "musicbrainz_id_not_found" else (503 if exc.retryable else 502)
+            payload = {"error": str(exc), "code": exc.code, "retryable": exc.retryable}
+            if exc.upstream_status is not None:
+                payload["upstream_status"] = exc.upstream_status
+            return jsonify(payload), status
+        except (OSError, ValueError, TypeError) as exc:
+            return jsonify(error=str(exc) or "candidate provider failed", code="provider_error", retryable=False), 502
+        if item is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        return jsonify(item)
+
+    @app.post("/api/library-import/albums/<int:album_review_id>/execute")
+    def execute_library_import_album(album_review_id: int):
+        values = request.get_json(silent=True)
+        if values is None:
+            values = {}
+        if (not isinstance(values, dict) or set(values) - {"dry_run", "candidate_id", "duplicate_action", "skip_artwork"}
+                or any(not isinstance(values.get(key, False), bool) for key in ("dry_run", "skip_artwork"))):
+            return jsonify(
+                error="request may contain only boolean dry_run/skip_artwork, candidate_id, and duplicate_action",
+                code="invalid_request",
+            ), 400
+        if "duplicate_action" in values and "candidate_id" not in values:
+            return jsonify(error="duplicate_action requires candidate_id", code="invalid_request"), 400
+        if "candidate_id" in values:
+            root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+            with _connect(app.config["APP_DB"]) as db:
+                existing = db.execute(
+                    "SELECT execution_status FROM album_reviews WHERE id = ? AND root_path = ?",
+                    (album_review_id, root),
+                ).fetchone()
+            if existing is None:
+                return jsonify(error="Album review not found", code="album_review_not_found"), 404
+            # Preserve execution idempotency if a client retries after losing the
+            # successful response; selection persistence must not reset completion.
+            if existing["execution_status"] == "complete":
+                result = _execute_library_import_album(
+                    app, album_review_id, dry_run=values.get("dry_run", False),
+                    skip_artwork=values.get("skip_artwork", False),
+                )
+                return jsonify(result), 200
+            selection = {"decision": "approved", "candidate_id": values["candidate_id"]}
+            if "duplicate_action" in values:
+                selection["duplicate_action"] = values["duplicate_action"]
+            try:
+                item = _update_album_review(app, album_review_id, selection, serialize=False)
+            except ValueError as exc:
+                return jsonify(error=str(exc), code="invalid_request"), 400
+            if item is None:
+                return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        try:
+            result = _execute_library_import_album(
+                app, album_review_id, dry_run=values.get("dry_run", False),
+                skip_artwork=values.get("skip_artwork", False),
+            )
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code, job_id=exc.job_id), exc.status
+        if result is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        return jsonify(result), (201 if result["status"] == "complete" and not result.get("already_complete") else 200)
+
+    @app.post("/api/library-import/albums/<int:album_review_id>/preview")
+    def preview_library_import_album(album_review_id: int):
+        """Save a match-screen selection and preview the existing in-place execution."""
+        values = request.get_json(silent=True)
+        if (not isinstance(values, dict) or "candidate_id" not in values
+                or set(values) - {"candidate_id", "duplicate_action"}):
+            return jsonify(
+                error="request must contain candidate_id and may contain duplicate_action",
+                code="invalid_request",
+            ), 400
+        root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+        with _connect(app.config["APP_DB"]) as db:
+            existing = db.execute(
+                "SELECT execution_status FROM album_reviews WHERE id = ? AND root_path = ?",
+                (album_review_id, root),
+            ).fetchone()
+        if existing is None:
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        if existing["execution_status"] == "complete":
+            result = _execute_library_import_album(app, album_review_id, dry_run=False)
+            return jsonify(result)
+        selection = {"decision": "approved", "candidate_id": values["candidate_id"]}
+        if "duplicate_action" in values:
+            selection["duplicate_action"] = values["duplicate_action"]
+        try:
+            item = _update_album_review(app, album_review_id, selection)
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        if item is None:  # The row can only disappear if storage changed between the two transactions.
+            return jsonify(error="Album review not found", code="album_review_not_found"), 404
+        try:
+            result = _execute_library_import_album(app, album_review_id, dry_run=True)
+        except LibraryImportExecutionError as exc:
+            return jsonify(error=str(exc), code=exc.code, job_id=exc.job_id), exc.status
+        return jsonify(result)
+
+    @app.patch("/api/library-import/reviews/<int:inventory_id>")
+    def update_library_import_review(inventory_id: int):
+        values = request.get_json(silent=True) or {}
+        decision = values.get("decision")
+        if decision not in LIBRARY_IMPORT_DECISIONS:
+            return jsonify(error="decision must be approved, rejected, or skipped"), 400
+        root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+        with _connect(app.config["APP_DB"]) as db:
+            row = db.execute(
+                """SELECT reviews.inventory_id
+                     FROM adoption_reviews AS reviews
+                     JOIN library_inventory AS inventory ON inventory.id = reviews.inventory_id
+                    WHERE reviews.inventory_id = ? AND inventory.root_path = ? AND inventory.present = 1""",
+                (inventory_id, root),
+            ).fetchone()
+            if row is None:
+                abort(404)
+            db.execute(
+                "UPDATE adoption_reviews SET state = ?, updated_at = ? WHERE inventory_id = ?",
+                (decision, _now(), inventory_id),
+            )
+        return jsonify(_library_import_review_item(app, inventory_id))
+
+    @app.post("/api/imports/preview")
+    def preview_import():
+        relative = _request_value("path")
+        inbox = _request_inbox(app)
+        root = Path(inbox["path"]).resolve()
+        source = _safe_inbox_path(app, inbox["id"], relative)
+        files = _inbox_audio_files(source, root)
+        if not files:
+            abort(400, "selection contains no supported audio files")
+        file_names = [str(p.relative_to(root)) for p in files]
+        snapshot = [_file_snapshot(path, root) for path in files]
+        with _connect(app.config["APP_DB"]) as db:
+            cursor = db.execute(
+                """INSERT INTO import_jobs(source, files_json, status, created_at, inbox_id, inbox_root)
+                   VALUES (?, ?, 'review', ?, ?, ?)""",
+                (relative, json.dumps(snapshot), _now(), inbox["id"], str(root)),
+            )
+            job_id = cursor.lastrowid
+        return jsonify(id=job_id, source=relative, files=file_names, status="review",
+                       inbox_id=inbox["id"], inbox_name=inbox["name"]), 201
+
+    @app.post("/api/imports/<int:job_id>/execute")
+    def execute_import(job_id: int):
+        with _connect(app.config["APP_DB"]) as db:
+            job = db.execute("SELECT * FROM import_jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                abort(404)
+            if job["status"] != "review":
+                abort(409, "job has already been executed")
+            inbox = _job_inbox(app, job)
+            root = Path(inbox["path"]).resolve()
+            if job["inbox_root"] and str(root) != job["inbox_root"]:
+                abort(409, "the selected inbox changed after preview; create a new preview")
+            source = _safe_inbox_path(app, inbox["id"], job["source"])
+            expected = json.loads(job["files_json"])
+            current_files = _inbox_audio_files(source, root)
+            current = ([_file_snapshot(path, root) for path in current_files]
+                       if expected and isinstance(expected[0], dict)
+                       else [str(path.relative_to(root)) for path in current_files])
+            if current != expected:
+                abort(409, "inbox contents changed; create a new preview")
+            reviewed_paths = db.execute(
+                """SELECT inventory.relative_path
+                     FROM album_review_tracks AS tracks
+                     JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                     JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                    WHERE albums.source_kind='inbox' AND albums.source_id=? AND albums.root_path=?
+                      AND inventory.present=1""",
+                (inbox["id"], str(root)),
+            ).fetchall()
+            selected_paths = {path.relative_to(root).as_posix() for path in current_files}
+            if any(row["relative_path"] in selected_paths for row in reviewed_paths):
+                abort(409, "this Inbox album requires an approved review; use the reviewed album API")
+            return jsonify(error="Refresh Inbox and use its selected copy imports.", code="reviewed_copy_import_required"), 409
+
+    @app.patch("/api/items/<int:item_id>")
+    @app.post("/api/items/<int:item_id>")
+    def edit_item(item_id: int):
+        values = request.get_json(silent=True) or request.form.to_dict()
+        unknown = set(values) - EDITABLE_FIELDS
+        if unknown:
+            abort(400, f"unsupported fields: {', '.join(sorted(unknown))}")
+        library = _library(app)
+        item = library.get_item(item_id)
+        if item is None:
+            abort(404)
+        try:
+            normalized = _validated_edit_fields(values, EDITABLE_FIELDS)
+            _mutate_managed_items([(item, normalized)])
+        except ValueError as exc:
+            abort(400, str(exc))
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if request.is_json:
+            return jsonify(_serialize_item(item))
+        flash("Metadata and file tags updated.")
+        return redirect(url_for("library_page"))
+
+    @app.post("/api/navidrome/rescan")
+    def navidrome_rescan():
+        target = app.config["NAVIDROME_RESCAN_URL"]
+        if not target:
+            abort(503, "NAVIDROME_RESCAN_URL is not configured")
+        headers = {"Accept": "application/json"}
+        if app.config["NAVIDROME_TOKEN"]:
+            headers["Authorization"] = f"Bearer {app.config['NAVIDROME_TOKEN']}"
+        upstream = urllib.request.Request(target, data=b"", headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(upstream, timeout=15) as response:
+                body = response.read(4096).decode("utf-8", "replace")
+                return jsonify(status="requested", upstream_status=response.status, response=body)
+        except urllib.error.URLError as exc:
+            return jsonify(status="failed", error=str(exc)), 502
+
+    # The supported single-worker server serializes mutating HTTP requests so
+    # removal cannot race imports, metadata/artwork edits or root changes.
+    mutation_lock = threading.RLock()
+
+    @app.before_request
+    def serialize_mutations():
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            mutation_lock.acquire()
+            g.library_mutation_locked = True
+
+    @app.teardown_request
+    def release_mutation_lock(_error):
+        if g.pop("library_mutation_locked", False):
+            mutation_lock.release()
+
+    from .removal import register_routes
+    register_routes(app)
+    from .inbox_imports import register_routes as register_inbox_import_routes
+    register_inbox_import_routes(app)
+    from .analytics import Beacon
+    app.extensions["beacon"] = Beacon(app)
+    if not app.testing:
+        app.extensions["beacon"].start()
+    return app
+
+
+def _load_or_create_secret_key(path: Path) -> str:
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        key = ""
+    if key:
+        return key
+    key = secrets.token_urlsafe(48)
+    try:
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(key + "\n")
+    except FileExistsError:
+        return path.read_text(encoding="utf-8").strip()
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return key
+
+
+def _write_beets_config(app: Flask, content: str | None = None) -> None:
+    path = Path(app.config["BEETS_CONFIG"])
+    if path.exists() and content is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if content is None:
+        content = _build_beets_config(app, {}, "", False)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _beets_config_document(content: str) -> dict:
+    if len(content.encode("utf-8")) > MAX_BEETS_CONFIG_BYTES:
+        raise ValueError("Beets configuration must be smaller than 128 KB.")
+    try:
+        document = yaml.safe_load(content) if content.strip() else {}
+    except yaml.YAMLError as exc:
+        detail = str(exc).splitlines()[0]
+        raise ValueError(f"Beets configuration is not valid YAML: {detail}") from exc
+    if not isinstance(document, dict):
+        raise ValueError("Beets configuration must be a YAML mapping.")
+    return document
+
+
+def _plugin_names(document: dict) -> list[str]:
+    plugins = document.get("plugins", [])
+    if isinstance(plugins, str):
+        plugins = plugins.split()
+    if plugins is None:
+        plugins = []
+    if not isinstance(plugins, list) or any(not isinstance(plugin, str) for plugin in plugins):
+        raise ValueError("The beets plugins setting must be a list or space-separated string.")
+    return list(dict.fromkeys(plugins))
+
+
+def _ftintitle_settings(content: str) -> dict:
+    values = dict(FTINTITLE_DEFAULTS)
+    try:
+        document = _beets_config_document(content)
+        plugins = _plugin_names(document)
+    except ValueError:
+        return values
+    values["enabled"] = "ftintitle" in plugins
+    values["projection_requires_recheck"] = values["enabled"] or "ftintitle" in document
+    try:
+        section = _validated_ftintitle_section(document)
+        if isinstance(section.get("format"), str):
+            values["format"] = section["format"]
+        for key in ("keep_in_artist", "preserve_album_artist", "drop", "auto"):
+            if isinstance(section.get(key), bool):
+                values[key] = section[key]
+        values["custom_words"] = _validated_string_list(section, "custom_words", [])
+        values["bracket_keywords"] = _validated_string_list(
+            section, "bracket_keywords", list(DEFAULT_BRACKET_KEYWORDS)
+        )
+    except ValueError:
+        # Keep plugin activation truthful so the first-class controls can fix
+        # a malformed advanced section on the next save.
+        return values
+    return values
+
+
+def _validated_ftintitle_section(document: dict) -> dict:
+    section = document.get("ftintitle")
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError("The ftintitle section must be a YAML mapping.")
+    _validated_string_list(section, "custom_words", [])
+    _validated_string_list(section, "bracket_keywords", list(DEFAULT_BRACKET_KEYWORDS))
+    return section
+
+
+def _validated_string_list(section: dict, key: str, default: list[str]) -> list[str]:
+    value = section.get(key, default)
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"The ftintitle {key} setting must be a list of non-empty strings.")
+    return [item.strip() for item in value]
+
+
+def _validate_ftintitle_settings(values: dict) -> None:
+    if not values.get("enabled"):
+        return
+    feat_format = values.get("format")
+    if not isinstance(feat_format, str) or not feat_format.strip():
+        raise ValueError("FtInTitle format must include a valid guest placeholder.")
+    guest = "CratekeepFeaturedArtist"
+    try:
+        rendered = feat_format.format(guest)
+    except (AttributeError, IndexError, KeyError, ValueError) as exc:
+        raise ValueError("FtInTitle format must format one guest using {} or {0}.") from exc
+    if guest not in rendered:
+        raise ValueError("FtInTitle format must include the guest using {} or {0}.")
+
+
+def _build_beets_config(
+    app: Flask, settings: dict[str, str], content: str, fetch_art: bool, ftintitle: dict | None = None
+) -> str:
+    document = _beets_config_document(content)
+    if "paths" not in document:
+        document["paths"] = dict(DEFAULT_BEETS_PATHS)
+    elif not isinstance(document["paths"], dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in document["paths"].items()
+    ):
+        raise ValueError("The beets paths section must map path-query names to format strings.")
+
+    import_config = document.get("import", {})
+    if import_config is None:
+        import_config = {}
+    if not isinstance(import_config, dict):
+        raise ValueError("The beets import section must be a YAML mapping.")
+    import_config.update(move=True, write=True, autotag=False, resume=False)
+
+    plugins = [plugin for plugin in _plugin_names(document) if plugin != "fetchart"]
+    section = _validated_ftintitle_section(document)
+    if ftintitle is not None:
+        _validate_ftintitle_settings(ftintitle)
+        plugins = [plugin for plugin in plugins if plugin != "ftintitle"]
+        if ftintitle.get("enabled"):
+            plugins.append("ftintitle")
+            section.update(
+                auto=True,
+                drop=False,
+                format=ftintitle["format"].strip(),
+                keep_in_artist=bool(ftintitle.get("keep_in_artist")),
+                preserve_album_artist=True,
+            )
+            document["ftintitle"] = section
+    if fetch_art:
+        plugins.append("fetchart")
+
+    library_path = settings.get("library_path") or app.config.get("LIBRARY_PATH", "")
+    document["directory"] = str(Path(library_path).expanduser().resolve())
+    document["library"] = str(Path(app.config["BEETS_DB"]).resolve())
+    document["import"] = import_config
+    document["plugins"] = plugins
+    rendered = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+    lines = rendered.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("directory:"):
+            lines[index] = f"directory: {json.dumps(document['directory'])}"
+        elif line.startswith("library:"):
+            lines[index] = f"library: {json.dumps(document['library'])}"
+    return "\n".join(lines) + "\n"
+
+
+def _init_db(path: str) -> None:
+    with _connect(path) as db:
+        from .inbox_imports import init_schema
+        init_schema(db)
+        db.execute("""CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS import_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS adoption_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS library_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            device INTEGER NOT NULL,
+            inode INTEGER NOT NULL,
+            beets_item_id INTEGER,
+            present INTEGER NOT NULL DEFAULT 1,
+            first_seen_job_id INTEGER NOT NULL REFERENCES adoption_jobs(id),
+            last_seen_job_id INTEGER NOT NULL REFERENCES adoption_jobs(id),
+            UNIQUE(root_path, relative_path)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS adoption_reviews (
+            inventory_id INTEGER PRIMARY KEY REFERENCES library_inventory(id),
+            state TEXT NOT NULL DEFAULT 'pending',
+            candidates_json TEXT NOT NULL DEFAULT '[]',
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS album_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path TEXT NOT NULL,
+            artist_key TEXT NOT NULL,
+            album_key TEXT NOT NULL,
+            artist TEXT NOT NULL,
+            album TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            selected_candidate_id INTEGER,
+            candidate_status TEXT NOT NULL DEFAULT 'not-run',
+            candidate_error TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            UNIQUE(root_path, artist_key, album_key)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS album_review_tracks (
+            album_review_id INTEGER NOT NULL REFERENCES album_reviews(id) ON DELETE CASCADE,
+            inventory_id INTEGER NOT NULL REFERENCES library_inventory(id) ON DELETE CASCADE,
+            exception_state TEXT,
+            PRIMARY KEY(album_review_id, inventory_id),
+            UNIQUE(inventory_id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS metadata_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            album_review_id INTEGER NOT NULL REFERENCES album_reviews(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            artist TEXT NOT NULL,
+            album TEXT NOT NULL,
+            year TEXT,
+            proposed_diff_json TEXT NOT NULL,
+            provider_data_json TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 2,
+            created_at TEXT NOT NULL,
+            UNIQUE(album_review_id, provider, provider_id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS managed_album_rematches (
+            id TEXT PRIMARY KEY,
+            album_id INTEGER NOT NULL,
+            release_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            evidence_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_json TEXT,
+            created_at TEXT NOT NULL,
+            applied_at TEXT
+        )""")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending_managed_album_rematch
+                       ON managed_album_rematches(album_id) WHERE status = 'pending'""")
+        _ensure_column(db, "album_reviews", "execution_status", "TEXT NOT NULL DEFAULT 'not-run'")
+        _ensure_column(db, "album_reviews", "execution_error", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "album_reviews", "last_execution_job_id", "INTEGER")
+        _ensure_column(db, "album_reviews", "executed_at", "TEXT")
+        _ensure_column(db, "album_reviews", "duplicate_action", "TEXT")
+        _ensure_column(db, "library_inventory", "source_kind", "TEXT NOT NULL DEFAULT 'library'")
+        _ensure_column(db, "library_inventory", "source_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "album_reviews", "source_kind", "TEXT NOT NULL DEFAULT 'library'")
+        _ensure_column(db, "album_reviews", "source_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "metadata_candidates", "schema_version", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(db, "adoption_reviews", "imported_at", "TEXT")
+        _ensure_column(db, "import_jobs", "inbox_id", "TEXT")
+        _ensure_column(db, "import_jobs", "inbox_root", "TEXT")
+        # Older candidate evidence remains visible for audit and keeps all
+        # review decisions, but is queued ahead of complete rows for a bounded
+        # refresh after evidence or presentation rules change.
+        db.execute(
+            """UPDATE album_reviews
+                  SET candidate_status = 'stale',
+                      candidate_error = 'Candidate evidence predates the current schema; refresh candidates.'
+                WHERE execution_status != 'complete'
+                  AND candidate_status = 'complete'
+                  AND EXISTS (
+                      SELECT 1 FROM metadata_candidates
+                       WHERE album_review_id = album_reviews.id AND schema_version < ?
+                  )""",
+            (MIN_SUPPORTED_CANDIDATE_SCHEMA_VERSION,),
+        )
+        db.execute(
+            """UPDATE adoption_reviews
+                  SET imported_at = COALESCE((
+                        SELECT albums.executed_at
+                          FROM album_review_tracks AS tracks
+                          JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                         WHERE tracks.inventory_id = adoption_reviews.inventory_id
+                           AND albums.execution_status = 'complete'
+                         LIMIT 1
+                      ), updated_at)
+                WHERE imported_at IS NULL
+                  AND EXISTS (
+                        SELECT 1
+                          FROM album_review_tracks AS tracks
+                          JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                         WHERE tracks.inventory_id = adoption_reviews.inventory_id
+                           AND albums.execution_status = 'complete'
+                      )"""
+        )
+
+
+def _ensure_column(db: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def _load_settings(path: str) -> dict[str, str]:
+    with _connect(path) as db:
+        rows = db.execute("SELECT key, value FROM app_settings").fetchall()
+        settings = {row["key"]: row["value"] for row in rows if row["key"] in SETTING_KEYS}
+        if not _valid_settings_inboxes(settings) and settings.get("inbox_path"):
+            inbox_id = uuid.uuid4().hex
+            inbox_root = str(Path(settings["inbox_path"]).expanduser().resolve())
+            settings["inboxes_json"] = json.dumps([{
+                "id": inbox_id, "name": "Inbox", "path": inbox_root,
+            }])
+            db.execute(
+                """INSERT INTO app_settings(key, value) VALUES ('inboxes_json', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (settings["inboxes_json"],),
+            )
+            db.execute(
+                """UPDATE import_jobs SET inbox_id = ?, inbox_root = ?
+                    WHERE status = 'review' AND inbox_id IS NULL AND inbox_root IS NULL""",
+                (inbox_id, inbox_root),
+            )
+        # The former setting was global. Preserve an opted-in installation by
+        # applying it to every inbox that existed at migration time. A missing
+        # or disabled global value maps to false, and newly-added inboxes are
+        # always disabled until their own row is explicitly enabled.
+        inboxes = _settings_inboxes(settings)
+        if inboxes and any("auto_match" not in inbox for inbox in inboxes):
+            legacy_enabled = settings.get("inbox_auto_match") == "1"
+            inboxes = [{**inbox, "auto_match": legacy_enabled} for inbox in inboxes]
+            settings["inboxes_json"] = json.dumps(inboxes)
+            db.execute(
+                """INSERT INTO app_settings(key, value) VALUES ('inboxes_json', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (settings["inboxes_json"],),
+            )
+    # Existing installations that opted into fetching retain beets' historical
+    # cover.jpg behavior. Embedding and replacement always require a new opt-in.
+    if settings.get("fetch_art") == "1" and "art_sidecar" not in settings:
+        settings["art_sidecar"] = "1"
+    return settings
+
+
+def _stale_changed_inbox_roots(
+    db: sqlite3.Connection, current: dict[str, str], inboxes: list[dict[str, str]]
+) -> None:
+    """Invalidate review identity when a stable Inbox ID stops naming its root."""
+    previous = {inbox["id"]: inbox for inbox in _settings_inboxes(current)}
+    submitted = {inbox["id"]: inbox for inbox in inboxes if inbox.get("id")}
+    changed = [
+        (source_id, str(Path(inbox["path"]).expanduser().resolve()))
+        for source_id, inbox in previous.items()
+        if source_id not in submitted
+        or str(Path(submitted[source_id]["path"]).expanduser().resolve())
+        != str(Path(inbox["path"]).expanduser().resolve())
+    ]
+    if not changed:
+        return
+    for source_id, root in changed:
+        album_ids = [
+            row["id"]
+            for row in db.execute(
+                """SELECT id FROM album_reviews WHERE source_kind='inbox' AND source_id=?
+                     AND root_path=? AND execution_status!='complete'""",
+                (source_id, root),
+            )
+        ]
+        if album_ids:
+            placeholders = ",".join("?" for _ in album_ids)
+            db.execute(f"DELETE FROM metadata_candidates WHERE album_review_id IN ({placeholders})", album_ids)
+            db.execute(
+                f"""UPDATE album_reviews SET state='pending', selected_candidate_id=NULL,
+                           candidate_status='stale', candidate_error='Inbox root changed or was removed.',
+                           execution_status='not-run', execution_error='', last_execution_job_id=NULL,
+                           executed_at=NULL, updated_at=? WHERE id IN ({placeholders})""",
+                (_now(), *album_ids),
+            )
+        db.execute(
+            "UPDATE library_inventory SET present=0 WHERE source_kind='inbox' AND source_id=? AND root_path=?",
+            (source_id, root),
+        )
+
+
+def _save_settings_and_stale_roots(
+    app: Flask, current: dict[str, str], inboxes: list[dict[str, str]], settings: dict[str, str],
+    *, db: sqlite3.Connection | None = None,
+) -> None:
+    """Commit settings and review invalidation in one SQLite transaction."""
+    def save(connection: sqlite3.Connection) -> None:
+        _stale_changed_inbox_roots(connection, current, inboxes)
+        connection.executemany(
+            "INSERT INTO app_settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [(key, settings.get(key, "")) for key in SETTING_KEYS],
+        )
+    if db is not None:
+        save(db)
+    else:
+        with _connect(app.config["APP_DB"]) as connection:
+            save(connection)
+
+
+def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
+    inboxes = _valid_settings_inboxes(settings)
+    app.config.update(
+        INBOXES=inboxes,
+        INBOX_PATH=inboxes[0]["path"] if inboxes else settings.get("inbox_path", ""),
+        LIBRARY_PATH=settings.get("library_path", ""),
+        NAVIDROME_RESCAN_URL=settings.get("navidrome_rescan_url", ""),
+        NAVIDROME_TOKEN=settings.get("navidrome_token", ""),
+        FETCH_ART=settings.get("fetch_art", "") == "1",
+        ART_SIDECAR=settings.get("art_sidecar", "") == "1",
+        ART_EMBED=settings.get("art_embed", "") == "1",
+        ART_REPLACE=settings.get("art_replace", "") == "1",
+        INBOX_AUTO_MATCH=any(inbox.get("auto_match", False) for inbox in inboxes),
+        MATCH_THRESHOLD=_match_threshold(settings),
+        TOAST_DURATION_SECONDS=_toast_duration(settings),
+    )
+    app.config["SETUP_COMPLETE"] = bool(inboxes and app.config["LIBRARY_PATH"])
+    app.config["LIBRARY_ROOT_ERROR"] = (
+        "Library root must not be a symlink or filesystem alias. Restore the configured directory or update Settings."
+        if app.config["LIBRARY_PATH"] and Path(app.config["LIBRARY_PATH"]).expanduser().is_symlink()
+        else ""
+    )
+    if app.config["SETUP_COMPLETE"]:
+        paths = [inbox["path"] for inbox in inboxes]
+        if not app.config["LIBRARY_ROOT_ERROR"]:
+            paths.append(app.config["LIBRARY_PATH"])
+        for path in paths:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        _write_beets_config(app)
+        app.config["FTINTITLE"] = _ftintitle_settings(
+            Path(app.config["BEETS_CONFIG"]).read_text(encoding="utf-8")
+        )
+        # The beets config object is process-global. Clear a prior app/test
+        # before loading this installation's persisted default or custom path
+        # formats rather than retaining stale formats from another app.
+        beets_config.clear()
+        beets_config.set_file(app.config["BEETS_CONFIG"])
+        beets_config.read(user=False, defaults=True)
+
+
+def _validated_library_root(app: Flask) -> Path:
+    configured = Path(app.config["LIBRARY_PATH"]).expanduser()
+    if configured.is_symlink():
+        raise ValueError(
+            "Library root must not be a symlink or filesystem alias. Restore it or choose a safe directory in Settings."
+        )
+    try:
+        root = configured.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"Library root is unavailable: {exc}") from exc
+    if not root.is_dir():
+        raise ValueError("Library root must be a directory.")
+    return root
+
+
+def _match_threshold(settings: dict[str, str]) -> int:
+    try:
+        value = int(settings.get("match_threshold", DEFAULT_MATCH_THRESHOLD))
+    except (TypeError, ValueError):
+        return DEFAULT_MATCH_THRESHOLD
+    return value if 1 <= value <= 100 else DEFAULT_MATCH_THRESHOLD
+
+
+def _toast_duration(settings: dict[str, str]) -> int:
+    try:
+        value = int(settings.get("toast_duration_seconds", 5))
+    except (TypeError, ValueError):
+        return 5
+    return value if 1 <= value <= 300 else 5
+
+
+def _render_ui(app: Flask, page: str, title: str, data: dict):
+    return render_template(
+        "app.html",
+        title=title,
+        bootstrap={
+            "page": page,
+            "buildSha": app.config["BUILD_SHA"],
+            "threshold": app.config.get("MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD),
+            "toastDurationSeconds": app.config.get("TOAST_DURATION_SECONDS", 5),
+            "data": data,
+        },
+    )
+
+
+def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "general", page: str = "settings"):
+    current = _load_settings(app.config["APP_DB"])
+    config_path = Path(app.config["BEETS_CONFIG"])
+    config_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    ftintitle = _ftintitle_settings(config_text)
+    if request.method == "POST":
+        inboxes = _submitted_inboxes(request.form, current)
+        library_path = request.form.get("library_path", "").strip()
+        rescan_url = request.form.get("navidrome_rescan_url", current.get("navidrome_rescan_url", "")).strip()
+        errors = []
+        existing_ids = {row["id"] for row in _settings_inboxes(current)}
+        submitted_ids = [row["id"] for row in inboxes if row["id"]]
+        if any(inbox_id not in existing_ids for inbox_id in submitted_ids):
+            errors.append("Inbox IDs are managed by Cratekeep; reload Settings and try again.")
+        if len(submitted_ids) != len(set(submitted_ids)):
+            errors.append("Each existing inbox may appear only once.")
+        if not inboxes:
+            errors.append("At least one inbox is required.")
+        if not library_path:
+            errors.append("Library path is required.")
+        elif Path(library_path).expanduser().is_symlink():
+            errors.append("Library path must not be a symlink or filesystem alias.")
+        names = set()
+        paths = set()
+        roots = _browse_roots(app)
+        for index, inbox in enumerate(inboxes, 1):
+            if not inbox["name"]:
+                errors.append(f"Inbox {index} name is required.")
+            elif inbox["name"].casefold() in names:
+                errors.append("Inbox names must be unique (ignoring case).")
+            names.add(inbox["name"].casefold())
+            if not inbox["path"]:
+                errors.append(f"Inbox {index} path is required.")
+                continue
+            if Path(inbox["path"]).expanduser().is_symlink():
+                errors.append(f"Inbox {index} path must not be a symlink or filesystem alias.")
+            resolved = str(Path(inbox["path"]).expanduser().resolve())
+            inbox["path"] = resolved
+            if resolved in paths:
+                errors.append("Inbox paths must be unique.")
+            paths.add(resolved)
+        resolved_library = str(Path(library_path).expanduser().resolve()) if library_path else ""
+        configured_roots = [(inbox["name"] or f"Inbox {index}", Path(inbox["path"]))
+                            for index, inbox in enumerate(inboxes, 1) if inbox["path"]]
+        if resolved_library:
+            library_root = Path(resolved_library)
+            for label, inbox_root in configured_roots:
+                if (inbox_root == library_root or inbox_root in library_root.parents
+                        or library_root in inbox_root.parents):
+                    errors.append(
+                        f"{label} and Library paths must not be equal or contain one another; "
+                        "choose separate, non-overlapping roots."
+                    )
+        for position, (label, root) in enumerate(configured_roots):
+            for other_label, other_root in configured_roots[position + 1:]:
+                if root == other_root or root in other_root.parents or other_root in root.parents:
+                    errors.append(
+                        f"{label} and {other_label} paths overlap; choose separate, non-nested inbox roots."
+                    )
+        for label, value in [(inbox["name"] or f"Inbox {index}", inbox["path"])
+                             for index, inbox in enumerate(inboxes, 1)] + [("Library", library_path)]:
+            if value:
+                candidate = Path(value).expanduser().resolve()
+                if not any(candidate == root or root in candidate.parents for root in roots):
+                    errors.append(f"{label} path must be inside a mounted directory shown by Browse.")
+        parsed_rescan_url = urllib.parse.urlparse(rescan_url)
+        if rescan_url and (parsed_rescan_url.scheme not in {"http", "https"} or not parsed_rescan_url.netloc):
+            errors.append("Navidrome rescan URL must be a complete http or https URL.")
+
+        threshold_text = request.form.get("match_threshold", str(_match_threshold(current))).strip()
+        try:
+            threshold = int(threshold_text)
+            if not 1 <= threshold <= 100:
+                raise ValueError
+        except ValueError:
+            threshold = _match_threshold(current)
+            errors.append("Match threshold must be a whole number from 1 to 100.")
+
+        try:
+            toast_duration = int(request.form.get("toast_duration_seconds", str(_toast_duration(current))))
+            if not 1 <= toast_duration <= 300:
+                raise ValueError
+        except ValueError:
+            toast_duration = _toast_duration(current)
+            errors.append("Toast duration must be a whole number from 1 to 300 seconds.")
+
+        token = request.form.get("navidrome_token", "")
+        if not token and current.get("navidrome_token") and not request.form.get("clear_navidrome_token"):
+            token = current["navidrome_token"]
+        enabled_inbox_ids = set(request.form.getlist("inbox_auto_match_id"))
+        for inbox in inboxes:
+            inbox["auto_match"] = bool(inbox["id"] and inbox["id"] in enabled_inbox_ids)
+        values = {
+            "inboxes_json": json.dumps(inboxes),
+            "inbox_path": inboxes[0]["path"] if inboxes else "",
+            "library_path": library_path,
+            "navidrome_rescan_url": rescan_url,
+            "navidrome_token": token,
+            "fetch_art": "1" if request.form.get("fetch_art") else "",
+            "art_sidecar": "1" if request.form.get("art_sidecar") else "",
+            "art_embed": "1" if request.form.get("art_embed") else "",
+            "art_replace": "1" if request.form.get("art_replace") else "",
+            # Retained only as a downgrade/migration breadcrumb. Runtime
+            # behavior is exclusively controlled by each inbox JSON row.
+            "inbox_auto_match": "1" if any(row["auto_match"] for row in inboxes) else "",
+            "match_threshold": str(threshold),
+            "toast_duration_seconds": str(toast_duration),
+            "analytics_enabled": "1" if request.form.get("analytics_enabled") else "",
+        }
+        submitted_config = request.form.get("beets_config", config_text)
+        submitted_ftintitle = {
+            "enabled": bool(request.form.get("ftintitle_enabled")),
+            "format": request.form.get("ftintitle_format", ftintitle["format"]),
+            "keep_in_artist": bool(request.form.get("ftintitle_keep_in_artist")),
+            # Cratekeep's reviewed import always preserves the release artist.
+            "preserve_album_artist": True,
+        }
+        rendered_config = None
+        if not first_run:
+            try:
+                rendered_config = _build_beets_config(
+                    app, values, submitted_config, values["fetch_art"] == "1", submitted_ftintitle
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+        if not errors:
+            for inbox in inboxes:
+                if not inbox["id"]:
+                    inbox["id"] = uuid.uuid4().hex
+            values["inboxes_json"] = json.dumps(inboxes)
+            values["inbox_path"] = inboxes[0]["path"]
+            try:
+                for inbox in inboxes:
+                    Path(inbox["path"]).mkdir(parents=True, exist_ok=True)
+                Path(library_path).expanduser().mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                errors.append(f"Could not create a configured directory: {exc}")
+        if not errors:
+            values["library_path"] = str(Path(library_path).expanduser().resolve())
+            if first_run:
+                rendered_config = _build_beets_config(app, values, "", values["fetch_art"] == "1")
+            config_path = Path(app.config["BEETS_CONFIG"])
+            previous_config = config_path.read_text(encoding="utf-8") if config_path.exists() else None
+            try:
+                _write_beets_config(app, rendered_config)
+                with _connect(app.config["APP_DB"]) as db:
+                    _save_settings_and_stale_roots(app, current, inboxes, values, db=db)
+                    _apply_settings(app, values)
+            except Exception:
+                if previous_config is None:
+                    config_path.unlink(missing_ok=True)
+                else:
+                    _write_beets_config(app, previous_config)
+                _apply_settings(app, current)
+                raise
+            app.extensions["beacon"].wake.set()
+            flash("Settings saved.")
+            if not first_run and request.form.get("settings_tab") == "about":
+                return redirect(url_for("settings") + "#about")
+            return redirect(url_for("index"))
+        for error in errors:
+            flash(error, "error")
+        current = values
+        config_text = submitted_config
+        ftintitle = submitted_ftintitle
+
+    defaults = _default_paths()
+    display_inboxes = _settings_inboxes(current) or [{
+        "id": "", "name": "Inbox", "path": defaults["inbox_path"],
+    }]
+    if first_run:
+        return render_template(
+            "settings.html", first_run=True, settings=current, inboxes=display_inboxes,
+            default_inbox=defaults["inbox_path"], default_library=defaults["library_path"],
+            has_token=bool(current.get("navidrome_token")), beets_config=config_text,
+            ftintitle=ftintitle, build_sha=app.config["BUILD_SHA"], active_tab=active_tab, page=page,
+        )
+    return _render_ui(app, "settings", "Settings", {
+        "settings": current,
+        "inboxes": display_inboxes,
+        "default_inbox": defaults["inbox_path"],
+        "default_library": defaults["library_path"],
+        "has_token": bool(current.get("navidrome_token")),
+        "beets_config": config_text,
+        "ftintitle": ftintitle,
+        "active_tab": active_tab,
+        "about": {"version": app.config["APP_VERSION"], "build": app.config["BUILD_SHA"], "discord_url": app.config["DISCORD_URL"]},
+        "flashes": get_flashed_messages(with_categories=True),
+    })
+
+
+def _default_paths() -> dict[str, str]:
+    container_data = Path("/data")
+    root = container_data if (container_data / "inbox").is_dir() and (container_data / "library").is_dir() else Path.cwd() / "data"
+    return {"inbox_path": str(root / "inbox"), "library_path": str(root / "library")}
+
+
+def _settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
+    try:
+        rows = json.loads(settings.get("inboxes_json", "[]"))
+    except (TypeError, json.JSONDecodeError):
+        rows = []
+    inboxes = []
+    if isinstance(rows, list):
+        for row in rows:
+            if (isinstance(row, dict) and isinstance(row.get("id"), str)
+                    and isinstance(row.get("name"), str) and isinstance(row.get("path"), str)):
+                inboxes.append({
+                    **{key: row[key] for key in ("id", "name", "path")},
+                    **({"auto_match": row["auto_match"]} if isinstance(row.get("auto_match"), bool) else {}),
+                })
+    return inboxes
+
+
+def _valid_settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
+    inboxes = _settings_inboxes(settings)
+    names = [row["name"].strip().casefold() for row in inboxes]
+    paths = [str(Path(row["path"]).expanduser().resolve()) for row in inboxes if row["path"].strip()]
+    if (not inboxes or any(not row[key].strip() for row in inboxes for key in ("id", "name", "path"))
+            or len(names) != len(set(names)) or len(paths) != len(set(paths))):
+        return []
+    return [
+        {**row, "name": row["name"].strip(), "path": path, "auto_match": bool(row.get("auto_match", False))}
+        for row, path in zip(inboxes, paths)
+    ]
+
+
+def _submitted_inboxes(form, current: dict[str, str]) -> list[dict[str, str]]:
+    names = form.getlist("inbox_name")
+    paths = form.getlist("inbox_path")
+    ids = form.getlist("inbox_id")
+    if not names and len(paths) == 1:  # Compatibility for existing clients and tests.
+        existing = _settings_inboxes(current)
+        return [{
+            "id": existing[0]["id"] if len(existing) == 1 else "",
+            "name": existing[0]["name"] if len(existing) == 1 else "Inbox",
+            "path": paths[0].strip(), "auto_match": bool(existing and existing[0].get("auto_match")),
+        }]
+    if not (len(names) == len(paths) == len(ids)):
+        return []
+    return [
+        {"id": submitted_id.strip(), "name": name.strip(), "path": path.strip(), "auto_match": False}
+        for submitted_id, name, path in zip(ids, names, paths)
+    ]
+
+
+def _browse_roots(app: Flask) -> list[Path]:
+    configured = app.config.get("BROWSE_ROOTS")
+    # A container mount destination is user-defined, so the default browser
+    # must be able to reach arbitrary mount names such as /userMedia.
+    # Tests and hardened deployments can still provide explicit roots.
+    candidates = configured or ("/",)
+    roots = []
+    for candidate in candidates:
+        path = Path(candidate).expanduser().resolve()
+        if path.is_dir() and path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _safe_browse_path(app: Flask, requested: str, roots: list[Path] | None = None) -> Path:
+    roots = roots if roots is not None else _browse_roots(app)
+    if not requested:
+        if not roots:
+            raise ValueError("no browseable mounted directories are available")
+        return roots[0]
+    path = Path(requested).expanduser().resolve()
+    if not path.is_dir() or not any(path == root or root in path.parents for root in roots):
+        raise ValueError("path is not inside a browseable mounted directory")
+    return path
+
+
+def _browse_parent(directory: Path, roots: list[Path]) -> str | None:
+    if directory in roots:
+        return None
+    parent = directory.parent
+    return str(parent) if any(parent == root or root in parent.parents for root in roots) else None
+
+
+def _connect(path: str) -> sqlite3.Connection:
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def _library(app: Flask) -> Library:
+    return Library(app.config["BEETS_DB"], directory=app.config["LIBRARY_PATH"])
+
+
+def _items(app: Flask) -> list[dict]:
+    return [_serialize_item(item) for item in _library(app).items()]
+
+
+def _promote_legacy_managed_albums(app: Flask) -> dict[str, int]:
+    """Give legacy ungrouped items bounded, stable Beets Album identities.
+
+    Completed Cratekeep reviews are authoritative. The fallback never combines
+    directories, editions with different release IDs, or incomplete metadata;
+    safe singletons become one-item albums instead of remaining invisible.
+    This changes Beets relationships only: ``add_album`` does not write tags.
+    """
+    promoted_groups = promoted_items = 0
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    library = _library(app)  # Also creates the Beets schema on a new install.
+    with _LEGACY_ALBUM_PROMOTION_LOCK:
+        with _connect(app.config["BEETS_DB"]) as db:
+            ungrouped_ids = [row["id"] for row in db.execute(
+                "SELECT id FROM items WHERE album_id IS NULL ORDER BY id LIMIT ?",
+                (MAX_LEGACY_PROMOTION_ITEMS,),
+            ).fetchall()]
+        review_ids = set()
+        with _connect(app.config["APP_DB"]) as db:
+            for offset in range(0, len(ungrouped_ids), 500):
+                chunk = ungrouped_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                review_ids.update(row[0] for row in db.execute(
+                    f"""SELECT DISTINCT albums.id
+                           FROM album_reviews AS albums
+                           JOIN album_review_tracks AS tracks ON tracks.album_review_id = albums.id
+                           JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                          WHERE albums.root_path = ? AND albums.execution_status = 'complete'
+                            AND inventory.beets_item_id IN ({placeholders})""",
+                    (str(root), *chunk),
+                ))
+            # Inspect at most the bounded item window. Reviews that are already
+            # partially grouped must not permanently starve later safe reviews.
+            reviews = [{"id": review_id} for review_id in
+                       sorted(review_ids)[:MAX_LEGACY_PROMOTION_ITEMS]]
+            review_members = {
+                row["id"]: db.execute(
+                    """SELECT inventory.beets_item_id, inventory.present
+                         FROM album_review_tracks AS tracks
+                         JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                        WHERE tracks.album_review_id = ? ORDER BY tracks.inventory_id""",
+                    (row["id"],),
+                ).fetchall()
+                for row in reviews
+            }
+
+        for row in reviews:
+            if promoted_groups >= MAX_LEGACY_ALBUM_PROMOTIONS:
+                break
+            members = review_members[row["id"]]
+            member_ids = [member["beets_item_id"] for member in members]
+            if (not member_ids or len(member_ids) != len(set(member_ids))
+                    or any(not member["present"] or member["beets_item_id"] is None for member in members)
+                    or promoted_items + len(member_ids) > MAX_LEGACY_PROMOTION_ITEMS):
+                continue
+            items = [library.get_item(item_id) for item_id in member_ids]
+            # Never merge into or modify an existing album relationship. A
+            # partially promoted review is deliberately left exactly as-is.
+            if not all(items) or not all(item.get("album_id") is None for item in items):
+                continue
+            library.add_album(items)
+            promoted_groups += 1
+            promoted_items += len(items)
+
+        remaining_groups = MAX_LEGACY_ALBUM_PROMOTIONS - promoted_groups
+        remaining_items = MAX_LEGACY_PROMOTION_ITEMS - promoted_items
+        if remaining_groups <= 0 or remaining_items <= 0:
+            return {"groups": promoted_groups, "items": promoted_items}
+
+        with _connect(app.config["BEETS_DB"]) as db:
+            fallback_rows = db.execute(
+                """SELECT id FROM items WHERE album_id IS NULL ORDER BY id LIMIT ?""",
+                (remaining_items,),
+            ).fetchall()
+        fallback_ids = [row["id"] for row in fallback_rows]
+        represented = set()
+        # Stay below SQLite builds with the traditional 999-variable limit.
+        with _connect(app.config["APP_DB"]) as db:
+            for offset in range(0, len(fallback_ids), 500):
+                chunk = fallback_ids[offset:offset + 500]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                represented.update(row[0] for row in db.execute(
+                    f"""SELECT DISTINCT inventory.beets_item_id
+                           FROM library_inventory AS inventory
+                           JOIN album_review_tracks AS tracks ON tracks.inventory_id = inventory.id
+                           JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                          WHERE albums.root_path = ? AND albums.execution_status = 'complete'
+                            AND inventory.beets_item_id IN ({placeholders})""",
+                    (str(root), *chunk),
+                ))
+
+        fallback_groups = {}
+        for item_id in fallback_ids:
+            if item_id in represented:
+                continue
+            item = library.get_item(item_id)
+            if item is None or item.get("album_id") is not None or not item.get("path"):
+                continue
+            try:
+                path = Path(os.fsdecode(item.path)).resolve(strict=True)
+            except (OSError, TypeError, ValueError):
+                continue
+            if not path.is_file() or not (path.parent == root or root in path.parent.parents):
+                continue
+            artist_key = _metadata_key(item.get("albumartist") or item.get("artist"))
+            album_key = _metadata_key(item.get("album"))
+            if not artist_key or not album_key:
+                continue
+            key = (str(path.parent), artist_key, album_key, _metadata_key(item.get("mb_albumid")))
+            fallback_groups.setdefault(key, []).append(item_id)
+
+        for key in sorted(fallback_groups):
+            if promoted_groups >= MAX_LEGACY_ALBUM_PROMOTIONS:
+                break
+            item_ids = fallback_groups[key]
+            if promoted_items + len(item_ids) > MAX_LEGACY_PROMOTION_ITEMS:
+                continue
+            # Reload under the lock immediately before storing relationships so
+            # repeat requests in this process cannot create duplicate albums.
+            items = [library.get_item(item_id) for item_id in item_ids]
+            if not all(items) or not all(item.get("album_id") is None for item in items):
+                continue
+            library.add_album(items)
+            promoted_groups += 1
+            promoted_items += len(items)
+    return {"groups": promoted_groups, "items": promoted_items}
+
+
+def _library_page_data(
+    app: Flask, query: str, sort: str, order: str, artist_filter: str = "",
+    album_filter: str = "", page: int = 1, view: str = "albums", recent_limit: int = 5,
+) -> dict:
+    """Return a bounded album page while keeping track rows out of the landing HTML."""
+    _promote_legacy_managed_albums(app)
+    library = _library(app)  # Ensure the Beets schema exists before direct bounded queries.
+    query = _normalize_metadata(query)
+    artist_filter = _normalize_metadata(artist_filter)
+    album_filter = _normalize_metadata(album_filter)
+    sort = sort if sort in {"artist", "album", "year", "recent"} else "artist"
+    order = order if order in {"asc", "desc"} else ("desc" if sort == "recent" else "asc")
+    view = "artists" if view == "artists" else "albums"
+    page = max(1, page)
+    clauses, parameters = [], []
+    artist_expression = """COALESCE(NULLIF(albums.albumartist, ''),
+        (SELECT NULLIF(fallback_items.artist, '') FROM items fallback_items
+          WHERE fallback_items.album_id = albums.id ORDER BY fallback_items.id LIMIT 1),
+        'Unknown artist')"""
+    if query:
+        escaped_query = query.casefold().replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_query}%"
+        clauses.append(f"""(CASEFOLD({artist_expression}) LIKE ? ESCAPE '\\'
+                         OR CASEFOLD(COALESCE(albums.album, '')) LIKE ? ESCAPE '\\'
+                         OR EXISTS (SELECT 1 FROM items search_items
+                                     WHERE search_items.album_id = albums.id
+                                       AND (CASEFOLD(COALESCE(search_items.title, '')) LIKE ? ESCAPE '\\'
+                                            OR CASEFOLD(COALESCE(search_items.artist, '')) LIKE ? ESCAPE '\\')))""")
+        parameters.extend((pattern, pattern, pattern, pattern))
+        if view == "artists":
+            clauses[-1] = f"CASEFOLD({artist_expression}) LIKE ? ESCAPE '\\'"
+            parameters = [pattern]
+    if artist_filter:
+        clauses.append(f"CASEFOLD({artist_expression}) = ?")
+        parameters.append(artist_filter.casefold())
+    if album_filter:
+        clauses.append("CASEFOLD(COALESCE(albums.album, '')) = ?")
+        parameters.append(album_filter.casefold())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    columns = {
+        "artist": (f"CASEFOLD({artist_expression})", "CASEFOLD(COALESCE(albums.album, ''))", "albums.year"),
+        "album": ("CASEFOLD(COALESCE(albums.album, ''))", f"CASEFOLD({artist_expression})", "albums.year"),
+        "year": ("albums.year", f"CASEFOLD({artist_expression})", "CASEFOLD(COALESCE(albums.album, ''))"),
+        "recent": ("albums.added",),
+    }
+    direction = "DESC" if order == "desc" else "ASC"
+    ordering = ", ".join(f"{column} {direction}" for column in columns[sort])
+    with _connect(app.config["BEETS_DB"]) as db:
+        db.create_function("CASEFOLD", 1, lambda value: str(value or "").casefold(), deterministic=True)
+        matching = db.execute(f"SELECT COUNT(*) FROM albums{where}", parameters).fetchone()[0]
+        page_count = max(1, math.ceil(matching / LIBRARY_ALBUM_PAGE_SIZE))
+        page = min(page, page_count)
+        artists = []
+        if view == "artists":
+            artist_groups = f"""SELECT {artist_expression} AS artist,
+                COUNT(*) AS album_count,
+                JSON_GROUP_ARRAY(DISTINCT COALESCE(
+                    NULLIF((SELECT value FROM album_attributes WHERE entity_id=albums.id AND key='genre' LIMIT 1), ''),
+                    NULLIF(albums.genres, ''),
+                    (SELECT COALESCE(NULLIF((SELECT value FROM item_attributes WHERE entity_id=genre_items.id AND key='genre' LIMIT 1), ''), NULLIF(genre_items.genres, ''))
+                     FROM items genre_items WHERE genre_items.album_id=albums.id
+                     ORDER BY genre_items.id LIMIT 1))) AS genres
+                FROM albums{where} GROUP BY CASEFOLD({artist_expression})"""
+            matching = db.execute(f"SELECT COUNT(*) FROM ({artist_groups})", parameters).fetchone()[0]
+            page_count = max(1, math.ceil(matching / LIBRARY_ALBUM_PAGE_SIZE))
+            page = min(page, page_count)
+            artists = [dict(row) for row in db.execute(
+                f"SELECT * FROM ({artist_groups}) ORDER BY CASEFOLD(artist) {direction}, artist {direction} LIMIT ? OFFSET ?",
+                (*parameters, LIBRARY_ALBUM_PAGE_SIZE, (page-1)*LIBRARY_ALBUM_PAGE_SIZE),
+            )]
+            for artist in artists:
+                artist["genres"] = ", ".join(dict.fromkeys(
+                    genre for value in json.loads(artist["genres"] or "[]") if value
+                    for genre in value.split(Item._fields["genres"].db_delimiter) if genre
+                ))
+            rows = []  # Artist browsing never loads full album/track payloads.
+        else:
+            rows = db.execute(
+                f"""SELECT albums.id FROM albums{where}
+                     ORDER BY {ordering}, albums.id {direction}
+                     LIMIT ? OFFSET ?""",
+                (*parameters, LIBRARY_ALBUM_PAGE_SIZE, (page - 1) * LIBRARY_ALBUM_PAGE_SIZE),
+            ).fetchall()
+        totals = db.execute(
+            f"""SELECT (SELECT COUNT(*) FROM items), (SELECT COUNT(*) FROM albums),
+                       (SELECT COUNT(DISTINCT CASEFOLD({artist_expression})) FROM albums)"""
+        ).fetchone()
+        top_rows = db.execute(
+            f"""SELECT {artist_expression} AS artist,
+                      COUNT(DISTINCT albums.id) AS albums, COUNT(items.id) AS tracks
+                 FROM albums LEFT JOIN items ON items.album_id = albums.id
+                GROUP BY CASEFOLD({artist_expression})
+                ORDER BY albums DESC, tracks DESC, CASEFOLD(artist) LIMIT 5"""
+        ).fetchall()
+        recent_rows = db.execute("SELECT id FROM albums ORDER BY added DESC, id DESC LIMIT ?", (recent_limit,)).fetchall()
+    summary_cache: dict[int, dict | None] = {}
+    albums = [_managed_album_summary(app, library.get_album(row["id"]), summary_cache) for row in rows]
+    albums = [album for album in albums if album is not None]
+    groups, group_by_artist = [], {}
+    for album in albums:
+        artist = album["albumartist"] or "Unknown artist"
+        key = artist.casefold()
+        if key not in group_by_artist:
+            group_by_artist[key] = {"artist": artist, "albums": []}
+            groups.append(group_by_artist[key])
+        group_by_artist[key]["albums"].append(album)
+    recent_albums = [] if view == "artists" else [
+        _managed_album_summary(app, library.get_album(row["id"]), summary_cache) for row in recent_rows
+    ]
+    # Use the persisted inventory snapshot when available. An installation
+    # that has never inventoried its Library reports an explicit unknown size
+    # instead of blocking navigation to stat every managed audio path.
+    with _connect(app.config["APP_DB"]) as db:
+        size_snapshot = db.execute(
+            """SELECT SUM(size_bytes) FROM library_inventory
+                WHERE source_kind='library' AND root_path=? AND present=1""",
+            (str(Path(app.config["LIBRARY_PATH"]).expanduser().resolve()),),
+        ).fetchone()[0]
+    library_bytes = size_snapshot
+    return {
+        "albums": albums, "album_groups": groups,
+        "recent_albums": [album for album in recent_albums if album is not None],
+        "top_artists": [dict(row) for row in top_rows],
+        "summary": {"tracks": totals[0], "albums": totals[1], "artists": totals[2], "bytes": library_bytes},
+        "query": query, "sort": sort, "order": order, "view": view, "artists": artists,
+        "matching_artists": matching if view == "artists" else 0,
+        "artist_filter": artist_filter, "album_filter": album_filter,
+        "page": page, "page_count": page_count, "page_size": LIBRARY_ALBUM_PAGE_SIZE,
+        "matching_albums": matching, "first_result": ((page - 1) * LIBRARY_ALBUM_PAGE_SIZE + 1) if matching else 0,
+        "last_result": min(page * LIBRARY_ALBUM_PAGE_SIZE, matching),
+    }
+
+
+def _overview_data(app: Flask) -> dict:
+    groups = _inbox_review_summaries(app)
+    inboxes = []
+    for group in groups:
+        error = group["scan_error"]
+        status = "error" if error or group["errors"] else (
+            "matching" if group["matching"] else "needs review" if group["albums"] else "empty"
+        )
+        inboxes.append({
+            "id": group["id"], "name": group["name"], "path": group["path"],
+            "pending_albums": group["albums"], "files": group["items"], "bytes": group["bytes"],
+            "status": status, "error": error,
+        })
+    library = _library_page_data(app, "", "recent", "desc", page=1, recent_limit=12)
+    return {
+        "inbox_summaries": inboxes,
+        "recent_albums": library["recent_albums"][:12],
+        "library_summary": library["summary"],
+        "inbox_album_count": sum(inbox["pending_albums"] or 0 for inbox in inboxes),
+        "inbox_file_count": sum(inbox["files"] or 0 for inbox in inboxes),
+        "inbox_bytes": sum(inbox["bytes"] or 0 for inbox in inboxes),
+        "inbox_totals_stale": any(inbox["error"] for inbox in inboxes),
+    }
+
+
+def _album_items(album) -> list[Item]:
+    return sorted(
+        list(album.items()),
+        key=lambda item: (
+            int(item.get("disc") or 0), int(item.get("track") or 0),
+            _metadata_key(item.get("title")), int(item.id or 0),
+        ),
+    )
+
+
+def _managed_path(app: Flask, raw_path: object) -> Path:
+    """Resolve a Beets path only within the configured managed library root."""
+    try:
+        root = _validated_library_root(app)
+        decoded = Path(os.fsdecode(raw_path))
+        candidate = decoded if decoded.is_absolute() else root / decoded
+        resolved = candidate.resolve(strict=True)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ManagedMutationError(
+            "A managed library path is missing or unreadable.", code="managed_path_invalid", status=409
+        ) from exc
+    if resolved == root or root not in resolved.parents or candidate.is_symlink() or not resolved.is_file():
+        raise ManagedMutationError(
+            "A managed library path is outside the configured library root.",
+            code="managed_path_invalid", status=409,
+        )
+    return resolved
+
+
+def _managed_track_payload(app: Flask, item: Item) -> dict:
+    result = {
+        key: item.get(key)
+        for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")
+    }
+    result["genre"] = _item_genre(item)
+    try:
+        path = _managed_path(app, item.path) if item.get("path") else None
+        result["bytes"] = path.stat().st_size if path else None
+    except (ManagedMutationError, OSError, TypeError, ValueError):
+        result["bytes"] = None
+    return result
+
+
+def _readable_managed_paths(app: Flask, items: list[Item]) -> list[Path]:
+    """Resolve only usable managed files for read-only browsing operations."""
+    paths = []
+    for item in items:
+        try:
+            paths.append(_managed_path(app, item.path))
+        except (ManagedMutationError, OSError, TypeError, ValueError):
+            continue
+    return paths
+
+
+def _require_managed_item_paths(app: Flask, items: list[Item]) -> None:
+    """Keep mutations strict even though read-only browsing tolerates stale rows."""
+    for item in items:
+        _managed_path(app, item.path)
+
+
+def _managed_album_summary(
+    app: Flask, album, cache: dict[int, dict | None] | None = None,
+) -> dict | None:
+    if album is None:
+        return None
+    if cache is not None and album.id in cache:
+        return cache[album.id]
+    items = _album_items(album)
+    genres = [_item_genre(item) for item in items if _item_genre(item)]
+    genre = _normalize_metadata(album.get("genre")) or (genres[0] if genres and len(set(genres)) == 1 else "")
+    size = 0
+    for item in items:
+        try:
+            size += _managed_path(app, item.path).stat().st_size
+        except (ManagedMutationError, OSError, TypeError, ValueError):
+            pass
+    artwork_source = _managed_album_artwork_source(app, items)
+    summary = {
+        "id": album.id,
+        "album": _normalize_metadata(album.get("album")) or "Unknown album",
+        "albumartist": _normalize_metadata(album.get("albumartist"))
+                       or (_normalize_metadata(items[0].get("artist")) if items else "") or "Unknown artist",
+        "year": int(album.get("year") or 0), "genre": genre,
+        "track_count": len(items), "bytes": size,
+        "artwork_available": artwork_source is not None,
+        "artwork_url": url_for("managed_album_artwork", album_id=album.id) if artwork_source else None,
+    }
+    if cache is not None:
+        cache[album.id] = summary
+    return summary
+
+
+def _managed_album_fingerprint(album, items: list[Item] | None = None) -> str:
+    items = items if items is not None else _album_items(album)
+    fields = (
+        "title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc",
+        "mb_trackid", "mb_albumid", "mb_releasegroupid", "albumtype", "country", "media",
+        "tracktotal", "disctotal",
+    )
+    evidence = []
+    for item in items:
+        path = Path(os.fsdecode(item.path))
+        try:
+            stat = path.stat()
+            file_state = [stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino]
+        except OSError:
+            file_state = None
+        evidence.append({
+            "id": item.id, "path": str(path), "stat": file_state,
+            "metadata": {field: (_item_genre(item) if field == "genre" else item.get(field)) for field in fields},
+        })
+    payload = {"album_id": album.id, "items": evidence}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _managed_album_payload(app: Flask, album_id: int) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    summary = _managed_album_summary(app, album)
+    return {**summary, "mb_albumid": str(album.get("mb_albumid") or ""),
+            "tracks": [_managed_track_payload(app, item) for item in items],
+            "fingerprint": _managed_album_fingerprint(album, items)}
+
+
+def _normalize_artwork_bytes(payload: bytes) -> bytes:
+    if not payload:
+        raise LibraryImportExecutionError(
+            "Artwork is empty; existing artwork was not changed.",
+            code="artwork_invalid", status=400,
+        )
+    if len(payload) > MAX_ARTWORK_BYTES:
+        raise LibraryImportExecutionError(
+            "Artwork exceeds the 10 MB limit; existing artwork was not changed.",
+            code="artwork_too_large", status=400,
+        )
+    try:
+        with PillowImage.open(BytesIO(payload)) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+                raise ValueError(f"unsupported artwork format {image.format or 'unknown'}")
+            if image.width <= 0 or image.height <= 0 or image.width * image.height > MAX_ARTWORK_PIXELS:
+                raise ValueError("artwork dimensions are invalid or too large")
+            image.seek(0)
+            normalized = image.convert("RGB")
+            output = BytesIO()
+            normalized.save(output, format="JPEG", quality=90, optimize=False, progressive=False)
+            return output.getvalue()
+    except (OSError, ValueError, TypeError, UnidentifiedImageError,
+            PillowImage.DecompressionBombError) as exc:
+        raise LibraryImportExecutionError(
+            f"Artwork validation failed before artwork was changed: {exc}",
+            code="artwork_invalid", status=400,
+        ) from exc
+
+
+def _managed_album_artwork_source(app: Flask, items: list[Item]) -> str | None:
+    """Discover artwork cheaply for summaries; never read or decode sidecar bytes."""
+    paths = _readable_managed_paths(app, items)
+    for folder in dict.fromkeys(path.parent for path in paths):
+        sidecar = folder / "cover.jpg"
+        if not sidecar.is_symlink() and sidecar.is_file():
+            return "sidecar"
+    if paths:
+        try:
+            if MediaFile(str(paths[0])).images:
+                return "embedded"
+        except (OSError, UnreadableFileError):
+            pass
+    return None
+
+
+def _managed_album_artwork_bytes(app: Flask, items: list[Item]) -> tuple[bytes, str] | None:
+    """Return normalized browser-safe art without disclosing or accepting a path."""
+    paths = _readable_managed_paths(app, items)
+    for folder in dict.fromkeys(path.parent for path in paths):
+        sidecar = folder / "cover.jpg"
+        try:
+            if sidecar.is_symlink() or not sidecar.is_file():
+                continue
+            payload = sidecar.read_bytes()
+            return _normalize_artwork_bytes(payload), "sidecar"
+        except (OSError, LibraryImportExecutionError):
+            continue
+    for path in paths:
+        try:
+            images = MediaFile(str(path)).images or []
+            front = next((image for image in images if image.type == ImageType.front), None)
+            image = front or (images[0] if images else None)
+            if image is not None:
+                return _normalize_artwork_bytes(image.data), "embedded"
+        except (OSError, UnreadableFileError, LibraryImportExecutionError):
+            continue
+    return None
+
+
+def _managed_artwork_state_fingerprint(app: Flask, items: list[Item]) -> str:
+    """Fingerprint configured artwork destinations using bounded filesystem metadata."""
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    paths = [_managed_path(app, item.path) for item in items]
+    evidence = []
+    if app.config["ART_SIDECAR"]:
+        for destination in dict.fromkeys(path.parent / "cover.jpg" for path in paths):
+            try:
+                stat = destination.lstat()
+                evidence.append(("sidecar", str(destination.relative_to(root)), stat.st_size, stat.st_mtime_ns,
+                                 stat.st_dev, stat.st_ino, destination.is_symlink()))
+            except OSError:
+                evidence.append(("sidecar", str(destination.relative_to(root)), None))
+    if app.config["ART_EMBED"]:
+        for path in paths:
+            stat = path.stat()
+            evidence.append(("embedded", str(path.relative_to(root)), stat.st_size, stat.st_mtime_ns,
+                             stat.st_dev, stat.st_ino))
+    return hashlib.sha256(json.dumps(evidence, separators=(",", ":")).encode()).hexdigest()
+
+
+def _purge_managed_artwork_previews_locked(app: Flask) -> None:
+    previews = app.config["MANAGED_ARTWORK_PREVIEWS"]
+    cutoff = time.monotonic() - MANAGED_ARTWORK_PREVIEW_TTL
+    for preview_id in [key for key, value in previews.items() if value["created"] < cutoff]:
+        previews.pop(preview_id, None)
+    while len(previews) >= MAX_MANAGED_ARTWORK_PREVIEWS:
+        oldest = min(previews, key=lambda key: previews[key]["created"])
+        previews.pop(oldest, None)
+
+
+def _invalidate_managed_artwork_previews_locked(app: Flask, album_id: int) -> None:
+    previews = app.config["MANAGED_ARTWORK_PREVIEWS"]
+    for preview_id in [key for key, value in previews.items() if value["album_id"] == album_id]:
+        previews.pop(preview_id, None)
+
+
+def _get_managed_artwork_preview(app: Flask, album_id: int, preview_id: str) -> dict | None:
+    with app.config["MANAGED_ARTWORK_PREVIEW_LOCK"]:
+        _purge_managed_artwork_previews_locked(app)
+        preview = app.config["MANAGED_ARTWORK_PREVIEWS"].get(preview_id)
+        return dict(preview) if preview and preview["album_id"] == album_id else None
+
+
+def _create_managed_artwork_preview(
+    app: Flask, album_id: int, expected: object, jpeg: bytes, *, source: str, message: str,
+    release_id: str | None = None,
+) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    if not isinstance(expected, str) or not expected:
+        raise ManagedMutationError("expected_fingerprint is required", code="invalid_request", status=400)
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    destinations = {
+        "sidecar": bool(app.config["ART_SIDECAR"]),
+        "embedded": bool(app.config["ART_EMBED"]),
+    }
+    if not any(destinations.values()):
+        raise ManagedMutationError(
+            "Enable sidecar and/or embedded artwork in Settings before replacing artwork.",
+            code="artwork_destinations_disabled", status=409,
+        )
+    with app.config["MANAGED_ARTWORK_PREVIEW_LOCK"]:
+        _purge_managed_artwork_previews_locked(app)
+        _invalidate_managed_artwork_previews_locked(app, album_id)
+        preview_id = secrets.token_urlsafe(24)
+        app.config["MANAGED_ARTWORK_PREVIEWS"][preview_id] = {
+            "album_id": album_id, "fingerprint": expected, "jpeg": jpeg,
+            "artwork_fingerprint": _managed_artwork_state_fingerprint(app, items),
+            "created": time.monotonic(), "source": source, "release_id": release_id,
+        }
+    return {
+        "preview_id": preview_id, "status": "preview", "source": source, "fingerprint": expected,
+        "release_id": release_id, "sha256": hashlib.sha256(jpeg).hexdigest(),
+        "bytes": len(jpeg), "destinations": destinations, "message": message,
+        "preview_url": url_for("managed_artwork_preview_image", album_id=album_id,
+                               preview_id=preview_id),
+    }
+
+
+def _preview_managed_artwork_refresh(app: Flask, album_id: int, expected: object) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    if not isinstance(expected, str) or not expected:
+        raise ManagedMutationError("expected_fingerprint is required", code="invalid_request", status=400)
+    _require_current_album(album, expected, items)
+    release_ids = {
+        str(value).lower() for value in [album.get("mb_albumid"), *(item.get("mb_albumid") for item in items)]
+        if value
+    }
+    if len(release_ids) != 1 or not MUSICBRAINZ_ID_PATTERN.fullmatch(next(iter(release_ids), "")):
+        raise ManagedMutationError(
+            "This album has no single valid MusicBrainz release ID; artwork was not changed.",
+            code="artwork_release_id_unavailable", status=409,
+        )
+    release_id = next(iter(release_ids))
+    candidates = app.config["MUSICBRAINZ_PROVIDER"](
+        {**_managed_album_query(album, items), "musicbrainz_id": release_id}, limit=1
+    )
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        raise ProviderError(
+            "The exact MusicBrainz release is unavailable; artwork was not changed.",
+            code="release_not_found",
+        )
+    candidate = candidates[0]
+    if str(candidate.get("provider_id") or "").lower() != release_id:
+        raise ProviderError("MusicBrainz returned a different release identity",
+                            code="provider_identity_mismatch")
+    artwork = candidate.get("artwork")
+    if not isinstance(artwork, dict) or not artwork.get("available"):
+        raise ManagedMutationError(
+            "No front artwork is available for this exact release or its release group; existing artwork was preserved.",
+            code="artwork_unavailable", status=409,
+        )
+    jpeg = app.config["ARTWORK_FETCHER"](candidate)
+    return _create_managed_artwork_preview(
+        app, album_id, expected, jpeg, source="musicbrainz", release_id=release_id,
+        message="Exact-release artwork fetched. Review the preview, then choose Apply artwork.",
+    )
+
+
+def _atomic_sidecar_write(destination: Path, payload: bytes) -> None:
+    temporary = destination.parent / f".cover.{secrets.token_hex(8)}.tmp"
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _managed_artwork_backup(path: Path) -> Path:
+    backup = path.parent / f".{path.name}.cratekeep-art-{secrets.token_hex(8)}.bak"
+    shutil.copy2(path, backup, follow_symlinks=False)
+    return backup
+
+
+def _replace_managed_artwork(app: Flask, items: list[Item], jpeg: bytes) -> dict:
+    paths = [_managed_path(app, item.path) for item in items]
+    destinations = {
+        "sidecar": bool(app.config["ART_SIDECAR"]),
+        "embedded": bool(app.config["ART_EMBED"]),
+    }
+    if not any(destinations.values()):
+        raise ManagedMutationError(
+            "Artwork destinations were disabled after preview; existing artwork was preserved.",
+            code="artwork_destinations_disabled", status=409,
+        )
+    sidecar_paths = list(dict.fromkeys(path.parent / "cover.jpg" for path in paths))
+    for destination in sidecar_paths:
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise ManagedMutationError(
+                "A cover.jpg destination is not a safe regular file; existing artwork was preserved.",
+                code="managed_path_invalid", status=409,
+            )
+    sidecar_backups: dict[Path, Path | None] = {}
+    embedded_backups: dict[Path, Path] = {}
+    try:
+        if destinations["sidecar"]:
+            for destination in sidecar_paths:
+                sidecar_backups[destination] = (
+                    _managed_artwork_backup(destination) if destination.exists() else None
+                )
+        if destinations["embedded"]:
+            for path in paths:
+                embedded_backups[path] = _managed_artwork_backup(path)
+    except Exception as exc:
+        for backup in [*sidecar_backups.values(), *embedded_backups.values()]:
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+        raise ManagedMutationError(
+            f"Artwork replacement could not create safe local backups; existing artwork was preserved: {exc}",
+            code="artwork_backup_failed", status=500,
+        ) from exc
+    touched_sidecars: list[Path] = []
+    touched_embedded: list[Path] = []
+    try:
+        if destinations["sidecar"]:
+            for destination in sidecar_paths:
+                touched_sidecars.append(destination)
+                _atomic_sidecar_write(destination, jpeg)
+        if destinations["embedded"]:
+            for path in paths:
+                touched_embedded.append(path)
+                media = MediaFile(str(path))
+                media.images = [MediaImage(jpeg, desc="Front cover", type=ImageType.front)]
+                media.save()
+                if _managed_path(app, path) != path:
+                    raise OSError("artwork update changed a managed path")
+    except Exception as exc:
+        rollback_errors = []
+        failed_backups = set()
+        for path in reversed(touched_embedded):
+            try:
+                embedded_backups[path].replace(path)
+            except OSError as rollback_exc:
+                failed_backups.add(embedded_backups[path])
+                rollback_errors.append(f"embedded rollback: {rollback_exc}")
+        for destination in reversed(touched_sidecars):
+            backup = sidecar_backups[destination]
+            try:
+                if backup is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    backup.replace(destination)
+            except OSError as rollback_exc:
+                if backup is not None:
+                    failed_backups.add(backup)
+                rollback_errors.append(f"sidecar rollback: {rollback_exc}")
+        for backup in [*sidecar_backups.values(), *embedded_backups.values()]:
+            if backup is not None and backup not in failed_backups:
+                backup.unlink(missing_ok=True)
+        if rollback_errors:
+            raise ManagedMutationError(
+                f"Artwork replacement failed ({exc}); rollback was incomplete: {'; '.join(rollback_errors)}",
+                code="artwork_rollback_failed", status=500,
+            ) from exc
+        raise ManagedMutationError(
+            f"Artwork replacement failed; all touched artwork was restored: {exc}",
+            code="artwork_mutation_rolled_back", status=500,
+        ) from exc
+    for backup in [*sidecar_backups.values(), *embedded_backups.values()]:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+    return {
+        "sidecars_written": len(sidecar_paths) if destinations["sidecar"] else 0,
+        "tracks_embedded": len(paths) if destinations["embedded"] else 0,
+    }
+
+
+def _apply_managed_artwork_preview(
+    app: Flask, album_id: int, preview_id: str, expected: str,
+) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    with app.config["MANAGED_ARTWORK_PREVIEW_LOCK"]:
+        _purge_managed_artwork_previews_locked(app)
+        preview = app.config["MANAGED_ARTWORK_PREVIEWS"].get(preview_id)
+        if preview is None or preview["album_id"] != album_id:
+            raise ManagedMutationError(
+                "Artwork preview expired or was already applied. Choose artwork again.",
+                code="preview_expired", status=409,
+            )
+        if preview["fingerprint"] != expected:
+            raise ManagedMutationError("Artwork preview does not match this album state.",
+                                       code="stale_fingerprint", status=409)
+        items = _album_items(album)
+        _require_current_album(album, expected, items)
+        if preview["artwork_fingerprint"] != _managed_artwork_state_fingerprint(app, items):
+            _invalidate_managed_artwork_previews_locked(app, album_id)
+            raise ManagedMutationError(
+                "Artwork changed after this preview was created. Choose artwork again.",
+                code="stale_artwork", status=409,
+            )
+        jpeg = preview["jpeg"]
+        source = preview["source"]
+        _invalidate_managed_artwork_previews_locked(app, album_id)
+        mutation = _replace_managed_artwork(app, items, jpeg)
+    return {
+        "status": "applied", "source": source,
+        "sha256": hashlib.sha256(jpeg).hexdigest(), **mutation,
+        "album": _managed_album_payload(app, album_id),
+    }
+
+
+def _validated_edit_fields(values: object, allowed: set[str]) -> dict:
+    if not isinstance(values, dict):
+        raise ValueError("a JSON object is required")
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported fields: {', '.join(sorted(unknown))}")
+    if not values:
+        raise ValueError("at least one editable field is required")
+    normalized = {}
+    for field, value in values.items():
+        if field in INTEGER_FIELDS:
+            if isinstance(value, bool):
+                raise ValueError(f"{field} must be an integer")
+            if not isinstance(value, (int, str)):
+                raise ValueError(f"{field} must be an integer")
+            if isinstance(value, str) and value.strip() and not re.fullmatch(r"[+-]?\d+", value.strip()):
+                raise ValueError(f"{field} must be an integer")
+            try:
+                normalized[field] = int(value or 0)
+            except (TypeError, ValueError):
+                raise ValueError(f"{field} must be an integer") from None
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f"{field} must be a string")
+            normalized[field] = _normalize_metadata(value)
+    return normalized
+
+
+def _validated_managed_edit(values: object, allowed: set[str]) -> tuple[dict, str]:
+    if not isinstance(values, dict):
+        raise ValueError("a JSON object is required")
+    expected = values.get("expected_fingerprint")
+    if not isinstance(expected, str) or not expected:
+        raise ValueError("expected_fingerprint is required")
+    fields = _validated_edit_fields({key: value for key, value in values.items() if key != "expected_fingerprint"}, allowed)
+    return fields, expected
+
+
+def _mutate_managed_items(
+    changes: list[tuple[Item, dict]], *, album=None, album_values: dict | None = None,
+    finalize=None,
+) -> list[dict]:
+    """Write tags before DB state and restore every touched item on any failure."""
+    snapshots = []
+    structured = []
+    for item, values in changes:
+        fields = set(values)
+        if "genre" in fields and "genres" in item._fields:
+            fields.add("genres")
+        original = {field: item.get(field) for field in fields}
+        snapshots.append((item, original, os.fsdecode(item.path)))
+        item_changes = {}
+        for field, value in values.items():
+            current = _item_genre(item) if field == "genre" else item.get(field)
+            if current != value:
+                item_changes[field] = {"from": current, "to": value}
+            _set_item_value(item, field, value)
+        structured.append({"item_id": item.id, "changes": item_changes})
+    album_values = album_values or {}
+    album_snapshot = {field: album.get(field) for field in album_values} if album is not None else {}
+    try:
+        for item, _, _ in snapshots:
+            item.write()
+        for item, _, path in snapshots:
+            item.store()
+            if os.fsdecode(item.path) != path:
+                raise OSError("metadata write changed a managed path")
+        if album is not None:
+            for field, value in album_values.items():
+                album[field] = value
+            album.store()
+        # Audit finalization belongs inside the mutation boundary. If it cannot
+        # commit its claimed state, the same snapshots restore tags and Beets.
+        if finalize is not None:
+            finalize()
+    except Exception as exc:
+        rollback_errors = []
+        for item, original, path in snapshots:
+            try:
+                for field, value in original.items():
+                    item[field] = value
+                item.path = os.fsencode(path)
+                item.write()
+                item.store()
+            except Exception as rollback_exc:
+                rollback_errors.append(f"item {item.id}: {rollback_exc}")
+        if album is not None:
+            try:
+                for field, value in album_snapshot.items():
+                    album[field] = value
+                album.store()
+            except Exception as rollback_exc:
+                rollback_errors.append(f"album {album.id}: {rollback_exc}")
+        if rollback_errors:
+            raise ManagedMutationError(
+                f"metadata write failed ({exc}); rollback was incomplete: {'; '.join(rollback_errors)}",
+                code="rollback_failed", status=500,
+            ) from exc
+        if isinstance(exc, ManagedMutationError):
+            raise exc
+        raise ManagedMutationError(
+            f"metadata write failed; original tags and database values were restored: {exc}",
+            code="mutation_rolled_back", status=500,
+        ) from exc
+    return structured
+
+
+def _require_current_album(album, expected: str, items: list[Item]) -> None:
+    if _managed_album_fingerprint(album, items) != expected:
+        raise ManagedMutationError(
+            "The album changed after it was opened. Refresh it before saving.",
+            code="stale_fingerprint", status=409,
+        )
+
+
+def _edit_managed_album(app: Flask, album_id: int, values: dict, expected: str) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
+    changes = _mutate_managed_items([(item, values) for item in items], album=album, album_values=values)
+    return {"changes": changes, "album": _managed_album_payload(app, album_id)}
+
+
+def _edit_managed_track(app: Flask, album_id: int, item_id: int, values: dict, expected: str):
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
+    item = next((candidate for candidate in items if candidate.id == item_id), None)
+    if item is None:
+        return False
+    changes = _mutate_managed_items([(item, values)])
+    return {"changes": changes, "album": _managed_album_payload(app, album_id)}
+
+
+def _managed_album_query(album, items: list[Item]) -> dict:
+    tracks = []
+    for item in items:
+        track = {
+            "title": _normalize_track_title(item.get("title")),
+            "artist": _normalize_metadata(item.get("artist")),
+            "disc": int(item.get("disc") or 1), "track": int(item.get("track") or 0),
+        }
+        if item.get("length"):
+            track["duration"] = item.get("length")
+        if item.get("mb_trackid"):
+            track["recording_id"] = item.get("mb_trackid")
+        tracks.append(track)
+    query = {
+        "artist": _normalize_metadata(album.get("albumartist")),
+        "album": _normalize_metadata(album.get("album")), "tracks": tracks,
+    }
+    if album.get("year"):
+        query["year"] = int(album.get("year"))
+    return query
+
+
+def _managed_rematch_plan(app: Flask, album, items: list[Item], raw: dict) -> dict:
+    query = _managed_album_query(album, items)
+    effective = _effective_candidate(app, raw, query)
+    match = _candidate_match(query, effective, exact_mbid=True)
+    details = {detail["position"]: detail for detail in match["track_details"] if detail.get("local") is not None}
+    local_positions = [(int(item.get("disc") or 1), int(item.get("track") or 0)) for item in items]
+    duplicate_positions = [list(position) for position in sorted(
+        {position for position in local_positions if local_positions.count(position) > 1}
+    )]
+    updates, changes = [], []
+    for position, item in enumerate(items, 1):
+        detail = details.get(position)
+        values = _candidate_item_values(effective, detail) if detail else {}
+        item_changes = {}
+        for field, value in values.items():
+            current = _item_genre(item) if field == "genre" else item.get(field)
+            if current != value:
+                item_changes[field] = {"from": current, "to": value}
+        updates.append({"item_id": item.id, "values": values})
+        changes.append({"item_id": item.id, "title": item.get("title"), "changes": item_changes})
+    unsafe_statuses = {"missing", "extra", "unmatched"}
+    unsafe_details = [detail for detail in match["track_details"] if detail["status"] in unsafe_statuses]
+    applicable = (
+        not match["track_count_mismatch"] and not unsafe_details and not duplicate_positions
+        and len(details) == len(items)
+    )
+    reasons = []
+    if match["track_count_mismatch"]:
+        reasons.append("The MusicBrainz release has a different track count.")
+    if unsafe_details:
+        reasons.append("One or more tracks could not be mapped unambiguously.")
+    if duplicate_positions:
+        reasons.append("The local album contains duplicate disc/track positions.")
+    return {
+        "candidate": {
+            "musicbrainz_id": raw.get("provider_id"), "album": effective.get("album"),
+            "artist": effective.get("artist"), "date": effective.get("date") or effective.get("year"),
+            "release_note": raw.get("release_disambiguation") or "",
+            "media": raw.get("media") or [], "region": raw.get("country") or "",
+            "raw_album": raw.get("album"), "raw_artist": raw.get("artist"),
+        },
+        "match": {key: match[key] for key in (
+            "confidence", "distance", "recommendation", "reasons", "track_details",
+            "track_count_mismatch", "matched_track_count", "unmatched_track_count", "hard_mismatches",
+        )},
+        "changes": changes, "updates": updates, "applicable": applicable,
+        "inapplicable_reasons": reasons, "duplicate_local_positions": duplicate_positions,
+    }
+
+
+def _preview_managed_rematch(app: Flask, album_id: int, mbid: str, expected: str) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
+    raw_candidates = app.config["MUSICBRAINZ_PROVIDER"](
+        {**_managed_album_query(album, items), "musicbrainz_id": mbid}, limit=1
+    )
+    if not isinstance(raw_candidates, list):
+        raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+    if not raw_candidates or not isinstance(raw_candidates[0], dict):
+        raise ProviderError(
+            "No MusicBrainz release exists for that ID. Check that it is a release ID, not a release-group ID.",
+            code="release_not_found",
+        )
+    raw = raw_candidates[0]
+    if str(raw.get("provider_id") or "").lower() != mbid:
+        raise ProviderError("MusicBrainz returned a different release identity", code="provider_identity_mismatch")
+    plan = _managed_rematch_plan(app, album, items, raw)
+    preview_id = secrets.token_urlsafe(24)
+    evidence_json = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    plan_json = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    evidence_sha = hashlib.sha256(f"{evidence_json}\n{plan_json}".encode()).hexdigest()
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute("DELETE FROM managed_album_rematches WHERE album_id = ? AND status = 'pending'", (album_id,))
+        db.execute(
+            """INSERT INTO managed_album_rematches
+                   (id, album_id, release_id, fingerprint, evidence_json, plan_json,
+                    evidence_sha256, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+            (preview_id, album_id, mbid, expected, evidence_json, plan_json, evidence_sha, _now()),
+        )
+        db.execute(
+            """DELETE FROM managed_album_rematches WHERE status != 'pending' AND id NOT IN
+                   (SELECT id FROM managed_album_rematches WHERE status != 'pending'
+                    ORDER BY COALESCE(applied_at, created_at) DESC LIMIT 100)"""
+        )
+    public_plan = {key: value for key, value in plan.items() if key != "updates"}
+    return {"preview_id": preview_id, "status": "preview", "fingerprint": expected,
+            "evidence_sha256": evidence_sha, **public_plan}
+
+
+def _apply_managed_rematch(app: Flask, album_id: int, preview_id: str, expected: str) -> dict | None:
+    album = _library(app).get_album(album_id)
+    if album is None:
+        return None
+    with _connect(app.config["APP_DB"]) as db:
+        row = db.execute("SELECT * FROM managed_album_rematches WHERE id = ?", (preview_id,)).fetchone()
+    if row is None or row["album_id"] != album_id:
+        raise ManagedMutationError("Rematch preview does not belong to this album.",
+                                   code="preview_album_mismatch", status=409)
+    if row["status"] != "pending":
+        raise ManagedMutationError("Rematch preview has already been applied or superseded.",
+                                   code="preview_not_pending", status=409)
+    items = _album_items(album)
+    current = _managed_album_fingerprint(album, items)
+    if expected != row["fingerprint"] or current != row["fingerprint"]:
+        raise ManagedMutationError("The album changed after this preview. Create a new preview.",
+                                   code="stale_fingerprint", status=409)
+    _require_managed_item_paths(app, items)
+    evidence_json, plan_json = row["evidence_json"], row["plan_json"]
+    evidence_sha = hashlib.sha256(f"{evidence_json}\n{plan_json}".encode()).hexdigest()
+    if evidence_sha != row["evidence_sha256"]:
+        raise ManagedMutationError("Stored rematch evidence failed integrity validation.",
+                                   code="preview_integrity_failed", status=409)
+    plan = json.loads(plan_json)
+    if not plan["applicable"]:
+        raise ManagedMutationError("This preview has an incomplete or ambiguous track mapping and cannot be applied.",
+                                   code="preview_not_applicable", status=409)
+    by_id = {item.id: item for item in items}
+    if set(by_id) != {update["item_id"] for update in plan["updates"]}:
+        raise ManagedMutationError("The album track identity changed after preview.",
+                                   code="stale_fingerprint", status=409)
+    changes = [(by_id[update["item_id"]], update["values"]) for update in plan["updates"]]
+    first_values = plan["updates"][0]["values"] if plan["updates"] else {}
+    album_values = {field: first_values[field] for field in ALBUM_EDITABLE_FIELDS if field in first_values}
+    with _connect(app.config["APP_DB"]) as db:
+        claimed = db.execute(
+            "UPDATE managed_album_rematches SET status = 'applying' WHERE id = ? AND status = 'pending'",
+            (preview_id,),
+        ).rowcount
+    if claimed != 1:
+        raise ManagedMutationError("Rematch preview was applied concurrently.",
+                                   code="preview_not_pending", status=409)
+    finalized = {}
+
+    def finalize_rematch():
+        refreshed = _managed_album_payload(app, album_id)
+        result = {
+            "preview_id": preview_id, "status": "applied", "evidence_sha256": evidence_sha,
+            "changes": plan["changes"], "candidate": plan["candidate"],
+            "fingerprint": refreshed["fingerprint"], "album": refreshed,
+        }
+        _finalize_managed_rematch(app, preview_id, result)
+        finalized["result"] = result
+
+    try:
+        _mutate_managed_items(
+            changes, album=album, album_values=album_values, finalize=finalize_rematch,
+        )
+    except Exception:
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE managed_album_rematches SET status = 'pending' WHERE id = ? AND status = 'applying'",
+                (preview_id,),
+            )
+        raise
+    return finalized["result"]
+
+
+def _finalize_managed_rematch(app: Flask, preview_id: str, result: dict) -> None:
+    """Commit the single-use audit record; callers retain metadata snapshots."""
+    with _connect(app.config["APP_DB"]) as db:
+        cursor = db.execute(
+            """UPDATE managed_album_rematches SET status = 'applied', result_json = ?, applied_at = ?
+                 WHERE id = ? AND status = 'applying'""",
+            (json.dumps(result, sort_keys=True), _now(), preview_id),
+        )
+        if cursor.rowcount != 1:
+            raise ManagedMutationError("Rematch audit state changed during apply.",
+                                       code="preview_audit_failed", status=500)
+
+
+FOLDER_STATUSES = {"all", "not-scanned", "ready", "needs-review", "error", "imported"}
+
+
+def _validated_folder_scope(app: Flask, value: object) -> str:
+    """Return a literal immediate-child scope without permitting traversal."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("folder scope is required")
+    scope = value.strip()
+    root = _validated_library_root(app)
+    if scope == ".":
+        return scope
+    candidate = Path(scope)
+    if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+        raise ValueError("folder scope must be an immediate child of the library root")
+    path = root / candidate.name
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("folder scope does not exist") from exc
+    if resolved.parent != root or path.is_symlink() or not resolved.is_dir():
+        raise ValueError("folder scope must resolve to a non-symlinked folder beneath the library root")
+    return candidate.name
+
+
+def _request_folder_scopes(app: Flask, values: dict | None = None) -> list[str]:
+    values = values if values is not None else request.get_json(silent=True)
+    if not isinstance(values, dict) or not isinstance(values.get("folders"), list):
+        raise ValueError("folders must be an array of folder scopes")
+    if not values["folders"]:
+        raise ValueError("select at least one folder")
+    if len(values["folders"]) > 1000:
+        raise ValueError("no more than 1000 folder scopes may be submitted at once")
+    scopes = []
+    for value in values["folders"]:
+        scope = _validated_folder_scope(app, value)
+        if scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _scope_for_relative_path(relative_path: str) -> str:
+    parts = Path(relative_path).parts
+    return parts[0] if len(parts) > 1 else "."
+
+
+def _relative_in_scope(relative_path: str, scope: str) -> bool:
+    return _scope_for_relative_path(relative_path) == scope
+
+
+def _literal_folder_scopes(root: Path) -> list[str]:
+    if not root.is_dir():
+        raise ValueError("configured library path is not a directory")
+    scopes = sorted(
+        (entry.name for entry in root.iterdir() if entry.is_dir() and not entry.is_symlink()),
+        key=lambda value: (value.casefold(), value),
+    )
+    if any(entry.is_file() and not entry.is_symlink() and entry.suffix.lower() in AUDIO_EXTENSIONS
+           for entry in root.iterdir()):
+        scopes.insert(0, ".")
+    return scopes
+
+
+def _album_bulk_readiness(album: dict, threshold: int = 100) -> tuple[bool, str]:
+    """Central exact/current/safe predicate used by queue display and execution."""
+    if album.get("execution_status") == "complete":
+        return False, "already imported"
+    if album.get("execution_status") == "failed" or album.get("candidate_status") == "error":
+        return False, "album has an error"
+    if album.get("candidate_status") != "complete" or album.get("candidate_error"):
+        return False, "candidate evidence is not current"
+    if album.get("decision") in {"rejected", "skipped"}:
+        return False, "album was excluded during review"
+    selected_id = album.get("selected_candidate_id")
+    candidate = next((item for item in album.get("candidates", []) if item.get("id") == selected_id), None)
+    if candidate is None:
+        return False, "no candidate is selected"
+    confidence = candidate.get("confidence")
+    if not isinstance(confidence, (int, float)) or confidence * 100 < threshold:
+        return False, f"selected candidate is below the {threshold}% match threshold"
+    alternatives = [item for item in album.get("candidates", []) if item.get("id") != selected_id]
+    if any(item.get("confidence") == candidate["confidence"] for item in alternatives):
+        return False, "best candidate is tied"
+    tracks = album.get("tracks", [])
+    details = candidate.get("track_details", [])
+    if (not tracks or len(details) != len(tracks)
+            or candidate.get("track_count_mismatch")
+            or candidate.get("unmatched_track_count")
+            or candidate.get("hard_mismatches")
+            or candidate.get("matched_track_count") != len(tracks)
+            or any(detail.get("status") != "matched" or detail.get("local") is None
+                   or detail.get("proposed") is None for detail in details)):
+        return False, "track pairing is incomplete or ambiguous"
+    if any(track.get("exception") is not None for track in tracks):
+        return False, "album has track exceptions"
+    if album.get("duplicate_preflight", {}).get("status") != "clear":
+        return False, "album has a duplicate conflict"
+    return True, "threshold met, current, conflict-free match"
+
+
+def _with_readiness(album: dict, threshold: int = 100) -> dict:
+    ready, reason = _album_bulk_readiness(album, threshold)
+    return {**album, "ready": ready, "readiness_reason": reason}
+
+
+def _request_selected_album_ids(values: dict | None, allowed_ids: list[int]) -> list[int]:
+    """Limit a bulk operation to checked albums while enforcing scope ownership."""
+    if not isinstance(values, dict):
+        return allowed_ids
+    field = "album_ids" if "album_ids" in values else "excluded_album_ids" if "excluded_album_ids" in values else None
+    if field is None:
+        return allowed_ids
+    raw_ids = values.get(field)
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError(f"{field} must be a non-empty array")
+    if len(raw_ids) > 5000:
+        raise ValueError("no more than 5000 albums may be submitted at once")
+    selected = []
+    for value in raw_ids:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field} must contain only integers")
+        if value not in selected:
+            selected.append(value)
+    if not set(selected).issubset(allowed_ids):
+        raise ValueError("selected albums must belong to the selected scopes")
+    return selected if field == "album_ids" else [album_id for album_id in allowed_ids if album_id not in selected]
+
+
+def _album_ids_for_scopes(app: Flask, scopes: list[str], *, include_complete: bool) -> list[int]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT albums.id, albums.execution_status, inventory.relative_path
+                 FROM album_reviews AS albums
+                 JOIN album_review_tracks AS tracks ON tracks.album_review_id = albums.id
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE albums.root_path = ? AND inventory.present = 1
+                ORDER BY albums.id""",
+            (root,),
+        ).fetchall()
+    wanted = set(scopes)
+    return list(dict.fromkeys(
+        row["id"] for row in rows
+        if _scope_for_relative_path(row["relative_path"]) in wanted
+        and (include_complete or row["execution_status"] != "complete")
+    ))
+
+
+def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dict:
+    if status not in FOLDER_STATUSES:
+        raise ValueError("status must be all, not-scanned, ready, needs-review, error, or imported")
+    root = _validated_library_root(app)
+    scopes = _literal_folder_scopes(root)
+    root_text = str(root)
+    with _connect(app.config["APP_DB"]) as db:
+        inventory = db.execute(
+            """SELECT inventory.relative_path, inventory.beets_item_id, inventory.present,
+                      albums.id AS album_id, albums.artist, albums.album, albums.execution_status,
+                      albums.execution_error, albums.candidate_status, albums.candidate_error, albums.state,
+                      selected.confidence AS selected_confidence
+                 FROM library_inventory AS inventory
+                 LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id = inventory.id
+                 LEFT JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                 LEFT JOIN metadata_candidates AS selected ON selected.id = albums.selected_candidate_id
+                WHERE inventory.root_path = ?""",
+            (root_text,),
+        ).fetchall()
+        scan_rows = db.execute(
+            "SELECT summary_json FROM adoption_jobs WHERE root_path=? AND kind='folder_inventory' AND status='complete'",
+            (root_text,),
+        ).fetchall()
+    scanned_scopes = {
+        summary.get("folder") for row in scan_rows
+        for summary in [json.loads(row["summary_json"])] if summary.get("folder")
+    }
+    # Inventory rows already belong to exactly one literal top-level scope. Group
+    # them once instead of rescanning the complete inventory for every folder.
+    rows_by_scope = {scope: [] for scope in scopes}
+    for row in inventory:
+        if row["present"]:
+            rows_by_scope.setdefault(_scope_for_relative_path(row["relative_path"]), []).append(row)
+
+    records = []
+    needle = query.casefold()
+    for scope in scopes:
+        rows = rows_by_scope.get(scope, [])
+        album_ids = {row["album_id"] for row in rows if row["album_id"] is not None}
+        pending = {row["album_id"] for row in rows if row["album_id"] is not None
+                   and row["execution_status"] != "complete"}
+        imported = {row["album_id"] for row in rows if row["album_id"] is not None
+                    and row["execution_status"] == "complete"}
+        errors = {row["album_id"] for row in rows if row["album_id"] is not None
+                  and row["execution_status"] != "complete"
+                  and (row["execution_status"] == "failed" or row["candidate_status"] == "error")}
+        error_message = next((row["execution_error"] or row["candidate_error"] for row in rows
+                              if row["album_id"] in errors
+                              and (row["execution_error"] or row["candidate_error"])), "")
+        if not rows and scope not in scanned_scopes:
+            fixed_status = "not-scanned"
+        elif errors:
+            fixed_status = "error"
+        elif pending:
+            fixed_status = None
+        elif imported:
+            fixed_status = "imported"
+        else:
+            # A scanned empty scope, or one containing only already-managed
+            # tracks with no active review album, has no queue work to show.
+            continue
+        if fixed_status == "imported" and status == "all":
+            continue
+        if fixed_status != "imported" and status == "imported":
+            continue
+        visible_ids = imported if fixed_status == "imported" else pending
+        visible_rows = [row for row in rows if row["album_id"] in visible_ids]
+        haystack = " ".join([
+            scope, *(row["relative_path"] for row in visible_rows),
+            *(str(row["artist"] or "") for row in visible_rows),
+            *(str(row["album"] or "") for row in visible_rows),
+        ]).casefold()
+        if needle and needle not in haystack:
+            continue
+        records.append({
+            "path": scope, "name": "Library root" if scope == "." else scope,
+            "status": fixed_status, "track_count": len(visible_rows), "album_count": len(visible_ids),
+            "error": error_message,
+            "available_album_count": len(pending), "imported_album_count": len(imported),
+            "_pending_ids": pending,
+            "_readiness_ids": {
+                row["album_id"] for row in rows
+                if row["album_id"] is not None and row["execution_status"] not in {"complete", "failed"}
+                and row["candidate_status"] == "complete" and not row["candidate_error"]
+                and row["state"] not in {"rejected", "skipped"}
+                # A managed projection can make the persisted provider score
+                # stale after settings change. Include it for payload-level
+                # recomputation; _album_bulk_readiness remains the strict gate.
+                and (app.config.get("FTINTITLE", {}).get("projection_requires_recheck")
+                     or (row["selected_confidence"] is not None
+                         and row["selected_confidence"] * 100 >= app.config["MATCH_THRESHOLD"]))
+            },
+        })
+
+    # Status filters must classify every matching folder. The ordinary all-status
+    # path paginates first, so candidate construction, duplicate checks, and audio
+    # duration inspection are bounded to albums on the displayed 25-folder page.
+    if status != "all":
+        fixed_matches = [record for record in records if record["status"] == status]
+        unresolved = [record for record in records if record["status"] is None]
+        if status in {"ready", "needs-review"}:
+            readiness_ids = sorted({album_id for record in unresolved for album_id in record["_readiness_ids"]})
+            ready_ids = {
+                album["id"] for album in (
+                    _with_readiness(item, app.config["MATCH_THRESHOLD"])
+                    for item in _album_review_payloads(app, readiness_ids)
+                )
+                if album["ready"]
+            }
+            for record in unresolved:
+                record["status"] = "ready" if record["_pending_ids"] & ready_ids else "needs-review"
+            records = fixed_matches + [record for record in unresolved if record["status"] == status]
+        else:
+            records = fixed_matches
+
+    total = len(records)
+    page_count = max(1, math.ceil(total / FOLDER_PAGE_SIZE))
+    page = min(page, page_count)
+    start = (page - 1) * FOLDER_PAGE_SIZE
+    page_records = records[start:start + FOLDER_PAGE_SIZE]
+    if status == "all":
+        unresolved = [record for record in page_records if record["status"] is None]
+        readiness_ids = sorted({album_id for record in unresolved for album_id in record["_readiness_ids"]})
+        ready_ids = {
+            album["id"] for album in (
+                _with_readiness(item, app.config["MATCH_THRESHOLD"])
+                for item in _album_review_payloads(app, readiness_ids)
+            )
+            if album["ready"]
+        }
+        for record in unresolved:
+            record["status"] = "ready" if record["_pending_ids"] & ready_ids else "needs-review"
+    for record in page_records:
+        ready = record["_pending_ids"] & (ready_ids if record["status"] in {"ready", "needs-review"} else set())
+        record["ready_album_count"] = len(ready)
+        record["exception_album_count"] = len(record["_pending_ids"] - ready)
+        record.pop("_pending_ids")
+        record.pop("_readiness_ids")
+    return {"folders": page_records, "page": page, "page_count": page_count,
+            "total": total, "limit": FOLDER_PAGE_SIZE, "query": query, "status": status}
+
+
+def _scope_audio_stats(root: Path, scope: str) -> list[tuple[Path, os.stat_result]]:
+    if scope != ".":
+        return _library_audio_stats(root / scope)
+    files = []
+    for path in sorted(root.iterdir(), key=lambda item: (item.name.casefold(), item.name)):
+        if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS:
+            files.append((path.resolve(), path.stat()))
+    return files
+
+
+def _preview_folder_inventory(app: Flask, scope: str) -> dict:
+    root = _validated_library_root(app)
+    created_at = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('folder_inventory', ?, 'running', ?)",
+            (str(root), created_at),
+        ).lastrowid
+    try:
+        discovered = _scope_audio_stats(root, scope)
+        discovered_by_path = {path.relative_to(root).as_posix(): (path, stat) for path, stat in discovered}
+        with _connect(app.config["APP_DB"]) as db:
+            existing = db.execute(
+                """SELECT inventory.id, inventory.relative_path, inventory.size_bytes, inventory.mtime_ns,
+                          inventory.device, inventory.inode, inventory.beets_item_id, inventory.present,
+                          tracks.album_review_id
+                     FROM library_inventory AS inventory
+                     LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id = inventory.id
+                    WHERE inventory.root_path = ?""", (str(root),)
+            ).fetchall()
+            scoped = {row["relative_path"]: row for row in existing
+                      if _relative_in_scope(row["relative_path"], scope)}
+            changed_paths = {
+                relative for relative, (_, stat) in discovered_by_path.items()
+                if relative not in scoped or not scoped[relative]["present"]
+                or (scoped[relative]["size_bytes"], scoped[relative]["mtime_ns"],
+                    scoped[relative]["device"], scoped[relative]["inode"])
+                != (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+            }
+            removed_paths = {relative for relative, row in scoped.items()
+                             if row["present"] and relative not in discovered_by_path}
+            affected_paths = changed_paths | removed_paths
+            affected_album_ids = sorted({scoped[path]["album_review_id"] for path in affected_paths
+                                         if path in scoped and scoped[path]["album_review_id"] is not None})
+            if not affected_paths:
+                tracked = sum(row["beets_item_id"] is not None for row in scoped.values()
+                              if row["present"] and row["relative_path"] in discovered_by_path)
+                summary = {"id": job_id, "folder": scope, "status": "complete", "files": len(discovered),
+                           "tracked": tracked, "untracked": len(discovered) - tracked,
+                           "changed": False, "changed_files": 0, "removed_files": 0,
+                           "finished_at": _now()}
+                db.execute("UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
+                           (json.dumps(summary), summary["finished_at"], job_id))
+                return {**summary, "_affected_inventory_ids": [],
+                        "_affected_album_ids": affected_album_ids}
+
+            beets_paths = {str(Path(os.fsdecode(item.path)).resolve()): item.id
+                           for item in _library(app).items() if item.path}
+            missing_ids = [(scoped[path]["id"],) for path in removed_paths]
+            if missing_ids:
+                db.executemany("UPDATE library_inventory SET present = 0, beets_item_id = NULL WHERE id = ?",
+                               missing_ids)
+            tracked = 0
+            for path, stat in discovered:
+                relative = path.relative_to(root).as_posix()
+                item_id = beets_paths.get(str(path)); tracked += item_id is not None
+                db.execute(
+                    """INSERT INTO library_inventory(root_path, relative_path, size_bytes, mtime_ns, device, inode,
+                              beets_item_id, present, first_seen_job_id, last_seen_job_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                       ON CONFLICT(root_path, relative_path) DO UPDATE SET size_bytes=excluded.size_bytes,
+                         mtime_ns=excluded.mtime_ns, device=excluded.device, inode=excluded.inode,
+                         beets_item_id=excluded.beets_item_id, present=1, last_seen_job_id=excluded.last_seen_job_id""",
+                    (str(root), relative, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino,
+                     item_id, job_id, job_id),
+                )
+                inventory_id = db.execute(
+                    "SELECT id FROM library_inventory WHERE root_path = ? AND relative_path = ?", (str(root), relative)
+                ).fetchone()["id"]
+                db.execute("INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
+                           (inventory_id, created_at))
+                if relative in changed_paths:
+                    candidates = ([{"kind": "beets-item", "beets_item_id": item_id}] if item_id is not None
+                                  else [{"kind": "needs-review", "match": None}])
+                    db.execute("UPDATE adoption_reviews SET candidates_json = ?, updated_at = ? WHERE inventory_id = ?",
+                               (json.dumps(candidates), created_at, inventory_id))
+            affected_inventory_ids = [
+                db.execute("SELECT id FROM library_inventory WHERE root_path=? AND relative_path=?",
+                           (str(root), relative)).fetchone()["id"]
+                for relative in sorted(affected_paths)
+            ]
+            summary = {"id": job_id, "folder": scope, "status": "complete", "files": len(discovered),
+                       "tracked": tracked, "untracked": len(discovered) - tracked, "changed": True,
+                       "changed_files": len(changed_paths), "removed_files": len(removed_paths),
+                       "finished_at": _now()}
+            db.execute("UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
+                       (json.dumps(summary), summary["finished_at"], job_id))
+        return {**summary, "_affected_inventory_ids": affected_inventory_ids,
+                "_affected_album_ids": affected_album_ids}
+    except Exception as exc:
+        message = f"folder inventory failed for {scope}: {exc}"
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute("UPDATE adoption_jobs SET status='failed', error=?, finished_at=? WHERE id=?",
+                       (message[:1000], _now(), job_id))
+        raise ValueError(message) from exc
+
+
+def _scan_folder_scopes(app: Flask, scopes: list[str], *, match_candidates: bool = True, unmanaged_only: bool = False) -> dict:
+    folders, errors = [], []
+    successful = []
+    for scope in scopes:
+        try:
+            folders.append(_preview_folder_inventory(app, scope)); successful.append(scope)
+        except ValueError as exc:
+            errors.append({"folder": scope, "error": str(exc)})
+    # Repair older queue rows even when no file's stat changed. Managed files
+    # may have been grouped before Inbox completion or by an earlier build.
+    if successful and unmanaged_only:
+        _prune_managed_adoption_tracks(app, successful)
+    albums = []
+    changed = [folder for folder in folders if folder["changed"]]
+    if successful:
+        affected_album_ids = {album_id for folder in changed for album_id in folder["_affected_album_ids"]}
+        if changed:
+            _sync_album_reviews(app, scopes=[folder["folder"] for folder in changed], unmanaged_only=unmanaged_only)
+            affected_inventory_ids = [inventory_id for folder in changed
+                                      for inventory_id in folder["_affected_inventory_ids"]]
+            if affected_inventory_ids:
+                placeholders = ", ".join("?" for _ in affected_inventory_ids)
+                with _connect(app.config["APP_DB"]) as db:
+                    affected_album_ids.update(row["album_review_id"] for row in db.execute(
+                        f"SELECT album_review_id FROM album_review_tracks WHERE inventory_id IN ({placeholders})",
+                        affected_inventory_ids,
+                    ).fetchall())
+        album_ids = sorted(affected_album_ids & set(
+            _album_ids_for_scopes(app, successful, include_complete=False)
+        ))
+        if album_ids:
+            with _connect(app.config["APP_DB"]) as db:
+                db.executemany(
+                    """UPDATE album_reviews SET candidate_status='stale',
+                              candidate_error='Inventory refreshed; candidate evidence requires refresh.'
+                         WHERE id=? AND execution_status!='complete'""", [(album_id,) for album_id in album_ids]
+                )
+            generated = (_generate_musicbrainz_candidates(app, len(album_ids), album_ids=album_ids)
+                         if match_candidates else {"errors": []})
+            error_by_id = {item["album_review_id"]: item for item in generated["errors"]}
+            for item in _album_review_payloads(app, album_ids):
+                album = _with_readiness(item, app.config["MATCH_THRESHOLD"])
+                albums.append({"album_review_id": album["id"], "artist": album["artist"], "album": album["album"],
+                               "status": "error" if album["id"] in error_by_id else "ready" if album["ready"] else "needs-review",
+                               "ready": album["ready"], "error": error_by_id.get(album["id"], {}).get("error", "")})
+            errors.extend({"album_review_id": item["album_review_id"], "error": item["error"]}
+                          for item in generated["errors"])
+        by_id = {album["album_review_id"]: album for album in albums}
+        for folder in folders:
+            folder_ids = _album_ids_for_scopes(app, [folder["folder"]], include_complete=False)
+            folder["albums"] = [by_id[album_id] for album_id in folder_ids if album_id in by_id]
+            folder["errors"] = [album for album in folder["albums"] if album["status"] == "error"]
+    for folder in folders:
+        folder.pop("_affected_inventory_ids", None)
+        folder.pop("_affected_album_ids", None)
+    return {"folders": folders, "albums": albums, "errors": errors,
+            "selected_folder_count": len(scopes), "scanned_folder_count": len(successful)}
+
+
+def _bulk_ready_summary(app: Flask, scopes: list[str], *, album_ids: list[int] | None = None) -> dict:
+    album_ids = album_ids if album_ids is not None else _album_ids_for_scopes(app, scopes, include_complete=False)
+    albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"])
+              for album in _album_review_payloads(app, album_ids)]
+    ready = [album for album in albums if album["ready"]]
+    excluded = [album for album in albums if not album["ready"]]
+    return {"selected_folder_count": len(scopes), "available_album_count": len(albums),
+            "ready_album_count": len(ready), "track_count": sum(len(album["tracks"]) for album in ready),
+            "exception_count": len(excluded),
+            "ready_albums": [{"id": album["id"], "artist": album["artist"], "album": album["album"],
+                              "tracks": len(album["tracks"])} for album in ready],
+            "exceptions": [{"id": album["id"], "artist": album["artist"], "album": album["album"],
+                            "reason": album["readiness_reason"]} for album in excluded]}
+
+
+def _execute_bulk_ready(app: Flask, scopes: list[str], *, album_ids: list[int] | None = None) -> dict:
+    summary = _bulk_ready_summary(app, scopes, album_ids=album_ids)
+    imported, failed = [], []
+    for album in summary["ready_albums"]:
+        try:
+            current = next(iter(_album_review_payloads(app, [album["id"]])), None)
+            ready, reason = _album_bulk_readiness(current or {}, app.config["MATCH_THRESHOLD"])
+            if not ready:
+                raise LibraryImportExecutionError(f"Album is no longer ready: {reason}", code="not_ready")
+            _update_album_review(app, album["id"], {"decision": "approved"})
+            _execute_library_import_album(app, album["id"], dry_run=True)
+            result = _execute_library_import_album(app, album["id"], dry_run=False)
+            imported.append({"album_review_id": album["id"], "files": result["files"],
+                             "artist": album["artist"], "album": album["album"]})
+        except Exception as exc:
+            failed.append({"album_review_id": album["id"], "artist": album["artist"],
+                           "album": album["album"], "error": str(exc)})
+    return {"selected_folder_count": len(scopes), "imported": imported,
+            "skipped": summary["exceptions"], "failed": failed}
+
+
+def _selected_library_choice(album: dict, *, inbox: bool = False) -> tuple[dict | None, str]:
+    """Explicit approval ignores score/ties, but preserves exclusions and safe pairing."""
+    if album.get("decision") in {"rejected", "skipped"}:
+        return None, "album was excluded during review"
+    if album.get("execution_status") == "complete":
+        return None, "already imported"
+    if inbox and any(track.get("exception") not in {None, "approved"} for track in album.get("tracks", [])):
+        return None, "Inbox albums copy together; clear track exclusions first"
+    tracks = [track for track in album.get("tracks", []) if track.get("exception") not in {"rejected", "skipped"}]
+    if not tracks:
+        return None, "no tracks are included"
+    candidate = None
+    as_is = album.get("selection_mode") == "as-is"
+    if not as_is:
+        if album.get("candidate_status") != "complete" or album.get("candidate_error"):
+            return None, "match evidence needs refresh"
+        pool = album.get("candidates", [])
+        selected_id = album.get("selected_candidate_id")
+        candidate = next((row for row in pool if row["id"] == selected_id), None)
+        if candidate is None and selected_id is None:
+            candidate = max(pool, key=lambda row: row.get("confidence", 0), default=None)
+        if candidate is None:
+            return None, "choose a match or As Is"
+        details = {row.get("position"): row for row in candidate.get("track_details", []) if row.get("local") is not None}
+        included = [index for index, track in enumerate(album.get("tracks", []), 1)
+                    if track.get("exception") not in {"rejected", "skipped"}]
+        if any(position not in details or details[position].get("proposed") is None
+               or details[position].get("status") not in {"matched", "title-mismatch", "duration-mismatch", "order-mismatch"}
+               for position in included):
+            return None, "track pairing needs review"
+    duplicate = candidate.get("duplicate_preflight", {"status": "clear"}) if candidate else album.get("duplicate_preflight", {"status": "clear"})
+    if duplicate.get("status") == "ambiguous":
+        return None, "managed recording identity is ambiguous"
+    selection = {"decision": "approved", "candidate_id": candidate["id"] if candidate else None}
+    if duplicate.get("status") != "clear":
+        action = album.get("duplicate_action")
+        if action not in ({"keep-existing", "replace", "keep-both"} if inbox else {"keep-existing", "skip", "keep-both"}):
+            return None, "duplicates require a decision before importing"
+        selection["duplicate_action"] = action
+    return selection, ""
+
+
+def _bulk_selected_library_summary(app: Flask, scopes: list[str], album_ids: list[int]) -> dict:
+    eligible, excluded = [], []
+    for album in _album_review_payloads(app, album_ids):
+        choice, reason = _selected_library_choice(album)
+        if choice is None:
+            excluded.append({"id": album["id"], "album": album["album"], "reason": reason})
+        else:
+            eligible.append({"id": album["id"], "album": album["album"], "tracks": len(album["tracks"])})
+    return {"selected_folder_count": len(scopes), "available_album_count": len(album_ids),
+            "importable_album_count": len(eligible), "importable_albums": eligible,
+            "exception_count": len(excluded), "exceptions": excluded}
+
+
+def _execute_bulk_selected_library(app: Flask, scopes: list[str], album_ids: list[int]) -> dict:
+    imported, skipped, failed = [], [], []
+    # Reload each album after earlier adoptions so new duplicate identities are seen.
+    for album_id in album_ids:
+        album = next(iter(_album_review_payloads(app, [album_id])), None)
+        if album is None:
+            skipped.append({"id": album_id, "reason": "album is no longer available"})
+            continue
+        choice, reason = _selected_library_choice(album)
+        if choice is None:
+            skipped.append({"id": album_id, "album": album["album"], "reason": reason})
+            continue
+        try:
+            _update_album_review(app, album_id, choice, serialize=False)
+            _execute_library_import_album(app, album_id, dry_run=True)
+            result = _execute_library_import_album(app, album_id, dry_run=False)
+            imported.append({"album_review_id": album_id, "album": album["album"], "files": result["files"]})
+        except Exception as exc:
+            failed.append({"album_review_id": album_id, "album": album["album"], "error": str(exc)})
+    return {"selected_folder_count": len(scopes), "imported": imported, "skipped": skipped, "failed": failed}
+
+
+def _preview_library_inventory(app: Flask) -> dict:
+    root = _validated_library_root(app)
+    created_at = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('inventory_preview', ?, 'running', ?)",
+            (str(root), created_at),
+        ).lastrowid
+
+    try:
+        discovered = _library_audio_stats(root)
+        beets_paths = {}
+        for item in _library(app).items():
+            item_path = item.get("path")
+            if item_path:
+                beets_paths[str(Path(os.fsdecode(item_path)).resolve())] = item.id
+    except (OSError, sqlite3.Error) as exc:
+        message = f"library inventory failed: {exc}"
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?",
+                (message, _now(), job_id),
+            )
+        raise ValueError(message) from exc
+
+    tracked = 0
+    total_bytes = 0
+    sample = []
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute("UPDATE library_inventory SET present = 0, beets_item_id = NULL WHERE root_path = ?", (str(root),))
+        for path, stat in discovered:
+            relative = path.relative_to(root).as_posix()
+            item_id = beets_paths.get(str(path))
+            tracked += item_id is not None
+            total_bytes += stat.st_size
+            db.execute(
+                """INSERT INTO library_inventory(
+                       root_path, relative_path, size_bytes, mtime_ns, device, inode, beets_item_id,
+                       present, first_seen_job_id, last_seen_job_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                   ON CONFLICT(root_path, relative_path) DO UPDATE SET
+                       size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns,
+                       device = excluded.device, inode = excluded.inode,
+                       beets_item_id = excluded.beets_item_id, present = 1,
+                       last_seen_job_id = excluded.last_seen_job_id""",
+                (str(root), relative, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino, item_id, job_id, job_id),
+            )
+            inventory_id = db.execute(
+                "SELECT id FROM library_inventory WHERE root_path = ? AND relative_path = ?", (str(root), relative)
+            ).fetchone()["id"]
+            db.execute(
+                "INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
+                (inventory_id, created_at),
+            )
+            candidates = (
+                [{"kind": "beets-item", "beets_item_id": item_id}]
+                if item_id is not None
+                else [{"kind": "needs-review", "match": None}]
+            )
+            db.execute(
+                "UPDATE adoption_reviews SET candidates_json = ?, updated_at = ? WHERE inventory_id = ?",
+                (json.dumps(candidates), created_at, inventory_id),
+            )
+            if item_id is None and len(sample) < MAX_INVENTORY_SAMPLE:
+                sample.append(relative)
+
+        missing = db.execute(
+            "SELECT COUNT(*) AS count FROM library_inventory WHERE root_path = ? AND present = 0", (str(root),)
+        ).fetchone()["count"]
+        summary = {
+            "id": job_id,
+            "status": "complete",
+            "root": str(root),
+            "files": len(discovered),
+            "tracked": tracked,
+            "untracked": len(discovered) - tracked,
+            "missing": missing,
+            "bytes": total_bytes,
+            "sample": sample,
+            "sample_truncated": len(discovered) - tracked > len(sample),
+            "created_at": created_at,
+            "finished_at": _now(),
+        }
+        db.execute(
+            "UPDATE adoption_jobs SET status = 'complete', summary_json = ?, finished_at = ? WHERE id = ?",
+            (json.dumps(summary), summary["finished_at"], job_id),
+        )
+    return summary
+
+
+def _library_audio_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
+    if not root.is_dir():
+        raise OSError("configured library path is not a directory")
+    files = []
+    for directory, names, filenames in os.walk(root, followlinks=False, onerror=_raise_os_error):
+        names[:] = sorted(name for name in names if not (Path(directory) / name).is_symlink())
+        for name in sorted(filenames):
+            path = Path(directory) / name
+            if path.is_symlink() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+                continue
+            files.append((path.resolve(), path.stat()))
+    return files
+
+
+def _raise_os_error(error: OSError) -> None:
+    raise error
+
+
+def _latest_inventory_summary(app: Flask) -> dict | None:
+    with _connect(app.config["APP_DB"]) as db:
+        row = db.execute(
+            "SELECT summary_json FROM adoption_jobs WHERE kind = 'inventory_preview' AND status = 'complete' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return json.loads(row["summary_json"]) if row else None
+
+
+def _library_import_review_album_page(app: Flask, limit: int, offset: int) -> tuple[list[int], bool, int]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        albums = db.execute(
+            """SELECT albums.id FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  AND albums.execution_status != 'complete'
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                ORDER BY albums.artist_key, albums.album_key, albums.id
+                LIMIT ? OFFSET ?""",
+            (root, limit + 1, offset),
+        ).fetchall()
+        total = db.execute(
+            """SELECT COUNT(*) FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  AND albums.execution_status != 'complete'
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)""",
+            (root,),
+        ).fetchone()[0]
+    return [row["id"] for row in albums[:limit]], len(albums) > limit, total
+
+
+def _library_import_review_items(app: Flask, album_ids: list[int]) -> list[dict]:
+    if not album_ids:
+        return []
+    placeholders = ", ".join("?" for _ in album_ids)
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            f"""SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                       reviews.state, reviews.candidates_json, reviews.updated_at
+                  FROM album_review_tracks AS tracks
+                  JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                  JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                  JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                 WHERE albums.root_path = ? AND albums.id IN ({placeholders})
+                   AND inventory.present = 1
+                 ORDER BY albums.artist_key, albums.album_key, albums.id,
+                          inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (root, *album_ids),
+        ).fetchall()
+    library = _library(app)
+    return [
+        _serialize_library_import_review(row, library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None)
+        for row in rows
+    ]
+
+
+def _library_import_review_item(app: Flask, inventory_id: int) -> dict:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        row = db.execute(
+            """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                      reviews.state, reviews.candidates_json, reviews.updated_at
+                 FROM library_inventory AS inventory
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                WHERE inventory.id = ? AND inventory.root_path = ? AND inventory.present = 1""",
+            (inventory_id, root),
+        ).fetchone()
+    if row is None:
+        abort(404)
+    item = _library(app).get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+    return _serialize_library_import_review(row, item)
+
+
+def _normalize_metadata(value: object) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).strip()
+
+
+def _item_genre(item: Item) -> str:
+    """Read genre across beets' legacy scalar and current multi-value fields."""
+    genre = _normalize_metadata(item.get("genre"))
+    if genre:
+        return genre
+    genres = item.get("genres")
+    if isinstance(genres, (list, tuple)):
+        for value in genres:
+            normalized = _normalize_metadata(value)
+            if normalized:
+                return normalized
+        return ""
+    return _normalize_metadata(genres)
+
+
+def _set_item_value(item: Item, field: str, value: object) -> None:
+    item[field] = value
+    if field == "genre" and "genres" in item._fields:
+        normalized = _normalize_metadata(value)
+        item["genres"] = [normalized] if normalized else []
+
+
+def _metadata_key(value: object) -> str:
+    return _normalize_metadata(value).casefold()
+
+
+def _genre_presentation_key(value: object) -> str:
+    """Compare genre presentation using only whitespace folding and Unicode casefolding."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _format_genre(value: object) -> str:
+    """Title-case one genre after whitespace cleanup while preserving its punctuation."""
+    return " ".join(str(value or "").split()).title()
+
+
+def _normalize_track_title(value: object) -> str:
+    title = _normalize_metadata(value)
+    return re.sub(r"^\s*(?:\d+[.-]?\s*[-–—.]?\s*)", "", title) or title
+
+
+def _track_title_key(value: object) -> str:
+    title = _normalize_track_title(value).casefold()
+    return title.translate(str.maketrans({
+        "‘": "'", "’": "'", "‚": "'", "‛": "'", "ʼ": "'", "＇": "'",
+        "“": '"', "”": '"', "„": '"', "‟": '"', "＂": '"',
+    }))
+
+
+def _all_library_import_review_items(app: Flask, scopes: list[str] | None = None) -> list[dict]:
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id,
+                      reviews.state, reviews.candidates_json, reviews.updated_at
+                 FROM library_inventory AS inventory
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                WHERE inventory.root_path = ? AND inventory.present = 1
+                  AND reviews.imported_at IS NULL
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (root,),
+        ).fetchall()
+    if scopes is not None:
+        wanted = set(scopes)
+        rows = [row for row in rows if _scope_for_relative_path(row["relative_path"]) in wanted]
+    library = _library(app)
+    return [
+        _serialize_library_import_review(row, library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None)
+        for row in rows
+    ]
+
+
+def _prune_managed_adoption_tracks(app: Flask, scopes: list[str]) -> None:
+    """Reconcile pending adoption links; never modify media or managed items."""
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT tracks.album_review_id, tracks.inventory_id, inventory.relative_path
+                 FROM album_review_tracks AS tracks
+                 JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE albums.root_path=? AND albums.source_kind='library'
+                  AND albums.execution_status!='complete'
+                  AND inventory.root_path=? AND inventory.source_kind='library'
+                  AND inventory.present=1 AND inventory.beets_item_id IS NOT NULL""",
+            (root, root),
+        ).fetchall()
+        wanted = set(scopes)
+        rows = [row for row in rows if _scope_for_relative_path(row["relative_path"]) in wanted]
+        if not rows:
+            return
+        db.executemany(
+            "DELETE FROM album_review_tracks WHERE album_review_id=? AND inventory_id=?",
+            [(row["album_review_id"], row["inventory_id"]) for row in rows],
+        )
+        db.executemany(
+            """UPDATE album_reviews SET candidate_status='stale',
+                      candidate_error='Managed tracks removed; match remaining files again.', updated_at=?
+                 WHERE id=?""",
+            [(_now(), album_id) for album_id in sorted({row["album_review_id"] for row in rows})],
+        )
+
+
+def _sync_album_reviews(app: Flask, scopes: list[str] | None = None, *, unmanaged_only: bool = False) -> None:
+    """Persist stable album groups without touching media or the beets database."""
+    root = str(Path(app.config["LIBRARY_PATH"]).resolve())
+    groups: dict[tuple[str, str, str], dict] = {}
+    for item in _all_library_import_review_items(app, scopes):
+        if unmanaged_only and item["status"] == "tracked":
+            continue
+        artist = _normalize_metadata(item["artist"]) or "Unknown artist"
+        album = _normalize_metadata(item["album"]) or "Unknown album"
+        # Folder scope is part of workflow identity. Identical tags in sibling
+        # top-level folders must never make selecting one folder operate on the
+        # other's files. Multi-disc subfolders inside one top-level scope still
+        # remain one matching/import unit.
+        scope_key = _scope_for_relative_path(item["path"])
+        group = groups.setdefault(
+            (scope_key, _metadata_key(artist), _metadata_key(album)),
+            {"artist": artist, "album": album, "items": []},
+        )
+        group["items"].append(item)
+    now = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        _migrate_legacy_album_scope_keys(db, root, now)
+        exceptions = {
+            row["inventory_id"]: row["exception_state"]
+            for row in db.execute(
+                """SELECT tracks.inventory_id, tracks.exception_state
+                     FROM album_review_tracks AS tracks
+                     JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                    WHERE albums.root_path = ? AND tracks.exception_state IS NOT NULL""", (root,)
+            )
+        }
+        if scopes is None:
+            db.execute(
+                """DELETE FROM album_review_tracks
+                     WHERE album_review_id IN (
+                       SELECT id FROM album_reviews WHERE root_path = ? AND execution_status != 'complete'
+                     )""",
+                (root,),
+            )
+        else:
+            wanted = set(scopes)
+            scoped_track_links = [
+                (row["album_review_id"], row["inventory_id"]) for row in db.execute(
+                    """SELECT tracks.album_review_id, tracks.inventory_id, inventory.relative_path
+                         FROM album_review_tracks AS tracks
+                         JOIN album_reviews AS albums ON albums.id = tracks.album_review_id
+                         JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                        WHERE albums.root_path = ? AND albums.execution_status != 'complete'
+                        ORDER BY tracks.album_review_id""", (root,),
+                ).fetchall()
+                if _scope_for_relative_path(row["relative_path"]) in wanted
+            ]
+            if scoped_track_links:
+                # A legacy or interrupted migration can leave one album row
+                # linked across sibling scopes. Never remove the unrequested
+                # scope's track link while reconciling this scope.
+                db.executemany(
+                    "DELETE FROM album_review_tracks WHERE album_review_id = ? AND inventory_id = ?",
+                    scoped_track_links,
+                )
+        for (scope_key, metadata_artist_key, album_key), group in groups.items():
+            artist_key = f"{scope_key.casefold()}\x1f{metadata_artist_key}"
+            db.execute(
+                """INSERT INTO album_reviews(root_path, artist_key, album_key, artist, album, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(root_path, artist_key, album_key) DO UPDATE SET
+                     artist = excluded.artist, album = excluded.album""",
+                (root, artist_key, album_key, group["artist"], group["album"], now),
+            )
+            album_id = db.execute(
+                "SELECT id FROM album_reviews WHERE root_path = ? AND artist_key = ? AND album_key = ?",
+                (root, artist_key, album_key),
+            ).fetchone()["id"]
+            db.executemany(
+                "INSERT INTO album_review_tracks(album_review_id, inventory_id, exception_state) VALUES (?, ?, ?)",
+                [(album_id, item["id"], exceptions.get(item["id"])) for item in group["items"]],
+            )
+
+
+def _migrate_legacy_album_scope_keys(db: sqlite3.Connection, root: str, now: str) -> None:
+    """Keep pre-folder-workflow review IDs and choices when adding scope identity.
+
+    Earlier databases keyed an album only by normalized artist and album. Most
+    such rows belong to one top-level folder and can be upgraded in place. If a
+    legacy row spans sibling folders, retain it for the first deterministic
+    scope but mark its merged candidate evidence stale; tracks in subsequent
+    scopes move to new pending review rows before any scoped sync runs.
+    """
+    legacy_rows = db.execute(
+        """SELECT id, artist, album, artist_key, album_key
+             FROM album_reviews
+            WHERE root_path = ? AND execution_status != 'complete'
+              AND instr(artist_key, char(31)) = 0
+            ORDER BY id""",
+        (root,),
+    ).fetchall()
+    for album in legacy_rows:
+        paths = db.execute(
+            """SELECT inventory.id, inventory.relative_path
+                 FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE tracks.album_review_id = ? AND inventory.present = 1
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (album["id"],),
+        ).fetchall()
+        scopes = sorted({_scope_for_relative_path(row["relative_path"]) for row in paths}, key=str.casefold)
+        if not scopes:
+            continue
+        scoped_artist_key = f"{scopes[0].casefold()}\x1f{_metadata_key(album['artist'])}"
+        conflict = db.execute(
+            """SELECT id FROM album_reviews
+                WHERE root_path = ? AND artist_key = ? AND album_key = ? AND id != ?""",
+            (root, scoped_artist_key, album["album_key"], album["id"]),
+        ).fetchone()
+        if conflict is not None:
+            # A prior folder-first sync may already have created an empty
+            # replacement row. Prefer the legacy row when it carries the only
+            # candidate history, so upgrades are idempotent across restarts.
+            legacy_candidates = db.execute(
+                "SELECT COUNT(*) AS count FROM metadata_candidates WHERE album_review_id = ?", (album["id"],)
+            ).fetchone()["count"]
+            conflict_candidates = db.execute(
+                "SELECT COUNT(*) AS count FROM metadata_candidates WHERE album_review_id = ?", (conflict["id"],)
+            ).fetchone()["count"]
+            if legacy_candidates and not conflict_candidates:
+                db.execute("DELETE FROM album_review_tracks WHERE album_review_id = ?", (conflict["id"],))
+                db.execute("DELETE FROM album_reviews WHERE id = ?", (conflict["id"],))
+            else:
+                continue
+        assignments = ["artist_key = ?", "updated_at = ?"]
+        values: list[object] = [scoped_artist_key, now]
+        if len(scopes) > 1:
+            assignments.extend(["candidate_status = 'stale'", "candidate_error = ?"])
+            values.append("Album was split by top-level folder; refresh candidate evidence.")
+        db.execute(
+            f"UPDATE album_reviews SET {', '.join(assignments)} WHERE id = ?",
+            (*values, album["id"]),
+        )
+        for extra_scope in scopes[1:]:
+            extra_artist_key = f"{extra_scope.casefold()}\x1f{_metadata_key(album['artist'])}"
+            db.execute(
+                """INSERT INTO album_reviews(root_path, artist_key, album_key, artist, album, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(root_path, artist_key, album_key) DO NOTHING""",
+                (root, extra_artist_key, album["album_key"], album["artist"], album["album"], now),
+            )
+            extra_album_id = db.execute(
+                "SELECT id FROM album_reviews WHERE root_path=? AND artist_key=? AND album_key=?",
+                (root, extra_artist_key, album["album_key"]),
+            ).fetchone()["id"]
+            db.executemany(
+                "UPDATE album_review_tracks SET album_review_id=? WHERE inventory_id=?",
+                [(extra_album_id, row["id"]) for row in paths
+                 if _scope_for_relative_path(row["relative_path"]) == extra_scope],
+            )
+
+
+def _has_current_match(app: Flask, album_id: int, *, root: str | None = None,
+                       source_kind: str = "library", source_id: str = "") -> bool:
+    root = root or str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        return db.execute(
+            """SELECT 1 FROM album_reviews WHERE id=? AND root_path=? AND source_kind=? AND source_id=?
+                AND candidate_status='complete' AND candidate_error=''
+                AND execution_status NOT IN ('complete','artwork-pending','cleanup-pending','duplicate-executing')
+                AND NOT EXISTS (SELECT 1 FROM metadata_candidates WHERE album_review_id=album_reviews.id AND schema_version<?)""",
+            (album_id, root, source_kind, source_id, MIN_SUPPORTED_CANDIDATE_SCHEMA_VERSION),
+        ).fetchone() is not None
+
+
+def _candidate_album_rows(
+    app: Flask, limit: int, album_ids: list[int] | None = None, *, root: str | None = None,
+    source_kind: str = "library", source_id: str | None = None,
+) -> list[sqlite3.Row]:
+    root = root or str(Path(app.config["LIBRARY_PATH"]).resolve())
+    album_filter = ""
+    source_filter = " AND albums.source_kind = ?"
+    parameters: list[object] = [root, source_kind]
+    if source_id is not None:
+        source_filter += " AND albums.source_id = ?"
+        parameters.append(source_id)
+    if album_ids is not None:
+        if not album_ids:
+            return []
+        album_filter = f" AND albums.id IN ({', '.join('?' for _ in album_ids)})"
+        parameters.extend(album_ids)
+    parameters.append(limit)
+    with _connect(app.config["APP_DB"]) as db:
+        return db.execute(
+            """SELECT albums.id, albums.artist, albums.album, albums.root_path,
+                      albums.state, albums.source_kind, albums.source_id, albums.candidate_status, albums.candidate_error
+                 FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  {source_filter}
+                  AND albums.execution_status NOT IN ('complete', 'artwork-pending', 'cleanup-pending', 'duplicate-executing')
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                  {album_filter}
+                ORDER BY CASE albums.candidate_status
+                           WHEN 'stale' THEN 0 WHEN 'not-run' THEN 1 WHEN 'error' THEN 2 ELSE 3
+                         END,
+                         albums.artist_key, albums.album_key, albums.id LIMIT ?""".format(
+                             album_filter=album_filter, source_filter=source_filter
+                         ),
+            tuple(parameters),
+        ).fetchall()
+
+
+def _album_query(app: Flask, album: sqlite3.Row) -> dict:
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.relative_path, inventory.beets_item_id, reviews.candidates_json
+                 FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                WHERE tracks.album_review_id = ? ORDER BY inventory.relative_path COLLATE NOCASE""",
+            (album["id"],),
+        ).fetchall()
+    library = _library(app)
+    source_root = Path(album["root_path"] if "root_path" in album.keys() else app.config["LIBRARY_PATH"])
+    inbox_source = "source_kind" in album.keys() and album["source_kind"] == "inbox"
+    tracks = []
+    years = []
+    dates = []
+    release_ids = []
+    release_group_ids = []
+    release_types = []
+    media_types = []
+    countries = []
+    genres = []
+    artwork_url = None
+    for row in rows:
+        item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+        snapshot = next(iter(json.loads(row["candidates_json"])), {}) if inbox_source else {}
+        if item is None:
+            if inbox_source:
+                item = snapshot
+            else:
+                try:
+                    item = Item.from_path(source_root / row["relative_path"])
+                except Exception:
+                    # Inventory may contain unreadable or synthetic fixtures. Path
+                    # fallback still provides a reviewable, non-mutating query.
+                    item = None
+        title = item.get("title") if item and item.get("title") else Path(row["relative_path"]).stem
+        track = {"title": _normalize_track_title(title), "path": row["relative_path"]}
+        stored_duration = item.get("length") if item and item.get("length") not in (None, "", 0) else None
+        duration = stored_duration if inbox_source else _audio_duration(source_root / row["relative_path"], stored_duration)
+        if duration is not None:
+            track["duration"] = duration
+        if item:
+            track["artist"] = _normalize_metadata(item.get("artist"))
+            for source, target in (("disc", "disc"), ("track", "track"),
+                                   ("mb_trackid", "recording_id")):
+                if item.get(source) not in (None, "", 0):
+                    track[target] = item.get(source)
+            if item.get("year"):
+                years.append(item.get("year"))
+                month = int(item.get("month") or 0)
+                day = int(item.get("day") or 0)
+                dates.append(f"{int(item.get('year')):04d}" + (f"-{month:02d}" if month else "")
+                             + (f"-{day:02d}" if month and day else ""))
+            if item.get("mb_albumid"):
+                release_ids.append(str(item.get("mb_albumid")).lower())
+            if item.get("mb_releasegroupid"):
+                release_group_ids.append(str(item.get("mb_releasegroupid")).lower())
+            for field, values in (("albumtype", release_types), ("media", media_types), ("country", countries)):
+                if item.get(field):
+                    values.append(str(item.get(field)))
+            if _item_genre(item):
+                genres.append(_item_genre(item))
+            if artwork_url is None:
+                artwork_url = _persisted_artwork_source({
+                    key: item.get(key) for key in ("artwork_url", "image_url", "cover_url", "cover_art")
+                }, allow_data=True)
+        tracks.append(track)
+    query = {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
+    query["folder_albums"] = list(dict.fromkeys(
+        Path(track["path"]).parent.name for track in tracks if Path(track["path"]).parent.name
+    ))[:2]
+    if years:
+        query["year"] = years[0]
+        query["date"] = dates[0]
+    if release_ids and len(set(release_ids)) == 1:
+        query["release_mbid"] = release_ids[0]
+    if release_group_ids and len(set(release_group_ids)) == 1:
+        query["release_group_id"] = release_group_ids[0]
+    for field, values in (("release_type", release_types), ("media", media_types), ("country", countries)):
+        if values and len(set(values)) == 1:
+            query[field] = values[0]
+    if genres and len(set(genres)) == 1:
+        query["genre"] = genres[0]
+    if artwork_url:
+        query["artwork_url"] = artwork_url
+    return query
+
+
+def _audio_duration(path: Path, fallback: object = None) -> float | object | None:
+    """Read an audio stream's duration without changing the file or library."""
+    try:
+        measured = MediaFile(str(path)).length
+        duration = float(measured)
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except (OSError, TypeError, ValueError, UnreadableFileError):
+        pass
+    return fallback
+
+
+def _candidate_match(query: dict, candidate: dict, *, exact_mbid: bool = False) -> dict:
+    exact = exact_mbid or bool(query.get("release_mbid") and
+                               str(candidate.get("provider_id", "")).lower() == query["release_mbid"])
+    retrieval = candidate.get("retrieval") if isinstance(candidate.get("retrieval"), dict) else {}
+    exact = exact or retrieval.get("source") == "release-id"
+    return score_release(query, candidate, exact_mbid=exact)
+
+
+def _effective_candidate(app: Flask, candidate: dict, query: dict | None = None) -> dict:
+    """Project reviewed-Library behavior without mutating provider evidence.
+
+    Provider JSON remains the audit source. Album-edition preservation requires
+    local Library metadata and is deliberately not applied to Inbox/beets CLI
+    imports. FtInTitle projection only calls bundled parser helpers; it never
+    constructs a plugin or runs import hooks.
+    """
+    projected = dict(candidate)
+    local_album = _normalize_metadata(query.get("album")) if isinstance(query, dict) else ""
+    canonical_album = _normalize_metadata(candidate.get("album"))
+    suffix = re.fullmatch(
+        r"(?P<base>.+?)(?:\s*\((?P<parenthesized>[^\[\]()]+)\)"
+        r"|\s*\[(?P<bracketed>[^\[\]()]+)\]"
+        r"|(?:\s(?P<separator>[-\u2013\u2014])|(?P<colon>:))\s+(?P<separated>.+))",
+        local_album,
+    )
+    if suffix:
+        local_base = _normalize_metadata(suffix.group("base"))
+        qualifier = _normalize_metadata(
+            suffix.group("parenthesized") or suffix.group("bracketed") or suffix.group("separated")
+        )
+        release_notes = [
+            _normalize_metadata(part) for part in
+            re.split(r"[,;]", str(candidate.get("release_disambiguation") or ""))
+        ]
+        if (_metadata_key(canonical_album) == _metadata_key(local_base)
+                and _metadata_key(qualifier) in {_metadata_key(note) for note in release_notes if note}):
+            projected["album"] = local_album
+
+    options = app.config.get("FTINTITLE", FTINTITLE_DEFAULTS)
+    if not options.get("enabled"):
+        return projected
+    albumartist = _normalize_metadata(candidate.get("artist"))
+    projected_tracks = []
+    drop_feat = bool(options.get("drop", False))
+    feat_format = str(options.get("format") or FTINTITLE_DEFAULTS["format"])
+    keep_in_artist = bool(options.get("keep_in_artist"))
+    preserve_album_artist = bool(options.get("preserve_album_artist", True))
+    custom_words = list(options.get("custom_words") or [])
+    bracket_keywords = list(options.get("bracket_keywords") or [])
+    for raw_track in candidate.get("tracks", []) if isinstance(candidate.get("tracks"), list) else []:
+        if not isinstance(raw_track, dict):
+            projected_tracks.append(raw_track)
+            continue
+        track = dict(raw_track)
+        artist = _normalize_metadata(track.get("track_artist"))
+        title = _normalize_track_title(track.get("title"))
+        structurally_valid = artist.count("(") == artist.count(")") and artist.count("[") == artist.count("]")
+        if preserve_album_artist and albumartist and artist == albumartist:
+            projected_tracks.append(track)
+            continue
+        for_artist = not albumartist or albumartist in artist
+        if artist and structurally_valid:
+            _, featured = split_on_feat(
+                artist, for_artist=for_artist, custom_words=custom_words
+            )
+            feat_part = find_feat_part(artist, albumartist, custom_words) if featured else None
+            if feat_part:
+                if not keep_in_artist:
+                    track["track_artist"] = split_on_feat(
+                        artist, custom_words=custom_words
+                    )[0]
+                if not drop_feat and not contains_feat(title, custom_words):
+                    try:
+                        track["title"] = FtInTitlePlugin.insert_ft_into_title(
+                            title, feat_format.format(feat_part), bracket_keywords
+                        )
+                    except (AttributeError, IndexError, KeyError, ValueError):
+                        # A hand-edited invalid YAML format remains visible in
+                        # Settings and is rejected on save; it cannot alter a
+                        # reviewed candidate in the meantime.
+                        track = dict(raw_track)
+        projected_tracks.append(track)
+    projected["tracks"] = projected_tracks
+    return projected
+
+
+def _candidate_confidence(query: dict, candidate: dict, *, exact_mbid: bool = False) -> float:
+    return _candidate_match(query, candidate, exact_mbid=exact_mbid)["confidence"]
+
+
+def _candidate_diff(query: dict, candidate: dict) -> dict:
+    proposed = {}
+    for key in ("artist", "album"):
+        value = _normalize_metadata(candidate.get(key))
+        if value and _metadata_key(value) != _metadata_key(query[key]):
+            proposed[key] = {"from": query[key], "to": value}
+    genre = _candidate_genre(candidate)
+    if genre and _genre_presentation_key(genre) != _genre_presentation_key(query.get("genre")):
+        proposed["genre"] = {"from": query.get("genre"), "to": genre}
+    count = candidate.get("track_count")
+    if isinstance(count, int) and count != len(query["tracks"]):
+        proposed["track_count"] = {"from": len(query["tracks"]), "to": count}
+    candidate_tracks = candidate.get("tracks")
+    if isinstance(candidate_tracks, list):
+        normalized_tracks = [_normalize_track_title(track.get("title") if isinstance(track, dict) else track)
+                             for track in candidate_tracks]
+        local_tracks = [_normalize_track_title(track.get("title") if isinstance(track, dict) else track)
+                        for track in query["tracks"]]
+        if [_track_title_key(track) for track in normalized_tracks] != [_track_title_key(track) for track in local_tracks]:
+            proposed["tracks"] = {"from": local_tracks, "to": normalized_tracks}
+        details = _candidate_track_details(query, candidate)
+        local_artists = [detail.get("local_artist") or "" for detail in details if detail.get("local") is not None]
+        proposed_artists = [detail.get("proposed_artist") or "" for detail in details if detail.get("local") is not None]
+        if [_metadata_key(value) for value in local_artists] != [_metadata_key(value) for value in proposed_artists]:
+            proposed["track_artists"] = {"from": local_artists, "to": proposed_artists}
+    return proposed
+
+
+def _candidate_reasons(query: dict, candidate: dict) -> list[str]:
+    return _candidate_match(query, candidate)["reasons"]
+
+
+def _candidate_genre(candidate: dict) -> str:
+    evidence = candidate.get("genre_evidence")
+    if not isinstance(evidence, dict) or evidence.get("source") != "musicbrainz-release-group-genres":
+        return ""
+    selected = " ".join(str(evidence.get("selected") or "").split())
+    genre = " ".join(str(candidate.get("genre") or "").split())
+    return _format_genre(genre) if genre and _genre_presentation_key(genre) == _genre_presentation_key(selected) else ""
+
+
+def _candidate_track_details(query: dict, candidate: dict) -> list[dict]:
+    return _candidate_match(query, candidate)["track_details"]
+
+
+def _cleanup_inbox_directories(app: Flask, inbox: dict, *, scopes=None, ignore_album_id=None) -> dict:
+    from .inbox_cleanup import prune_empty_directories
+    root = Path(inbox["path"])
+    library = _validated_library_root(app)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Inbox root must be a real directory.")
+    root = root.resolve()
+    if root == library or root in library.parents or library in root.parents:
+        raise ValueError("Inbox and Library roots overlap.")
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.relative_path FROM album_review_tracks AS tracks
+                 JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE albums.source_kind='inbox' AND albums.source_id=? AND albums.root_path=?
+                  AND albums.execution_status IN ('artwork-pending','cleanup-pending','duplicate-executing')
+                  AND (? IS NULL OR albums.id!=?)""",
+            (inbox["id"], str(root), ignore_album_id, ignore_album_id),
+        ).fetchall()
+    protected = {_scope_for_relative_path(row["relative_path"]) for row in rows}
+    return prune_empty_directories(root, scopes=scopes, protected=protected)
+
+
+def _refresh_inbox_scope_inventory(app: Flask, inbox: dict, scopes: list[str]) -> dict:
+    lock = app.config["INBOX_EXECUTION_LOCK"]
+    if not lock.acquire(blocking=False):
+        raise ValueError("An Inbox import is running; refresh this folder after it finishes.")
+    try:
+        return _scan_inbox_inventory(app, inbox, scopes=scopes)
+    finally:
+        lock.release()
+
+
+def _refresh_review_inventory(
+    app: Flask, album_id: int, *, root: str | None = None,
+    source_kind: str = "library", source_id: str | None = None,
+) -> None:
+    root = root or str(Path(app.config["LIBRARY_PATH"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            "SELECT * FROM album_reviews WHERE id=? AND root_path=? AND source_kind=?",
+            (album_id, root, source_kind),
+        ).fetchone()
+        if album is None:
+            return
+        if album["execution_status"] in {"complete", "artwork-pending", "cleanup-pending", "duplicate-executing"}:
+            raise ValueError("This album has already imported audio; finish import recovery instead of rematching.")
+        paths = db.execute(
+            """SELECT inventory.id, inventory.relative_path FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE tracks.album_review_id=?""", (album_id,),
+        ).fetchall()
+    scopes = sorted({_scope_for_relative_path(row["relative_path"]) for row in paths})
+    if not scopes:
+        raise ValueError("This album no longer has source tracks; reload the queue to review its current files.")
+    if source_kind == "inbox":
+        inbox = _configured_inbox(app, source_id)
+        if inbox is None or album["source_id"] != source_id:
+            raise ValueError("Inbox source is unavailable.")
+        scopes = [_validated_inbox_scope(inbox, scope) for scope in scopes]
+        _refresh_inbox_scope_inventory(app, inbox, scopes)
+    else:
+        scopes = [_validated_folder_scope(app, scope) for scope in scopes]
+        result = _scan_folder_scopes(app, scopes, match_candidates=False)
+        if result["errors"]:
+            raise ValueError(result["errors"][0]["error"])
+    with _connect(app.config["APP_DB"]) as db:
+        current_ids = {row["inventory_id"] for row in db.execute(
+            "SELECT inventory_id FROM album_review_tracks WHERE album_review_id=?", (album_id,),
+        )}
+        if not current_ids:
+            raise ValueError("Album grouping changed; reload the queue to review its current files.")
+        if current_ids != {row["id"] for row in paths}:
+            db.execute(
+                """UPDATE album_reviews SET state='pending', candidate_status='stale',
+                          candidate_error='Source track membership changed; refresh candidates.', updated_at=?
+                    WHERE id=?""", (_now(), album_id),
+            )
+
+
+def _rematch_album_by_musicbrainz_id(
+    app: Flask, album_review_id: int, musicbrainz_id: str, *, root: str | None = None,
+    source_kind: str = "library", source_id: str | None = None,
+) -> dict | None:
+    root = root or str(Path(app.config["LIBRARY_PATH"]).resolve())
+    source_sql = " AND source_kind = ?" + (" AND source_id = ?" if source_id is not None else "")
+    parameters = (album_review_id, root, source_kind, *([source_id] if source_id is not None else []))
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            f"SELECT * FROM album_reviews WHERE id = ? AND root_path = ?{source_sql}",
+            parameters,
+        ).fetchone()
+    if album is None:
+        return None
+    _refresh_review_inventory(app, album_review_id, root=root, source_kind=source_kind, source_id=source_id)
+    query = _album_query(app, album)
+    with match_diagnostics.attempt(source=source_kind, review_id=album_review_id, operation="exact-id"):
+        provider = app.config["MUSICBRAINZ_PROVIDER"]
+        release_error = None
+        try:
+            raw = provider({**query, "musicbrainz_id": musicbrainz_id, "force_refresh": True}, limit=1)
+        except ProviderError as exc:
+            if exc.code != "release_not_found":
+                raise
+            release_error = exc
+            raw = []
+        if not isinstance(raw, list):
+            raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+        exact_release = next((
+            value for value in raw
+            if isinstance(value, dict) and str(value.get("provider_id", "")).lower() == musicbrainz_id
+        ), None)
+        if exact_release is not None:
+            candidates = [dict(exact_release)]
+            retrieval_source = "release-id"
+        else:
+            group_raw = provider({**query, "musicbrainz_release_group_id": musicbrainz_id, "force_refresh": True}, limit=10)
+            if not isinstance(group_raw, list):
+                raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+            candidates = [
+                dict(value) for value in group_raw
+                if isinstance(value, dict) and str(value.get("release_group_id", "")).lower() == musicbrainz_id
+                and MUSICBRAINZ_ID_PATTERN.fullmatch(str(value.get("provider_id", "")))
+            ]
+            retrieval_source = "release-group-id"
+            if not candidates:
+                if raw or group_raw:
+                    raise ProviderError(
+                        "MusicBrainz provider returned identities unrelated to the requested MBID.",
+                        code="provider_invalid_response",
+                    )
+                message = "No MusicBrainz release or release group exists for that ID."
+                if release_error is not None and release_error.retryable:
+                    raise release_error
+                raise ProviderError(message, code="musicbrainz_id_not_found")
+        for candidate in candidates:
+            candidate["retrieval"] = {
+                **(candidate.get("retrieval") or {}), "source": retrieval_source, "search_score": None,
+            }
+        diagnostic_candidates = []
+        now = _now()
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE metadata_candidates SET rank = rank + ? WHERE album_review_id = ?",
+                (len(candidates), album_review_id),
+            )
+            for rank, candidate in enumerate(candidates, 1):
+                provider_id = str(candidate["provider_id"]).lower()
+                existing = db.execute(
+                    "SELECT id FROM metadata_candidates WHERE album_review_id = ? AND provider = 'musicbrainz' AND provider_id = ?",
+                    (album_review_id, provider_id),
+                ).fetchone()
+                effective = _effective_candidate(app, candidate, query)
+                match = _candidate_match(query, effective, exact_mbid=True)
+                diagnostic_candidates.append(match_diagnostics.evidence(query, effective, match))
+                values = (
+                    rank, match["confidence"],
+                    _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
+                    str(candidate.get("year")) if candidate.get("year") else None,
+                    json.dumps(_candidate_diff(query, effective), sort_keys=True),
+                    json.dumps(candidate, sort_keys=True), CANDIDATE_SCHEMA_VERSION, now,
+                )
+                if existing:
+                    db.execute(
+                        """UPDATE metadata_candidates SET rank=?, confidence=?, artist=?, album=?, year=?,
+                                  proposed_diff_json=?, provider_data_json=?, schema_version=?, created_at=? WHERE id=?""",
+                        (*values, existing["id"]),
+                    )
+                else:
+                    db.execute(
+                        """INSERT INTO metadata_candidates(
+                               album_review_id, provider, provider_id, rank, confidence, artist, album, year,
+                               proposed_diff_json, provider_data_json, schema_version, created_at
+                           ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (album_review_id, provider_id, *values),
+                    )
+            db.execute(
+                """UPDATE album_reviews SET state='pending', selected_candidate_id=NULL,
+                          candidate_status='complete', candidate_error='', execution_status='not-run',
+                          execution_error='', last_execution_job_id=NULL, executed_at=NULL, updated_at=? WHERE id=?""",
+                (now, album_review_id),
+            )
+        match_diagnostics.emit("matching.completed", source=source_kind, review_id=album_review_id, operation="exact-id", candidates=diagnostic_candidates)
+        return next(iter(_album_review_payloads(
+            app, [album_review_id], root=root, source_kind=source_kind, source_id=source_id
+        )), None)
+
+
+def _generate_musicbrainz_candidates(
+    app: Flask, limit: int, *, album_ids: list[int] | None = None, root: str | None = None,
+    source_kind: str = "library", source_id: str | None = None,
+) -> dict:
+    provider = app.config["MUSICBRAINZ_PROVIDER"]
+    albums = _candidate_album_rows(
+        app, limit, album_ids, root=root, source_kind=source_kind, source_id=source_id
+    )
+    errors = []
+    generated = 0
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('musicbrainz_candidates', ?, 'running', ?)",
+            (root or (albums[0]["root_path"] if albums else str(Path(app.config["LIBRARY_PATH"]).resolve())), _now()),
+        ).lastrowid
+    for album in albums:
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE album_reviews SET candidate_status='running', candidate_error='', updated_at=? WHERE id=?",
+                (_now(), album["id"]),
+            )
+        query = _album_query(app, album)
+        try:
+            match_diagnostics.emit("matching.started", source=source_kind, review_id=album["id"], operation="search")
+            with _connect(app.config["APP_DB"]) as db:
+                selected = db.execute(
+                    """SELECT candidates.provider, candidates.provider_id
+                         FROM album_reviews AS albums
+                         JOIN metadata_candidates AS candidates ON candidates.id = albums.selected_candidate_id
+                        WHERE albums.id = ?""",
+                    (album["id"],),
+                ).fetchone()
+            raw = provider(query, limit=MAX_CANDIDATES_PER_ALBUM)
+            if not isinstance(raw, list):
+                raise ProviderError("MusicBrainz provider returned invalid candidates")
+            candidates = [
+                candidate for candidate in raw[:MAX_CANDIDATES_PER_ALBUM]
+                if isinstance(candidate, dict) and candidate.get("provider_id")
+            ]
+            # Ranked text-search hits need not contain a saved release. Retrieve
+            # that identity directly before treating its evidence as unavailable.
+            if (selected is not None and selected["provider"] == "musicbrainz"
+                    and MUSICBRAINZ_ID_PATTERN.fullmatch(selected["provider_id"])
+                    and not any(str(row["provider_id"]).lower() == selected["provider_id"].lower()
+                                for row in candidates)):
+                exact = provider({**query, "musicbrainz_id": selected["provider_id"]}, limit=1)
+                if not isinstance(exact, list):
+                    raise ProviderError("MusicBrainz provider returned invalid candidates", code="provider_invalid_response")
+                refreshed_selection = next((row for row in exact if isinstance(row, dict)
+                    and str(row.get("provider_id", "")).lower() == selected["provider_id"].lower()), None)
+                if refreshed_selection is None:
+                    raise ProviderError(
+                        "The selected release could not be retrieved by ID. Search a different release ID or explicitly choose As Is.",
+                        code="release_not_found",
+                    )
+                candidates = [*candidates[:MAX_CANDIDATES_PER_ALBUM - 1], refreshed_selection]
+            candidates.sort(key=lambda candidate: (
+                -_candidate_confidence(query, _effective_candidate(app, candidate, query)), str(candidate["provider_id"])
+            ))
+            with _connect(app.config["APP_DB"]) as db:
+                selected = db.execute(
+                    """SELECT candidates.provider, candidates.provider_id
+                         FROM album_reviews AS albums
+                         JOIN metadata_candidates AS candidates ON candidates.id = albums.selected_candidate_id
+                        WHERE albums.id = ?""",
+                    (album["id"],),
+                ).fetchone()
+                if selected is not None and not any(
+                    selected["provider"] == "musicbrainz"
+                    and str(candidate["provider_id"]) == selected["provider_id"]
+                    for candidate in candidates
+                ):
+                    message = "The selected candidate was not returned during refresh; review it before importing."
+                    db.execute(
+                        """UPDATE album_reviews SET candidate_status = 'stale', candidate_error = ?,
+                                  updated_at = ? WHERE id = ?""",
+                        (message, _now(), album["id"]),
+                    )
+                    errors.append({"album_review_id": album["id"], "error": message, "retryable": False})
+                    match_diagnostics.emit("matching.failed", source=source_kind, review_id=album["id"], operation="search", code="selected_candidate_unavailable", retryable=False)
+                    continue
+                db.execute("DELETE FROM metadata_candidates WHERE album_review_id = ?", (album["id"],))
+                diagnostic_candidates = []
+                for rank, candidate in enumerate(candidates, 1):
+                    effective = _effective_candidate(app, candidate, query)
+                    match = _candidate_match(query, effective)
+                    diagnostic_candidates.append(match_diagnostics.evidence(query, effective, match))
+                    db.execute(
+                        """INSERT INTO metadata_candidates(
+                               album_review_id, provider, provider_id, rank, confidence, artist, album,
+                               year, proposed_diff_json, provider_data_json, schema_version, created_at
+                           ) VALUES (?, 'musicbrainz', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (album["id"], str(candidate["provider_id"]), rank,
+                         match["confidence"],
+                         _normalize_metadata(candidate.get("artist")), _normalize_metadata(candidate.get("album")),
+                         str(candidate.get("year")) if candidate.get("year") else None,
+                         json.dumps(_candidate_diff(query, _effective_candidate(app, candidate, query)), sort_keys=True),
+                         json.dumps(candidate, sort_keys=True), CANDIDATE_SCHEMA_VERSION, _now()),
+                    )
+                selected_id = None
+                if selected is not None:
+                    refreshed = db.execute(
+                        """SELECT id FROM metadata_candidates
+                            WHERE album_review_id = ? AND provider = ? AND provider_id = ?""",
+                        (album["id"], selected["provider"], selected["provider_id"]),
+                    ).fetchone()
+                    selected_id = refreshed["id"] if refreshed else None
+                elif candidates and album["state"] != "approved":
+                    matches = [_candidate_match(query, _effective_candidate(app, candidate, query)) for candidate in candidates]
+                    best = matches[0]
+                    tied = len(matches) > 1 and matches[1]["confidence"] == best["confidence"]
+                    exact_tracks = (
+                        best["confidence"] == 1.0 and not tied and not best["track_count_mismatch"]
+                        and not best["unmatched_track_count"] and not best["hard_mismatches"]
+                        and best["matched_track_count"] == len(query["tracks"])
+                        and all(detail.get("status") == "matched" for detail in best["track_details"])
+                    )
+                    if exact_tracks:
+                        selected_id = db.execute(
+                            "SELECT id FROM metadata_candidates WHERE album_review_id=? ORDER BY rank, id LIMIT 1",
+                            (album["id"],),
+                        ).fetchone()["id"]
+                db.execute(
+                    """UPDATE album_reviews SET selected_candidate_id = ?, candidate_status = 'complete',
+                              candidate_error = '', updated_at = ? WHERE id = ?""",
+                    (selected_id, _now(), album["id"]),
+                )
+            match_diagnostics.emit("matching.completed", source=source_kind, review_id=album["id"], operation="search", candidates=diagnostic_candidates)
+            generated += len(candidates)
+        except (ProviderError, OSError, ValueError, TypeError) as exc:
+            match_diagnostics.emit("matching.failed", source=source_kind, review_id=album["id"], operation="search", code=str(getattr(exc, "code", "match_failed")), retryable=bool(getattr(exc, "retryable", False)), upstream_status=getattr(exc, "upstream_status", None))
+            message = str(exc) or "candidate provider failed"
+            errors.append({"album_review_id": album["id"], "error": message,
+                           "retryable": bool(getattr(exc, "retryable", False)),
+                           "code": getattr(exc, "code", "provider_error"),
+                           "retry_after_seconds": max(0, int(getattr(exc, "retry_after_seconds", 0) or 0)),
+                           "upstream_status": getattr(exc, "upstream_status", None)})
+            with _connect(app.config["APP_DB"]) as db:
+                db.execute(
+                    "UPDATE album_reviews SET candidate_status = ?, candidate_error = ?, updated_at = ? WHERE id = ?",
+                    ("complete" if album["candidate_status"] == "complete" and not album["candidate_error"] else "error",
+                     "" if album["candidate_status"] == "complete" and not album["candidate_error"] else message[:500],
+                     _now(), album["id"]),
+                )
+    result = {"id": job_id, "albums": len(albums), "candidates": generated, "errors": errors}
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute(
+            "UPDATE adoption_jobs SET status = ?, summary_json = ?, error = ?, finished_at = ? WHERE id = ?",
+            ("partial" if errors else "complete", json.dumps(result), "; ".join(error["error"] for error in errors)[:1000], _now(), job_id),
+        )
+    return result
+
+
+def _persisted_artwork_source(provider_data: dict, *, allow_data: bool = False) -> str | None:
+    """Expose only an already-persisted, browser-renderable artwork source."""
+    values = [provider_data.get(key) for key in ("artwork_url", "image_url", "cover_url")]
+    artwork = provider_data.get("artwork")
+    if isinstance(artwork, dict) and artwork.get("source") == "cover-art-archive":
+        values.insert(0, artwork.get("thumbnail_url"))
+    cover_art = provider_data.get("cover_art")
+    if isinstance(cover_art, dict):
+        values.extend(cover_art.get(key) for key in ("url", "image", "data"))
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        source = value.strip()
+        lowered = source.lower()
+        parsed = urllib.parse.urlparse(source)
+        host = (parsed.hostname or "").lower()
+        trusted_remote = parsed.scheme == "https" and (
+            host in TRUSTED_ARTWORK_HOSTS or host.endswith(".archive.org")
+        )
+        if trusted_remote or (allow_data and lowered.startswith(
+            ("data:image/png;", "data:image/jpeg;", "data:image/gif;", "data:image/webp;", "data:image/avif;")
+        )):
+            return source
+    return None
+
+
+def _duplicate_preflight(
+    app: Flask, tracks: list[sqlite3.Row], query: dict, details: list[dict] | None = None,
+    managed_items: list[Item] | None = None, candidate: dict | None = None,
+) -> dict:
+    """Report recording/album collisions without choosing a target or changing state."""
+    root = Path(app.config["LIBRARY_PATH"]).resolve()
+    managed_by_recording: dict[str, list[Item]] = {}
+    for item in managed_items if managed_items is not None else _library(app).items():
+        recording_id = str(item.get("mb_trackid") or "").strip()
+        if recording_id:
+            managed_by_recording.setdefault(recording_id, []).append(item)
+    proposed_by_position = {
+        detail["position"]: str(detail.get("recording_id") or "").strip()
+        for detail in (details or []) if detail.get("local") is not None and detail.get("recording_id")
+    }
+    warnings = []
+    for position, (track, source) in enumerate(zip(tracks, query["tracks"]), 1):
+        if track["beets_item_id"] is not None:
+            continue
+        recording_id = proposed_by_position.get(position) or str(source.get("recording_id") or "").strip()
+        detail = next((row for row in (details or []) if row.get("local") is not None and row.get("position") == position), None)
+        if detail is None and source.get("track"):
+            detail = {"proposed_position": [source.get("disc") or 1, source["track"]]}
+        matches = duplicate_matches(managed_by_recording.get(recording_id, []), recording_id, candidate or query, detail)
+        if not matches:
+            continue
+        managed_paths = []
+        for item in matches:
+            try:
+                path = Path(os.fsdecode(item.path)).resolve()
+                managed_paths.append(path.relative_to(root).as_posix() if root in path.parents else str(path))
+            except (OSError, ValueError, TypeError):
+                managed_paths.append("Managed path unavailable")
+        warnings.append({
+            "incoming_path": track["relative_path"],
+            "recording_id": recording_id,
+            "managed_paths": sorted(managed_paths, key=str.casefold),
+            "ambiguous": len(matches) != 1,
+        })
+    ambiguous = any(warning["ambiguous"] for warning in warnings)
+    return {
+        "status": "ambiguous" if ambiguous else "possible" if warnings else "clear",
+        "count": len(warnings),
+        "warnings": warnings,
+        "message": (
+            "Managed recording identity is ambiguous; queueing is blocked until the library identity is corrected."
+            if ambiguous else
+            f"{len(warnings)} incoming file{' may' if len(warnings) == 1 else 's may'} already be managed. Review the duplicate decision before queueing."
+            if warnings else "No managed recording-ID duplicate was found during preflight."
+        ),
+    }
+
+
+def _album_review_payloads(
+    app: Flask, album_ids: list[int] | None = None, *, root: str | None = None,
+    source_kind: str = "library", source_id: str | None = None,
+) -> list[dict]:
+    if album_ids == []:
+        return []
+    root = root or str(Path(app.config["LIBRARY_PATH"]).resolve())
+    album_filter = ""
+    source_filter = " AND albums.source_kind = ?" + (" AND albums.source_id = ?" if source_id is not None else "")
+    parameters: tuple = (root, source_kind, *([source_id] if source_id is not None else []))
+    if album_ids is not None:
+        album_filter = f" AND albums.id IN ({', '.join('?' for _ in album_ids)})"
+        parameters = (*parameters, *album_ids)
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            f"""SELECT albums.* FROM album_reviews AS albums
+                WHERE albums.root_path = ?
+                  {source_filter}
+                  AND (albums.execution_status != 'complete' OR EXISTS (SELECT 1 FROM inbox_copy_imports receipt WHERE receipt.album_review_id=albums.id AND receipt.status='imported'))
+                  AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id = albums.id)
+                  {album_filter}
+                ORDER BY albums.artist_key, albums.album_key, albums.id""", parameters
+        ).fetchall()
+        payloads = []
+        managed_items = list(_library(app).items())
+        for row in rows:
+            query = _album_query(app, row)
+            tracks = db.execute(
+                """SELECT inventory.id, inventory.relative_path, inventory.beets_item_id, tracks.exception_state
+                     FROM album_review_tracks AS tracks
+                     JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                    WHERE tracks.album_review_id = ? ORDER BY inventory.relative_path COLLATE NOCASE""", (row["id"],)
+            ).fetchall()
+            candidates = db.execute(
+                "SELECT * FROM metadata_candidates WHERE album_review_id = ? ORDER BY rank, id", (row["id"],)
+            ).fetchall()
+            serialized_candidates = []
+            for candidate in candidates:
+                provider_data = json.loads(candidate["provider_data_json"])
+                effective_candidate = _effective_candidate(app, provider_data, query)
+                match = _candidate_match(query, effective_candidate)
+                serialized_candidates.append({
+                    "id": candidate["id"], "provider": candidate["provider"],
+                    "provider_id": candidate["provider_id"], "rank": candidate["rank"],
+                    "confidence": match["confidence"], "distance": match["distance"],
+                    "recommendation": match["recommendation"], "confidence_reasons": match["reasons"],
+                    "penalties": match["penalties"], "track_count_mismatch": match["track_count_mismatch"],
+                    "matched_track_count": match["matched_track_count"],
+                    "unmatched_track_count": match["unmatched_track_count"],
+                    "hard_mismatches": match["hard_mismatches"],
+                    "selected_by_mbid": match["selected_by_mbid"],
+                    "artist": _normalize_metadata(effective_candidate.get("artist")),
+                    "album": _normalize_metadata(effective_candidate.get("album")), "year": candidate["year"],
+                    "genre": _candidate_genre(effective_candidate) or None,
+                    "genre_evidence": provider_data.get("genre_evidence"),
+                    "date": provider_data.get("date"), "release_group_id": provider_data.get("release_group_id"),
+                    "release_type": provider_data.get("release_type"),
+                    "release_status": provider_data.get("status"), "country": provider_data.get("country"),
+                    "release_disambiguation": provider_data.get("release_disambiguation"),
+                    "artwork_url": _persisted_artwork_source(provider_data),
+                    "artwork": provider_data.get("artwork"),
+                    "media": provider_data.get("media", []), "recordings": effective_candidate.get("tracks", []),
+                    "retrieval": provider_data.get("retrieval", {}),
+                    "proposed_diff": _candidate_diff(query, effective_candidate),
+                    "track_details": match["track_details"],
+                    "duplicate_preflight": _duplicate_preflight(
+                        app, tracks, query, match["track_details"], managed_items, candidate=effective_candidate
+                    ),
+                })
+            selected_id = row["selected_candidate_id"]
+            proposed_match = next((candidate for candidate in serialized_candidates if candidate["id"] == selected_id), None)
+            if proposed_match is None and serialized_candidates:
+                proposed_match = max(serialized_candidates, key=lambda candidate: candidate["confidence"])
+            duplicate_preflight = (
+                proposed_match["duplicate_preflight"] if proposed_match is not None and not (row["state"] == "approved" and selected_id is None)
+                else _duplicate_preflight(app, tracks, query, managed_items=managed_items)
+            )
+            highest_confidence = max((candidate["confidence"] for candidate in serialized_candidates), default=None)
+            current_metadata = {
+                "artist": query["artist"], "album": query["album"],
+                "year": query.get("year"), "date": query.get("date"),
+                "genre": query.get("genre"),
+                "track_count": len(query["tracks"]),
+                "disc_count": len({track.get("disc") or 1 for track in query["tracks"]}),
+                "artwork_url": query.get("artwork_url"),
+            }
+            current_metadata.update({field: query[field] for field in ("release_type", "media", "country")
+                                     if query.get(field)})
+            from .inbox_imports import import_state
+            imported = import_state(app, row["id"]) if row["source_kind"] == "inbox" else None
+            payloads.append({
+                "imported": imported,
+                "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
+                "source_kind": row["source_kind"], "source_id": row["source_id"],
+                "duplicate_action": row["duplicate_action"],
+                "duplicate_actions": (["keep-existing", "replace", "keep-both"] if row["source_kind"] == "inbox" else ["keep-existing", "keep-both"]),
+                "source_paths": sorted({str(Path(track["relative_path"]).parent.as_posix()) for track in tracks}, key=str.casefold),
+                "selected_candidate_id": selected_id, "proposed_match": proposed_match,
+                "selection_mode": ("as-is" if row["state"] == "approved" and selected_id is None
+                                   else "candidate" if selected_id is not None else "suggested"),
+                "current_metadata": current_metadata,
+                "highest_confidence": highest_confidence,
+                "duplicate_preflight": duplicate_preflight,
+                "candidate_status": row["candidate_status"],
+                "candidate_error": row["candidate_error"],
+                "execution_status": row["execution_status"],
+                "execution_error": row["execution_error"],
+                "last_execution_job_id": row["last_execution_job_id"],
+                "executed_at": row["executed_at"],
+                "tracks": [{"id": track["id"], "path": track["relative_path"],
+                            "title": query["tracks"][index]["title"],
+                            "artist": query["tracks"][index].get("artist"),
+                            "duration": query["tracks"][index].get("duration"),
+                            "disc": query["tracks"][index].get("disc"),
+                            "position": query["tracks"][index].get("track"),
+                            "recording_id": query["tracks"][index].get("recording_id"),
+                            "exception": track["exception_state"],
+                            "effective_decision": track["exception_state"] or row["state"]}
+                           for index, track in enumerate(tracks)],
+                "candidates": serialized_candidates,
+                "updated_at": row["updated_at"],
+            })
+    return payloads
+
+
+def _update_album_review(
+    app: Flask, album_review_id: int, values: dict, *, serialize: bool = True,
+    root: str | None = None, source_kind: str = "library", source_id: str | None = None,
+) -> dict | None:
+    allowed = {"decision", "candidate_id", "track_exceptions", "duplicate_action"}
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported fields: {', '.join(sorted(unknown))}")
+    decision = values.get("decision")
+    if decision is not None and decision not in LIBRARY_IMPORT_DECISIONS:
+        raise ValueError("decision must be approved, rejected, or skipped")
+    duplicate_action = values.get("duplicate_action")
+    if "duplicate_action" in values and duplicate_action not in DUPLICATE_ACTIONS:
+        raise ValueError("duplicate_action must be keep-existing, keep-both, merge, replace, or skip")
+    exceptions = values.get("track_exceptions", {})
+    if not isinstance(exceptions, dict):
+        raise ValueError("track_exceptions must be an object keyed by track id")
+    root = root or str(Path(app.config["LIBRARY_PATH"]).resolve())
+    source_sql = " AND source_kind = ?" + (" AND source_id = ?" if source_id is not None else "")
+    source_parameters = (source_kind, *([source_id] if source_id is not None else []))
+    with _connect(app.config["APP_DB"]) as db:
+        existing = db.execute(
+            f"SELECT * FROM album_reviews WHERE id = ? AND root_path = ?{source_sql}",
+            (album_review_id, root, *source_parameters),
+        ).fetchone()
+        if existing is None:
+            return None
+        if existing["execution_status"] in {"complete", "artwork-pending", "cleanup-pending", "duplicate-executing"}:
+            changed = any(values[key] != existing[column] for key, column in (
+                ("decision", "state"), ("candidate_id", "selected_candidate_id"),
+                ("duplicate_action", "duplicate_action"),
+            ) if key in values)
+            if changed or exceptions:
+                raise ValueError("This album has already moved or completed import; finish recovery before changing its review.")
+            if not serialize:
+                return {"id": album_review_id}
+            if existing["execution_status"] == "complete":
+                return {"id": album_review_id, "decision": existing["state"],
+                        **{key: existing[key] for key in (
+                            "selected_candidate_id", "execution_status", "last_execution_job_id",
+                        )}}
+            return next(iter(_album_review_payloads(
+                app, [album_review_id], root=root, source_kind=source_kind, source_id=source_id
+            )), None)
+        candidate_id = values.get("candidate_id")
+        if candidate_id is not None and db.execute(
+            "SELECT id FROM metadata_candidates WHERE id = ? AND album_review_id = ?", (candidate_id, album_review_id)
+        ).fetchone() is None:
+            raise ValueError("candidate_id must belong to this album review")
+        for raw_id, state in exceptions.items():
+            try:
+                inventory_id = int(raw_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("track exception ids must be integers") from exc
+            if state is not None and state not in LIBRARY_IMPORT_DECISIONS:
+                raise ValueError("track exception decisions must be approved, rejected, skipped, or null")
+            if db.execute(
+                "SELECT 1 FROM album_review_tracks WHERE album_review_id = ? AND inventory_id = ?",
+                (album_review_id, inventory_id),
+            ).fetchone() is None:
+                raise ValueError("track exception must belong to this album review")
+            db.execute(
+                "UPDATE album_review_tracks SET exception_state = ? WHERE album_review_id = ? AND inventory_id = ?",
+                (state, album_review_id, inventory_id),
+            )
+        assignments, parameters = [], []
+        if decision is not None:
+            assignments.append("state = ?"); parameters.append(decision)
+        if "candidate_id" in values:
+            assignments.append("selected_candidate_id = ?"); parameters.append(candidate_id)
+        if "duplicate_action" in values:
+            assignments.append("duplicate_action = ?"); parameters.append(duplicate_action)
+        if assignments or exceptions:
+            assignments.extend(["execution_status = 'not-run'", "execution_error = ''",
+                                "last_execution_job_id = NULL", "executed_at = NULL"])
+            assignments.append("updated_at = ?"); parameters.append(_now())
+            db.execute(f"UPDATE album_reviews SET {', '.join(assignments)} WHERE id = ?", (*parameters, album_review_id))
+    if not serialize:
+        return {"id": album_review_id}
+    return next(iter(_album_review_payloads(
+        app, [album_review_id], root=root, source_kind=source_kind, source_id=source_id
+    )), None)
+
+
+def _inbox_album_context(app: Flask, album_review_id: int) -> dict | None:
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            "SELECT root_path, source_id, candidate_status FROM album_reviews WHERE id=? AND source_kind='inbox'",
+            (album_review_id,),
+        ).fetchone()
+    if album is None:
+        return None
+    inbox = _configured_inbox(app, album["source_id"])
+    if inbox is None or str(Path(inbox["path"]).resolve()) != album["root_path"]:
+        return None
+    return {"root": album["root_path"], "inbox": inbox, "candidate_status": album["candidate_status"]}
+
+
+def _beets_import_command(app: Flask, source: Path, *, pretend: bool = False) -> tuple[list[str], dict]:
+    command = [
+        "beet", "-c", app.config["BEETS_CONFIG"], "import", "--quiet", "--quiet-fallback", "asis",
+        "--noautotag", "--move",
+    ]
+    if pretend:
+        command.append("--pretend")
+    command.append(str(source))
+    environment = os.environ.copy()
+    environment["BEETSDIR"] = app.config["STATE_PATH"]
+    return command, environment
+
+
+def _run_beets_import(
+    app: Flask, source: Path, *, pretend: bool = False, allow_album_duplicates: bool = True,
+) -> subprocess.CompletedProcess:
+    command, environment = _beets_import_command(app, source, pretend=pretend)
+    if not allow_album_duplicates:
+        return subprocess.run(command, text=True, capture_output=True, timeout=3600, check=False, env=environment)
+    # Reviewed imports already enforce recording identity and destination
+    # collisions. Beets must neither skip this album nor delete old tracks.
+    # Use an execution-only config; retain all custom paths and saved settings.
+    config = yaml.safe_load(Path(app.config["BEETS_CONFIG"]).read_text())
+    config.setdefault("import", {})["duplicate_action"] = "keep"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", prefix="reviewed-import-", dir=app.config["STATE_PATH"]) as temporary:
+        yaml.safe_dump(config, temporary, sort_keys=False)
+        temporary.flush()
+        command[2] = temporary.name
+        return subprocess.run(command, text=True, capture_output=True, timeout=3600, check=False, env=environment)
+
+
+def _inbox_destination_preflight(
+    app: Flask, rows: list[sqlite3.Row], paths: list[Path], provider_data: dict | None,
+    *, positions: list[int] | None = None,
+) -> list[str]:
+    library = _library(app)
+    try:
+        library_root = _validated_library_root(app)
+    except ValueError as exc:
+        raise LibraryImportExecutionError(str(exc), code="library_root_unsafe") from exc
+    query = None
+    details = {}
+    if provider_data:
+        with _connect(app.config["APP_DB"]) as db:
+            album = db.execute(
+                "SELECT * FROM album_reviews WHERE id=(SELECT album_review_id FROM album_review_tracks WHERE inventory_id=? LIMIT 1)",
+                (rows[0]["id"],),
+            ).fetchone()
+        query = _album_query(app, album)
+        effective = _effective_candidate(app, provider_data, query)
+        details = {
+            detail["position"]: detail for detail in _candidate_match(query, effective)["track_details"]
+            if detail.get("local") is not None
+        }
+        provider_data = effective
+    planned_items = []
+    for position, path in zip(positions or range(1, len(paths) + 1), paths):
+        item = Item.from_path(path)
+        if provider_data:
+            for field, value in _candidate_item_values(provider_data, details.get(position)).items():
+                _set_item_value(item, field, value)
+        planned_items.append(item)
+    task = ImportTask(None, [], planned_items)
+    task.set_choice(Action.ASIS)
+    task.align_album_level_fields()
+    destinations = []
+    seen = set()
+    for row, item in zip(rows, planned_items):
+        # Destination formatting needs a Library for configured path formats
+        # and replacements, but this synthetic ID is never stored. Registering
+        # an Inbox path before Beets moves it would violate source isolation.
+        item._db = library
+        item.id = -1
+        item.album_id = -1
+        destination = Path(os.fsdecode(item.destination(
+            basedir=library.directory, path_formats=library.path_formats
+        ))).resolve()
+        if destination == library_root or library_root not in destination.parents:
+            raise LibraryImportExecutionError(
+                f"Beets proposed a destination outside the managed library for {row['relative_path']}.",
+                code="destination_unsafe",
+            )
+        key = str(destination).casefold()
+        if key in seen:
+            raise LibraryImportExecutionError(
+                f"Multiple tracks resolve to the same Beets destination: {destination.relative_to(library_root)}.",
+                code="destination_collision",
+            )
+        seen.add(key)
+        if destination.exists():
+            raise LibraryImportExecutionError(
+                f"Beets destination already exists: {destination.relative_to(library_root)}. "
+                "Cratekeep will not overwrite an unrelated managed file.",
+                code="destination_collision",
+            )
+        destinations.append(destination.relative_to(library_root).as_posix())
+    return destinations
+
+
+def _existing_release_album(app: Flask, candidate: dict | None) -> int | None:
+    if not candidate or not candidate.get("provider_id"):
+        return None
+    matches = [album.id for album in _library(app).albums()
+               if str(album.get("mb_albumid") or "").lower() == str(candidate["provider_id"]).lower()
+               and _metadata_key(album.get("albumartist")) == _metadata_key(candidate.get("artist"))]
+    if len(matches) > 1:
+        raise LibraryImportExecutionError(
+            "Multiple managed albums share this release identity; resolve the ambiguous album before adding tracks.",
+            code="managed_album_ambiguous",
+        )
+    return next(iter(matches), None)
+
+
+def _attach_inbox_release_items(app: Flask, album_id: int, items: list[dict], candidate: dict) -> None:
+    library = _library(app)
+    with library.transaction():
+        target = library.get_album(album_id)
+        if (target is None or str(target.get("mb_albumid") or "").lower() != str(candidate["provider_id"]).lower()
+                or _metadata_key(target.get("albumartist")) != _metadata_key(candidate.get("artist"))):
+            raise LibraryImportExecutionError("Managed album identity changed during import.", code="managed_album_changed")
+        emptied = set()
+        for record in items:
+            item = library.get_item(record["beets_item_id"])
+            if item is None or Path(os.fsdecode(item.path)) != Path(record["path"]):
+                raise LibraryImportExecutionError("Imported item changed before album association.", code="managed_album_changed")
+            if item.album_id != album_id:
+                emptied.add(item.album_id)
+                item.album_id = album_id
+                item.store(fields=["album_id"])
+        for old_id in emptied:
+            old = library.get_album(old_id) if old_id is not None else None
+            if old is not None and not list(old.items()):
+                old.remove(delete=False)
+
+
+def _restore_inbox_sources(
+    backups: list[tuple[Path, Path]], *, restore_missing: bool = False,
+) -> tuple[int, int]:
+    restored = moved = 0
+    for source, backup in backups:
+        if source.exists():
+            shutil.copy2(backup, source)
+            restored += 1
+        elif restore_missing:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, source)
+            restored += 1
+        else:
+            moved += 1
+    return restored, moved
+
+
+def _persist_inbox_execution_failure(
+    app: Flask, album_review_id: int, job_id: int, message: str, result: dict
+) -> None:
+    finished = _now()
+    result.update(status="failed", finished_at=finished, error=message)
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute(
+            "UPDATE adoption_jobs SET status='failed', error=?, summary_json=?, finished_at=? WHERE id=?",
+            (message[:1000], json.dumps(result, sort_keys=True), finished, job_id),
+        )
+        db.execute(
+            """UPDATE album_reviews SET execution_status='failed', execution_error=?,
+                      last_execution_job_id=?, updated_at=? WHERE id=?""",
+            (message[:500], job_id, finished, album_review_id),
+        )
+
+
+def _verify_inbox_move(
+    app: Flask, source_paths: list[Path], destinations: list[str], *, retained: bool = False
+) -> list[dict]:
+    """Prove that exactly the reviewed files landed at their predicted paths."""
+    if len(source_paths) != len(destinations) or len(set(destinations)) != len(destinations):
+        raise LibraryImportExecutionError(
+            "Beets completion could not be proven because expected path counts differ.",
+            code="beets_incomplete", status=502,
+        )
+    # Only recovery of an already-executed copy-candidate job may retain originals.
+    remaining = [] if retained else [str(path) for path in source_paths if os.path.lexists(path)]
+    try:
+        library_root = _validated_library_root(app)
+    except ValueError as exc:
+        raise LibraryImportExecutionError(str(exc), code="library_root_unsafe") from exc
+    verified_paths: list[Path] = []
+    problems = []
+    seen_files: set[tuple[int, int]] = set()
+    seen_path_keys: set[str] = set()
+    for relative in destinations:
+        candidate = library_root / relative
+        try:
+            resolved = candidate.resolve(strict=True)
+            if candidate.is_symlink() or library_root not in resolved.parents or not resolved.is_file():
+                raise OSError("not a regular file inside the managed library")
+            stat = resolved.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            path_key = str(resolved).casefold()
+            if identity in seen_files or path_key in seen_path_keys:
+                raise OSError("duplicates another expected destination")
+            seen_files.add(identity)
+            seen_path_keys.add(path_key)
+            verified_paths.append(resolved)
+        except OSError as exc:
+            problems.append(f"{relative}: {exc}")
+    records: dict[str, list[Item]] = {}
+    for item in _library(app).items():
+        try:
+            resolved = Path(os.fsdecode(item.path)).resolve(strict=True)
+        except (OSError, TypeError, ValueError):
+            continue
+        records.setdefault(str(resolved).casefold(), []).append(item)
+    items = []
+    item_ids = set()
+    for path in verified_paths:
+        matches = records.get(str(path).casefold(), [])
+        if len(matches) != 1:
+            problems.append(f"{path.relative_to(library_root)}: {len(matches)} Beets database records")
+        elif matches[0].id in item_ids:
+            problems.append(f"{path.relative_to(library_root)}: Beets item {matches[0].id} was already counted")
+        else:
+            item_ids.add(matches[0].id)
+            items.append({"beets_item_id": matches[0].id, "path": str(path)})
+    if remaining:
+        problems.append(f"{len(remaining)} reviewed source file(s) remain")
+    if len(items) != len(destinations):
+        problems.append(f"verified {len(items)} of {len(destinations)} expected Beets items")
+    if problems:
+        error = LibraryImportExecutionError(
+            "Beets returned success but completion was not exact: " + "; ".join(problems),
+            code="beets_incomplete", status=502,
+        )
+        error.diagnostics = {
+            "expected": len(destinations), "verified": len(items),
+            "remaining_sources": remaining, "problems": problems,
+            "verified_items": items,
+        }
+        raise error
+    return items
+
+
+def _apply_inbox_embedded_artwork(
+    app: Flask, paths: list[Path], rows: list[sqlite3.Row], jpeg: bytes
+) -> dict:
+    result = {"written": [], "preserved": []}
+    if not app.config["ART_EMBED"]:
+        return result
+    for path, row in zip(paths, rows):
+        media = MediaFile(str(path))
+        if media.images and not app.config["ART_REPLACE"]:
+            result["preserved"].append(row["relative_path"])
+            continue
+        media.images = [MediaImage(jpeg, desc="Front cover", type=ImageType.front)]
+        media.save()
+        result["written"].append(row["relative_path"])
+    return result
+
+
+def _read_inbox_source_sidecar(path: Path) -> bytes | None:
+    """Read and validate an incoming cover without following filesystem aliases."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Incoming cover.jpg is unreadable; audio was not moved: {exc}",
+            code="source_artwork_unsafe",
+        ) from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise LibraryImportExecutionError(
+            "Incoming cover.jpg is not a safe regular file; audio was not moved.",
+            code="source_artwork_unsafe",
+        )
+    if before.st_size > MAX_ARTWORK_BYTES:
+        raise LibraryImportExecutionError(
+            "Incoming cover.jpg exceeds the 10 MB limit; audio was not moved.",
+            code="source_artwork_unsafe",
+        )
+    descriptor = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise OSError("cover.jpg changed during validation")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            payload = stream.read(MAX_ARTWORK_BYTES + 1)
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Incoming cover.jpg is unreadable or unsafe; audio was not moved: {exc}",
+            code="source_artwork_unsafe",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(payload) > MAX_ARTWORK_BYTES:
+        raise LibraryImportExecutionError(
+            "Incoming cover.jpg exceeds the 10 MB limit; audio was not moved.",
+            code="source_artwork_unsafe",
+        )
+    try:
+        _normalize_artwork_bytes(payload)
+    except LibraryImportExecutionError as exc:
+        raise LibraryImportExecutionError(
+            f"Incoming cover.jpg is invalid; audio was not moved: {exc}",
+            code="source_artwork_unsafe",
+        ) from exc
+    return payload
+
+
+def _apply_inbox_destination_sidecars(
+    app: Flask, destinations: list[str], jpeg: bytes, *, replace: bool | None = None,
+) -> dict:
+    result = {"written": [], "preserved": []}
+    if not app.config["ART_SIDECAR"]:
+        return result
+    replace = bool(app.config["ART_REPLACE"]) if replace is None else replace
+    try:
+        library_root = _validated_library_root(app)
+    except ValueError as exc:
+        raise LibraryImportExecutionError(str(exc), code="library_root_unsafe") from exc
+    folders = sorted({(library_root / relative).resolve(strict=True).parent for relative in destinations}, key=str)
+    staged: list[tuple[Path, Path, Path | None]] = []
+    for folder in folders:
+        if folder != library_root and library_root not in folder.parents:
+            raise LibraryImportExecutionError(
+                "Final artwork folder is outside the managed library.", code="artwork_destination_unsafe"
+            )
+        destination = folder / "cover.jpg"
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise LibraryImportExecutionError(
+                f"Final artwork destination is unsafe: {destination}", code="artwork_destination_unsafe"
+            )
+        if destination.exists() and not replace:
+            result["preserved"].append(str(destination))
+            continue
+        temporary = folder / f".cover.{secrets.token_hex(8)}.tmp"
+        backup = folder / f".cover.{secrets.token_hex(8)}.bak" if destination.exists() else None
+        try:
+            temporary.write_bytes(jpeg)
+            if backup is not None:
+                shutil.copy2(destination, backup)
+            staged.append((destination, temporary, backup))
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+            for _, staged_temp, staged_backup in staged:
+                staged_temp.unlink(missing_ok=True)
+                if staged_backup is not None:
+                    staged_backup.unlink(missing_ok=True)
+            raise
+    replaced: list[tuple[Path, Path | None]] = []
+    try:
+        for destination, temporary, backup in staged:
+            temporary.replace(destination)
+            replaced.append((destination, backup))
+            result["written"].append(str(destination))
+    except Exception as exc:
+        rollback_errors = []
+        rolled_back = []
+        for destination, backup in reversed(replaced):
+            try:
+                if backup is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    backup.replace(destination)
+                rolled_back.append(str(destination))
+            except OSError as rollback_exc:
+                rollback_errors.append(f"{destination}: {rollback_exc}")
+        detail = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ""
+        error = LibraryImportExecutionError(
+            f"Final artwork sidecars could not be committed: {exc}{detail}",
+            code="artwork_destination_failed", status=502,
+        )
+        error.diagnostics = {
+            "staged": [str(item[0]) for item in staged],
+            "rolled_back": rolled_back,
+            "rollback_errors": rollback_errors,
+        }
+        raise error from exc
+    finally:
+        for _, temporary, backup in staged:
+            temporary.unlink(missing_ok=True)
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+    return result
+
+
+def _pending_inbox_artwork_path(app: Flask, job_id: int) -> Path:
+    return Path(app.config["STATE_PATH"]) / "pending-inbox-artwork" / f"{job_id}.jpg"
+
+
+def _persist_inbox_artwork_pending(
+    app: Flask, album_review_id: int, job_id: int, message: str, result: dict, jpeg: bytes
+) -> None:
+    pending = _pending_inbox_artwork_path(app, job_id)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    temporary = pending.with_name(f".{pending.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        temporary.write_bytes(jpeg)
+        temporary.replace(pending)
+    finally:
+        temporary.unlink(missing_ok=True)
+    finished = _now()
+    result.update(status="partial", finished_at=finished, error=message)
+    result["artwork"].update(
+        status="finalize-pending", retryable=True,
+        recovery="Retry import to finalize the verified destination sidecar; audio will not move again.",
+    )
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute(
+            "UPDATE adoption_jobs SET status='partial', error=?, summary_json=?, finished_at=? WHERE id=?",
+            (message[:1000], json.dumps(result, sort_keys=True), finished, job_id),
+        )
+        db.execute(
+            """UPDATE album_reviews SET execution_status='artwork-pending', execution_error=?,
+                      last_execution_job_id=?, updated_at=? WHERE id=?""",
+            (message[:500], job_id, finished, album_review_id),
+        )
+
+
+def _persist_inbox_artwork_retry_failure(
+    app: Flask, album_review_id: int, job_id: int, message: str
+) -> None:
+    finished = _now()
+    summary = {"id": job_id, "album_review_id": album_review_id, "status": "failed",
+               "error": message, "retryable": True, "finished_at": finished}
+    with _connect(app.config["APP_DB"]) as db:
+        db.execute(
+            "UPDATE adoption_jobs SET status='failed', error=?, summary_json=?, finished_at=? WHERE id=?",
+            (message[:1000], json.dumps(summary, sort_keys=True), finished, job_id),
+        )
+        db.execute(
+            "UPDATE album_reviews SET execution_error=?, updated_at=? WHERE id=?",
+            (message[:500], finished, album_review_id),
+        )
+
+
+def _complete_inbox_execution(app: Flask, album_review_id: int, job_id: int, result: dict) -> dict:
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute("SELECT * FROM album_reviews WHERE id=?", (album_review_id,)).fetchone()
+        scopes = {_scope_for_relative_path(row["relative_path"]) for row in db.execute(
+            """SELECT inventory.relative_path FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE tracks.album_review_id=?""", (album_review_id,),
+        )}
+    inbox = _configured_inbox(app, album["source_id"]) if album else None
+    if not result.get("copy_import") and inbox is not None and str(Path(inbox["path"]).resolve()) == album["root_path"]:
+        try:
+            result["directory_cleanup"] = _cleanup_inbox_directories(
+                app, inbox, scopes=scopes - {"."}, ignore_album_id=album_review_id,
+            )
+        except (OSError, ValueError) as exc:
+            result["directory_cleanup"] = {"removed": [], "errors": [{"error": str(exc)}]}
+    finished = _now()
+    result.update(status="complete", finished_at=finished)
+    result.pop("error", None)
+    with _connect(app.config["APP_DB"]) as db:
+        from .inbox_imports import record_completion
+        record_completion(app, album, job_id, result, db)
+        db.execute(
+            "UPDATE adoption_jobs SET status='complete', error='', summary_json=?, finished_at=? WHERE id=?",
+            (json.dumps(result, sort_keys=True), finished, job_id),
+        )
+        db.execute(
+            """UPDATE album_reviews SET execution_status='complete', execution_error='',
+                      last_execution_job_id=?, executed_at=?, updated_at=? WHERE id=?""",
+            (job_id, finished, finished, album_review_id),
+        )
+        db.execute(
+            """UPDATE library_inventory SET present=? WHERE id IN (
+                   SELECT inventory_id FROM album_review_tracks WHERE album_review_id=?)""",
+            (int(bool(result.get("copy_import"))), album_review_id),
+        )
+        db.execute(
+            """UPDATE adoption_reviews SET imported_at=?, updated_at=? WHERE inventory_id IN (
+                   SELECT inventory_id FROM album_review_tracks WHERE album_review_id=?)""",
+            (finished, finished, album_review_id),
+        )
+    return result
+
+
+def _retry_inbox_artwork_finalize(
+    app: Flask, album: sqlite3.Row, rows: list[sqlite3.Row], candidate: sqlite3.Row | None,
+    job_id: int, *, dry_run: bool, skip_artwork: bool = False,
+) -> dict:
+    previous_job_id = album["last_execution_job_id"]
+    with _connect(app.config["APP_DB"]) as db:
+        previous = db.execute("SELECT summary_json FROM adoption_jobs WHERE id=?", (previous_job_id,)).fetchone()
+    prior = json.loads(previous["summary_json"]) if previous and previous["summary_json"] else {}
+    destinations = prior.get("destinations")
+    if not isinstance(destinations, list) or any(not isinstance(path, str) for path in destinations):
+        raise LibraryImportExecutionError(
+            "Pending artwork retry has no trustworthy destination manifest.",
+            code="artwork_retry_unsafe", status=502, job_id=job_id,
+        )
+    root = Path(album["root_path"])
+    items = _verify_inbox_move(app, [root / row["relative_path"] for row in rows], destinations, retained=prior.get("copy_import", False))
+    pending = _pending_inbox_artwork_path(app, previous_job_id)
+    if skip_artwork:
+        artwork = prior.get("artwork", {})
+        failure = artwork.get("failure", {})
+        if (artwork.get("source_sidecar_sha256")
+                or "rollback_errors" not in failure or failure["rollback_errors"]):
+            raise LibraryImportExecutionError(
+                "Pending sidecar cannot be skipped safely; retry artwork finalization to preserve incoming artwork and resolve any rollback failure.",
+                code="artwork_skip_unsafe", job_id=job_id,
+            )
+        result = {
+            **prior, "id": job_id, "status": "preview" if dry_run else "complete", "dry_run": dry_run,
+            "items": items, "retry_of_job_id": previous_job_id,
+            "artwork": {**artwork, "status": "sidecar-skipped", "retryable": False,
+                        "recovery": "New destination sidecar skipped explicitly; already imported audio and embedded artwork retained."},
+        }
+        result.pop("error", None)
+        if dry_run:
+            result["finished_at"] = _now()
+            with _connect(app.config["APP_DB"]) as db:
+                db.execute(
+                    "UPDATE adoption_jobs SET status='complete',summary_json=?,finished_at=? WHERE id=?",
+                    (json.dumps(result, sort_keys=True), result["finished_at"], job_id),
+                )
+            return result
+        result = _complete_inbox_execution(app, album["id"], job_id, result)
+        pending.unlink(missing_ok=True)
+        return result
+    try:
+        jpeg = pending.read_bytes()
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Pending artwork bytes are unavailable: {exc}", code="artwork_retry_unavailable", status=502, job_id=job_id
+        ) from exc
+    checksum = hashlib.sha256(jpeg).hexdigest()
+    if checksum != prior.get("artwork", {}).get("sidecar_sha256", prior.get("artwork", {}).get("sha256")):
+        raise LibraryImportExecutionError(
+            "Pending artwork checksum changed; use Library artwork replacement for recovery.",
+            code="artwork_retry_unsafe", status=502, job_id=job_id,
+        )
+    result = {
+        **prior, "id": job_id, "status": "preview" if dry_run else "complete", "dry_run": dry_run,
+        "items": items, "retry_of_job_id": previous_job_id,
+    }
+    result.pop("error", None)
+    if dry_run:
+        result["finished_at"] = _now()
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
+                (json.dumps(result, sort_keys=True), result["finished_at"], job_id),
+            )
+        return result
+    if not app.config["ART_SIDECAR"]:
+        raise LibraryImportExecutionError(
+            "Sidecar artwork was disabled; enable it or use Library artwork replacement.",
+            code="artwork_retry_settings_changed", job_id=job_id,
+        )
+    try:
+        sidecars = _apply_inbox_destination_sidecars(
+            app, destinations, jpeg, replace=bool(prior.get("artwork", {}).get("sidecar_replace", False)),
+        )
+    except (OSError, LibraryImportExecutionError) as exc:
+        result["artwork"]["failure"] = getattr(exc, "diagnostics", {"error": str(exc)})
+        _persist_inbox_artwork_pending(app, album["id"], job_id, str(exc), result, jpeg)
+        pending.unlink(missing_ok=True)
+        raise LibraryImportExecutionError(
+            f"Final artwork retry failed: {exc}", code="artwork_finalize_failed", status=502, job_id=job_id
+        ) from exc
+    result["artwork"].update(
+        status="applied", retryable=False, sidecars=sidecars,
+        recovery="Destination sidecar finalized after a verified retry.",
+    )
+    failure = result["artwork"].pop("failure", None)
+    if failure is not None:
+        result["artwork"]["recovered_from"] = failure
+    pending.unlink(missing_ok=True)
+    return _complete_inbox_execution(app, album["id"], job_id, result)
+
+
+def _validate_inbox_album_scope(root: Path, source: Path, paths: list[Path]) -> None:
+    """Ensure Beets' source argument contains exactly this reviewed album."""
+    try:
+        resolved = source.resolve(strict=True)
+        if source.is_symlink() or (resolved != root and root not in resolved.parents):
+            raise OSError("source selection escaped its configured Inbox root")
+        if resolved.is_dir():
+            command_files = [path for path, _ in _library_audio_stats(resolved)]
+        elif resolved.is_file() and resolved.suffix.lower() in AUDIO_EXTENSIONS:
+            command_files = [resolved]
+        else:
+            command_files = []
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Inbox source selection is no longer safe: {exc}", code="inventory_stale"
+        ) from exc
+    if {str(path) for path in command_files} != {str(path) for path in paths}:
+        raise LibraryImportExecutionError(
+            "The reviewed album shares a non-root source folder with audio from another review. "
+            "Move this album into its own folder inside the configured Inbox and rescan.",
+            code="source_contains_other_albums",
+        )
+
+
+def _inbox_execution_selection(root: Path, source: Path, paths: list[Path]) -> str:
+    """Choose a source form that never exposes unrelated Inbox audio to Beets."""
+    try:
+        _validate_inbox_album_scope(root, source, paths)
+    except LibraryImportExecutionError as exc:
+        if exc.code != "source_contains_other_albums":
+            raise
+        # A shared ordinary folder has the same ownership problem as loose
+        # files at the Inbox root.  Pass only the inventory-proven selection
+        # to Beets; multi-track selections retain album semantics by staging
+        # all selected files in one temporary album directory.
+        root_level_single = source == root and len(paths) == 1 and paths[0].parent == root
+        return "exact-file" if root_level_single else "staged-album"
+    return "exclusive-scope"
+
+
+def _stage_exact_inbox_album(directory: Path, paths: list[Path]) -> tuple[Path, list[Path]]:
+    """Build an album-shaped source containing only selected files.
+
+    Hard links keep this constant-space on the usual single-volume install. A
+    cross-device state directory falls back to copies without touching any
+    unreviewed source.
+    """
+    selection = directory / "selection"
+    selection.mkdir()
+    staged = []
+    for path in paths:
+        target = selection / path.name
+        if target.exists():
+            raise LibraryImportExecutionError(
+                f"Exact Inbox selection has duplicate filename {path.name}.", code="source_ambiguous"
+            )
+        try:
+            os.link(path, target, follow_symlinks=False)
+        except OSError:
+            shutil.copy2(path, target, follow_symlinks=False)
+        staged.append(target)
+    if {path.name for path in staged} != {path.name for path in paths}:
+        raise LibraryImportExecutionError(
+            "Exact Inbox selection could not be staged without changing its file set.",
+            code="source_ambiguous",
+        )
+    return selection, staged
+
+
+def _exact_inbox_source_identities(paths: list[Path]) -> list[tuple[Path, int, int, int, int]]:
+    """Capture regular-file identities around exact-album staging."""
+    identities = []
+    for path in paths:
+        current = path.lstat()
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise OSError(f"{path} is no longer a regular file")
+        identities.append((path, current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns))
+    return identities
+
+
+def _unlink_exact_inbox_sources(identities: list[tuple[Path, int, int, int, int]]) -> None:
+    """Remove only unchanged selected paths after a complete staging pass."""
+    for path, device, inode, size, modified in identities:
+        current = path.lstat()
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            device, inode, size, modified,
+        ):
+            raise OSError(f"{path} changed during exact selection staging")
+    for path, *_ in identities:
+        path.unlink()
+
+
+def _execute_inbox_album(
+    app: Flask, album_review_id: int, *, dry_run: bool, skip_artwork: bool = False,
+) -> dict | None:
+    context = _inbox_album_context(app, album_review_id)
+    if context is None:
+        return None
+    try:
+        _validated_library_root(app)
+    except ValueError as exc:
+        raise LibraryImportExecutionError(str(exc), code="library_root_unsafe") from exc
+    root = Path(context["root"])
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            "SELECT * FROM album_reviews WHERE id=? AND root_path=? AND source_kind='inbox' AND source_id=?",
+            (album_review_id, str(root), context["inbox"]["id"]),
+        ).fetchone()
+        if album is None:
+            return None
+        if album["execution_status"] == "cleanup-pending":
+            from .inbox_duplicates import finish_cleanup
+            return finish_cleanup(app, album, dry_run=dry_run)
+        if album["execution_status"] == "duplicate-executing":
+            raise LibraryImportExecutionError("An earlier duplicate import was interrupted. Inbox originals and recovery backups were retained; inspect partial library state before retrying.", code="duplicate_execution_interrupted", job_id=album["last_execution_job_id"])
+        if album["execution_status"] == "complete":
+            previous = db.execute(
+                "SELECT summary_json FROM adoption_jobs WHERE id=?", (album["last_execution_job_id"],)
+            ).fetchone()
+            result = json.loads(previous["summary_json"]) if previous else {
+                "album_review_id": album_review_id, "status": "complete"
+            }
+            return {**result, "already_complete": True}
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES (?, ?, 'running', ?)",
+            ("inbox_import_preview" if dry_run else "inbox_import_execute", str(root), _now()),
+        ).lastrowid
+        rows = db.execute(
+            """SELECT inventory.*, tracks.exception_state
+                 FROM album_review_tracks AS tracks JOIN library_inventory AS inventory
+                   ON inventory.id=tracks.inventory_id
+                WHERE tracks.album_review_id=? ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (album_review_id,),
+        ).fetchall()
+        candidate = db.execute(
+            "SELECT * FROM metadata_candidates WHERE id=? AND album_review_id=?",
+            (album["selected_candidate_id"], album_review_id),
+        ).fetchone() if album["selected_candidate_id"] is not None else None
+        if album["state"] != "approved":
+            _fail_library_execution(db, album_review_id, job_id, "album review is not approved", dry_run)
+            raise LibraryImportExecutionError(
+                "Approve a candidate or explicitly choose As Is before importing.",
+                code="review_not_approved", job_id=job_id,
+            )
+        if album["selected_candidate_id"] is not None and candidate is None:
+            _fail_library_execution(db, album_review_id, job_id, "selected candidate is unavailable", dry_run)
+            raise LibraryImportExecutionError(
+                "The selected metadata candidate is no longer available.", code="candidate_unavailable", job_id=job_id
+            )
+        if candidate is not None and album["execution_status"] != "artwork-pending" and (
+            album["candidate_status"] != "complete"
+            or album["candidate_error"]
+            or candidate["schema_version"] < MIN_SUPPORTED_CANDIDATE_SCHEMA_VERSION
+        ):
+            _fail_library_execution(db, album_review_id, job_id, "selected candidate evidence is stale", dry_run)
+            raise LibraryImportExecutionError(
+                "Refresh and approve current MusicBrainz candidate evidence before importing.",
+                code="candidate_stale", job_id=job_id,
+            )
+        if album["execution_status"] == "artwork-pending":
+            artwork_retry = True
+        else:
+            artwork_retry = False
+        if any(row["exception_state"] not in (None, "approved") for row in rows):
+            _fail_library_execution(db, album_review_id, job_id, "per-track exceptions block album move", dry_run)
+            raise LibraryImportExecutionError(
+                "Inbox albums move as one unit; approve all tracks or clear per-track exceptions before importing.",
+                code="partial_album_not_supported", job_id=job_id,
+            )
+    if artwork_retry:
+        try:
+            return _retry_inbox_artwork_finalize(
+                app, album, rows, candidate, job_id, dry_run=dry_run, skip_artwork=skip_artwork,
+            )
+        except LibraryImportExecutionError as exc:
+            if exc.code != "artwork_finalize_failed":
+                _persist_inbox_artwork_retry_failure(app, album_review_id, job_id, str(exc))
+            raise
+    if not rows:
+        _persist_library_execution_failure(app, album_review_id, job_id, "album contains no audio files", dry_run)
+        raise LibraryImportExecutionError("The reviewed album contains no audio files.", code="empty_album", job_id=job_id)
+    try:
+        paths = [_validate_inventory_file(root, row) for row in rows]
+    except LibraryImportExecutionError as exc:
+        _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
+        exc.job_id = job_id
+        raise
+    scopes = {_scope_for_relative_path(row["relative_path"]) for row in rows}
+    if len(scopes) != 1:
+        message = "Inbox album spans more than one source selection."
+        _persist_library_execution_failure(app, album_review_id, job_id, message, dry_run)
+        raise LibraryImportExecutionError(message, code="source_ambiguous", job_id=job_id)
+    source = root / next(iter(scopes))
+    try:
+        execution_selection = _inbox_execution_selection(root, source, paths)
+    except LibraryImportExecutionError as exc:
+        _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
+        exc.job_id = job_id
+        raise
+    provider_data = json.loads(candidate["provider_data_json"]) if candidate else None
+    query = _album_query(app, album)
+    details = None
+    if provider_data:
+        effective = _effective_candidate(app, provider_data, query)
+        details = _candidate_match(query, effective)["track_details"]
+    duplicate = _duplicate_preflight(app, rows, query, details, candidate=effective if provider_data else None)
+    if duplicate["warnings"]:
+        if album["duplicate_action"] is None:
+            _persist_library_execution_failure(app, album_review_id, job_id, duplicate["message"], dry_run)
+            raise LibraryImportExecutionError(
+                "Choose an explicit duplicate policy before importing this album.",
+                code="duplicate_decision_required", job_id=job_id,
+            )
+        if duplicate["status"] == "ambiguous":
+            raise LibraryImportExecutionError("Managed recording identity is ambiguous.", code="duplicate_ambiguous", job_id=job_id)
+        if album["duplicate_action"] in {"keep-existing", "replace"}:
+            from .inbox_duplicates import execute
+            try:
+                return execute(app, album, rows, paths, provider_data, job_id, dry_run=dry_run)
+            except (ManagedMutationError, OSError, ValueError) as exc:
+                _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
+                raise LibraryImportExecutionError(str(exc), code="duplicate_target_invalid", job_id=job_id) from exc
+        if album["duplicate_action"] != "keep-both":
+            _persist_library_execution_failure(app, album_review_id, job_id, duplicate["message"], dry_run)
+            raise LibraryImportExecutionError(
+                "Choose keep existing, replace, or keep both for Inbox duplicates. "
+                "Merge and per-track skip are available only in Library Import.",
+                code="duplicate_policy_not_supported", job_id=job_id,
+            )
+    try:
+        if execution_selection == "staged-album":
+            with tempfile.TemporaryDirectory(prefix="cratekeep-preflight-", dir=app.config["STATE_PATH"]) as staging:
+                preflight_source, _ = _stage_exact_inbox_album(Path(staging), paths)
+                preflight = _run_beets_import(app, preflight_source, pretend=True)
+        else:
+            preflight_source = paths[0] if execution_selection == "exact-file" else source
+            preflight = _run_beets_import(app, preflight_source, pretend=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _persist_library_execution_failure(app, album_review_id, job_id, f"Beets preflight failed: {exc}", dry_run)
+        raise LibraryImportExecutionError(
+            f"Beets preflight failed: {exc}", code="beets_preflight_failed", status=502, job_id=job_id
+        ) from exc
+    preflight_output = (preflight.stdout + preflight.stderr)[-12000:]
+    if preflight.returncode != 0:
+        _persist_library_execution_failure(app, album_review_id, job_id, preflight_output, dry_run)
+        raise LibraryImportExecutionError(
+            f"Beets preflight failed ({preflight.returncode}): {preflight_output}",
+            code="beets_preflight_failed", status=502, job_id=job_id,
+        )
+    try:
+        destinations = _inbox_destination_preflight(app, rows, paths, provider_data)
+        existing_album_id = _existing_release_album(app, provider_data)
+    except LibraryImportExecutionError as exc:
+        _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
+        exc.job_id = job_id
+        raise
+    result = {
+        "id": job_id, "album_review_id": album_review_id, "status": "preview" if dry_run else "complete",
+        "dry_run": dry_run, "selection_mode": "candidate" if candidate else "as-is",
+        "files": len(paths), "source": next(iter(scopes)), "destinations": destinations,
+        "execution_selection": execution_selection, "preflight_output": preflight_output,
+    }
+    if dry_run:
+        result["finished_at"] = _now()
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
+                (json.dumps(result, sort_keys=True), result["finished_at"], job_id),
+            )
+        return result
+
+    try:
+        # The no-write Beets and destination preflights may take time. Recheck
+        # every persisted stat identity at the final boundary before backups,
+        # tag/artwork writes, or the moving import can mutate source media.
+        try:
+            paths = [_validate_inventory_file(root, row) for row in rows]
+            current_selection = _inbox_execution_selection(root, source, paths)
+            if execution_selection == "exclusive-scope" and current_selection != execution_selection:
+                raise LibraryImportExecutionError(
+                    "The reviewed album's source folder gained unrelated audio after preflight.",
+                    code="source_contains_other_albums",
+                )
+        except LibraryImportExecutionError as exc:
+            _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
+            exc.job_id = job_id
+            raise
+        source_cover = (source if source.is_dir() else source.parent) / "cover.jpg"
+        if execution_selection == "exclusive-scope":
+            try:
+                source_sidecar = _read_inbox_source_sidecar(source_cover)
+            except LibraryImportExecutionError as exc:
+                _persist_library_execution_failure(app, album_review_id, job_id, str(exc), False)
+                exc.job_id = job_id
+                raise
+        else:
+            # A cover beside more than one reviewed album is not assignable.
+            # Leave it untouched instead of silently attaching it.
+            source_sidecar = None
+            if os.path.lexists(source_cover):
+                result["source_artwork"] = {
+                    "status": "ignored-shared-source",
+                    "message": "Shared Inbox source cover.jpg was left untouched.",
+                }
+        with tempfile.TemporaryDirectory(prefix="cratekeep-inbox-", dir=app.config["STATE_PATH"]) as backup_dir:
+            backup_root = Path(backup_dir)
+            try:
+                from .inbox_imports import source_manifest, identity
+                result.update(copy_import=True, original_sources=source_manifest(app, album_review_id))
+                before_item_ids = {item.id for item in _library(app).items()}
+                result["new_sidecar_paths"] = [str(Path(app.config["LIBRARY_PATH"]) / path / "cover.jpg")
+                    for path in sorted({str(Path(relative).parent) for relative in destinations})
+                    if not os.path.lexists(Path(app.config["LIBRARY_PATH"]) / path / "cover.jpg")]
+                working = backup_root / "selection"
+                working.mkdir()
+                copies = []
+                originals = {row["path"]: row for row in result["original_sources"]}
+                for index, path in enumerate(paths):
+                    original = originals[path.relative_to(root).as_posix()]
+                    # Keep disc subfolders/duplicate basenames distinct without altering tags.
+                    target = working / path.relative_to(root)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, target)
+                    if identity(path) != original["identity"] or identity(target)["sha256"] != original["identity"]["sha256"]:
+                        raise LibraryImportExecutionError("An Inbox original changed while preparing its copy.", code="inventory_stale")
+                    copies.append(target)
+            except (OSError, ValueError, LibraryImportExecutionError) as exc:
+                _persist_inbox_execution_failure(app, album_review_id, job_id, str(exc), result)
+                raise LibraryImportExecutionError(
+                    f"Inbox originals could not be copied safely: {exc}", code="inventory_stale", job_id=job_id,
+                ) from exc
+            paths = copies
+            backups = []  # Only disposable working copies are tagged or moved.
+            artwork_bytes = None
+            embedded = {"written": [], "preserved": []}
+            try:
+                if provider_data:
+                    album_query = _album_query(app, album)
+                    effective = _effective_candidate(app, provider_data, album_query)
+                    details = {
+                        detail["position"]: detail for detail in _candidate_match(album_query, effective)["track_details"]
+                        if detail.get("local") is not None
+                    }
+                    for position, path in enumerate(paths, 1):
+                        item = Item.from_path(path)
+                        for field, value in _candidate_item_values(effective, details.get(position)).items():
+                            _set_item_value(item, field, value)
+                        item.write()
+                    artwork_plans = [{"artwork_path": path, "target_path": row["relative_path"], "action": "import"}
+                                     for row, path in zip(rows, paths)]
+                    artwork = _artwork_plan(app, provider_data, artwork_plans, skip_artwork=skip_artwork)
+                    if artwork["status"] == "ready":
+                        artwork_bytes = app.config["ARTWORK_FETCHER"](provider_data)
+                        embedded = _apply_inbox_embedded_artwork(app, paths, rows, artwork_bytes)
+                        result["artwork"] = {
+                            **artwork, "status": "prepared", "embedded": embedded,
+                            "sidecars": {"written": [], "preserved": []},
+                            "sha256": hashlib.sha256(artwork_bytes).hexdigest(),
+                            "message": "Artwork fetched once; embedded art is prepared and sidecars await the verified destination.",
+                        }
+                    else:
+                        result["artwork"] = artwork
+            except Exception as exc:
+                restored, moved = _restore_inbox_sources(backups)
+                result.update(restored_files=restored, already_moved_files=moved)
+                _persist_inbox_execution_failure(app, album_review_id, job_id, str(exc), result)
+                if isinstance(exc, LibraryImportExecutionError):
+                    exc.job_id = job_id
+                    raise
+                raise LibraryImportExecutionError(
+                    f"Inbox metadata or artwork preparation failed: {exc}",
+                    code="execution_failed", status=500, job_id=job_id,
+                ) from exc
+            restore_staged_sources = False
+            execution_source = working
+            staged_paths = paths
+            try:
+                execution = _run_beets_import(app, execution_source)
+            except Exception as exc:
+                restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
+                message = f"Beets import could not complete: {exc}"
+                if moved:
+                    message += f" {moved} file(s) were already moved by Beets and were not rolled back."
+                result.update(status="failed", restored_files=restored, already_moved_files=moved)
+                _persist_inbox_execution_failure(app, album_review_id, job_id, message, result)
+                raise LibraryImportExecutionError(
+                    message, code="beets_import_failed", status=502, job_id=job_id
+                ) from exc
+            output = (execution.stdout + execution.stderr)[-12000:]
+            result.update(returncode=execution.returncode, output=output)
+            if execution.returncode != 0:
+                restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
+                result.update(status="failed", restored_files=restored, already_moved_files=moved)
+                message = f"Beets import failed ({execution.returncode}): {output}"
+                if moved:
+                    message += f" {moved} file(s) were already moved by Beets and were not rolled back."
+                _persist_inbox_execution_failure(app, album_review_id, job_id, message, result)
+                raise LibraryImportExecutionError(message, code="beets_import_failed", status=502, job_id=job_id)
+            try:
+                verification_sources = staged_paths if restore_staged_sources else paths
+                result["items"] = _verify_inbox_move(app, verification_sources, destinations)
+                result["created_item_ids"] = [row["beets_item_id"] for row in result["items"] if row["beets_item_id"] not in before_item_ids]
+                if existing_album_id is not None:
+                    _attach_inbox_release_items(app, existing_album_id, result["items"], provider_data)
+                    result["managed_album_id"] = existing_album_id
+            except LibraryImportExecutionError as exc:
+                restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
+                result.update(
+                    restored_files=restored, already_moved_files=moved,
+                    verification=getattr(exc, "diagnostics", {"expected": len(destinations)}),
+                )
+                _persist_inbox_execution_failure(app, album_review_id, job_id, str(exc), result)
+                exc.job_id = job_id
+                raise
+            sidecar_bytes = None
+            sidecar_replace = False
+            if app.config["ART_SIDECAR"]:
+                if source_sidecar is not None and (not app.config["ART_REPLACE"] or artwork_bytes is None):
+                    sidecar_bytes = source_sidecar
+                elif artwork_bytes is not None:
+                    sidecar_bytes = artwork_bytes
+                    sidecar_replace = bool(app.config["ART_REPLACE"])
+            finalization_bytes = sidecar_bytes if sidecar_bytes is not None else artwork_bytes
+            if finalization_bytes is not None:
+                if "artwork" not in result:
+                    result["artwork"] = {
+                        "status": "preserved", "destinations": {"sidecar": True, "embedded": False},
+                        "replace_existing": False, "embedded": {"written": [], "preserved": []},
+                        "message": "Incoming sidecar artwork is ready for the verified destination.",
+                    }
+                if sidecar_bytes is not None:
+                    result["artwork"].update(
+                        source_sidecar_sha256=(hashlib.sha256(source_sidecar).hexdigest()
+                                               if source_sidecar is not None else None),
+                        sidecar_sha256=hashlib.sha256(sidecar_bytes).hexdigest(),
+                        sidecar_replace=sidecar_replace,
+                    )
+                try:
+                    final_sidecars = _apply_inbox_destination_sidecars(
+                        app, destinations, finalization_bytes, replace=sidecar_replace,
+                    )
+                except (OSError, LibraryImportExecutionError) as exc:
+                    message = (
+                        f"Files moved and verified, but final artwork could not be completed: {exc}. "
+                        "Retry import to finalize artwork without moving audio again."
+                    )
+                    result.update(already_moved_files=len(paths), verified_items=len(result["items"]))
+                    result["artwork"]["failure"] = getattr(exc, "diagnostics", {"error": str(exc)})
+                    _persist_inbox_artwork_pending(
+                        app, album_review_id, job_id, message, result, finalization_bytes
+                    )
+                    raise LibraryImportExecutionError(
+                        message, code="artwork_finalize_failed", status=502, job_id=job_id
+                    ) from exc
+                final_by_source = dict(zip((row["relative_path"] for row in rows), destinations))
+                update = {
+                    "sidecars": final_sidecars,
+                    "embedded": {
+                        "written": [final_by_source[path] for path in embedded["written"]],
+                        "preserved": [final_by_source[path] for path in embedded["preserved"]],
+                    },
+                    "album_folders": sorted({str((Path(app.config["LIBRARY_PATH"]) / path).parent) for path in destinations}),
+                    "message": "Artwork finalized in verified album destinations; incoming artwork was preserved unless replacement was enabled.",
+                }
+                if artwork_bytes is not None or result["artwork"]["status"] == "preserved":
+                    update["status"] = "applied" if artwork_bytes is not None else "preserved"
+                result["artwork"].update(update)
+    except LibraryImportExecutionError:
+        raise
+    except Exception as exc:
+        message = f"Inbox import failed before Beets completed: {exc}"
+        _persist_inbox_execution_failure(app, album_review_id, job_id, message, result)
+        raise LibraryImportExecutionError(message, code="execution_failed", status=500, job_id=job_id) from exc
+    return _complete_inbox_execution(app, album_review_id, job_id, result)
+
+
+def _execute_library_import_album(
+    app: Flask, album_review_id: int, *, dry_run: bool, skip_artwork: bool = False,
+) -> dict | None:
+    """Register an approved in-library album and optionally write its chosen tags in place."""
+    try:
+        root = _validated_library_root(app)
+    except ValueError as exc:
+        raise LibraryImportExecutionError(str(exc), code="library_root_unsafe") from exc
+    with _connect(app.config["APP_DB"]) as db:
+        album = db.execute(
+            "SELECT * FROM album_reviews WHERE id = ? AND root_path = ?", (album_review_id, str(root))
+        ).fetchone()
+        if album is None:
+            return None
+        if album["execution_status"] == "complete":
+            previous = db.execute(
+                "SELECT summary_json FROM adoption_jobs WHERE id = ?", (album["last_execution_job_id"],)
+            ).fetchone()
+            result = json.loads(previous["summary_json"]) if previous else {
+                "album_review_id": album_review_id, "status": "complete"
+            }
+            return {**result, "already_complete": True}
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES (?, ?, 'running', ?)",
+            ("library_import_preview" if dry_run else "library_import_execute", str(root), _now()),
+        ).lastrowid
+        if album["state"] != "approved":
+            _fail_library_execution(db, album_review_id, job_id, "album review is not approved", dry_run)
+            db.commit()
+            raise LibraryImportExecutionError(
+                "Album review must be approved before execution.", code="review_not_approved", job_id=job_id
+            )
+        rows = db.execute(
+            """SELECT inventory.*, tracks.exception_state
+                 FROM album_review_tracks AS tracks
+                 JOIN library_inventory AS inventory ON inventory.id = tracks.inventory_id
+                WHERE tracks.album_review_id = ?
+                ORDER BY inventory.relative_path COLLATE NOCASE, inventory.id""",
+            (album_review_id,),
+        ).fetchall()
+        candidate = None
+        if album["selected_candidate_id"] is not None:
+            candidate = db.execute(
+                "SELECT * FROM metadata_candidates WHERE id = ? AND album_review_id = ?",
+                (album["selected_candidate_id"], album_review_id),
+            ).fetchone()
+            if candidate is None:
+                _fail_library_execution(db, album_review_id, job_id, "selected candidate is unavailable", dry_run)
+                db.commit()
+                raise LibraryImportExecutionError(
+                    "The selected metadata candidate is no longer available.",
+                    code="candidate_unavailable", job_id=job_id,
+                )
+            if (album["candidate_status"] != "complete" or album["candidate_error"]
+                    or candidate["schema_version"] < MIN_SUPPORTED_CANDIDATE_SCHEMA_VERSION):
+                _fail_library_execution(db, album_review_id, job_id, "selected candidate evidence is stale", dry_run)
+                db.commit()
+                raise LibraryImportExecutionError(
+                    "Saved match no longer describes current files; refresh matches before importing.",
+                    code="candidate_stale", job_id=job_id,
+                )
+
+    # Keep each row's position in the complete album query. Candidate track
+    # details use that position even when an earlier track is excluded.
+    approved = [
+        (position, row) for position, row in enumerate(rows, 1)
+        if (row["exception_state"] or album["state"]) == "approved"
+    ]
+    if not approved:
+        _persist_library_execution_failure(app, album_review_id, job_id, "no tracks are approved", dry_run)
+        raise LibraryImportExecutionError("No tracks are approved for execution.", code="no_approved_tracks", job_id=job_id)
+    try:
+        paths = [_validate_inventory_file(root, row) for _, row in approved]
+        provider_data = json.loads(candidate["provider_data_json"]) if candidate else None
+        plans = _library_import_plans(app, album, approved, paths, provider_data)
+        artwork = _artwork_plan(app, provider_data, plans, skip_artwork=skip_artwork)
+        artwork_bytes = None
+        if not dry_run and artwork["status"] == "ready":
+            artwork_bytes = app.config["ARTWORK_FETCHER"](provider_data)
+        result = {
+            "id": job_id,
+            "album_review_id": album_review_id,
+            "status": "preview" if dry_run else "complete",
+            "dry_run": dry_run,
+            "selection_mode": "candidate" if candidate else "as-is",
+            "files": len(plans),
+            "registered": sum(plan["action"] in {"register", "keep-both"} for plan in plans),
+            "metadata_updates": sum(bool(plan["changes"]) for plan in plans),
+            "duplicate_action": album["duplicate_action"],
+            "duplicates": sum(plan["duplicate_of"] is not None for plan in plans),
+            "skipped_tracks": len(rows) - len(approved),
+            "artwork": artwork,
+            "items": [{key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes", "action", "duplicate_of", "target_path")} for plan in plans],
+        }
+        if not dry_run:
+            _apply_library_import_plans(app, plans)
+            if artwork_bytes is not None:
+                result["artwork"] = _apply_artwork(app, plans, artwork_bytes, artwork)
+            result["items"] = [
+                {key: plan[key] for key in ("inventory_id", "path", "beets_item_id", "changes", "action", "duplicate_of", "target_path")} for plan in plans
+            ]
+        finished = _now()
+        result["finished_at"] = finished
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status = 'complete', summary_json = ?, finished_at = ? WHERE id = ?",
+                (json.dumps(result, sort_keys=True), finished, job_id),
+            )
+            if not dry_run:
+                db.executemany(
+                    "UPDATE library_inventory SET beets_item_id = NULL WHERE root_path = ? AND beets_item_id = ? AND id != ?",
+                    [
+                        (str(root), plan["duplicate_of"], plan["inventory_id"])
+                        for plan in plans if plan["action"] == "replace"
+                    ],
+                )
+                db.executemany(
+                    "UPDATE library_inventory SET beets_item_id = ? WHERE id = ?",
+                    [(plan["beets_item_id"], plan["inventory_id"]) for plan in plans],
+                )
+                db.execute(
+                    """UPDATE album_reviews SET execution_status = 'complete', execution_error = '',
+                              last_execution_job_id = ?, executed_at = ?, updated_at = ? WHERE id = ?""",
+                    (job_id, finished, finished, album_review_id),
+                )
+                db.execute(
+                    """UPDATE adoption_reviews SET imported_at = ?, updated_at = ?
+                         WHERE inventory_id IN (
+                           SELECT inventory_id FROM album_review_tracks WHERE album_review_id = ?
+                         )""",
+                    (finished, finished, album_review_id),
+                )
+        return result
+    except LibraryImportExecutionError as exc:
+        _persist_library_execution_failure(app, album_review_id, job_id, str(exc), dry_run)
+        exc.job_id = job_id
+        raise
+    except Exception as exc:
+        message = f"library import execution failed: {exc}"
+        _persist_library_execution_failure(app, album_review_id, job_id, message, dry_run)
+        raise LibraryImportExecutionError(message, code="execution_failed", status=500, job_id=job_id) from exc
+
+
+def _fail_library_execution(
+    db: sqlite3.Connection, album_review_id: int, job_id: int, message: str, dry_run: bool
+) -> None:
+    finished = _now()
+    db.execute(
+        "UPDATE adoption_jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?",
+        (message[:1000], finished, job_id),
+    )
+    if not dry_run:
+        db.execute(
+            """UPDATE album_reviews SET execution_status = 'failed', execution_error = ?,
+                      last_execution_job_id = ?, updated_at = ? WHERE id = ?""",
+            (message[:500], job_id, finished, album_review_id),
+        )
+
+
+def _persist_library_execution_failure(
+    app: Flask, album_review_id: int, job_id: int, message: str, dry_run: bool
+) -> None:
+    with _connect(app.config["APP_DB"]) as db:
+        _fail_library_execution(db, album_review_id, job_id, message, dry_run)
+
+
+def _validate_inventory_file(root: Path, row: sqlite3.Row) -> Path:
+    path = root / row["relative_path"]
+    try:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+    except OSError as exc:
+        raise LibraryImportExecutionError(
+            f"Library file is missing: {row['relative_path']}", code="inventory_stale"
+        ) from exc
+    if resolved == root or root not in resolved.parents or path.is_symlink() or not resolved.is_file():
+        raise LibraryImportExecutionError(
+            f"Library file is no longer a safe regular file: {row['relative_path']}", code="inventory_stale"
+        )
+    expected = (row["size_bytes"], row["mtime_ns"], row["device"], row["inode"])
+    current = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+    if not row["present"] or current != expected:
+        raise LibraryImportExecutionError(
+            f"Library file changed after inventory preview: {row['relative_path']}", code="inventory_stale"
+        )
+    return resolved
+
+
+def _library_import_plans(
+    app: Flask, album: sqlite3.Row, rows: list[tuple[int, sqlite3.Row]], paths: list[Path], provider_data: dict | None
+) -> list[dict]:
+    library = _library(app)
+    managed_items = list(library.items())
+    details = {}
+    query = _album_query(app, album)
+    if provider_data:
+        provider_data = _effective_candidate(app, provider_data, query)
+        details = {
+            detail["position"]: detail for detail in _candidate_match(query, provider_data)["track_details"]
+            if detail.get("local") is not None
+        }
+    plans = []
+    for (position, row), path in zip(rows, paths):
+        item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
+        if item is not None and Path(os.fsdecode(item.path)).resolve() != path:
+            raise LibraryImportExecutionError(
+                f"Tracked item path changed after inventory preview: {row['relative_path']}", code="inventory_stale"
+            )
+        if item is None:
+            item = Item.from_path(path)
+        values = _candidate_item_values(provider_data, details.get(position)) if provider_data else {}
+        duplicate = None
+        recording_id = values.get("mb_trackid") or item.get("mb_trackid")
+        if row["beets_item_id"] is None and recording_id:
+            context = provider_data or {**dict(item), "tracks": query["tracks"]}
+            detail = details.get(position) or ({"proposed_position": [item.get("disc") or 1, item.get("track")]} if item.get("track") else None)
+            matches = duplicate_matches(managed_items, recording_id, context, detail)
+            if len(matches) > 1:
+                raise LibraryImportExecutionError(
+                    f"Duplicate identity is ambiguous for {row['relative_path']}; {len(matches)} managed tracks share recording ID {recording_id}.",
+                    code="duplicate_ambiguous",
+                )
+            duplicate = matches[0] if matches else None
+        duplicate_action = album["duplicate_action"] if duplicate is not None else None
+        if duplicate is not None and duplicate_action is None:
+            raise LibraryImportExecutionError(
+                f"Choose merge, replace, keep both, or skip for duplicate {row['relative_path']} before execution.",
+                code="duplicate_decision_required",
+            )
+        target_path = row["relative_path"]
+        artwork_path = path
+        action = "update" if row["beets_item_id"] is not None else "register"
+        comparison_item = item
+        if duplicate is not None:
+            if duplicate_action in {"merge", "replace"}:
+                duplicate_path = _validate_duplicate_item(app, root=Path(app.config["LIBRARY_PATH"]).resolve(), item=duplicate)
+                target_path = duplicate_path.relative_to(Path(app.config["LIBRARY_PATH"]).resolve()).as_posix()
+                artwork_path = duplicate_path
+            if duplicate_action in {"skip", "keep-existing"}:
+                action = "skip"
+                values = {}
+            elif duplicate_action == "keep-both":
+                action = "keep-both"
+            elif duplicate_action == "replace":
+                action = "replace"
+                target_path = row["relative_path"]
+                artwork_path = path
+            elif duplicate_action == "merge":
+                action = "merge"
+                comparison_item = duplicate
+        changes = {}
+        for field, value in list(values.items()):
+            current = _item_genre(comparison_item) if field == "genre" else comparison_item.get(field)
+            if field == "genre" and _genre_presentation_key(current) == _genre_presentation_key(value):
+                # Preserve the exact existing spelling and avoid both tag and
+                # database writes for presentation-only differences.
+                del values[field]
+                continue
+            if current != value:
+                changes[field] = {"from": current, "to": value}
+        plans.append({
+            "inventory_id": row["id"], "path": row["relative_path"], "absolute_path": path,
+            "beets_item_id": row["beets_item_id"], "item": item, "values": values, "changes": changes,
+            "action": action, "duplicate_item": duplicate,
+            "duplicate_of": duplicate.id if duplicate is not None else None, "target_path": target_path,
+            "artwork_path": artwork_path,
+        })
+    return plans
+
+
+def _validate_duplicate_item(app: Flask, *, root: Path, item: Item) -> Path:
+    """Require a unique, current inventory snapshot before touching a managed duplicate."""
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            "SELECT * FROM library_inventory WHERE root_path = ? AND beets_item_id = ? AND present = 1",
+            (str(root), item.id),
+        ).fetchall()
+    if len(rows) != 1:
+        raise LibraryImportExecutionError(
+            f"Managed duplicate identity {item.id} is not uniquely represented in the current inventory.",
+            code="duplicate_ambiguous",
+        )
+    path = _validate_inventory_file(root, rows[0])
+    if Path(os.fsdecode(item.path)).resolve() != path:
+        raise LibraryImportExecutionError(
+            f"Managed duplicate path changed after inventory preview: {rows[0]['relative_path']}",
+            code="inventory_stale",
+        )
+    return path
+
+
+def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
+    values = {}
+    artist = _normalize_metadata(candidate.get("artist"))
+    album = _normalize_metadata(candidate.get("album"))
+    if artist:
+        values["albumartist"] = artist
+        values["artist"] = _normalize_metadata(detail.get("proposed_artist")) if detail else artist
+        if not values["artist"]:
+            values["artist"] = artist
+    if album:
+        values["album"] = album
+    genre = _candidate_genre(candidate)
+    if genre:
+        values["genre"] = genre
+    date = str(candidate.get("date") or candidate.get("year") or "")
+    date_match = re.fullmatch(r"(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?", date)
+    if date_match:
+        values["year"] = int(date_match.group(1))
+        values["month"] = int(date_match.group(2) or 0)
+        values["day"] = int(date_match.group(3) or 0)
+    if candidate.get("provider_id"):
+        values["mb_albumid"] = str(candidate["provider_id"])
+    if candidate.get("release_group_id"):
+        values["mb_releasegroupid"] = str(candidate["release_group_id"])
+    if candidate.get("release_type"):
+        values["albumtype"] = str(candidate["release_type"])
+    if candidate.get("country"):
+        values["country"] = str(candidate["country"])
+    media = candidate.get("media") if isinstance(candidate.get("media"), list) else []
+    if media and isinstance(media[0], dict) and media[0].get("format"):
+        values["media"] = str(media[0]["format"])
+    try:
+        if candidate.get("track_count") is not None:
+            values["tracktotal"] = int(candidate["track_count"])
+        if media:
+            values["disctotal"] = len(media)
+    except (TypeError, ValueError):
+        pass
+    if detail and detail.get("proposed") is not None:
+        values["title"] = detail["proposed"]
+        proposed_position = detail.get("proposed_position")
+        if proposed_position:
+            values["disc"], values["track"] = (int(proposed_position[0]), int(proposed_position[1]))
+        if detail.get("recording_id"):
+            values["mb_trackid"] = str(detail["recording_id"])
+    return values
+
+
+def _artwork_plan(
+    app: Flask, candidate: dict | None, plans: list[dict], *, skip_artwork: bool = False,
+) -> dict:
+    destinations = {"sidecar": bool(app.config["ART_SIDECAR"]), "embedded": bool(app.config["ART_EMBED"])}
+    base = {"destinations": destinations, "replace_existing": bool(app.config["ART_REPLACE"])}
+    if skip_artwork:
+        return {**base, "status": "skipped", "message": "New artwork was skipped for this import; existing artwork is preserved."}
+    if not app.config["FETCH_ART"]:
+        return {**base, "status": "disabled", "message": "Artwork fetching is disabled."}
+    if not any(destinations.values()):
+        return {**base, "status": "disabled", "message": "No artwork destination is enabled."}
+    artwork = candidate.get("artwork") if isinstance(candidate, dict) else None
+    if not isinstance(artwork, dict) or not artwork.get("available"):
+        return {**base, "status": "unavailable", "message": "No candidate artwork is available; existing artwork will be preserved."}
+    entity, mbid = artwork.get("entity"), str(artwork.get("mbid") or "")
+    if entity not in {"release", "release-group"} or not MUSICBRAINZ_ID_PATTERN.fullmatch(mbid):
+        raise LibraryImportExecutionError("Candidate artwork identity is invalid.", code="artwork_identity_invalid", status=400)
+    album_folders = sorted({str(plan["artwork_path"].parent) for plan in plans if plan["action"] != "skip"})
+    return {
+        **base, "status": "ready", "source": "cover-art-archive", "entity": entity, "mbid": mbid,
+        "album_folders": album_folders, "message": "Candidate artwork is ready for approved import.",
+    }
+
+
+class _SafeArtworkRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlparse(newurl)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host in TRUSTED_ARTWORK_HOSTS or host.endswith(".archive.org")):
+            raise urllib.error.URLError("Cover Art Archive redirected to an untrusted host")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_and_normalize_artwork(candidate: dict) -> bytes:
+    artwork = candidate["artwork"]
+    # Request CAA's resized image instead of downloading the full-size original.
+    url = f"https://coverartarchive.org/{artwork['entity']}/{artwork['mbid']}/front-1200"
+    request_object = urllib.request.Request(
+        url, headers={"Accept": "image/jpeg,image/png,image/webp,image/gif", "User-Agent": "Cratekeep/0.1 (https://github.com/kylejschultz/cratekeep)"}
+    )
+    try:
+        with urllib.request.build_opener(_SafeArtworkRedirect()).open(request_object, timeout=15) as response:
+            length = response.headers.get("Content-Length")
+            if length and int(length) > MAX_ARTWORK_BYTES:
+                raise ValueError("artwork exceeds 10 MB limit")
+            payload = response.read(MAX_ARTWORK_BYTES + 1)
+            if len(payload) > MAX_ARTWORK_BYTES:
+                raise ValueError("artwork exceeds 10 MB limit")
+        return _normalize_artwork_bytes(payload)
+    except (
+        OSError, ValueError, TypeError, urllib.error.URLError, LibraryImportExecutionError,
+        UnidentifiedImageError, PillowImage.DecompressionBombError,
+    ) as exc:
+        raise LibraryImportExecutionError(
+            f"Artwork retrieval failed before artwork was changed: {exc}", code="artwork_fetch_failed", status=502
+        ) from exc
+
+
+def _apply_artwork(app: Flask, plans: list[dict], jpeg: bytes, summary: dict) -> dict:
+    replace = bool(app.config["ART_REPLACE"])
+    sidecars = {"written": [], "preserved": []}
+    embedded = {"written": [], "preserved": []}
+    if app.config["ART_SIDECAR"]:
+        for folder in sorted({plan["artwork_path"].parent for plan in plans if plan["action"] != "skip"}, key=str):
+            destination = folder / "cover.jpg"
+            if destination.exists() and not replace:
+                sidecars["preserved"].append(str(destination))
+                continue
+            temporary = folder / f".cover.{secrets.token_hex(8)}.tmp"
+            try:
+                temporary.write_bytes(jpeg)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            sidecars["written"].append(str(destination))
+    if app.config["ART_EMBED"]:
+        for plan in plans:
+            if plan["action"] == "skip":
+                continue
+            media = MediaFile(str(plan["artwork_path"]))
+            if media.images and not replace:
+                embedded["preserved"].append(plan["target_path"])
+                continue
+            media.images = [MediaImage(jpeg, desc="Front cover", type=ImageType.front)]
+            media.save()
+            embedded["written"].append(plan["target_path"])
+    return {
+        **summary, "status": "applied", "sidecars": sidecars, "embedded": embedded,
+        "sha256": hashlib.sha256(jpeg).hexdigest(),
+        "message": "Artwork applied; pre-existing artwork was preserved unless replacement was enabled.",
+    }
+
+
+def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
+    library = _library(app)
+    album_items = []
+    for plan in plans:
+        if plan["action"] == "skip":
+            continue
+        if plan["action"] == "merge":
+            item = plan["duplicate_item"]
+            for field, value in plan["values"].items():
+                _set_item_value(item, field, value)
+            if plan["changes"]:
+                item.write()
+                item.store()
+            continue
+        item = plan["item"]
+        for field, value in plan["values"].items():
+            _set_item_value(item, field, value)
+        if plan["action"] == "replace":
+            replacement = plan["duplicate_item"]
+            for field in ("title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc"):
+                current = _item_genre(item) if field == "genre" else item.get(field)
+                _set_item_value(replacement, field, current)
+            for field, value in plan["values"].items():
+                _set_item_value(replacement, field, value)
+            replacement.path = os.fsencode(plan["absolute_path"])
+            replacement.write()
+            replacement.store()
+            if Path(os.fsdecode(replacement.path)).resolve() != plan["absolute_path"]:
+                raise OSError(f"beets changed the replacement path for {plan['path']}")
+            plan["beets_item_id"] = replacement.id
+            continue
+        if plan["changes"]:
+            item.write()
+        if plan["beets_item_id"] is None:
+            # Library.add only registers the existing path in beets. File
+            # copying and moving are importer operations, not Library.add
+            # options; the invariant below verifies registration stayed in place.
+            library.add(item)
+        else:
+            item.store()
+        if Path(os.fsdecode(item.path)).resolve() != plan["absolute_path"]:
+            raise OSError(f"beets changed the file path for {plan['path']}")
+        plan["beets_item_id"] = item.id
+        album_items.append(item)
+    # Cratekeep imports one reviewed release at a time. Promote a wholly
+    # ungrouped result to Beets' first-class Album model so Library can use the
+    # stable album ID without inventing a path-derived identity. Existing
+    # album relationships and duplicate merge/replace identities are preserved.
+    if album_items and all(item.get("album_id") is None for item in album_items):
+        # Reload through this Library handle: plans may carry models obtained
+        # from the read-side handle used during planning, and mixing their
+        # SQLite transactions can retain a write lock.
+        grouped_items = [library.get_item(item.id) for item in album_items]
+        if all(grouped_items):
+            library.add_album(grouped_items)
+
+
+def _serialize_library_import_review(row: sqlite3.Row, item=None) -> dict:
+    candidates = json.loads(row["candidates_json"])
+    path = Path(row["relative_path"])
+    parts = path.parts
+    fallback_artist = parts[0] if len(parts) >= 3 else "Unknown artist"
+    fallback_album = parts[1] if len(parts) >= 3 else (parts[0] if len(parts) == 2 else "Unknown album")
+    return {
+        "id": row["id"],
+        "path": row["relative_path"],
+        "artist": (item.get("albumartist") or item.get("artist") or fallback_artist) if item else fallback_artist,
+        "album": item.get("album") if item and item.get("album") else fallback_album,
+        "title": item.get("title") if item and item.get("title") else path.stem,
+        "status": "tracked" if row["beets_item_id"] is not None else "needs-review",
+        "decision": row["state"],
+        "candidate": candidates[0] if candidates else None,
+        "candidates": candidates,
+        "updated_at": row["updated_at"],
+    }
+
+
+def _group_library_import_review_items(items: list[dict]) -> list[dict]:
+    root = {"name": "Library root", "path": "", "folders": {}, "albums": {}}
+    for item in items:
+        parts = Path(item["path"]).parts[:-1]
+        folder = root
+        path_parts = []
+        for part in parts:
+            path_parts.append(part)
+            folder = folder["folders"].setdefault(
+                part,
+                {"name": part, "path": "/".join(path_parts), "folders": {}, "albums": {}},
+            )
+        album_key = (item["artist"], item["album"])
+        album = folder["albums"].setdefault(
+            album_key,
+            {"artist": item["artist"], "album": item["album"], "songs": []},
+        )
+        album["songs"].append(item)
+
+    def serialize(folder: dict) -> dict:
+        return {
+            "name": folder["name"],
+            "path": folder["path"],
+            "folders": [
+                serialize(child)
+                for _, child in sorted(folder["folders"].items(), key=lambda entry: entry[0].casefold())
+            ],
+            "albums": [
+                album for _, album in sorted(
+                    folder["albums"].items(), key=lambda entry: (entry[0][0].casefold(), entry[0][1].casefold())
+                )
+            ],
+        }
+
+    grouped = [
+        serialize(folder)
+        for _, folder in sorted(root["folders"].items(), key=lambda entry: entry[0].casefold())
+    ]
+    if root["albums"]:
+        grouped.insert(0, serialize(root))
+    return grouped
+
+
+def _serialize_item(item) -> dict:
+    result = {key: item.get(key) for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")}
+    result["genre"] = _item_genre(item)
+    path = item.get("path")
+    result["path"] = os.fsdecode(path) if path else ""
+    result["bytes"] = Path(result["path"]).stat().st_size if result["path"] and Path(result["path"]).is_file() else None
+    return result
+
+
+def _inbox_tag_snapshot(path: Path) -> dict:
+    """Read one source file once and persist only metadata needed by review."""
+    try:
+        item = Item.from_path(path)
+    except Exception:
+        item = None
+    values = {"kind": "source-tags"}
+    if item is not None:
+        for field in (
+            "title", "artist", "album", "albumartist", "genre", "year", "month", "day",
+            "track", "disc", "length", "mb_trackid", "mb_albumid", "mb_releasegroupid", "albumtype", "media", "country",
+        ):
+            value = _item_genre(item) if field == "genre" else item.get(field)
+            if value not in (None, "", 0, []):
+                values[field] = value
+    return values
+
+
+def _validated_inbox_scope(inbox: dict[str, str], value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("scope is required")
+    scope = value.strip()
+    root = Path(inbox["path"]).resolve()
+    if scope == ".":
+        return scope
+    candidate = Path(scope)
+    if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+        raise ValueError("scope must be an immediate child of this Inbox")
+    path = root / candidate.name
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("Inbox scope does not exist") from exc
+    if path.is_symlink() or not resolved.is_dir() or resolved.parent != root:
+        raise ValueError("Inbox scope must be a non-symlinked immediate folder")
+    return candidate.name
+
+
+def _request_inbox_scopes(inbox: dict[str, str], values: dict | None = None) -> list[str]:
+    values = values if values is not None else request.get_json(silent=True)
+    if not isinstance(values, dict) or not isinstance(values.get("scopes"), list):
+        raise ValueError("scopes must be an array")
+    if not values["scopes"]:
+        raise ValueError("select at least one Inbox scope")
+    if len(values["scopes"]) > 1000:
+        raise ValueError("no more than 1000 Inbox scopes may be submitted")
+    scopes = []
+    for value in values["scopes"]:
+        scope = _validated_inbox_scope(inbox, value)
+        if scope not in scopes:
+            scopes.append(scope)
+    return scopes
+
+
+def _inbox_scope_album_ids(
+    app: Flask, inbox: dict[str, str], scopes: list[str], *, include_complete: bool = False,
+) -> list[int]:
+    root = str(Path(inbox["path"]).resolve())
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT albums.id, albums.execution_status, inventory.relative_path
+                 FROM album_reviews AS albums
+                 JOIN album_review_tracks AS tracks ON tracks.album_review_id=albums.id
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE albums.root_path=? AND albums.source_kind='inbox' AND albums.source_id=?
+                  AND inventory.present=1 ORDER BY albums.id""",
+            (root, inbox["id"]),
+        ).fetchall()
+    wanted = set(scopes)
+    return list(dict.fromkeys(
+        row["id"] for row in rows if _scope_for_relative_path(row["relative_path"]) in wanted
+        and (include_complete or row["execution_status"] != "complete")
+    ))
+
+
+def _inbox_scope_list(app: Flask, inbox: dict[str, str], *, page: int = 1) -> dict:
+    configured = Path(inbox["path"])
+    if configured.is_symlink():
+        raise ValueError("Inbox root must not be a symlink.")
+    root = configured.resolve()
+    library_root = _validated_library_root(app)
+    if root == library_root or root in library_root.parents or library_root in root.parents:
+        raise ValueError("Inbox and Library roots overlap; choose separate, non-nested paths in Settings.")
+    if not root.is_dir():
+        raise ValueError("Configured Inbox path is not a directory.")
+    entries = list(root.iterdir())
+    scopes = sorted(
+        (entry.name for entry in entries if entry.is_dir() and not entry.is_symlink()),
+        key=lambda value: (value.casefold(), value),
+    )
+    if any(entry.is_file() and not entry.is_symlink() and entry.suffix.lower() in AUDIO_EXTENSIONS
+           for entry in entries):
+        scopes.insert(0, ".")
+    root_text = str(root)
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.relative_path, inventory.size_bytes, albums.id AS album_id,
+                      albums.execution_status, albums.execution_error, albums.candidate_status,
+                      albums.candidate_error, albums.state
+                 FROM library_inventory AS inventory
+                 LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id=inventory.id
+                 LEFT JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                WHERE inventory.source_kind='inbox' AND inventory.source_id=?
+                  AND inventory.root_path=? AND inventory.present=1""",
+            (inbox["id"], root_text),
+        ).fetchall()
+        scan_rows = db.execute(
+            """SELECT summary_json FROM adoption_jobs
+                WHERE root_path=? AND kind='inbox_inventory' AND status='complete'""", (root_text,),
+        ).fetchall()
+    scanned = set()
+    for row in scan_rows:
+        summary = json.loads(row["summary_json"] or "{}")
+        scanned.update(summary.get("scopes") or [])
+    by_scope = {scope: [] for scope in scopes}
+    for row in rows:
+        by_scope.setdefault(_scope_for_relative_path(row["relative_path"]), []).append(row)
+    records = []
+    for scope in scopes:
+        scoped = by_scope.get(scope, [])
+        # A completed import may intentionally leave a sidecar or now-empty
+        # directory behind. Once a scope has been inventoried, no active audio
+        # rows means it is complete rather than selectable queue work.
+        if scope in scanned and not scoped:
+            continue
+        album_ids = {row["album_id"] for row in scoped if row["album_id"] is not None
+                     and row["execution_status"] != "complete"}
+        errors = [row for row in scoped if row["album_id"] in album_ids and (
+            row["execution_status"] == "failed" or row["candidate_status"] == "error"
+        )]
+        complete = {row["album_id"] for row in scoped if row["album_id"] in album_ids
+                    and row["candidate_status"] == "complete" and not row["candidate_error"]}
+        # The lightweight row reports candidate lifecycle only. Strict "ready"
+        # remains the shared payload-level predicate used by preview/execution.
+        status = ("error" if errors else "matched" if complete and complete == album_ids
+                  else "needs-review" if album_ids else "scanned" if scope in scanned else "not-scanned")
+        records.append({
+            "path": scope, "name": "Loose files" if scope == "." else scope, "status": status,
+            "track_count": len(scoped), "album_count": len(album_ids),
+            "bytes": sum(row["size_bytes"] or 0 for row in scoped),
+            "error": next((row["execution_error"] or row["candidate_error"] for row in errors), ""),
+        })
+    total = len(records)
+    page_count = max(1, math.ceil(total / FOLDER_PAGE_SIZE))
+    page = min(page, page_count)
+    start = (page - 1) * FOLDER_PAGE_SIZE
+    return {"inbox_id": inbox["id"], "inbox_name": inbox["name"],
+            "scopes": records[start:start + FOLDER_PAGE_SIZE], "total": total,
+            "page": page, "page_count": page_count, "limit": FOLDER_PAGE_SIZE}
+
+
+def _inbox_bulk_ready_summary(
+    app: Flask, inbox: dict[str, str], scopes: list[str], *, album_ids: list[int] | None = None,
+) -> dict:
+    album_ids = album_ids if album_ids is not None else _inbox_scope_album_ids(app, inbox, scopes)
+    albums = [_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in _album_review_payloads(
+        app, album_ids, root=str(Path(inbox["path"]).resolve()),
+        source_kind="inbox", source_id=inbox["id"],
+    )]
+    ready = [album for album in albums if album["ready"]]
+    exceptions = [album for album in albums if not album["ready"]]
+    return {
+        "inbox_id": inbox["id"], "selected_scope_count": len(scopes),
+        "available_album_count": len(albums), "ready_album_count": len(ready),
+        "track_count": sum(len(album["tracks"]) for album in ready),
+        "exception_count": len(exceptions),
+        "ready_albums": [{"id": album["id"], "artist": album["artist"],
+                          "album": album["album"], "tracks": len(album["tracks"])} for album in ready],
+        "exceptions": [{"id": album["id"], "artist": album["artist"], "album": album["album"],
+                        "reason": album["readiness_reason"]} for album in exceptions],
+    }
+
+
+def _execute_inbox_bulk_ready(
+    app: Flask, inbox: dict[str, str], scopes: list[str], *, album_ids: list[int] | None = None,
+) -> dict:
+    summary = _inbox_bulk_ready_summary(app, inbox, scopes, album_ids=album_ids)
+    imported, failed = [], []
+    lock = app.config["INBOX_EXECUTION_LOCK"]
+    if not lock.acquire(blocking=False):
+        raise LibraryImportExecutionError(
+            "Another Inbox execution is already running; retry after it finishes.",
+            code="execution_in_progress", status=409,
+        )
+    try:
+        for album in summary["ready_albums"]:
+            try:
+                current = next(iter(_album_review_payloads(
+                    app, [album["id"]], root=str(Path(inbox["path"]).resolve()),
+                    source_kind="inbox", source_id=inbox["id"],
+                )), None)
+                ready, reason = _album_bulk_readiness(current or {}, app.config["MATCH_THRESHOLD"])
+                if not ready:
+                    raise LibraryImportExecutionError(f"Album is no longer ready: {reason}", code="not_ready")
+                _update_album_review(
+                    app, album["id"], {"decision": "approved"},
+                    root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"],
+                )
+                _execute_inbox_album(app, album["id"], dry_run=True)
+                result = _execute_inbox_album(app, album["id"], dry_run=False)
+                imported.append({"album_review_id": album["id"], "artist": album["artist"],
+                                 "album": album["album"], "files": result["files"]})
+            except Exception as exc:
+                failed.append({"album_review_id": album["id"], "artist": album["artist"],
+                               "album": album["album"], "error": str(exc)})
+    finally:
+        lock.release()
+    return {"inbox_id": inbox["id"], "selected_scope_count": len(scopes),
+            "imported": imported, "skipped": summary["exceptions"], "failed": failed}
+
+
+def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, os.stat_result]]:
+    discovered = []
+    for scope in scopes:
+        if scope == ".":
+            discovered.extend(
+                (path.resolve(), path.stat()) for path in sorted(root.iterdir(), key=lambda item: item.name.casefold())
+                if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS
+            )
+        else:
+            discovered.extend(_library_audio_stats(root / scope))
+    return sorted(dict(discovered).items(), key=lambda item: str(item[0]).casefold())
+
+
+def _scan_inbox_inventory(
+    app: Flask, inbox: dict[str, str], *, scopes: list[str] | None = None,
+) -> dict:
+    configured = Path(inbox["path"])
+    if configured.is_symlink():
+        raise ValueError("Inbox root must not be a symlink.")
+    root = configured.resolve()
+    library_root = _validated_library_root(app)
+    if root == library_root or root in library_root.parents or library_root in root.parents:
+        raise ValueError("Inbox and Library roots overlap; choose separate, non-nested paths in Settings.")
+    created_at = _now()
+    with _connect(app.config["APP_DB"]) as db:
+        job_id = db.execute(
+            "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('inbox_inventory', ?, 'running', ?)",
+            (str(root), created_at),
+        ).lastrowid
+        previous = {
+            row["relative_path"]: row for row in db.execute(
+                """SELECT inventory.*, reviews.candidates_json
+                     FROM library_inventory AS inventory
+                     JOIN adoption_reviews AS reviews ON reviews.inventory_id = inventory.id
+                    WHERE inventory.source_kind = 'inbox' AND inventory.source_id = ? AND inventory.root_path = ?""",
+                (inbox["id"], str(root)),
+            )
+        }
+    try:
+        discovered = _library_audio_stats(root) if scopes is None else _inbox_scope_audio_stats(root, scopes)
+    except OSError as exc:
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "UPDATE adoption_jobs SET status='failed', error=?, finished_at=? WHERE id=?",
+                (str(exc)[:1000], _now(), job_id),
+            )
+        raise ValueError(f"Unable to inventory inbox: {exc}") from exc
+
+    discovered_relatives = {path.relative_to(root).as_posix() for path, _ in discovered}
+    wanted = set(scopes or [])
+    changed_ids = [
+        row["id"] for relative, row in previous.items()
+        if row["present"] and relative not in discovered_relatives
+        and (scopes is None or _scope_for_relative_path(relative) in wanted)
+    ]
+    total_bytes = 0
+    with _connect(app.config["APP_DB"]) as db:
+        # A stable source ID may be renamed, but a root change is a new snapshot.
+        if scopes is None:
+            db.execute(
+                "UPDATE library_inventory SET present=0 WHERE source_kind='inbox' AND source_id=?",
+                (inbox["id"],),
+            )
+        else:
+            scoped_ids = [(row["id"],) for relative, row in previous.items()
+                          if _scope_for_relative_path(relative) in wanted]
+            if scoped_ids:
+                db.executemany("UPDATE library_inventory SET present=0 WHERE id=?", scoped_ids)
+        for path, stat in discovered:
+            relative = path.relative_to(root).as_posix()
+            old = previous.get(relative)
+            signature = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+            unchanged = bool(old and signature == (
+                old["size_bytes"], old["mtime_ns"], old["device"], old["inode"]
+            ))
+            snapshot_json = old["candidates_json"] if unchanged else json.dumps([_inbox_tag_snapshot(path)])
+            db.execute(
+                """INSERT INTO library_inventory(
+                       root_path, relative_path, size_bytes, mtime_ns, device, inode, beets_item_id,
+                       present, first_seen_job_id, last_seen_job_id, source_kind, source_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, 'inbox', ?)
+                   ON CONFLICT(root_path, relative_path) DO UPDATE SET
+                       size_bytes=excluded.size_bytes, mtime_ns=excluded.mtime_ns,
+                       device=excluded.device, inode=excluded.inode, beets_item_id=NULL,
+                       present=1, last_seen_job_id=excluded.last_seen_job_id,
+                       source_kind='inbox', source_id=excluded.source_id""",
+                (str(root), relative, *signature, job_id, job_id, inbox["id"]),
+            )
+            inventory_id = db.execute(
+                "SELECT id FROM library_inventory WHERE root_path=? AND relative_path=?",
+                (str(root), relative),
+            ).fetchone()["id"]
+            db.execute(
+                "INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
+                (inventory_id, created_at),
+            )
+            db.execute(
+                "UPDATE adoption_reviews SET candidates_json=?, updated_at=? WHERE inventory_id=?",
+                (snapshot_json, created_at, inventory_id),
+            )
+            if not unchanged:
+                changed_ids.append(inventory_id)
+            total_bytes += stat.st_size
+        if changed_ids:
+            placeholders = ",".join("?" for _ in changed_ids)
+            db.execute(
+                f"""UPDATE album_reviews SET state='pending', selected_candidate_id=NULL,
+                            candidate_status='stale', candidate_error='Source files changed; refresh candidates.',
+                            execution_status='not-run', execution_error='', updated_at=?
+                      WHERE id IN (SELECT album_review_id FROM album_review_tracks
+                                    WHERE inventory_id IN ({placeholders}))
+                        AND execution_status NOT IN ('complete', 'artwork-pending', 'cleanup-pending', 'duplicate-executing')""",
+                (_now(), *changed_ids),
+            )
+        db.execute(
+            "UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
+            (json.dumps({"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids),
+                         "scopes": scopes}), _now(), job_id),
+        )
+    _sync_inbox_album_reviews(app, inbox, root)
+    return {"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids),
+            "scopes": scopes}
+
+
+def _inbox_album_folder(relative: str) -> str | None:
+    """Folder identity is independent of unreliable tags; root files stay tagged groups."""
+    parent = Path(relative).parent
+    if parent == Path("."):
+        return None
+    # Keep conventional multi-disc subfolders in one album without combining
+    # unrelated leaf albums beneath an artist or Inbox scope.
+    if re.fullmatch(r"(?:cd|disc|disk)[ ._-]*[0-9]+", parent.name, re.IGNORECASE) and parent.parent != Path("."):
+        parent = parent.parent
+    return parent.as_posix()
+
+
+def _inbox_folder_metadata(folder: str, rows: list) -> tuple[str, str]:
+    snapshots = [next(iter(json.loads(row["candidates_json"])), {}) for row in rows]
+
+    def consensus(values, fallback):
+        names = {}
+        counts = Counter()
+        for value in values:
+            value = _normalize_metadata(value)
+            if value:
+                key = _metadata_key(value)
+                names.setdefault(key, value)
+                counts[key] += 1
+        ranked = counts.most_common()
+        return names[ranked[0][0]] if ranked and (len(ranked) == 1 or ranked[0][1] > ranked[1][1]) else fallback
+
+    parent_artist = Path(folder).parent.name or "Unknown artist"
+    album_artists = [snapshot.get("albumartist") for snapshot in snapshots if snapshot.get("albumartist")]
+    artist = consensus(album_artists or [snapshot.get("artist") for snapshot in snapshots], parent_artist)
+    album = consensus([snapshot.get("album") for snapshot in snapshots], Path(folder).name)
+    return artist, album
+
+
+def _sync_inbox_album_reviews(app: Flask, inbox: dict[str, str], root: Path) -> None:
+    with _connect(app.config["APP_DB"]) as db:
+        rows = db.execute(
+            """SELECT inventory.id, inventory.relative_path, reviews.candidates_json,
+                      albums.id AS existing_album_id, albums.state AS existing_state,
+                      albums.candidate_status AS existing_candidate_status,
+                      albums.selected_candidate_id AS existing_candidate_id,
+                      albums.execution_status AS existing_execution_status
+                 FROM library_inventory AS inventory
+                 JOIN adoption_reviews AS reviews ON reviews.inventory_id=inventory.id
+                 LEFT JOIN album_review_tracks AS tracks ON tracks.inventory_id=inventory.id
+                 LEFT JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                WHERE inventory.source_kind='inbox' AND inventory.source_id=?
+                  AND inventory.root_path=? AND inventory.present=1
+                ORDER BY inventory.relative_path COLLATE NOCASE""",
+            (inbox["id"], str(root)),
+        ).fetchall()
+        from .inbox_imports import retained_ids
+        retained = retained_ids(app, inbox)
+        rows = [row for row in rows if row["id"] not in retained]
+        prior_members = {}
+        for row in db.execute(
+            """SELECT tracks.album_review_id, tracks.inventory_id FROM album_review_tracks AS tracks
+                 JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                WHERE albums.source_kind='inbox' AND albums.source_id=?""", (inbox["id"],),
+        ):
+            prior_members.setdefault(row["album_review_id"], set()).add(row["inventory_id"])
+        prior_albums = {row["id"]: row for row in db.execute(
+            "SELECT id,artist,album,execution_status FROM album_reviews WHERE source_kind='inbox' AND source_id=?",
+            (inbox["id"],),
+        )}
+        existing_exceptions = {
+            row["inventory_id"]: row["exception_state"] for row in db.execute(
+                """SELECT tracks.inventory_id, tracks.exception_state
+                     FROM album_review_tracks AS tracks JOIN album_reviews AS albums
+                       ON albums.id=tracks.album_review_id
+                    WHERE albums.source_kind='inbox' AND albums.source_id=?""",
+                (inbox["id"],),
+            )
+        }
+        db.execute(
+            """DELETE FROM album_review_tracks WHERE album_review_id IN (
+                   SELECT id FROM album_reviews WHERE source_kind='inbox' AND source_id=?
+                     AND execution_status NOT IN ('complete', 'artwork-pending', 'cleanup-pending', 'duplicate-executing'))""",
+            (inbox["id"],),
+        )
+        recovery = {"artwork-pending", "cleanup-pending", "duplicate-executing"}
+        protected_rows = db.execute(
+            """SELECT inventory.id,inventory.relative_path FROM album_review_tracks AS tracks
+                 JOIN album_reviews AS albums ON albums.id=tracks.album_review_id
+                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
+                WHERE albums.source_kind='inbox' AND albums.source_id=? AND albums.root_path=?
+                  AND albums.execution_status IN ('artwork-pending','cleanup-pending','duplicate-executing')""",
+            (inbox["id"], str(root)),
+        ).fetchall()
+        protected_folders = {_inbox_album_folder(row["relative_path"]) for row in protected_rows}
+        protected_ids = {row["id"] for row in protected_rows}
+        groups = {}
+        # Historical completed reviews may reference an inventory row that was
+        # reused by a re-download. Consume each present source path only once.
+        unique_rows = {row["id"]: row for row in rows}
+        for row in unique_rows.values():
+            folder = _inbox_album_folder(row["relative_path"])
+            if row["id"] in protected_ids or (folder is not None and folder in protected_folders):
+                continue
+            if folder is not None:
+                key = ("\x1ffolder:" + folder, "")
+                groups.setdefault(key, {"folder": folder, "rows": []})["rows"].append(row)
+            else:
+                snapshot = next(iter(json.loads(row["candidates_json"])), {})
+                scope = "."
+                # Preserve reviewed legacy root-level identities and decisions.
+                if row["existing_album_id"] is not None and (
+                    row["existing_state"] != "pending" or row["existing_candidate_status"] != "not-run"
+                    or row["existing_candidate_id"] is not None or row["existing_execution_status"] != "not-run"
+                ):
+                    scope = Path(row["relative_path"]).name
+                artist = _normalize_metadata(snapshot.get("albumartist") or snapshot.get("artist")) or "Unknown artist"
+                album = _normalize_metadata(snapshot.get("album")) or Path(row["relative_path"]).stem
+                key = (f"{scope.casefold()}\x1f{_metadata_key(artist)}", _metadata_key(album))
+                groups.setdefault(key, {"artist": artist, "album": album, "rows": []})["rows"].append(row)
+        for group in groups.values():
+            if "folder" in group:
+                group["artist"], group["album"] = _inbox_folder_metadata(group["folder"], group["rows"])
+        now = _now()
+        for (stable_artist_key, album_key), group in groups.items():
+            previous = db.execute(
+                "SELECT id,execution_status FROM album_reviews WHERE root_path=? AND artist_key=? AND album_key=?",
+                (str(root), stable_artist_key, album_key),
+            ).fetchone()
+            members = {row["id"] for row in group["rows"]}
+            if previous is None and "folder" in group:
+                # Upgrade a truly unchanged review in place. Combining/splitting
+                # groups creates a fresh pending review, never inherited approval.
+                compatible = [identity for identity, old_members in prior_members.items()
+                              if old_members == members and identity in prior_albums
+                              and prior_albums[identity]["execution_status"] not in recovery | {"complete"}
+                              and _metadata_key(prior_albums[identity]["artist"]) == _metadata_key(group["artist"])
+                              and _metadata_key(prior_albums[identity]["album"]) == _metadata_key(group["album"])]
+                if len(compatible) == 1:
+                    db.execute("UPDATE album_reviews SET artist_key=?,album_key=? WHERE id=?",
+                               (stable_artist_key, album_key, compatible[0]))
+                    previous = db.execute("SELECT id,execution_status FROM album_reviews WHERE id=?",
+                                          (compatible[0],)).fetchone()
+            # The completed job manifest retains its audit; current inventory
+            # membership now belongs to the new review of returned source files.
+            for identity, old_members in prior_members.items():
+                if prior_albums[identity]["execution_status"] == "complete":
+                    db.executemany("DELETE FROM album_review_tracks WHERE album_review_id=? AND inventory_id=?",
+                                   [(identity, member) for member in members & old_members])
+            if previous and previous["execution_status"] == "complete":
+                db.execute("UPDATE album_reviews SET artist_key=artist_key || ? WHERE id=?",
+                           (f"\x1fcompleted:{previous['id']}", previous["id"]))
+                # Re-downloading the same relative filename reuses an inventory
+                # row. The completed job manifest remains the immutable audit.
+                db.executemany("DELETE FROM album_review_tracks WHERE album_review_id=? AND inventory_id=?",
+                               [(previous["id"], row["id"]) for row in group["rows"]])
+            elif previous and previous["execution_status"] in {"artwork-pending", "cleanup-pending", "duplicate-executing"}:
+                continue  # Keep the destination-only recovery manifest intact.
+            db.execute(
+                """INSERT INTO album_reviews(
+                       root_path, artist_key, album_key, artist, album, updated_at, source_kind, source_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'inbox', ?)
+                   ON CONFLICT(root_path, artist_key, album_key) DO UPDATE SET
+                       artist=excluded.artist, album=excluded.album,
+                       source_kind='inbox', source_id=excluded.source_id""",
+                (str(root), stable_artist_key, album_key, group["artist"], group["album"], now, inbox["id"]),
+            )
+            album_id = db.execute(
+                "SELECT id FROM album_reviews WHERE root_path=? AND artist_key=? AND album_key=?",
+                (str(root), stable_artist_key, album_key),
+            ).fetchone()["id"]
+            db.executemany(
+                "INSERT INTO album_review_tracks(album_review_id, inventory_id, exception_state) VALUES (?, ?, ?)",
+                [(album_id, row["id"], existing_exceptions.get(row["id"])) for row in group["rows"]],
+            )
+            if album_id in prior_members and prior_members[album_id] != {row["id"] for row in group["rows"]}:
+                db.execute(
+                    """UPDATE album_reviews SET state='pending', candidate_status='stale',
+                              candidate_error='Source track membership changed; refresh candidates.',
+                              execution_status='not-run', execution_error='', last_execution_job_id=NULL,
+                              executed_at=NULL, updated_at=?
+                        WHERE id=? AND execution_status NOT IN ('complete','artwork-pending')""",
+                    (now, album_id),
+                )
+
+
+INBOX_REVIEW_PAGE_SIZE = 25
+
+
+def _inbox_review_groups(
+    app: Flask, *, scan: bool = True, inbox_ids: set[str] | None = None, page: int = 1,
+) -> list[dict]:
+    result = []
+    new_album_ids = []
+    for inbox in app.config["INBOXES"]:
+        if inbox_ids is not None and inbox["id"] not in inbox_ids:
+            continue
+        error = ""
+        try:
+            if scan:
+                _scan_inbox_inventory(app, inbox)
+            root = str(Path(inbox["path"]).resolve())
+            with _connect(app.config["APP_DB"]) as db:
+                active_filter = """source_kind='inbox' AND source_id=? AND root_path=?
+                    AND execution_status!='complete' AND state NOT IN ('rejected', 'skipped')
+                    AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id=album_reviews.id)"""
+                total = db.execute(
+                    f"SELECT COUNT(*) FROM album_reviews WHERE {active_filter}", (inbox["id"], root),
+                ).fetchone()[0]
+                offset = min((page - 1) * INBOX_REVIEW_PAGE_SIZE,
+                             max(0, ((total - 1) // INBOX_REVIEW_PAGE_SIZE) * INBOX_REVIEW_PAGE_SIZE))
+                album_ids = [row["id"] for row in db.execute(
+                    f"""SELECT id FROM album_reviews WHERE {active_filter}
+                         ORDER BY artist_key, album_key, id LIMIT ? OFFSET ?""",
+                    (inbox["id"], root, INBOX_REVIEW_PAGE_SIZE, offset),
+                )]
+                if scan:
+                    new_album_ids.extend(
+                        (row["id"], inbox["id"]) for row in db.execute(
+                            f"""SELECT id FROM album_reviews WHERE {active_filter}
+                                 AND candidate_status IN ('not-run', 'stale') ORDER BY id LIMIT ?""",
+                            (inbox["id"], root, MAX_INBOX_AUTO_MATCH_PENDING),
+                        )
+                    )
+            albums = _album_review_payloads(
+                app, album_ids, root=root, source_kind="inbox", source_id=inbox["id"],
+            )
+        except (OSError, ValueError) as exc:
+            albums = []
+            total = 0
+            offset = 0
+            error = str(exc)
+        page_count = max(1, (total + INBOX_REVIEW_PAGE_SIZE - 1) // INBOX_REVIEW_PAGE_SIZE)
+        result.append({
+            **inbox, "albums": albums, "error": error, "total_albums": total,
+            "page": (offset // INBOX_REVIEW_PAGE_SIZE) + 1, "page_count": page_count,
+            "page_size": INBOX_REVIEW_PAGE_SIZE,
+        })
+    if scan and new_album_ids:
+        enabled_ids = {inbox["id"] for inbox in app.config["INBOXES"] if inbox.get("auto_match")}
+        enabled_album_ids = [album_id for album_id, inbox_id in new_album_ids if inbox_id in enabled_ids]
+        if enabled_album_ids:
+            _start_inbox_auto_match(app, enabled_album_ids[:MAX_INBOX_AUTO_MATCH_PENDING])
+    return result
+
+
+def _inbox_review_summaries(app: Flask) -> list[dict]:
+    """Return persisted, bounded status without traversing configured roots."""
+    summaries = []
+    with _connect(app.config["APP_DB"]) as db:
+        for inbox in app.config["INBOXES"]:
+            root = str(Path(inbox["path"]).expanduser().resolve())
+            counts = db.execute(
+                """SELECT COUNT(*) AS albums,
+                          COALESCE(SUM(CASE WHEN candidate_status='running' THEN 1 ELSE 0 END), 0) AS matching,
+                          COALESCE(SUM(CASE WHEN candidate_status='error' THEN 1 ELSE 0 END), 0) AS errors,
+                          COALESCE(SUM(CASE WHEN candidate_status='complete' THEN 1 ELSE 0 END), 0) AS ready
+                     FROM album_reviews
+                    WHERE source_kind='inbox' AND source_id=? AND root_path=?
+                      AND execution_status!='complete' AND state NOT IN ('rejected', 'skipped')
+                      AND EXISTS (SELECT 1 FROM album_review_tracks WHERE album_review_id=album_reviews.id)""",
+                (inbox["id"], root),
+            ).fetchone()
+            items = db.execute(
+                """SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes FROM library_inventory
+                    WHERE source_kind='inbox' AND source_id=? AND root_path=? AND present=1""",
+                (inbox["id"], root),
+            ).fetchone()
+            scan = db.execute(
+                """SELECT status, error, created_at, finished_at FROM adoption_jobs
+                    WHERE kind='inbox_inventory' AND root_path=? ORDER BY id DESC LIMIT 1""",
+                (root,),
+            ).fetchone()
+            summaries.append({
+                **inbox, "albums": counts["albums"], "items": items["count"], "bytes": items["bytes"],
+                "matching": counts["matching"], "errors": counts["errors"], "ready": counts["ready"],
+                "scanned_at": (scan["finished_at"] or scan["created_at"]) if scan else None,
+                "scan_error": scan["error"] if scan and scan["status"] == "failed" else "",
+            })
+    return summaries
+
+
+def _start_inbox_auto_match(app: Flask, album_ids: list[int]) -> None:
+    lock = app.config["INBOX_MATCH_LOCK"]
+    with lock:
+        pending = app.config["INBOX_MATCH_PENDING"]
+        for album_id in album_ids:
+            if len(pending) >= MAX_INBOX_AUTO_MATCH_PENDING:
+                break
+            pending.add(album_id)
+        if app.config["INBOX_MATCH_RUNNING"]:
+            return
+        app.config["INBOX_MATCH_RUNNING"] = True
+    def worker() -> None:
+        try:
+            with app.app_context():
+                while True:
+                    with lock:
+                        pending = app.config["INBOX_MATCH_PENDING"]
+                        if not pending:
+                            app.config["INBOX_MATCH_RUNNING"] = False
+                            return
+                        album_id = min(pending)
+                        pending.remove(album_id)
+                    with app.config["INBOX_CANDIDATE_LOCK"]:
+                        with _connect(app.config["APP_DB"]) as db:
+                            album = db.execute(
+                                """SELECT id, root_path, source_id, state, candidate_status
+                                     FROM album_reviews WHERE id=? AND source_kind='inbox'""",
+                                (album_id,),
+                            ).fetchone()
+                        if (album is None or album["state"] != "pending"
+                                or album["candidate_status"] not in {"not-run", "stale"}):
+                            continue
+                        _generate_musicbrainz_candidates(
+                            app, 1, album_ids=[album["id"]], root=album["root_path"],
+                            source_kind="inbox", source_id=album["source_id"],
+                        )
+        except Exception:
+            with lock:
+                app.config["INBOX_MATCH_RUNNING"] = False
+            raise
+    threading.Thread(target=worker, name="cratekeep-inbox-match", daemon=True).start()
+
+
+def _inbox_candidates(app: Flask) -> list[dict]:
+    return [candidate for group in _inbox_groups(app) for candidate in group["candidates"]]
+
+
+def _inbox_groups(app: Flask) -> list[dict]:
+    groups = []
+    for inbox in app.config["INBOXES"]:
+        root = Path(inbox["path"]).resolve()
+        candidates = []
+        error = ""
+        try:
+            entries = sorted(root.iterdir(), key=lambda path: path.name.casefold())
+            for entry in entries:
+                if entry.name.startswith(".") or (entry.is_file() and entry.suffix.lower() not in AUDIO_EXTENSIONS):
+                    continue
+                files = _inbox_audio_files(entry, root)
+                if files:
+                    candidates.append({
+                        "path": entry.name, "files": len(files),
+                        "bytes": sum(path.stat().st_size for path in files),
+                        "inbox_id": inbox["id"], "inbox_name": inbox["name"],
+                    })
+        except OSError as exc:
+            error = f"Unable to read this inbox: {exc}"
+        groups.append({**inbox, "candidates": candidates, "error": error})
+    return groups
+
+
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "—"
+    if value == 0:
+        return "0 MB"
+    if value >= 1024**3:
+        return f"{value / 1024**3:.1f} GB"
+    size_mb = value / 1024**2
+    return f"{size_mb:.1f} MB" if size_mb >= 0.1 else "<0.1 MB"
+
+
+def _audio_files(path: Path) -> list[Path]:
+    iterator = path.rglob("*") if path.is_dir() else [path]
+    return sorted((p.resolve() for p in iterator if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS), key=str)
+
+
+def _configured_inbox(app: Flask, inbox_id: str) -> dict[str, str] | None:
+    return next((inbox for inbox in app.config["INBOXES"] if inbox["id"] == inbox_id), None)
+
+
+def _request_inbox(app: Flask) -> dict[str, str]:
+    inbox_id = _request_value("inbox_id")
+    if not inbox_id:
+        if len(app.config["INBOXES"]) != 1:
+            abort(400, "inbox_id is required when multiple inboxes are configured")
+        return app.config["INBOXES"][0]
+    inbox = _configured_inbox(app, inbox_id)
+    if inbox is None:
+        abort(400, "unknown inbox_id")
+    return inbox
+
+
+def _job_inbox(app: Flask, job: sqlite3.Row) -> dict[str, str]:
+    if not job["inbox_id"] or not job["inbox_root"]:
+        abort(409, "this legacy preview is not bound to an inbox root; create a new preview")
+    inbox = _configured_inbox(app, job["inbox_id"])
+    if inbox is None:
+        abort(409, "the selected inbox is no longer configured; create a new preview")
+    return inbox
+
+
+def _safe_inbox_path(app: Flask, inbox_id: str, relative: str) -> Path:
+    if not relative:
+        abort(400, "path is required")
+    inbox = _configured_inbox(app, inbox_id)
+    if inbox is None:
+        abort(400, "unknown inbox_id")
+    root = Path(inbox["path"]).resolve()
+    candidate = (root / relative).resolve()
+    if candidate == root or root not in candidate.parents or not candidate.exists():
+        abort(400, "path must identify an existing selection inside the inbox")
+    return candidate
+
+
+def _inbox_audio_files(path: Path, root: Path) -> list[Path]:
+    files = []
+    for candidate in _audio_files(path):
+        if root not in candidate.parents:
+            abort(400, "selection contains a file outside the selected inbox")
+        files.append(candidate)
+    return files
+
+
+def _file_snapshot(path: Path, root: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    return {
+        "path": str(path.relative_to(root)), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev, "inode": stat.st_ino,
+    }
+
+
+def _request_value(name: str) -> str:
+    values = request.get_json(silent=True) or request.form
+    return str(values.get(name, ""))
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _queue_match_state(album: dict) -> str:
+    if album.get("imported"):
+        return "imported"
+    if album.get("selection_mode") == "as-is":
+        return "matched"
+    if album.get("candidate_status") != "complete" or album.get("candidate_error"):
+        return "pending"
+    selected = album.get("selected_candidate_id")
+    return "matched" if any(selected is None or candidate["id"] == selected for candidate in album.get("candidates", [])) else "pending"
+
+
+def _inbox_selected_summary(app, inbox, album_ids):
+    eligible, excluded = [], []
+    for album in _album_review_payloads(app, album_ids, root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"]):
+        choice, reason = _selected_library_choice(album, inbox=True)
+        row = {"id": album["id"], "album": album["album"], "tracks": len(album["tracks"])}
+        (eligible if choice else excluded).append(row if choice else {**row, "reason": reason})
+    return {"importable_albums": eligible, "exceptions": excluded}
+
+
+def _execute_inbox_selected(app, inbox, album_ids):
+    imported, failed, skipped = [], [], []
+    lock = app.config["INBOX_EXECUTION_LOCK"]
+    if not lock.acquire(blocking=False):
+        raise LibraryImportExecutionError("Another Inbox import is running.", code="execution_in_progress", status=409)
+    try:
+        for album_id in album_ids:
+            album = next(iter(_album_review_payloads(app, [album_id], root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"])), None)
+            if album is None:
+                skipped.append({"id": album_id, "reason": "album is no longer available"})
+                continue
+            choice, reason = _selected_library_choice(album, inbox=True)
+            if not choice:
+                skipped.append({"id": album_id, "reason": reason})
+                continue
+            try:
+                _update_album_review(app, album_id, choice, serialize=False, root=album.get("root_path", str(Path(inbox["path"]).resolve())), source_kind="inbox", source_id=inbox["id"])
+                _execute_inbox_album(app, album_id, dry_run=True)
+                result = _execute_inbox_album(app, album_id, dry_run=False)
+                imported.append({"album_review_id": album_id, "album": album["album"], "files": result["files"]})
+            except Exception as exc:
+                failed.append({"album_review_id": album_id, "error": str(exc)})
+    finally:
+        lock.release()
+    return {"imported": imported, "skipped": skipped, "failed": failed}
