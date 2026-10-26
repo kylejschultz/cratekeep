@@ -24,90 +24,82 @@ Matching works with complete albums or just a few tracks. Choose a MusicBrainz r
 
 ## Install
 
-Cratekeep runs in Docker on Linux/amd64 and Linux/arm64. Use Compose, plain Docker or the manual Unraid setup below.
+Cratekeep runs in Docker on Linux/amd64 and Linux/arm64.
 
 > Cratekeep can change tags and delete files when requested. It has no built-in authentication or CSRF protection, so use a trusted network or an authenticating reverse proxy. Start with copies of a few albums.
 
 ### Docker Compose
 
-```sh
-mkdir -p cratekeep/data/inbox cratekeep/data/library cratekeep/data/config
-cd cratekeep
-```
-
-Save this as `compose.yaml`:
+Replace the host paths with your own folders and save as `compose.yaml`:
 
 ```yaml
 services:
   app:
     image: ghcr.io/kylejschultz/cratekeep:latest
-    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    user: "1000:1000" # UID:GID with write access to your folders
     ports:
       - "8788:8788"
     environment:
       STATE_PATH: /data/config
     volumes:
-      - ./data/inbox:/data/inbox
-      - ./data/library:/data/library
-      - ./data/config:/data/config
+      - /path/to/inbox:/data/inbox     # Inbox location
+      - /path/to/music:/data/library  # Library path, new or existing
+      - /path/to/config:/data/config  # Persistent settings and database
     restart: unless-stopped
 ```
 
-On Linux or macOS, save your user and group IDs, then start the container:
+Start Cratekeep:
 
 ```sh
-printf 'APP_UID=%s\nAPP_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+docker compose up -d
+```
+
+<details>
+<summary>Plain Docker</summary>
+
+Use your own folder paths and the same UID:GID permissions as above:
+
+```sh
+docker run -d \
+  --name cratekeep \
+  --restart unless-stopped \
+  --user 1000:1000 \
+  -p 8788:8788 \
+  -e STATE_PATH=/data/config \
+  -v /path/to/inbox:/data/inbox \
+  -v /path/to/music:/data/library \
+  -v /path/to/config:/data/config \
+  ghcr.io/kylejschultz/cratekeep:latest
+```
+
+</details>
+
+### Unraid
+
+Community Applications approval is pending.
+
+## Getting started
+
+Open **http://localhost:8788**, or use your server's address. During setup, choose `/data/inbox` and `/data/library` for the example mounts. Add more Inbox folders in Settings.
+
+Use **Inbox** for downloads and **Library → Import existing files** for music already in your Library folder. Inbox imports copy files and tag the copies; Library Import leaves files in place. Choose a match, review the changes and import individually or in batches.
+
+Eligible copy imports can be undone; replacements cannot. **Remove imported** deletes the Inbox originals and keeps the Library copies.
+
+## Analytics
+
+Optional [Beacon analytics](https://github.com/kylejschultz/beacon) is off by default. It reports a random installation ID, build/platform details and collection totals at most once a day, without track names, media paths or listening history. The receiving server also sees the connection IP address. You can opt in under Settings → About.
+
+## Updates and help
+
+Stop Cratekeep with `docker compose stop app`, then back up your config directory and music before updating. Keep the same mounts and user settings:
+
+```sh
 docker compose pull app
 docker compose up -d app
 ```
 
-On Windows, skip the ID command and share the folders through Docker Desktop. The example defaults to `1000:1000`; use IDs with write access to your media.
-
-### Plain Docker
-
-```sh
-mkdir -p data/inbox data/library data/config
-docker run -d \
-  --name cratekeep \
-  --restart unless-stopped \
-  --user "$(id -u):$(id -g)" \
-  -p 8788:8788 \
-  -e STATE_PATH=/data/config \
-  -v "$PWD/data/inbox:/data/inbox" \
-  -v "$PWD/data/library:/data/library" \
-  -v "$PWD/data/config:/data/config" \
-  ghcr.io/kylejschultz/cratekeep:latest
-```
-
-This command uses a Unix shell. Change the host paths on the left of each mount to use your own folders, and keep `/data/config` persistent across updates.
-
-### Unraid
-
-In **Docker → Add Container**, use `ghcr.io/kylejschultz/cratekeep:latest` as the repository and map container port `8788` to an available host port.
-
-| Host folder | Container path |
-| --- | --- |
-| Your download or Inbox folder | `/data/inbox` |
-| Your music library | `/data/library` |
-| `/mnt/user/appdata/cratekeep` | `/data/config` |
-
-Give the container read/write access to these folders and set `STATE_PATH=/data/config`. Choose a numeric user that can access the shares, commonly `--user=99:100` in Extra Parameters. Open `http://SERVER-IP:HOST-PORT` to finish setup. A Community Applications listing is planned; installation is currently manual.
-
-## Getting started
-
-Open **http://localhost:8788**, or use your server's address. During setup, choose `/data/inbox` and `/data/library` for the example mounts. Additional Inbox folders can be added in Settings.
-
-Use **Inbox** for downloads and **Library → Import existing files** for music already in your Library folder. Import selected uses your saved metadata choice, or the best match if you have not chosen one. An Inbox copy import can be undone while its originals and Library copies remain unchanged; replacement imports cannot be undone. **Remove imported** deletes the Inbox originals while keeping your Library copies.
-
-Enable automatic matching and artwork fetching in Settings if you want them. Settings → About shows the version, build and community links. Optional [Beacon analytics](https://github.com/kylejschultz/beacon) is off by default. It reports a random installation ID, build/platform details and collection totals at most once a day, without track names, media paths or listening history. The receiving server also sees the connection IP address.
-
-## Updates and help
-
-Before updating, stop Cratekeep and back up its entire config directory and your music separately. With Compose, run `docker compose stop app`, make your backup, then run `docker compose pull app` and `docker compose up -d app`. Keep the same mounts and user settings.
-
-A wiki is planned for advanced setup, development and API documentation.
-
-For questions, [join the Discord](https://discord.gg/QgkUzqa2Mw). Bugs and feature requests can also go in [GitHub Issues](https://github.com/kylejschultz/cratekeep/issues). Include your build identifier and relevant container logs, checking them for private information before sharing.
+For questions, [join the Discord](https://discord.gg/QgkUzqa2Mw). Report bugs and feature requests in [GitHub Issues](https://github.com/kylejschultz/cratekeep/issues), including your build identifier and relevant logs with private details removed.
 
 ## License
 
