@@ -20,7 +20,11 @@ jobs:
             const ownRepo = `${context.repo.owner}/${context.repo.repo}`;
             const sameRepo = pr.head.repo?.full_name === ownRepo;
             const promotion = pr.head.ref === 'dev';
-            const releasePR = pr.head.ref === 'release-please--branches--release'
+            const releaseBranches = [
+              'release-please--branches--release',
+              'release-please--branches--release--components--cratekeep',
+            ];
+            const releasePR = releaseBranches.includes(pr.head.ref)
               && pr.user.login === context.repo.owner
               && pr.labels.some(label => label.name === 'autorelease: pending');
             if (!sameRepo || (!promotion && !releasePR)) {
