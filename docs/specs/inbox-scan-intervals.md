@@ -244,3 +244,13 @@ intervals, source isolation, source recovery, watcher fallback/replacement,
 reloader ownership, matching opt-in and committed event payloads. Container/runtime
 verification and Kyle's manual acceptance are recorded with the local candidate;
 these automated results do not mark manual acceptance complete.
+
+## Candidate feedback — 2026-10-27
+
+Kyle requested the automatic matching preference beside each Inbox's discovery
+mode as a checkbox. Remove the Metadata-tab multi-select and its Select all/Clear
+controls; keep the match threshold on Metadata. Preserve the existing per-Inbox
+saved boolean and form field, with new Inboxes still requiring their first save
+before matching can be enabled. This is a settings presentation change, not a
+change to scheduling, matching or import behavior. Verify independent toggles,
+identity retention after rename/delete, and round-trip persistence.

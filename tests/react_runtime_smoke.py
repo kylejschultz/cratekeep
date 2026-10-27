@@ -171,11 +171,13 @@ def main() -> None:
         page.screenshot(path=args.evidence_dir / "05-settings-metadata-mobile.png", full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.get_by_label("Matched threshold (%)").fill("50")
-        match_inboxes = page.get_by_role("listbox", name="Automatically find matches for", exact=True)
-        page.get_by_role("button", name="Select all", exact=True).click()
-        assert match_inboxes.evaluate("node => node.selectedOptions.length") == 1
-        page.get_by_role("button", name="Clear selection", exact=True).click()
-        assert match_inboxes.evaluate("node => node.selectedOptions.length") == 0
+        page.get_by_role("tab", name="General").click()
+        match_inbox = page.get_by_role("checkbox", name="Automatically find matches for Inbox", exact=True)
+        assert match_inbox.locator("xpath=ancestor::tr").get_by_role("combobox", name="Discovery for Inbox", exact=True).count() == 1
+        match_inbox.check()
+        assert match_inbox.is_checked()
+        match_inbox.uncheck()
+        assert not match_inbox.is_checked()
         page.get_by_role("tab", name="Metadata").click()
         page.get_by_label("Fetch Cover Art Archive artwork").check()
         page.get_by_label("Save cover.jpg sidecars").check()
@@ -199,7 +201,8 @@ def main() -> None:
         assert page.get_by_label("Save cover.jpg sidecars").is_checked()
         page.get_by_role("tab", name="Metadata").click()
         assert page.get_by_label("Matched threshold (%)").input_value() == "50"
-        assert page.get_by_role("listbox", name="Automatically find matches for", exact=True).evaluate("node => node.selectedOptions.length") == 0
+        page.get_by_role("tab", name="General").click()
+        assert not page.get_by_role("checkbox", name="Automatically find matches for Inbox", exact=True).is_checked()
 
         page.goto(base + "/inbox", wait_until="networkidle")
         assert page.get_by_role("button", name="Match Selected").count() == 0

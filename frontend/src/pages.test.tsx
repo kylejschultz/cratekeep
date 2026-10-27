@@ -16,9 +16,10 @@ describe("settings and managed album presentation", () => {
     fireEvent.click(help);
     expect(screen.getByRole("note")).toHaveTextContent("source folders");
     expect(screen.getByLabelText("Library path")).toHaveValue("/music");
+    expect(screen.getByRole("checkbox", { name: "Automatically find matches for Downloads" })).toBeChecked();
     fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
     expect(screen.getByRole("heading", { name: /^Matching/ })).toBeInTheDocument();
-    expect(screen.getByRole("listbox", { name: "Automatically find matches for" })).toHaveValue(["one"]);
+    expect(screen.queryByRole("listbox", { name: "Automatically find matches for" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
     expect(screen.getByRole("heading", { name: /Feature in Title/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Advanced" }));
@@ -197,7 +198,7 @@ it("renders artist browse rows with album counts, genres, drill-down and paginat
   expect(screen.queryByRole("complementary", { name: "Album inspector" })).not.toBeInTheDocument();
 });
 
-it("keeps Inbox identities, edits and multiselect choices together through row changes", () => {
+it("keeps per-Inbox matching checkboxes with identities and discovery through row changes", () => {
   location.hash = "";
   render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", auto_match: true }, { id: "two", name: "Manual", path: "/manual", auto_match: false }] } }}/>);
   const table = screen.getByRole("table", { name: "Configured Inboxes" });
@@ -213,15 +214,13 @@ it("keeps Inbox identities, edits and multiselect choices together through row c
   fireEvent.click(screen.getByRole("button", { name: "Done" }));
   fireEvent.click(screen.getByRole("button", { name: "Delete Manual" }));
   expect(screen.getByText("/new-downloads")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
-  const select = screen.getByRole("listbox", { name: "Automatically find matches for" });
-  expect(select).toHaveValue(["one"]);
-  expect(screen.getByRole("option", { name: "Renamed" })).toHaveValue("one");
-  expect(screen.getByRole("option", { name: "New source (save first)" })).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
-  expect(select).toHaveValue([]);
-  fireEvent.click(screen.getByRole("button", { name: "Select all" }));
-  expect(select).toHaveValue(["one"]);
+  const checkbox = screen.getByRole("checkbox", { name: "Automatically find matches for Renamed" });
+  expect(checkbox).toBeChecked();
+  expect(screen.getByRole("checkbox", { name: "Automatically find matches for New source" })).toBeDisabled();
+  fireEvent.click(checkbox);
+  expect(checkbox).not.toBeChecked();
+  fireEvent.click(checkbox);
+  expect(checkbox).toBeChecked();
   const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
   const payload = new FormData(form);
   expect(payload.getAll("inbox_id")).toEqual(["one", ""]);
@@ -349,4 +348,21 @@ it("saves discovery independently for each Inbox, with a five-minute default and
   const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
   expect(new FormData(form).getAll("inbox_discovery")).toEqual(["instant", "manual"]);
   expect(screen.queryByRole("option", { name: /Custom/ })).not.toBeInTheDocument();
+});
+
+it("keeps matching independent per Inbox beside discovery, including when saving another tab", () => {
+  location.hash = "";
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/one", auto_match: true, discovery: "instant" }, { id: "two", name: "Slow", path: "/two", auto_match: false, discovery: "15" }] } }}/>);
+  const table = screen.getByRole("table", { name: "Configured Inboxes" });
+  const first = within(table).getByRole("checkbox", { name: "Automatically find matches for Downloads" });
+  const second = within(table).getByRole("checkbox", { name: "Automatically find matches for Slow" });
+  expect(first).toBeChecked(); expect(second).not.toBeChecked();
+  fireEvent.click(second);
+  fireEvent.click(first);
+  expect(within(table).getByRole("combobox", { name: "Discovery for Downloads" })).toHaveValue("instant");
+  expect(within(table).getByRole("combobox", { name: "Discovery for Slow" })).toHaveValue("15");
+  fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
+  const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
+  expect(new FormData(form).getAll("inbox_auto_match_id")).toEqual(["two"]);
+  expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
 });

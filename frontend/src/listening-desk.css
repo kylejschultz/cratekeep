@@ -305,9 +305,6 @@ code{overflow-wrap:anywhere}
 .inbox-settings-table strong{font-size:13px;font-weight:500}
 .inbox-printed-path{display:block;font:13px/1.5 "Public Sans",sans-serif;color:var(--muted);overflow-wrap:anywhere}
 .inbox-row-actions{display:flex;gap:14px;justify-content:flex-end}
-.inbox-match-select{width:100%;min-height:100px}
-.inbox-match-select option{padding:5px 8px}
-.match-selection-actions{display:flex;align-items:center;gap:14px;margin-top:6px;font-size:13px}
 .settings-card{position:relative}
 .settings-card .help-wrap{position:static}
 .help{font-size:12px;width:18px;height:18px;min-height:0;border:1px solid var(--control);color:var(--muted);background:none}
@@ -581,3 +578,6 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .inbox-discovery-setting{display:flex!important;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:8px!important;flex-wrap:wrap}
 .inbox-discovery-setting select{width:auto;max-width:100%;font-size:12px;padding:4px 8px}
 .inbox-discovery-status{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);padding:8px 0}
+
+.inbox-settings-table .inbox-auto-match-setting{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;margin:8px 0 0}
+.inbox-settings-table .inbox-auto-match-setting input{width:auto;margin:0}
