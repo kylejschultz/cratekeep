@@ -138,8 +138,9 @@ export function Library({ data }: { data: Record<string, any> }) {
   </div>;
 }
 
-type InboxSetting = { key: string; id: string; name: string; path: string; auto_match: boolean };
-type InboxDraft = Pick<InboxSetting, "key" | "name" | "path"> & { isNew?: boolean };
+type InboxSetting = { key: string; id: string; name: string; path: string; auto_match: boolean; discovery?: string };
+type InboxDraft = InboxSetting & { isNew?: boolean };
+const inboxDiscoveryOptions = [["manual", "Manual only"], ["instant", "Instant"], ["5", "Every 5 minutes"], ["15", "Every 15 minutes"], ["30", "Every 30 minutes"], ["60", "Every hour"], ["360", "Every 6 hours"], ["1440", "Every 24 hours"]];
 
 export function Settings({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const settings = data.settings || {}, initial = data.inboxes || [];
@@ -152,14 +153,14 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
   const nextInbox = useRef(0);
   const [inboxes, setInboxes] = useState<InboxSetting[]>(() => initial.map((inbox: InboxSetting) => ({ ...inbox, key: inbox.id })));
   const [draft, setDraft] = useState<InboxDraft | null>(null);
-  const editor = useRef<HTMLTableRowElement>(null);
+  const editor = useRef<HTMLDivElement>(null);
   const [tab, setTab] = useState(() => {
     const hash = location.hash.slice(1);
     return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
   });
   function finishInbox() {
     if (!draft || !Array.from(editor.current?.querySelectorAll("input:not([type=hidden])") || []).every(input => (input as HTMLInputElement).reportValidity())) return;
-    setInboxes(rows => rows.map(row => row.key === draft.key ? { ...row, name: draft.name.trim(), path: draft.path.trim() } : row));
+    setInboxes(rows => rows.map(row => row.key === draft.key ? { ...row, name: draft.name.trim(), path: draft.path.trim(), discovery: draft.discovery || "5", auto_match: Boolean(draft.auto_match) } : row));
     setDraft(null);
   }
   function cancelInbox() {
@@ -167,7 +168,7 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
     setDraft(null);
   }
   function addInbox() {
-    const inbox = { key: `new-${nextInbox.current++}`, id: "", name: `Inbox ${inboxes.length + 1}`, path: data.default_inbox || "", auto_match: false };
+    const inbox = { key: `new-${nextInbox.current++}`, id: "", name: `Inbox ${inboxes.length + 1}`, path: data.default_inbox || "", auto_match: false, discovery: "5" };
     setInboxes(rows => [...rows, inbox]);
     setDraft({ ...inbox, isNew: true });
   }
@@ -181,20 +182,38 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
       <input type="hidden" name="settings_tab" value={tab}/>
       <section hidden={tab !== "general"} className="settings-section">
         <div className="settings-card inbox-settings-card">
-          <h2>Inboxes <Help label="Inboxes">Named source folders where new music waits before review and import. Each Inbox must be a separate container-visible path outside the managed Library. Edit or delete configuration rows, then Save settings. Deleting a row does not delete files.</Help></h2>
+          <h2>Inboxes <Help label="Inboxes">Named source folders where new music waits before review and import. Each Inbox must be a separate container-visible path outside the managed Library. Edit or delete configuration rows, then Save settings. Deleting a row does not delete files. Discovery is independent per Inbox. Choose a timed interval or Manual only for downloads that arrive one file at a time. Instant waits briefly for files to settle and keeps a five-minute safety scan; it cannot know whether a download is complete.</Help></h2>
           <table className="inbox-settings-table"><caption className="sr-only">Configured Inboxes</caption>
             <thead><tr><th scope="col">Name</th><th scope="col">Inbox path</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
-            <tbody>{inboxes.map(inbox => <tr data-inbox-row key={inbox.key} ref={draft?.key === inbox.key ? editor : undefined}>
-              <td><input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/>
-                {draft?.key === inbox.key ? <label><span className="sr-only">Name for {inbox.name}</span><input autoFocus value={draft.name} pattern=".*\S.*" onChange={event => setDraft({ ...draft, name: event.target.value })} required/></label> : <strong>{inbox.name}</strong>}
+            <tbody>{inboxes.map(inbox => draft?.key === inbox.key ? <tr data-inbox-row className="inbox-editor-row" key={inbox.key}>
+              <td colSpan={3}>
+                <input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/><input type="hidden" name="inbox_path" value={inbox.path}/><input type="hidden" name="inbox_discovery" value={inbox.discovery || "5"}/>
+                {inbox.auto_match && inbox.id && <input type="hidden" name="inbox_auto_match_id" value={inbox.id}/>}
+                <div ref={editor} className="inbox-editor" role="group" aria-label={draft.isNew ? "Add Inbox" : `Edit ${inbox.name}`}>
+                  <h3>{draft.isNew ? "Add Inbox" : `Edit ${inbox.name}`}</h3>
+                  <div className="inbox-editor-fields">
+                    <label>Name<input aria-label={`Name for ${inbox.name}`} autoFocus value={draft.name} pattern=".*\S.*" onChange={event => setDraft({ ...draft, name: event.target.value })} required/></label>
+                    <label>Inbox path<input aria-label={`Inbox path for ${inbox.name}`} value={draft.path} pattern=".*\S.*" onChange={event => setDraft({ ...draft, path: event.target.value })} required/></label>
+                    <label>Discovery<select aria-label={`Discovery for ${inbox.name}`} value={draft.discovery || "5"} onChange={event => setDraft({ ...draft, discovery: event.target.value })}>
+                      {inboxDiscoveryOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                    </select></label>
+                    <div className="inbox-editor-matching"><span>Matching</span><label className="check"><input type="checkbox" aria-label={`Automatically find matches for ${inbox.name}`} checked={Boolean(draft.auto_match)} disabled={!inbox.id} onChange={event => setDraft({ ...draft, auto_match: event.target.checked })}/>Automatically find matches</label><small>{!inbox.id ? "Save this Inbox before enabling automatic matching." : "Find MusicBrainz suggestions without importing or changing tags."}</small></div>
+                  </div>
+                  <div className="inbox-editor-footer"><small>Changes apply when you save settings.</small><div className="inbox-row-actions"><button type="button" onClick={finishInbox}>Done</button><button className="text-button" type="button" onClick={cancelInbox}>Cancel</button></div></div>
+                </div>
               </td>
-              <td><input type="hidden" name="inbox_path" value={inbox.path}/>
-                {draft?.key === inbox.key ? <label><span className="sr-only">Inbox path for {inbox.name}</span><input value={draft.path} pattern=".*\S.*" onChange={event => setDraft({ ...draft, path: event.target.value })} required/></label> : <code className="inbox-printed-path">{inbox.path}</code>}
+            </tr> : <tr data-inbox-row key={inbox.key}>
+              <td><input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/><strong>{inbox.name}</strong></td>
+              <td><input type="hidden" name="inbox_path" value={inbox.path}/><code className="inbox-printed-path">{inbox.path}</code>
+                <input type="hidden" name="inbox_discovery" value={inbox.discovery || "5"}/>
+                {inbox.auto_match && inbox.id && <input type="hidden" name="inbox_auto_match_id" value={inbox.id}/>}
+                <div className="inbox-preferences-summary"><span>Discovery: {inboxDiscoveryOptions.find(([value]) => value === (inbox.discovery || "5"))?.[1]}</span><span>Auto-match: {inbox.auto_match ? "On" : "Off"}</span></div>
               </td>
-              <td><div className="inbox-row-actions">{draft?.key === inbox.key ? <><button className="text-button" type="button" onClick={finishInbox}>Done</button><button className="text-button" type="button" onClick={cancelInbox}>Cancel</button></> : <><button className="text-button" type="button" aria-label={`Edit ${inbox.name}`} disabled={draft !== null} onClick={() => setDraft({ key: inbox.key, name: inbox.name, path: inbox.path })}>Edit</button><button className="text-button" type="button" aria-label={`Delete ${inbox.name}`} disabled={draft !== null} onClick={() => setInboxes(rows => rows.filter(row => row.key !== inbox.key))}>Delete</button></>}</div></td>
+              <td><div className="inbox-row-actions"><button className="text-button" type="button" aria-label={`Edit ${inbox.name}`} disabled={draft !== null} onClick={() => setDraft({ ...inbox })}>Edit</button><button className="text-button" type="button" aria-label={`Delete ${inbox.name}`} disabled={draft !== null} onClick={() => setInboxes(rows => rows.filter(row => row.key !== inbox.key))}>Delete</button></div></td>
             </tr>)}</tbody>
           </table>
           <button className="text-button" type="button" disabled={draft !== null} onClick={addInbox}>+ Add inbox</button>
+
         </div>
         <div className="settings-card"><h2>Library <Help label="Library path">The managed destination where Cratekeep stores approved albums.</Help></h2><label>Library path<input name="library_path" defaultValue={settings.library_path || data.default_library} required/></label></div>
         <div className="settings-card"><h2>Notifications <Help label="Notifications">Automatically dismiss notifications after the configured interval. Timing pauses while a notification is hovered or focused.</Help></h2><label>Toast duration (seconds)<input className="short-setting" type="number" name="toast_duration_seconds" min="1" max="300" step="1" defaultValue={settings.toast_duration_seconds || 5} required/></label></div>
@@ -215,8 +234,7 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
         </div>
         <div className="settings-card"><h2>Matching <Help label="Match threshold">The minimum candidate confidence treated as ready for safe bulk import when all other safety checks pass. Lower scores remain for review. Library Import selected actions can explicitly approve saved matches regardless of score.</Help></h2>
           <label>Matched threshold (%)<input className="short-setting" name="match_threshold" type="number" min="1" max="100" step="1" defaultValue={threshold} required/></label>
-          <label>Automatically find matches for<select multiple className="inbox-match-select" name="inbox_auto_match_id" size={Math.min(6, Math.max(3, inboxes.length))} value={inboxes.filter(row => row.auto_match && row.id).map(row => row.id)} onChange={event => { const selected = new Set(Array.from(event.target.selectedOptions, option => option.value)); setInboxes(rows => rows.map(row => ({ ...row, auto_match: selected.has(row.id) }))); }}>{inboxes.map(inbox => <option key={inbox.key} value={inbox.id} disabled={!inbox.id}>{inbox.name}{!inbox.id ? " (save first)" : ""}</option>)}</select></label>
-          <div className="match-selection-actions"><button className="text-button" type="button" onClick={() => setInboxes(rows => rows.map(row => ({ ...row, auto_match: Boolean(row.id) })))}>Select all</button><button className="text-button" type="button" onClick={() => setInboxes(rows => rows.map(row => ({ ...row, auto_match: false })))}>Clear selection</button><Help label="Automatic Inbox matching">Select the named Inboxes to match automatically during discovery. This does not import music. Use Command or Control to select multiple entries, or Select all / Clear selection. Save new Inboxes first to enable automatic matching for them.</Help></div>
+
         </div>
       </section>
       <section hidden={tab !== "advanced"} className="advanced-settings"><div className="settings-card"><h2>Beets YAML <Help label="Beets YAML">Advanced beets configuration. Invalid YAML is rejected and the saved configuration remains unchanged.</Help></h2><p>Folder and file names come from <code>paths:</code> in this YAML. <a href="https://beets.readthedocs.io/en/stable/reference/pathformat.html" target="_blank" rel="noreferrer">Beets naming guide ↗</a></p><details><summary>Naming examples</summary><p><code>$albumartist/$album/$track $title</code> puts each album in its artist’s folder.</p><p><code>$albumartist/$year - $album/$track $title</code> adds the year before the album name.</p><p>Use <code>$albumartist</code> to keep compilation tracks together. Beets adds the file extension. Saving these settings does not rename existing files.</p></details><label className="sr-only" htmlFor="beets-config">Beets configuration</label><textarea id="beets-config" name="beets_config" defaultValue={data.beets_config}/></div></section>

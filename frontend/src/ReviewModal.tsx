@@ -6,7 +6,7 @@ import { api, ApiError } from "./api";
 import { formatMatchPercent } from "./status";
 import type { Album, Candidate, DuplicatePreflight } from "./types";
 
-type Props = { album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onSelectionChange?: (album: Album) => void };
+type Props = { onDeleteAlbum?: () => void; onDeleteTrack?: (trackId: number, title: string) => void; album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onSelectionChange?: (album: Album) => void };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -77,8 +77,8 @@ function TrackEvidence({ album, candidate, comparisonRef }: { album: Album; cand
       <thead><tr><th scope="col">#</th><th scope="col">Current title</th><th scope="col">Proposed title</th></tr></thead>
       <tbody>{details.map((detail, index) => {
         const localTrack = detail.local == null ? {} : (album.tracks || album.files || [])[Number(detail.position ?? index + 1) - 1] || {};
-        const localTitle = String(detail.local == null ? "Not present locally" : detail.local);
-        const proposedTitle = String(detail.proposed ?? "Not found online");
+        const localTitle = String(detail.local == null ? "Not on disk" : detail.local);
+        const proposedTitle = String(detail.proposed ?? "Not in MusicBrainz");
         const localArtist = String(detail.local_artist ?? localTrack.artist ?? album.artist ?? album.albumartist ?? "Unknown artist");
         const proposedArtist = String(detail.proposed_artist ?? candidate.artist ?? "Unknown artist");
         const titleChanged = localTitle !== proposedTitle;
@@ -87,7 +87,7 @@ function TrackEvidence({ album, candidate, comparisonRef }: { album: Album; cand
         const path = localTrack.path ?? localTrack.relative_path ?? localTrack.filename ?? localTrack.name;
         return <tr className="track-evidence-row" key={index}>
           <th scope="row"><span>{(Array.isArray(detail.proposed_position) ? detail.proposed_position.join(".") : String(detail.proposed_position ?? index + 1))}</span><FieldIcon kind="track" label="Metadata" changed={changed}/></th>
-          <td><strong>{localTitle}</strong><span>{localArtist}</span>{path && <small>{fileName(path)}</small>}</td>
+          <td><strong>{localTitle}</strong><span>{localArtist}</span>{path && <small>{fileName(path)}</small>}{(detail.status === "unmatched" || detail.status === "missing") && <small>Unpaired · keeps local track tags</small>}</td>
           <td><strong className={titleChanged ? "track-changed" : undefined}>{proposedTitle}</strong><span className={artistChanged ? "track-changed" : undefined}>{proposedArtist}</span></td>
         </tr>;
       })}</tbody>
@@ -101,9 +101,14 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
   const diff = candidate.proposed_diff || {};
   const albumDiff = Object.entries(diff).filter(([key]) => key !== "tracks");
   const changeCount = albumDiff.length + (diff.tracks ? 1 : 0);
-  const changedTitles = candidate.track_details?.filter(row => row.local !== row.proposed).length;
+  const changedTitles = candidate.track_details?.filter(row => row.local != null && row.proposed != null && row.status !== "unmatched" && row.local !== row.proposed).length;
   const localCount = album.track_count ?? album.file_count ?? album.tracks?.length ?? album.files?.length;
   const onlineCount = candidate.recordings?.length ?? candidate.track_details?.filter(item => item.proposed != null).length;
+  const comparisonCount = localCount != null && onlineCount != null ? Math.max(localCount, onlineCount) : undefined;
+  const totalsDiffer = localCount != null && onlineCount != null && localCount !== onlineCount;
+  const matchesDiffer = comparisonCount != null && candidate.matched_track_count != null && candidate.matched_track_count < comparisonCount;
+  const trackTotals = `${localCount ?? "—"} / ${onlineCount ?? "—"}`;
+  const trackMatches = `${candidate.matched_track_count ?? "—"} / ${comparisonCount ?? "—"}`;
   const releaseFormat = [candidate.release_type, mediaText(candidate)].filter(value => value && value !== "Not available").join(" · ");
   const fields: { kind: FieldKind; label: string; changed: boolean }[] = [
     { kind: "artist", label: "Artist", changed: Boolean(diff.artist) },
@@ -112,15 +117,15 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
     { kind: "year", label: "Release year", changed: Boolean(diff.year || diff.date) },
     { kind: "medium", label: "Release type / medium", changed: Boolean(diff.release_type || diff.media) },
     { kind: "region", label: "Release region", changed: Boolean(diff.country) },
-    { kind: "local", label: "Local tracks found online", changed: Boolean(candidate.unmatched_track_count) },
-    { kind: "online", label: "Online tracks present locally", changed: onlineCount != null && (candidate.matched_track_count ?? 0) < onlineCount },
+    { kind: "local", label: "On disk / MusicBrainz", changed: totalsDiffer },
+    { kind: "online", label: "Track matches", changed: matchesDiffer },
   ];
   const changed = fields.filter(field => field.changed).map(field => field.label);
   return <article className={`candidate-card${String(chosen) === String(candidate.id) ? " selected" : ""}`}>
     <div className="candidate-heading"><label><input type="radio" name="candidate" checked={String(chosen) === String(candidate.id)} disabled={busy} onChange={() => { choose(candidate.id); if (!expanded) onExpand(); }}/><span className="sr-only">Select {candidate.album || album.album || "candidate"}</span></label><span className="candidate-artwork">{candidate.artwork_url && !artFailed ? <img src={candidate.artwork_url} alt="" onError={() => setArtFailed(true)}/> : <ArtworkPlaceholder/>}</span><button className="candidate-summary" type="button" aria-expanded={expanded} onClick={onExpand}><span className="candidate-title"><strong>{candidate.artist || album.artist || "Unknown"} — {candidate.album || album.album || "Untitled"}</strong><small>{candidate.confidence == null ? "Candidate" : `${formatMatchPercent(candidate.confidence * 100)} match`}{candidate.year ? ` · ${candidate.year}` : ""}</small></span><span className="candidate-change-icons" aria-label={changed.length ? `Changes: ${changed.join(", ")}` : "No album field changes"}>{fields.map(field => <FieldIcon key={field.kind} {...field}/>)}</span><span aria-hidden="true">{expanded ? "⌃" : "⌄"}</span></button></div>
     {expanded && <div className="candidate-expanded">
-      {changeCount > 0 && <section className="review-change-summary" aria-label="Proposed changes"><h3>{changeCount} proposed {changeCount === 1 ? "change" : "changes"}</h3><dl>{albumDiff.map(([key, value]) => <div key={key}><dt><FieldIcon kind={fields.find(field => field.kind === key)?.kind || (key === "country" ? "region" : key === "date" ? "year" : key === "media" || key === "release_type" ? "medium" : "album")} label={key.replaceAll("_", " ")} changed/>{key.replaceAll("_", " ")}</dt><dd><span>{text(value.from, "—")}</span><span aria-hidden="true">→</span><strong>{text(value.to, "—")}</strong></dd></div>)}{diff.tracks && <div className="track-change-link"><dt><FieldIcon kind="track" label="Tracks" changed/>Tracks</dt><dd><button className="text-button" type="button" onClick={() => { if (comparisonRef.current) { comparisonRef.current.open = true; comparisonRef.current.scrollIntoView?.({ block: "nearest" }); comparisonRef.current.querySelector("summary")?.focus(); } }}>{changedTitles ? `${changedTitles} track ${changedTitles === 1 ? "title" : "titles"} changed` : "Track metadata changed"} — Compare tracks →</button></dd></div>}</dl></section>}
-      <div className="review-track-coverage">{localCount != null && <div>Local tracks matched<strong>{candidate.matched_track_count ?? 0} of {localCount}</strong></div>}{onlineCount != null && <div>Release tracks present<strong>{candidate.matched_track_count ?? 0} of {onlineCount}</strong></div>}</div>
+      {changeCount > 0 && <section className="review-change-summary" aria-label="Proposed changes"><h3>{changeCount} proposed {changeCount === 1 ? "change" : "changes"}</h3><dl>{albumDiff.map(([key, value]) => <div key={key}><dt><FieldIcon kind={fields.find(field => field.kind === key)?.kind || (key === "country" ? "region" : key === "date" ? "year" : key === "media" || key === "release_type" ? "medium" : "album")} label={key.replaceAll("_", " ")} changed/>{key.replaceAll("_", " ")}</dt><dd><span>{text(value.from, "—")}</span><span aria-hidden="true">→</span><strong>{text(value.to, "—")}</strong></dd></div>)}{diff.tracks && <div className="track-change-link"><dt><FieldIcon kind="track" label="Tracks" changed/>Tracks</dt><dd><button className="text-button" type="button" onClick={() => { if (comparisonRef.current) { comparisonRef.current.open = true; comparisonRef.current.scrollIntoView?.({ block: "nearest" }); comparisonRef.current.querySelector("summary")?.focus(); } }}>{changedTitles ? `${changedTitles} track ${changedTitles === 1 ? "title" : "titles"} changed` : "Review track differences"} — Compare tracks →</button></dd></div>}</dl></section>}
+      <div className="review-track-coverage"><div>On disk / MusicBrainz<strong>{trackTotals}</strong></div><div>Track matches<strong>{trackMatches}</strong></div></div>
       <details className="release-metadata"><summary>Release metadata and ID</summary>{candidate.provider_id && <p><code>{candidate.provider_id}</code></p>}<div className="candidate-facts">
       <Fact kind="artist" label="Artist" value={candidate.artist} changed={Boolean(diff.artist)}/>
       <Fact kind="album" label="Album" value={candidate.album} changed={Boolean(diff.album)}/>
@@ -128,8 +133,8 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
       {(candidate.year || diff.year || diff.date) && <Fact kind="year" label="Release year" value={candidate.year} changed={Boolean(diff.year || diff.date)}/>}
       {releaseFormat && <Fact kind="medium" label="Release type / medium" value={releaseFormat} changed={Boolean(diff.release_type || diff.media)}/>}
       {candidate.country && <Fact kind="region" label="Release region" value={candidate.country} changed={Boolean(diff.country)}/>}
-      {localCount != null && <Fact kind="local" label="Local tracks found online" value={`${candidate.matched_track_count ?? 0} of ${localCount}`} changed={Boolean(candidate.unmatched_track_count)}/>}
-      {onlineCount != null && <Fact kind="online" label="Online tracks present locally" value={`${candidate.matched_track_count ?? 0} of ${onlineCount}`} changed={(candidate.matched_track_count ?? 0) < onlineCount}/>}
+      <Fact kind="local" label="On disk / MusicBrainz" value={trackTotals} changed={totalsDiffer}/>
+      <Fact kind="online" label="Track matches" value={trackMatches} changed={matchesDiffer}/>
     </div>
     </details>
     {albumDiff.length > 0 && <details className="metadata-comparison"><summary>Compare metadata</summary><dl>{albumDiff.map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{text(value.from, "—")} → {text(value.to, "—")}</dd></div>)}</dl></details>}
@@ -137,7 +142,7 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
   </article>;
 }
 
-export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onSelectionChange }: Props) {
+export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onSelectionChange, onDeleteAlbum, onDeleteTrack }: Props) {
   const [album, setAlbum] = useState(seed);
   const notify = useToast();
   const [operation, setOperation] = useState<"match" | "search" | "import" | "selection" | null>(null);
@@ -253,6 +258,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
       <div className="dialog-body">
         <div className="review-tools"><button type="button" onClick={() => void match()} disabled={busy || moved} aria-busy={operation === "match"}>{operation === "match" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches" : "Match"}</button><button className="secondary" type="button" onClick={() => { setMbidOpen(value => !value); setError(""); }} disabled={busy || moved} aria-expanded={mbidOpen}>Search MBID</button></div>
         {mbidOpen && <form className="mbid-search" onSubmit={searchMbid}><label>MusicBrainz release UUID<input value={mbid} onChange={event => setMbid(event.target.value)} placeholder="123e4567-e89b-42d3-a456-426614174000" disabled={busy} autoFocus/></label><button type="submit" disabled={busy} aria-busy={operation === "search"}>{operation === "search" && <span className="spinner"/>}Search exact release</button></form>}
+        {source === "inbox" && onDeleteTrack && <details className="inbox-local-tracks"><summary>Inbox files ({(album.tracks || []).length})</summary><ul className="track-list">{(album.tracks || []).map(track => <li key={track.id}><div><strong>{track.title || fileName(track.path)}</strong><small>{track.path}</small></div><button type="button" className="danger-action" disabled={busy || moved || !Number.isInteger(track.id)} aria-label={`Delete track ${track.title || fileName(track.path)}`} onClick={() => onDeleteTrack(track.id, String(track.title || fileName(track.path)))}>Delete track</button></li>)}</ul></details>}
         <fieldset className="candidate-list" data-review-candidates><legend>Metadata choice</legend>
           {candidates(album).map(candidate => <CandidateCard key={candidate.id} album={album} candidate={candidate} chosen={chosen} expanded={String(expanded) === String(candidate.id)} busy={busy || moved} choose={choose} onExpand={() => setExpanded(current => String(current) === String(candidate.id) ? null : candidate.id)}/>) }
           <article className={`candidate-card as-is${chosen === null ? " selected" : ""}`}><div className="candidate-heading"><label><input type="radio" name="candidate" checked={chosen === null} disabled={busy || moved} onChange={() => { choose(null); setExpanded("as-is"); }}/><span className="sr-only">Select As Is</span></label><span className="candidate-artwork"><ArtworkPlaceholder/></span><button className="candidate-summary" type="button" aria-expanded={expanded === "as-is"} onClick={() => setExpanded(current => current === "as-is" ? null : "as-is")}><span className="candidate-title"><strong>As Is</strong><small>Retain incoming/local metadata unchanged</small></span><span className="candidate-change-icons" aria-label="No MusicBrainz association">—</span><span aria-hidden="true">{expanded === "as-is" ? "⌃" : "⌄"}</span></button></div>{expanded === "as-is" && <p className="as-is-detail">Do not associate a MusicBrainz release.</p>}</article>
@@ -264,7 +270,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
         {["artwork_fetch_failed", "artwork_finalize_failed"].includes(recovery) && <div className="notice"><p>{moved ? "You can retry the pending sidecar, or finish without it when no incoming artwork needs recovery. Already embedded artwork is retained." : "You can retry artwork retrieval or continue with the selected metadata while preserving existing artwork. This applies only to this import."}</p><button type="button" className="secondary" disabled={busy} onClick={() => void execute(true)}>{moved ? "Finish without new sidecar" : "Continue without new artwork"}</button></div>}
         {status && <p className="notice" aria-live="polite" data-review-status>{status}</p>}{error && <p className="notice error" role="alert" data-review-status>{error}</p>}
       </div>
-      <footer><button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button><button type="button" onClick={() => void execute()} disabled={busy || chosen === undefined || ["candidate_stale", "candidate_unavailable"].includes(recovery)} aria-busy={operation === "import"} data-review-execute>{operation === "import" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches before importing" : cleanupPending ? "Finish Inbox cleanup" : moved ? "Retry artwork finalization" : error ? "Retry import" : "Import to Library"}</button></footer>
+      <footer><button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button>{onDeleteAlbum && <button type="button" className="danger-action" disabled={busy || moved} onClick={onDeleteAlbum}>Delete from Inbox</button>}<button type="button" onClick={() => void execute()} disabled={busy || chosen === undefined || ["candidate_stale", "candidate_unavailable"].includes(recovery)} aria-busy={operation === "import"} data-review-execute>{operation === "import" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches before importing" : cleanupPending ? "Finish Inbox cleanup" : moved ? "Retry artwork finalization" : error ? "Retry import" : "Import to Library"}</button></footer>
     </div>
   </div>;
 }

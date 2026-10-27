@@ -45,3 +45,30 @@ it("does not retry an uncertain transport failure or start more albums", async (
   expect(screen.getByText("Check result")).toBeInTheDocument();
   expect(screen.getByText(/Check the Library and queue before retrying/)).toBeInTheDocument();
 });
+
+it("offers cleanup only for successful retained Inbox copies from this batch", async () => {
+  const remove=vi.fn();
+  show(vi.fn(async id => id===1 ? {imported:[{album_review_id:1,job_id:77}]} : {failed:[{error:"File changed"}]}),{source:"inbox",onRemoveImported:remove});
+  expect(screen.queryByRole("button",{name:"Clear imported from Inbox"})).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button",{name:"Start import"}));
+  fireEvent.click(await screen.findByRole("button",{name:"Clear imported from Inbox"}));
+  expect(remove).toHaveBeenCalledWith([77]);
+});
+it.each(["library-import","inbox"] as const)("omits cleanup for %s without retained originals", async source => {
+  show(vi.fn(async id => ({imported:[{album_review_id:id,...(source==="library-import"?{job_id:77}:{})}]})),{source,onRemoveImported:vi.fn()});
+  fireEvent.click(screen.getByRole("button",{name:"Start import"}));
+  await screen.findByRole("heading",{name:"Import results"});
+  expect(screen.queryByRole("button",{name:"Clear imported from Inbox"})).not.toBeInTheDocument();
+});
+
+it("shows metadata warnings while keeping Start import available", async () => {
+  const execute=vi.fn(async id=>({imported:[{album_review_id:id}]}));
+  show(execute,{rows:[{id:1,album:"Reviewed release",status:"queued",warnings:["Track counts differ. Only files on disk will be imported."]}]});
+  expect(screen.getByRole("note")).toHaveTextContent("Metadata warnings do not block import");
+  expect(screen.getByText(/Warning: Track counts differ/)).toBeInTheDocument();
+  expect(screen.getByRole("button",{name:"Start import"})).toBeEnabled();
+  fireEvent.click(screen.getByRole("button",{name:"Start import"}));
+  await screen.findByRole("heading",{name:"Import results"});
+  expect(execute).toHaveBeenCalledWith(1);
+  expect(screen.getByText("1 of 1 albums imported.")).toBeInTheDocument();
+});

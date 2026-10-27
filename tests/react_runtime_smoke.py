@@ -42,7 +42,7 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def match_selected(page, endpoint, evidence_dir, *, cooldown=False):
+def match_selected(page, endpoint, evidence_dir, *, cooldown=False, expected_matches=1):
     page.get_by_role("button", name="Match Selected", exact=True).click()
     confirmation=page.get_by_role("dialog",name="Match selected albums",exact=True)
     confirmation.wait_for()
@@ -58,7 +58,9 @@ def match_selected(page, endpoint, evidence_dir, *, cooldown=False):
         page.set_viewport_size({"width":1440,"height":1000})
     results=page.get_by_role("dialog",name="Matching results",exact=True)
     results.wait_for(timeout=60000)
-    assert results.get_by_text("Matched",exact=True).is_visible()
+    matched_rows=results.get_by_text("Matched",exact=True)
+    assert matched_rows.count()==expected_matches
+    assert all(row.is_visible() for row in matched_rows.all())
     page.screenshot(path=evidence_dir/("06-inbox-matching-results.png" if cooldown else "06-library-matching-results.png"),full_page=True)
     results.get_by_role("button",name="Close results",exact=True).click()
     return matched.value
@@ -171,11 +173,18 @@ def main() -> None:
         page.screenshot(path=args.evidence_dir / "05-settings-metadata-mobile.png", full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.get_by_label("Matched threshold (%)").fill("50")
-        match_inboxes = page.get_by_role("listbox", name="Automatically find matches for", exact=True)
-        page.get_by_role("button", name="Select all", exact=True).click()
-        assert match_inboxes.evaluate("node => node.selectedOptions.length") == 1
-        page.get_by_role("button", name="Clear selection", exact=True).click()
-        assert match_inboxes.evaluate("node => node.selectedOptions.length") == 0
+        page.get_by_role("tab", name="General").click()
+        summary_row = page.get_by_role("button", name="Edit Inbox", exact=True).locator("xpath=ancestor::tr")
+        assert summary_row.get_by_role("combobox").count() == 0
+        assert summary_row.get_by_role("checkbox").count() == 0
+        page.get_by_role("button", name="Edit Inbox", exact=True).click()
+        match_inbox = page.get_by_role("checkbox", name="Automatically find matches for Inbox", exact=True)
+        assert match_inbox.locator("xpath=ancestor::tr").get_by_role("combobox", name="Discovery for Inbox", exact=True).count() == 1
+        match_inbox.check()
+        assert match_inbox.is_checked()
+        match_inbox.uncheck()
+        assert not match_inbox.is_checked()
+        page.get_by_role("button", name="Done", exact=True).click()
         page.get_by_role("tab", name="Metadata").click()
         page.get_by_label("Fetch Cover Art Archive artwork").check()
         page.get_by_label("Save cover.jpg sidecars").check()
@@ -199,7 +208,9 @@ def main() -> None:
         assert page.get_by_label("Save cover.jpg sidecars").is_checked()
         page.get_by_role("tab", name="Metadata").click()
         assert page.get_by_label("Matched threshold (%)").input_value() == "50"
-        assert page.get_by_role("listbox", name="Automatically find matches for", exact=True).evaluate("node => node.selectedOptions.length") == 0
+        page.get_by_role("tab", name="General").click()
+        assert page.get_by_text("Auto-match: Off", exact=True).count() == 1
+        assert page.get_by_role("table", name="Configured Inboxes").get_by_role("checkbox").count() == 0
 
         page.goto(base + "/inbox", wait_until="networkidle")
         assert page.get_by_role("button", name="Match Selected").count() == 0
@@ -216,10 +227,10 @@ def main() -> None:
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).check()
         page.get_by_role("button", name="Next", exact=True).click()
         page.get_by_text(re.compile("Page 2 of 2")).wait_for()
-        assert page.get_by_text("1 selected", exact=True).is_visible()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
         page.get_by_role("button", name="Previous", exact=True).click()
         page.get_by_text(re.compile("Page 1 of 2")).wait_for()
-        assert page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).is_checked()
+        assert not page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).is_checked()
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).uncheck()
         page.get_by_role("searchbox", name="Find an album").fill("Inbox Ready")
         page.get_by_role("checkbox", name="Select album Inbox Ready", exact=True).check()
@@ -281,7 +292,7 @@ def main() -> None:
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).check()
         page.get_by_role("button", name="Next", exact=True).click()
         page.get_by_text(re.compile("Page 2 of 2")).wait_for()
-        assert page.get_by_text("1 selected", exact=True).is_visible()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
         page.get_by_role("button", name="Previous", exact=True).click()
         page.get_by_text(re.compile("Page 1 of 2")).wait_for()
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).uncheck()
@@ -337,6 +348,10 @@ def main() -> None:
         assert page.locator(".track-evidence-row").get_by_role("img", name=re.compile(r"Metadata (changed|unchanged)")).first.is_visible()
         assert page.locator(".candidate-fact").get_by_role("img", name=re.compile(r"Artist (changed|unchanged)")).is_visible()
         assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        coverage = page.locator(".review-track-coverage")
+        assert "On disk / MusicBrainz" in coverage.inner_text()
+        assert "Track matches" in coverage.inner_text() and " / " in coverage.inner_text()
+        assert "Release tracks present" not in coverage.inner_text()
         page.screenshot(path=args.evidence_dir / "06-review-modal-desktop.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
         page.wait_for_function("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
@@ -361,7 +376,11 @@ def main() -> None:
         page.get_by_role("button", name="Duplicates", exact=True).click()
         page.get_by_text("No albums match this view", exact=True).wait_for()
         page.get_by_role("button", name="All albums", exact=True).click()
-        page.get_by_role("checkbox", name="Select album Bulk Ready", exact=True).wait_for()
+        bulk_checkbox = page.get_by_role("checkbox", name="Select album Bulk Ready", exact=True)
+        bulk_checkbox.wait_for()
+        assert not bulk_checkbox.is_checked()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
+        bulk_checkbox.check()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
             page.locator(".toolbar-actions").get_by_role("button", name="Import selected", exact=True).click()
         confirmation = page.get_by_role("dialog", name="Import selected albums", exact=True)
@@ -589,20 +608,132 @@ def main() -> None:
         page.get_by_role("button",name="Import selected",exact=True).click()
         page.get_by_role("button",name="Start import",exact=True).click()
         page.get_by_role("heading",name="Import results",exact=True).wait_for()
-        page.get_by_role("button",name="Close results",exact=True).click()
-        copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
-        page.reload(wait_until="networkidle")
-        page.get_by_role("button",name="Imported",exact=True).click()
-        page.get_by_role("searchbox",name="Find an album").fill("Copy Lifecycle")
-        copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
         saved={path:sha256(path) for path in targets}
-        page.screenshot(path=args.evidence_dir/"10a-copy-imported-undo.png",full_page=True)
-        page.get_by_role("button",name="Remove imported",exact=True).click()
+        # Download-client sidecars must leave with the cleared album folder.
+        (copy_folder/"album.nfo").write_text("download metadata")
+        (copy_folder/"folder.jpg").write_bytes(b"disposable cover")
+        (copy_folder/"artwork").mkdir()
+        (copy_folder/"artwork"/"large.jpg").write_bytes(b"disposable artwork")
+        page.screenshot(path=args.evidence_dir/"10a-copy-import-results.png",full_page=True)
+        page.get_by_role("button",name="Clear imported from Inbox",exact=True).click()
+        page.get_by_role("button",name="Permanently remove Inbox originals",exact=True).wait_for(state="visible")
+        assert all(sha256(path)==originals[path] for path in copy_sources)
+        assert all(sha256(path)==saved[path] for path in targets)
         page.get_by_role("button",name="Permanently remove Inbox originals",exact=True).click()
         copy_row.wait_for(state="hidden")
         assert not any(path.exists() for path in copy_sources) and not copy_folder.exists()
         assert all(sha256(path)==saved[path] for path in targets)
         page.screenshot(path=args.evidence_dir/"10b-imported-originals-removed.png",full_page=True)
+        # Unimported deletion: inspector cancellation, exact track, then page batch.
+        delete_folders=[args.fixture_root/"inbox"/name for name in ("Delete Download","Delete Other")]
+        delete_sources=[]
+        for folder in delete_folders:
+            for index in range(2 if folder.name=="Delete Download" else 1):
+                path=folder/f"{index+1}.wav";write_wav(path)
+                media=MediaFile(path);media.album=folder.name;media.artist="Delete fixture"
+                media.title="Bad song" if index==0 else "Keep song";media.track=index+1;media.save()
+                delete_sources.append(path)
+            (folder/"album.nfo").write_bytes(b"disposable metadata")
+            (folder/"artwork").mkdir();(folder/"artwork"/"back.jpg").write_bytes(b"disposable artwork")
+        expected={path:sha256(path) for path in delete_sources}
+        page.get_by_role("searchbox",name="Find an album").fill("Delete")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Delete Download",exact=True).click()
+        inspector=page.get_by_role("region",name="Delete Download",exact=True)
+        inspector.get_by_role("button",name="Delete from Inbox",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        deletion.get_by_role("button",name="Delete permanently",exact=True).wait_for()
+        assert "without importing" in deletion.inner_text()
+        deletion.get_by_role("button",name="Cancel",exact=True).click()
+        assert all(sha256(path)==expected[path] for path in delete_sources)
+        inspector.get_by_text("Inbox files (2)",exact=True).click()
+        page.screenshot(path=args.evidence_dir/"11-inbox-files-desktop.png",full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        inspector.get_by_role("button",name="Delete track Bad song",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete track from Inbox",exact=True)
+        deletion.locator("li").filter(has_text="Delete Download/1.wav").wait_for()
+        assert "Delete Download/1.wav" in deletion.inner_text()
+        page.screenshot(path=args.evidence_dir/"11a-delete-track-mobile.png",full_page=True)
+        deletion.get_by_role("button",name="Delete permanently",exact=True).click()
+        page.wait_for_function("!document.querySelector('dialog[open]')")
+        page.get_by_role("button",name="Review Delete Download",exact=True).wait_for()
+        assert not delete_sources[0].exists() and sha256(delete_sources[1])==expected[delete_sources[1]]
+        assert (delete_folders[0]/"album.nfo").is_file()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        page.locator('[aria-label="Selected album actions"]').get_by_role("button",name="Delete from Inbox",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        deletion.locator("li").first.wait_for()
+        assert "Delete Download" in deletion.inner_text() and "Delete Other" in deletion.inner_text()
+        assert "2 folders · 6 files" in deletion.inner_text()
+        assert not deletion.get_by_text("Delete Download/2.wav",exact=True).is_visible()
+        page.screenshot(path=args.evidence_dir/"11b-delete-batch-mobile.png",full_page=True)
+        deletion.get_by_text("Show files",exact=True).click()
+        assert deletion.get_by_text("Delete Download/2.wav",exact=True).is_visible()
+        deletion.get_by_text("Show files",exact=True).click()
+        assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        deletion.get_by_role("button",name="Delete permanently",exact=True).click()
+        page.get_by_text("No albums match this view",exact=True).wait_for()
+        assert not any(folder.exists() for folder in delete_folders)
+        assert all(sha256(path)==saved[path] for path in targets)
+        assert page.get_by_text(re.compile("Inbox updates waiting")).count()==0
+        # Symbol title changes must not block the actual selected bulk path.
+        symbol_sources=[]
+        for album_index, album_title in enumerate(("Symbol Pair One","Symbol Pair Two"),1):
+            for index,title in enumerate(("Opening","Human Heart","Rainbow"),1):
+                path=args.fixture_root/"inbox"/album_title/f"{index}.wav";write_wav(path)
+                media=MediaFile(path);media.album=album_title;media.artist=f"Symbol fixture {album_index}"
+                media.title=title;media.track=index;media.disc=1;media.save();symbol_sources.append(path)
+        symbol_before={path:sha256(path) for path in symbol_sources}
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.get_by_role("searchbox",name="Find an album").fill("Symbol Pair")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Symbol Pair One",exact=True).wait_for()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        match_selected(page,"/api/inbox/candidates",args.evidence_dir,expected_matches=2)
+        page.get_by_role("button",name="Review Symbol Pair One",exact=True).click()
+        coverage=page.locator(".review-track-coverage")
+        assert "3 / 3" in coverage.inner_text() and "2 / 3" not in coverage.inner_text()
+        page.get_by_text("Compare tracks (3)",exact=True).click()
+        assert page.get_by_text("Match needs review",exact=True).count()==0
+        assert page.get_by_text("Unpaired · keeps local track tags",exact=True).count()==0
+        assert page.get_by_role("table",name="Current and proposed track metadata").get_by_text("🌈",exact=True).is_visible()
+        page.screenshot(path=args.evidence_dir/"12-symbol-title-review.png",full_page=True)
+        page.locator("[data-review-close]").click()
+        page.get_by_role("button",name="Import selected",exact=True).click()
+        page.get_by_role("button",name="Start import",exact=True).click()
+        page.get_by_text("2 of 2 albums imported.",exact=True).wait_for()
+        page.screenshot(path=args.evidence_dir/"12a-symbol-bulk-results.png",full_page=True)
+        assert all(sha256(path)==symbol_before[path] for path in symbol_sources)
+        receipts=page.request.get(inbox_base+"/imports").json()["imports"]
+        symbol_receipts=[row for row in receipts if row['album'].startswith("Symbol Pair")]
+        assert len(symbol_receipts)==2
+        for receipt in symbol_receipts:
+            assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"Opening","❤️ feat. We Are KING & Jacob Collier","🌈"}
+        # Metadata warnings remain advisory for an explicitly started import.
+        page.get_by_role("button",name="Close results",exact=True).click()
+        warning_sources=[]
+        for index,title in enumerate(("First","Second","Third"),1):
+            path=args.fixture_root/"inbox"/"Warning Import"/f"{index}.wav";write_wav(path)
+            media=MediaFile(path);media.album="Warning Import";media.artist="Warning fixture"
+            media.title=title;media.track=index;media.save();warning_sources.append(path)
+        warning_before={path:sha256(path) for path in warning_sources}
+        page.get_by_role("searchbox",name="Find an album").fill("Warning Import")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Warning Import",exact=True).wait_for()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        match_selected(page,"/api/inbox/candidates",args.evidence_dir)
+        page.get_by_role("button",name="Import selected",exact=True).click()
+        confirmation=page.get_by_role("dialog",name="Import selected albums",exact=True)
+        confirmation.get_by_text(re.compile("Warning: Track counts differ")).wait_for()
+        assert confirmation.get_by_text("Blocked",exact=True).count()==0
+        assert confirmation.get_by_role("button",name="Start import",exact=True).is_enabled()
+        page.screenshot(path=args.evidence_dir/"13-metadata-warning-confirmation.png",full_page=True)
+        confirmation.get_by_role("button",name="Start import",exact=True).click()
+        page.get_by_text("1 of 1 albums imported.",exact=True).wait_for()
+        assert all(sha256(path)==warning_before[path] for path in warning_sources)
+        receipt=next(row for row in page.request.get(inbox_base+"/imports").json()["imports"] if row['album']=="Warning Import")
+        assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"First","Second","Third"}
+        assert {MediaFile(args.fixture_root/"library"/relative).album for relative in receipt['destinations']}=={"Warning Import Chosen"}
         browser_version = browser.version
         browser.close()
 
@@ -625,7 +756,7 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True,
+        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

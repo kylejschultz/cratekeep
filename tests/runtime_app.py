@@ -78,6 +78,14 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
                         "length_ms": round(float(track.get("duration") or 1) * 1000)}
                        for index, track in enumerate(query.get("tracks", []), 1)],
         }
+        if query["album"] == "Warning Import":
+            base.update(provider_id="warning-import",album="Warning Import Chosen")
+            base["tracks"]=base["tracks"][:2]
+            base["tracks"][1]["title"]="Unrelated release recording"
+        if query["album"].startswith("Symbol Pair"):
+            base["provider_id"] = "symbol-" + query["album"]
+            for track in base["tracks"]:
+                track["title"] = {"Human Heart":"❤️ feat. We Are KING & Jacob Collier", "Rainbow":"🌈"}.get(track["title"],track["title"])
         if query["album"] == "Shared Selection":
             base["provider_id"] = "123e4567-e89b-42d3-a456-426614174013"
             base["tracks"][0]["length_ms"] += 10_000

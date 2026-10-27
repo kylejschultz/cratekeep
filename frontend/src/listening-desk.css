@@ -305,9 +305,6 @@ code{overflow-wrap:anywhere}
 .inbox-settings-table strong{font-size:13px;font-weight:500}
 .inbox-printed-path{display:block;font:13px/1.5 "Public Sans",sans-serif;color:var(--muted);overflow-wrap:anywhere}
 .inbox-row-actions{display:flex;gap:14px;justify-content:flex-end}
-.inbox-match-select{width:100%;min-height:100px}
-.inbox-match-select option{padding:5px 8px}
-.match-selection-actions{display:flex;align-items:center;gap:14px;margin-top:6px;font-size:13px}
 .settings-card{position:relative}
 .settings-card .help-wrap{position:static}
 .help{font-size:12px;width:18px;height:18px;min-height:0;border:1px solid var(--control);color:var(--muted);background:none}
@@ -577,3 +574,51 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 
 .managed-release-id{display:grid;gap:4px;margin:0 0 18px;font-size:13px;color:var(--muted);min-width:0}
 .managed-release-id code{font-size:12px;overflow-wrap:anywhere;user-select:text}
+
+.inbox-discovery-status{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);padding:8px 0}
+
+
+/* The editor spans the table; its fields share a grid instead of data columns. */
+.inbox-settings-table .inbox-editor-row>td{padding:12px 0}
+.inbox-editor{padding:16px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;min-width:0}
+.inbox-editor h3{margin:0 0 16px;font-size:14px;font-weight:600}
+.inbox-editor-fields{display:grid;grid-template-columns:minmax(160px,1fr) minmax(0,2fr);gap:16px 20px;align-items:start}
+.inbox-settings-table .inbox-editor-fields>label{display:grid;gap:8px;min-width:0;margin:0;font-size:13px}
+.settings-form .inbox-editor input:not([type=checkbox]),.settings-form .inbox-editor select{width:100%;max-width:none;min-width:0;height:38px}
+.inbox-editor-matching{min-width:0;font-size:13px;line-height:20px}
+.inbox-editor-matching>span{font-weight:500}
+.inbox-settings-table .inbox-editor-matching .check{display:flex;gap:8px;margin:8px 0 4px;font-size:13px}
+.inbox-editor-matching input[type=checkbox]{width:16px}
+.inbox-editor small{display:block;color:var(--muted);font-size:12px;line-height:18px}
+.inbox-editor-footer{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:20px}
+.inbox-editor-footer .inbox-row-actions{gap:12px;flex:none;align-items:center}
+.inbox-editor-footer button{min-height:32px}
+@media(max-width:700px){
+  .inbox-settings-table,.inbox-settings-table tbody{display:block;width:100%}
+  .inbox-settings-table tr{width:100%}
+  .inbox-settings-table .inbox-editor-row{display:block}
+  .inbox-settings-table .inbox-editor-row>td{display:block;width:100%;padding:12px 0}
+  .inbox-editor-fields{grid-template-columns:minmax(0,1fr);gap:16px}
+  .inbox-editor{padding:14px}
+  .inbox-editor-footer{align-items:flex-start;flex-direction:column;gap:12px}
+  .inbox-editor-footer .inbox-row-actions{align-self:flex-end}
+  .inbox-editor-footer button{min-height:44px}
+  .settings-form .inbox-editor input:not([type=checkbox]),.settings-form .inbox-editor select{height:44px}
+  .inbox-settings-table .inbox-editor-matching .check{min-height:44px}
+}
+
+.inbox-preferences-summary{display:flex;gap:4px 16px;flex-wrap:wrap;margin-top:4px;color:var(--muted);font-size:12px;line-height:18px}
+
+.inbox-local-tracks{margin:14px 0;color:var(--muted);font-size:13px}
+.inbox-local-tracks li{align-items:center;gap:10px;flex-wrap:wrap}
+.inbox-local-tracks li>div{min-width:0;flex:1;overflow-wrap:anywhere}
+.inbox-local-tracks strong,.inbox-local-tracks small{display:block}
+.inbox-local-tracks strong{color:var(--text)}
+.inbox-local-tracks button{flex-shrink:0}
+.inbox-action-dialog li{overflow-wrap:anywhere}
+
+.inbox-delete-folders{list-style:none;padding:0;margin:12px 0}
+.inbox-delete-folders li{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid var(--border)}
+.inbox-delete-folders strong{min-width:0;font-weight:500;overflow-wrap:anywhere}
+.inbox-delete-folders small{flex-shrink:0;color:var(--muted);white-space:nowrap}
+.inbox-delete-files{margin-top:14px;color:var(--muted);font-size:13px}

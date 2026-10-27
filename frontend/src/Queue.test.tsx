@@ -1,6 +1,6 @@
 import type { ReactElement } from "react";
 import { ToastProvider } from "./Toasts";
-import { act, cleanup, fireEvent, render as renderComponent, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as renderComponent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Queue } from "./Queue";
 import { albumStatus, formatMatchPercent } from "./status";
@@ -26,19 +26,36 @@ describe("albumStatus", () => {
     expect(albumStatus({ id: 1, candidate_error: "provider unavailable" }, 90).key).toBe("pending");
   });
 });
-it("retains album selection across pages and select-page affects only the displayed page", async () => {
-  vi.stubGlobal("fetch", vi.fn(async (input: string) => response(input.includes("page=2") ? page([album(3, "Three")], 2) : page([album(1, "One"), album(2, "Two")]))));
-  render(<Queue source="library-import" threshold={90}/>);
+it.each(["inbox", "library-import"] as const)("%s clears hidden selection on paging and submits only the visible page", async source => {
+  const fetch = vi.fn(async (input: string) => response(input.endsWith("/preview") ? {importable_albums:[{id:3,album:"Three"}]} : input.includes("page=2") ? page([album(3, "Three")], 2) : page([album(1, "One"), album(2, "Two")])));
+  vi.stubGlobal("fetch", fetch);
+  render(<Queue source={source} inboxId="manual" threshold={90}/>);
   await selectAlbum("Select album One");
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
   await screen.findByText(/Page 2 of 2/);
+  expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", {name:"Import selected"})).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("checkbox", { name: "Select this page" }));
-  expect(screen.getByText("2 selected")).toBeInTheDocument();
+  expect(screen.getByText("1 selected")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Import selected" }));
+  await screen.findByRole("button",{name:"Start import"});
+  const preview = fetch.mock.calls.find(([url]) => url.endsWith("/preview"));
+  expect(JSON.parse((preview as unknown as [string,RequestInit])[1].body as string).album_ids).toEqual([3]);
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
   fireEvent.click(screen.getByRole("button", { name: "Previous" }));
-  expect(await screen.findByRole("checkbox", { name: "Select album One" })).toBeChecked();
-  expect(screen.getByRole("checkbox", { name: "Select album Two" })).not.toBeChecked();
-  expect(screen.getByRole("checkbox", { name: "Select this page" })).toBePartiallyChecked();
+  expect(await screen.findByRole("checkbox", { name: "Select album One" })).not.toBeChecked();
+  expect(screen.getByRole("checkbox", { name: "Select this page" })).not.toBeChecked();
 });
+it.each(["search", "filter"])("clears selection when the %s changes", async change => {
+  vi.stubGlobal("fetch", vi.fn(async () => response(page([album(1,"One"),album(2,"Two")]))));
+  render(<Queue source="library-import" threshold={90}/>);
+  await selectAlbum("Select album One");
+  if (change === "search") fireEvent.change(screen.getByRole("searchbox"),{target:{value:"Two"}});
+  else fireEvent.click(screen.getByRole("button",{name:"Pending"}));
+  expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+  expect(screen.getByRole("checkbox",{name:"Select album One"})).not.toBeChecked();
+});
+
 it("lists albums flat and opens an inspector without approving or matching", async () => {
   const fetch = vi.fn(async () => response(page([album(1, "One"), album(2, "Two")])));
   vi.stubGlobal("fetch", fetch);
@@ -232,4 +249,79 @@ it("shows scan errors instead of claiming the Inbox is empty", async () => {
   expect(await screen.findByText(/Unable to inventory inbox: permission denied/)).toBeInTheDocument();
   expect(screen.queryByText("Nothing waiting here")).not.toBeInTheDocument();
   expect(screen.queryByText("Scanning Inbox…")).not.toBeInTheDocument();
+});
+
+it("defers live arrivals during selection then updates without a disk rescan", async () => {
+  vi.useFakeTimers();
+  try {
+    let changed = false;
+    const fetch = vi.fn(async (url: string) => response(url.endsWith("/discovery")
+      ? { mode: "instant", revision: changed ? "two" : "one", scanned_at: null, error: "", watcher_error: "" }
+      : page(changed ? [album(1, "One"), album(2, "New arrival")] : [album(1, "One")])));
+    vi.stubGlobal("fetch", fetch);
+    render(<Queue source="inbox" inboxId="one" threshold={90}/>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select album One" }));
+    changed = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.getByRole("checkbox", { name: "Select album One" })).toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: "Select album New arrival" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Inbox updates waiting/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.getByRole("checkbox", { name: "Select album New arrival" })).toBeInTheDocument();
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith("/refresh"))).toHaveLength(1);
+  } finally { vi.useRealTimers(); }
+});
+
+it("opens scoped removal confirmation directly from successful Inbox results", async () => {
+  const fetch = vi.fn(async (url: string) => response(url.endsWith("/actions/preview") ? {preview_id:"cleanup",fingerprint:"hash",count:1,files:[]} : url.endsWith("/bulk/preview") ? {importable_albums:[{id:1,album:"One"},{id:2,album:"Two"}]} : url.endsWith("/execute") ? {imported:[{album_review_id:1,job_id:77}],failed:[{error:"Not imported"}]} : page([album(1,"One"),album(2,"Two")])));
+  vi.stubGlobal("fetch",fetch);
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  await selectAlbum("Select album One");
+  fireEvent.click(screen.getByRole("checkbox",{name:"Select album Two"}));
+  fireEvent.click(screen.getByRole("button",{name:"Import selected"}));
+  fireEvent.click(await screen.findByRole("button",{name:"Start import"}));
+  fireEvent.click(await screen.findByRole("button",{name:"Clear imported from Inbox"}));
+  await screen.findByRole("heading",{name:"Remove imported originals"});
+  expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-imported",job_ids:[77]})}));
+  expect(screen.getByText(/Library copies stay unchanged/)).toBeInTheDocument();
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
+  expect(fetch.mock.calls.some(([url]) => url.endsWith("/apply"))).toBe(false);
+});
+
+it("deletes only selected visible unimported albums after explicit confirmation", async () => {
+  let deleted=false;
+  const fetch=vi.fn(async(url:string)=>response(url.endsWith("/actions/preview") ? {preview_id:"delete",fingerprint:"hash",count:1,albums:["One"],files:[{location:"Inbox",path:"Artist/One/Song.wav"}]} : url.endsWith("/actions/apply") ? (deleted=true,{status:"complete",message:"Deleted without importing"}) : page(deleted?[album(2,"Two")]:[album(1,"One"),album(2,"Two")])));
+  vi.stubGlobal("fetch",fetch);
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  await selectAlbum("Select album One");
+  fireEvent.click(within(screen.getByLabelText("Selected album actions")).getByRole("button",{name:"Delete from Inbox"}));
+  const confirm=await screen.findByRole("button",{name:"Delete permanently"});
+  await waitFor(()=>expect(confirm).toBeEnabled());
+  expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-albums",album_ids:[1]})}));
+  expect(screen.getByRole("dialog")).toHaveTextContent("Artist/One");
+  expect(within(screen.getByRole("dialog")).getByText("Artist/One/Song.wav")).not.toBeVisible();
+  fireEvent.click(screen.getByText("Show files"));
+  expect(within(screen.getByRole("dialog")).getByText("Artist/One/Song.wav")).toBeVisible();
+  expect(screen.getByRole("dialog")).toHaveTextContent("without importing");
+  fireEvent.click(confirm);
+  await waitFor(()=>expect(screen.queryByRole("checkbox",{name:"Select album One"})).not.toBeInTheDocument());
+  expect(fetch.mock.calls.some(([url])=>url.endsWith("/execute"))).toBe(false);
+  expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+});
+it("opens exact single-track deletion from the independent Inbox files list and cancels safely", async () => {
+  const fetch=vi.fn(async(url:string)=>response(url.endsWith("/actions/preview") ? {preview_id:"delete",fingerprint:"hash",count:1,albums:["One"],files:[{location:"Inbox",path:"One/Bad.wav"}]} : page([{...album(1,"One"),tracks:[{id:42,title:"Bad song",path:"One/Bad.wav"},{id:43,title:"Good song",path:"One/Good.wav"}]}])));
+  vi.stubGlobal("fetch",fetch);
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Review One"}));
+  fireEvent.click(screen.getByText("Inbox files (2)"));
+  fireEvent.click(screen.getByRole("button",{name:"Delete track Bad song"}));
+  await screen.findByRole("heading",{name:"Delete track from Inbox"});
+  expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-track",album_id:1,track_id:42})}));
+  await waitFor(()=>expect(screen.getByRole("button",{name:"Delete permanently"})).toBeEnabled());
+  expect(screen.getByRole("dialog")).toHaveTextContent("Bad song");
+  expect(screen.getByRole("dialog")).toHaveTextContent("Other files and your Library stay unchanged");
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
+  expect(fetch.mock.calls.some(([url])=>url.endsWith("/apply"))).toBe(false);
 });
