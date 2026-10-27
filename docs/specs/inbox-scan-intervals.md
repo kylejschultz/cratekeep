@@ -310,3 +310,16 @@ the confirmed plan. Preserve Library guards, cancellation, durable partial/repla
 handling, and unrelated sibling folders. Update confirmation wording. Validate
 whole-folder removal, shared/root/multi-disc cases, preview races and partial
 recovery; add accompanying files to the real browser/container lifecycle fixture.
+
+## Candidate feedback — track totals versus match coverage — 2026-10-27
+
+Kyle verified whole-folder cleanup. Investigated ten local/ten release tracks
+showing nine matched and nine present: Rainbow versus 🌈 reproduces an unresolved
+title pair, not a missing file. Preserve matching thresholds and import safety.
+Show On disk / MusicBrainz totals (10 / 10) separately from Track matches (9 / 10),
+using the larger total as the comparison denominator. Use the same values and
+change indicators in release metadata. Unknown counts display a dash. Mark
+unresolved paired rows Match needs review; genuinely one-sided rows say Not on
+disk or Not in MusicBrainz, without misleading aggregate missing-file claims.
+Verify equal totals with an unresolved title, genuine missing/extra rows,
+complete matches and unchanged conservative scoring/import behavior.

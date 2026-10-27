@@ -77,8 +77,8 @@ function TrackEvidence({ album, candidate, comparisonRef }: { album: Album; cand
       <thead><tr><th scope="col">#</th><th scope="col">Current title</th><th scope="col">Proposed title</th></tr></thead>
       <tbody>{details.map((detail, index) => {
         const localTrack = detail.local == null ? {} : (album.tracks || album.files || [])[Number(detail.position ?? index + 1) - 1] || {};
-        const localTitle = String(detail.local == null ? "Not present locally" : detail.local);
-        const proposedTitle = String(detail.proposed ?? "Not found online");
+        const localTitle = String(detail.local == null ? "Not on disk" : detail.local);
+        const proposedTitle = String(detail.proposed ?? "Not in MusicBrainz");
         const localArtist = String(detail.local_artist ?? localTrack.artist ?? album.artist ?? album.albumartist ?? "Unknown artist");
         const proposedArtist = String(detail.proposed_artist ?? candidate.artist ?? "Unknown artist");
         const titleChanged = localTitle !== proposedTitle;
@@ -87,7 +87,7 @@ function TrackEvidence({ album, candidate, comparisonRef }: { album: Album; cand
         const path = localTrack.path ?? localTrack.relative_path ?? localTrack.filename ?? localTrack.name;
         return <tr className="track-evidence-row" key={index}>
           <th scope="row"><span>{(Array.isArray(detail.proposed_position) ? detail.proposed_position.join(".") : String(detail.proposed_position ?? index + 1))}</span><FieldIcon kind="track" label="Metadata" changed={changed}/></th>
-          <td><strong>{localTitle}</strong><span>{localArtist}</span>{path && <small>{fileName(path)}</small>}</td>
+          <td><strong>{localTitle}</strong><span>{localArtist}</span>{path && <small>{fileName(path)}</small>}{detail.status === "unmatched" && <small>Match needs review</small>}</td>
           <td><strong className={titleChanged ? "track-changed" : undefined}>{proposedTitle}</strong><span className={artistChanged ? "track-changed" : undefined}>{proposedArtist}</span></td>
         </tr>;
       })}</tbody>
@@ -104,6 +104,11 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
   const changedTitles = candidate.track_details?.filter(row => row.local !== row.proposed).length;
   const localCount = album.track_count ?? album.file_count ?? album.tracks?.length ?? album.files?.length;
   const onlineCount = candidate.recordings?.length ?? candidate.track_details?.filter(item => item.proposed != null).length;
+  const comparisonCount = localCount != null && onlineCount != null ? Math.max(localCount, onlineCount) : undefined;
+  const totalsDiffer = localCount != null && onlineCount != null && localCount !== onlineCount;
+  const matchesDiffer = comparisonCount != null && candidate.matched_track_count != null && candidate.matched_track_count < comparisonCount;
+  const trackTotals = `${localCount ?? "—"} / ${onlineCount ?? "—"}`;
+  const trackMatches = `${candidate.matched_track_count ?? "—"} / ${comparisonCount ?? "—"}`;
   const releaseFormat = [candidate.release_type, mediaText(candidate)].filter(value => value && value !== "Not available").join(" · ");
   const fields: { kind: FieldKind; label: string; changed: boolean }[] = [
     { kind: "artist", label: "Artist", changed: Boolean(diff.artist) },
@@ -112,15 +117,15 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
     { kind: "year", label: "Release year", changed: Boolean(diff.year || diff.date) },
     { kind: "medium", label: "Release type / medium", changed: Boolean(diff.release_type || diff.media) },
     { kind: "region", label: "Release region", changed: Boolean(diff.country) },
-    { kind: "local", label: "Local tracks found online", changed: Boolean(candidate.unmatched_track_count) },
-    { kind: "online", label: "Online tracks present locally", changed: onlineCount != null && (candidate.matched_track_count ?? 0) < onlineCount },
+    { kind: "local", label: "On disk / MusicBrainz", changed: totalsDiffer },
+    { kind: "online", label: "Track matches", changed: matchesDiffer },
   ];
   const changed = fields.filter(field => field.changed).map(field => field.label);
   return <article className={`candidate-card${String(chosen) === String(candidate.id) ? " selected" : ""}`}>
     <div className="candidate-heading"><label><input type="radio" name="candidate" checked={String(chosen) === String(candidate.id)} disabled={busy} onChange={() => { choose(candidate.id); if (!expanded) onExpand(); }}/><span className="sr-only">Select {candidate.album || album.album || "candidate"}</span></label><span className="candidate-artwork">{candidate.artwork_url && !artFailed ? <img src={candidate.artwork_url} alt="" onError={() => setArtFailed(true)}/> : <ArtworkPlaceholder/>}</span><button className="candidate-summary" type="button" aria-expanded={expanded} onClick={onExpand}><span className="candidate-title"><strong>{candidate.artist || album.artist || "Unknown"} — {candidate.album || album.album || "Untitled"}</strong><small>{candidate.confidence == null ? "Candidate" : `${formatMatchPercent(candidate.confidence * 100)} match`}{candidate.year ? ` · ${candidate.year}` : ""}</small></span><span className="candidate-change-icons" aria-label={changed.length ? `Changes: ${changed.join(", ")}` : "No album field changes"}>{fields.map(field => <FieldIcon key={field.kind} {...field}/>)}</span><span aria-hidden="true">{expanded ? "⌃" : "⌄"}</span></button></div>
     {expanded && <div className="candidate-expanded">
       {changeCount > 0 && <section className="review-change-summary" aria-label="Proposed changes"><h3>{changeCount} proposed {changeCount === 1 ? "change" : "changes"}</h3><dl>{albumDiff.map(([key, value]) => <div key={key}><dt><FieldIcon kind={fields.find(field => field.kind === key)?.kind || (key === "country" ? "region" : key === "date" ? "year" : key === "media" || key === "release_type" ? "medium" : "album")} label={key.replaceAll("_", " ")} changed/>{key.replaceAll("_", " ")}</dt><dd><span>{text(value.from, "—")}</span><span aria-hidden="true">→</span><strong>{text(value.to, "—")}</strong></dd></div>)}{diff.tracks && <div className="track-change-link"><dt><FieldIcon kind="track" label="Tracks" changed/>Tracks</dt><dd><button className="text-button" type="button" onClick={() => { if (comparisonRef.current) { comparisonRef.current.open = true; comparisonRef.current.scrollIntoView?.({ block: "nearest" }); comparisonRef.current.querySelector("summary")?.focus(); } }}>{changedTitles ? `${changedTitles} track ${changedTitles === 1 ? "title" : "titles"} changed` : "Track metadata changed"} — Compare tracks →</button></dd></div>}</dl></section>}
-      <div className="review-track-coverage">{localCount != null && <div>Local tracks matched<strong>{candidate.matched_track_count ?? 0} of {localCount}</strong></div>}{onlineCount != null && <div>Release tracks present<strong>{candidate.matched_track_count ?? 0} of {onlineCount}</strong></div>}</div>
+      <div className="review-track-coverage"><div>On disk / MusicBrainz<strong>{trackTotals}</strong></div><div>Track matches<strong>{trackMatches}</strong></div></div>
       <details className="release-metadata"><summary>Release metadata and ID</summary>{candidate.provider_id && <p><code>{candidate.provider_id}</code></p>}<div className="candidate-facts">
       <Fact kind="artist" label="Artist" value={candidate.artist} changed={Boolean(diff.artist)}/>
       <Fact kind="album" label="Album" value={candidate.album} changed={Boolean(diff.album)}/>
@@ -128,8 +133,8 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
       {(candidate.year || diff.year || diff.date) && <Fact kind="year" label="Release year" value={candidate.year} changed={Boolean(diff.year || diff.date)}/>}
       {releaseFormat && <Fact kind="medium" label="Release type / medium" value={releaseFormat} changed={Boolean(diff.release_type || diff.media)}/>}
       {candidate.country && <Fact kind="region" label="Release region" value={candidate.country} changed={Boolean(diff.country)}/>}
-      {localCount != null && <Fact kind="local" label="Local tracks found online" value={`${candidate.matched_track_count ?? 0} of ${localCount}`} changed={Boolean(candidate.unmatched_track_count)}/>}
-      {onlineCount != null && <Fact kind="online" label="Online tracks present locally" value={`${candidate.matched_track_count ?? 0} of ${onlineCount}`} changed={(candidate.matched_track_count ?? 0) < onlineCount}/>}
+      <Fact kind="local" label="On disk / MusicBrainz" value={trackTotals} changed={totalsDiffer}/>
+      <Fact kind="online" label="Track matches" value={trackMatches} changed={matchesDiffer}/>
     </div>
     </details>
     {albumDiff.length > 0 && <details className="metadata-comparison"><summary>Compare metadata</summary><dl>{albumDiff.map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{text(value.from, "—")} → {text(value.to, "—")}</dd></div>)}</dl></details>}

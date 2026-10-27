@@ -408,8 +408,8 @@ it("uses semantic icons with neutral unchanged fields and highlighted changes", 
 it("highlights incomplete online coverage even when every local track is matched", () => {
   const album = { ...richAlbum, candidates: [{ ...richAlbum.candidates[0], matched_track_count: 2, unmatched_track_count: 0, recordings: [{}, {}, {}] }] };
   render(<ReviewModal album={album} source="library-import" onClose={() => {}} onComplete={() => {}}/>);
-  expect(screen.getAllByRole("img", { name: "Local tracks found online unchanged" }).length).toBeGreaterThan(0);
-  expect(screen.getAllByRole("img", { name: "Online tracks present locally changed" }).length).toBeGreaterThan(0);
+  expect(screen.getAllByRole("img", { name: "On disk / MusicBrainz changed" }).length).toBeGreaterThan(0);
+  expect(screen.getAllByRole("img", { name: "Track matches changed" }).length).toBeGreaterThan(0);
 });
 
 
@@ -428,4 +428,34 @@ it.each(["inbox", "library-import"] as const)("links track changes to aligned ev
   expect(table.querySelector("tbody tr:last-child td:last-child strong")).toHaveClass("track-changed");
   expect(document.querySelector("[data-review-execute]")?.closest("footer")).not.toBeNull();
   expect(document.querySelector(".dialog-body footer")).toBeNull();
+});
+
+it("separates equal track totals from an unresolved title pair", () => {
+  const titles = ["One", "Two", "Three", "Four", "Five", "Rainbow", "Seven", "Eight", "Nine", "Ten"];
+  const album = {...richAlbum, tracks: titles.map(title => ({title})), candidates: [{...richAlbum.candidates[0], recordings: titles.map(title => ({title})), matched_track_count: 9, unmatched_track_count: 2, track_details: titles.map((title,index) => ({position:index+1,local:title,proposed:index===5?"🌈":title,status:index===5?"unmatched":"matched"}))}]};
+  render(<ReviewModal album={album} source="inbox" onClose={() => {}} onComplete={() => {}}/>);
+  expect(document.querySelector(".review-track-coverage")).toHaveTextContent("On disk / MusicBrainz10 / 10Track matches9 / 10");
+  expect(screen.getAllByRole("img",{name:"On disk / MusicBrainz unchanged"}).length).toBeGreaterThan(0);
+  fireEvent.click(screen.getByText("Compare tracks (10)"));
+  expect(screen.getByText("Match needs review").closest("tr")).toHaveTextContent("Rainbow");
+  expect(screen.getByText("Match needs review").closest("tr")).toHaveTextContent("🌈");
+  expect(screen.queryByText("Not on disk")).not.toBeInTheDocument();
+});
+it.each(["disk", "musicbrainz"])("distinguishes a track absent from %s from an unresolved title pair", missing => {
+  const detail = missing==="disk" ? {status:"extra",local:null,proposed:"Extra recording"} : {status:"missing",local:"Local extra",proposed:null};
+  const album={...richAlbum,tracks:missing==="disk"?[{title:"Same"}]:richAlbum.tracks,candidates:[{...richAlbum.candidates[0],matched_track_count:1,recordings:missing==="disk"?[{},{}]:[{}],track_details:[{status:"matched",local:"Same",proposed:"Same"},detail]}]};
+  render(<ReviewModal album={album} source="inbox" onClose={() => {}} onComplete={() => {}}/>);
+  expect(document.querySelector(".review-track-coverage")).toHaveTextContent(missing==="disk"?"1 / 2":"2 / 1");
+  fireEvent.click(screen.getByText("Compare tracks (2)"));
+  expect(screen.getByText(missing==="disk"?"Not on disk":"Not in MusicBrainz")).toBeInTheDocument();
+  expect(screen.queryByText("Match needs review")).not.toBeInTheDocument();
+});
+
+it("shows complete and unknown coverage without inventing missing files", () => {
+  const album={...richAlbum,candidates:[{...richAlbum.candidates[0],matched_track_count:2,unmatched_track_count:0}]};
+  const view=render(<ReviewModal album={album} source="inbox" onClose={() => {}} onComplete={() => {}}/>);
+  expect(document.querySelector(".review-track-coverage")).toHaveTextContent("On disk / MusicBrainz2 / 2Track matches2 / 2");
+  view.unmount();
+  render(<ReviewModal album={{id:9,album:"Unknown",candidates:[{id:10,album:"Unknown"}]}} source="inbox" onClose={() => {}} onComplete={() => {}}/>);
+  expect(document.querySelector(".review-track-coverage")).toHaveTextContent("On disk / MusicBrainz— / —Track matches— / —");
 });
