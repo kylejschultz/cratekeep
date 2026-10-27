@@ -366,3 +366,38 @@ it("keeps matching independent per Inbox beside discovery, including when saving
   expect(new FormData(form).getAll("inbox_auto_match_id")).toEqual(["two"]);
   expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
 });
+
+it("groups all Inbox fields in one editor and cancels the entire draft", () => {
+  location.hash = "";
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", discovery: "15", auto_match: false }] } }}/>);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Downloads" }));
+  const editor = screen.getByRole("group", { name: "Edit Downloads" });
+  expect(within(editor).getByRole("textbox", { name: "Name for Downloads" })).toHaveFocus();
+  fireEvent.change(within(editor).getByRole("textbox", { name: "Name for Downloads" }), { target: { value: "Discarded" } });
+  fireEvent.change(within(editor).getByRole("textbox", { name: "Inbox path for Downloads" }), { target: { value: "/discarded" } });
+  fireEvent.change(within(editor).getByRole("combobox", { name: "Discovery for Downloads" }), { target: { value: "instant" } });
+  fireEvent.click(within(editor).getByRole("checkbox", { name: "Automatically find matches for Downloads" }));
+  fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+  expect(screen.getByText("/downloads")).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Discovery for Downloads" })).toHaveValue("15");
+  expect(screen.getByRole("checkbox", { name: "Automatically find matches for Downloads" })).not.toBeChecked();
+});
+
+it("applies the full Inbox editor draft on Done before the settings form saves", () => {
+  location.hash = "";
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", discovery: "15", auto_match: false }] } }}/>);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Downloads" }));
+  fireEvent.change(screen.getByLabelText("Name for Downloads"), { target: { value: "Renamed" } });
+  fireEvent.change(screen.getByLabelText("Inbox path for Downloads"), { target: { value: "/renamed" } });
+  fireEvent.change(screen.getByRole("combobox", { name: "Discovery for Downloads" }), { target: { value: "instant" } });
+  fireEvent.click(screen.getByRole("checkbox", { name: "Automatically find matches for Downloads" }));
+  expect(screen.getByRole("button", { name: "Save settings" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
+  const payload = new FormData(form);
+  expect(payload.getAll("inbox_id")).toEqual(["one"]);
+  expect(payload.getAll("inbox_name")).toEqual(["Renamed"]);
+  expect(payload.getAll("inbox_path")).toEqual(["/renamed"]);
+  expect(payload.getAll("inbox_discovery")).toEqual(["instant"]);
+  expect(payload.getAll("inbox_auto_match_id")).toEqual(["one"]);
+});

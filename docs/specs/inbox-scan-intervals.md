@@ -254,3 +254,14 @@ saved boolean and form field, with new Inboxes still requiring their first save
 before matching can be enabled. This is a settings presentation change, not a
 change to scheduling, matching or import behavior. Verify independent toggles,
 identity retention after rename/delete, and round-trip persistence.
+
+## Candidate feedback — grouped Inbox editor — 2026-10-27
+
+The inline Name/Path inputs became crowded when editing. Keep the normal rows
+compact, but Edit/Add expands a full-width labeled form for Name, Inbox path,
+Discovery and matching. Fields align in a two-column grid on desktop and stack on
+phones. Done applies the entire draft to the unsaved Settings form; Cancel drops
+all draft fields. The existing Save settings action remains the persistence step.
+Preserve stable Inbox IDs, existing preferences, new-Inbox matching opt-in rules,
+validation and the single-editor guard. Verify edit/add/cancel/Done/save plus focus
+and no overflow at 1440, 768 and 390 pixels. Keep the surrounding design system.

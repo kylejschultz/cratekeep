@@ -581,3 +581,32 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 
 .inbox-settings-table .inbox-auto-match-setting{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;margin:8px 0 0}
 .inbox-settings-table .inbox-auto-match-setting input{width:auto;margin:0}
+
+/* The editor spans the table; its fields share a grid instead of data columns. */
+.inbox-settings-table .inbox-editor-row>td{padding:12px 0}
+.inbox-editor{padding:16px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;min-width:0}
+.inbox-editor h3{margin:0 0 16px;font-size:14px;font-weight:600}
+.inbox-editor-fields{display:grid;grid-template-columns:minmax(160px,1fr) minmax(0,2fr);gap:16px 20px;align-items:start}
+.inbox-settings-table .inbox-editor-fields>label{display:grid;gap:8px;min-width:0;margin:0;font-size:13px}
+.settings-form .inbox-editor input:not([type=checkbox]),.settings-form .inbox-editor select{width:100%;max-width:none;min-width:0;height:38px}
+.inbox-editor-matching{min-width:0;font-size:13px;line-height:20px}
+.inbox-editor-matching>span{font-weight:500}
+.inbox-settings-table .inbox-editor-matching .check{display:flex;gap:8px;margin:8px 0 4px;font-size:13px}
+.inbox-editor-matching input[type=checkbox]{width:16px}
+.inbox-editor small{display:block;color:var(--muted);font-size:12px;line-height:18px}
+.inbox-editor-footer{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:20px}
+.inbox-editor-footer .inbox-row-actions{gap:12px;flex:none;align-items:center}
+.inbox-editor-footer button{min-height:32px}
+@media(max-width:700px){
+  .inbox-settings-table,.inbox-settings-table tbody{display:block;width:100%}
+  .inbox-settings-table tr{width:100%}
+  .inbox-settings-table .inbox-editor-row{display:block}
+  .inbox-settings-table .inbox-editor-row>td{display:block;width:100%;padding:12px 0}
+  .inbox-editor-fields{grid-template-columns:minmax(0,1fr);gap:16px}
+  .inbox-editor{padding:14px}
+  .inbox-editor-footer{align-items:flex-start;flex-direction:column;gap:12px}
+  .inbox-editor-footer .inbox-row-actions{align-self:flex-end}
+  .inbox-editor-footer button{min-height:44px}
+  .settings-form .inbox-editor input:not([type=checkbox]),.settings-form .inbox-editor select{height:44px}
+  .inbox-settings-table .inbox-editor-matching .check{min-height:44px}
+}
