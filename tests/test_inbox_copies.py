@@ -465,3 +465,108 @@ def test_remove_imported_refreshes_only_the_affected_source_scope(app,tmp_path,m
     action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
     assert scans==[['Affected']]
     assert not source.exists() and untouched.read_bytes()==before
+
+
+def test_clear_imported_removes_album_companions_and_nested_folders(app,tmp_path):
+    source,_,result,_=copied(app,tmp_path,folder='Artist/Album')
+    folder=source.parent
+    for relative in ['album.nfo','folder.jpg','artwork/large.jpg','logs/download.txt']:
+        path=folder/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'companion')
+    sibling=folder.parent/'Other/keep.nfo';sibling.parent.mkdir();sibling.write_bytes(b'keep')
+    target=Path(result['items'][0]['path']);library_bytes=target.read_bytes()
+    preview,done,_=action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
+    assert preview['count']==5 and done['status']=='complete'
+    assert not folder.exists() and sibling.read_bytes()==b'keep'
+    assert target.read_bytes()==library_bytes
+
+
+@pytest.mark.parametrize('location',['same','nested'])
+def test_clear_imported_preserves_companions_with_unimported_audio(app,tmp_path,location):
+    source,_,result,_=copied(app,tmp_path)
+    extra=source.parent/('Other.wav' if location=='same' else 'Other/Other.wav')
+    tagged_inbox_wav(extra,artist='Other',album='Other',title='Other')
+    before=extra.read_bytes();cover=source.parent/'album.nfo';cover.write_bytes(b'keep')
+    preview,_,_=action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
+    assert preview['count']==1
+    assert not source.exists() and extra.read_bytes()==before and cover.read_bytes()==b'keep'
+
+
+def test_clear_root_audio_never_clears_inbox_companions(app,tmp_path):
+    source,_,result,_=copied(app,tmp_path,folder='')
+    companion=source.parent/'folder.jpg';companion.write_bytes(b'keep')
+    action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
+    assert not source.exists() and companion.read_bytes()==b'keep' and source.parent.is_dir()
+
+
+@pytest.mark.parametrize('change',['modify','add','symlink','hardlink'])
+def test_clear_folder_changed_preview_never_deletes_anything(app,tmp_path,change):
+    source,before,result,_=copied(app,tmp_path)
+    companion=source.parent/'album.nfo';companion.write_bytes(b'original')
+    client=app.test_client();base=imports_base(app)
+    preview=client.post(base+'/actions/preview',json={'kind':'delete-imported','job_ids':[result['id']]}).json
+    if change=='modify': companion.write_bytes(b'changed')
+    elif change=='add': (source.parent/'new.jpg').write_bytes(b'new')
+    elif change=='symlink':
+        companion.unlink();companion.symlink_to(Path(result['items'][0]['path']))
+    else: os.link(companion,source.parent/'other.nfo')
+    response=client.post(base+'/actions/apply',json={'preview_id':preview['preview_id'],'expected_fingerprint':preview['fingerprint'],'confirmed':True})
+    assert response.status_code==409,response.json
+    assert source.read_bytes()==before and companion.exists()
+    assert Path(result['items'][0]['path']).is_file()
+
+
+def test_clear_folder_partial_companion_failure_can_resume(app,tmp_path,monkeypatch):
+    from beets_mvp import removal
+    source,_,result,_=copied(app,tmp_path)
+    companion=source.parent/'album.nfo';companion.write_bytes(b'info')
+    unlink=removal._unlink_reviewed
+    def fail_companion(root,row):
+        if Path(row['path']).suffix=='.nfo': raise PermissionError('companion locked')
+        return unlink(root,row)
+    monkeypatch.setattr(removal,'_unlink_reviewed',fail_companion)
+    client=app.test_client();base=imports_base(app)
+    preview=client.post(base+'/actions/preview',json={'kind':'delete-imported','job_ids':[result['id']]}).json
+    values={'preview_id':preview['preview_id'],'expected_fingerprint':preview['fingerprint'],'confirmed':True}
+    partial=client.post(base+'/actions/apply',json=values)
+    assert partial.status_code==207 and not source.exists() and companion.is_file()
+    assert client.get(base+'/actions/'+preview['preview_id']).json['status']=='partial'
+    assert client.post(base+'/actions/apply',json=values).status_code==409
+    monkeypatch.setattr(removal,'_unlink_reviewed',unlink)
+    action(client,base,{'kind':'delete-imported','job_ids':[result['id']]})
+    assert not source.parent.exists() and Path(result['items'][0]['path']).is_file()
+
+
+def test_clear_multidisc_album_removes_common_folder_sidecars(app,tmp_path):
+    second=tmp_path/'inbox/Artist/Album/CD2/Second.wav'
+    tagged_inbox_wav(second,artist='Original',album='Original Album',title='Second',track=2)
+    media=MediaFile(second);media.disc=2;media.save()
+    source,_,result,_=copied(app,tmp_path,folder='Artist/Album/CD1')
+    album_folder=source.parent.parent
+    (album_folder/'album.nfo').write_bytes(b'info')
+    assert len(result['items'])==2
+    action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
+    assert not album_folder.exists()
+    assert all(Path(row['path']).is_file() for row in result['items'])
+
+
+def test_clear_folder_rejects_symlinked_subdirectory(app,tmp_path):
+    source,before,result,_=copied(app,tmp_path)
+    outside=tmp_path/'outside';outside.mkdir();(outside/'keep.nfo').write_bytes(b'keep')
+    (source.parent/'artwork').symlink_to(outside,target_is_directory=True)
+    response=app.test_client().post(imports_base(app)+'/actions/preview',json={'kind':'delete-imported','job_ids':[result['id']]})
+    assert response.status_code==409
+    assert source.read_bytes()==before and (outside/'keep.nfo').read_bytes()==b'keep'
+
+
+def test_clear_keeps_files_arriving_during_deletion(app,tmp_path,monkeypatch):
+    from beets_mvp import removal
+    source,_,result,_=copied(app,tmp_path)
+    companion=source.parent/'album.nfo';companion.write_bytes(b'info')
+    late=source.parent/'late.jpg';unlink=removal._unlink_reviewed
+    def arrival(root,row):
+        unlink(root,row)
+        late.write_bytes(b'new file')
+    monkeypatch.setattr(removal,'_unlink_reviewed',arrival)
+    action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
+    assert not source.exists() and not companion.exists()
+    assert late.read_bytes()==b'new file' and Path(result['items'][0]['path']).is_file()

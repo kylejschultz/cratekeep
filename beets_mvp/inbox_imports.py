@@ -25,7 +25,7 @@ def init_schema(db):
         result_json TEXT, created_at TEXT NOT NULL)""")
 
 
-def _path(root, relative, *, artwork=False):
+def _path(root, relative, *, artwork=False, ancillary=False):
     root, relative = Path(root), Path(relative)
     if relative.is_absolute() or not relative.parts or any(part in {'.', '..'} for part in relative.parts):
         raise ValueError('Unsafe file path; refresh before continuing.')
@@ -39,7 +39,7 @@ def _path(root, relative, *, artwork=False):
     if artwork:
         if relative.name != 'cover.jpg':
             raise ValueError('Unrecognized artwork path.')
-    else:
+    elif not ancillary:
         from . import AUDIO_EXTENSIONS
         if path.suffix.lower() not in AUDIO_EXTENSIONS:
             raise ValueError('Only reviewed audio files can be changed.')
@@ -185,7 +185,7 @@ def _roots(app, inbox):
 
 
 def _plan(app, inbox, values):
-    from . import _connect, _library, _scope_for_relative_path
+    from . import _connect, _library, _scope_for_relative_path, _inbox_album_folder
     source_root, library_root = _roots(app, inbox)
     with _connect(app.config['APP_DB']) as db:
         if db.execute("SELECT 1 FROM inbox_file_actions WHERE source_id=? AND status='running'", (inbox['id'],)).fetchone():
@@ -200,6 +200,7 @@ def _plan(app, inbox, values):
     writes, versions, guards = [], {}, []
     receipt_ids = []
     refresh_scopes = set()
+    folders = []
     if kind == 'delete-imported' and 'job_ids' not in values:
         if set(values) != {'kind'}:
             raise ValueError('Delete imported does not accept a selection.')
@@ -241,6 +242,10 @@ def _plan(app, inbox, values):
                     writes.append({'root':receipt['library_root'], **row, 'job_id':job_id,
                                    'artifact_index':index, 'location':'Library artwork', 'artifact':True})
         else:
+            # Match the queue's physical album grouping, including CD/Disc folders.
+            folders.extend((Path(folder), job_id) for folder in sorted({
+                _inbox_album_folder(source['path']) for source in manifest['sources']
+            } - {None}))
             if receipt['library_root'] != str(library_root):
                 raise ValueError('The Library root changed; inspect this import before deleting originals.')
             if kind == 'delete-imported':
@@ -257,6 +262,10 @@ def _plan(app, inbox, values):
                     raise ValueError('An imported Inbox original changed or is missing; refresh and review it instead.')
                 writes.append({'root': receipt['source_root'], **source, 'job_id':job_id,
                                'source_index':index, 'location':'Inbox'})
+    if kind == 'delete-imported':
+        companions = _folder_companions(source_root, folders, {row['path'] for row in writes})
+        writes.extend(companions)
+        refresh_scopes.update(_scope_for_relative_path(row['path']) for row in companions)
     if not writes and not (kind == 'undo' and receipt_ids):
         raise ValueError('No eligible files are selected.')
     paths = [(row['root'],row['path']) for row in writes]
@@ -265,6 +274,45 @@ def _plan(app, inbox, values):
     return {'kind':kind, 'source_id':inbox['id'], 'source_root':str(source_root), 'library_root':str(library_root),
             'request':values, 'job_ids':receipt_ids, 'versions':versions, 'files':writes, 'library_guards':guards,
             'refresh_scopes':sorted(refresh_scopes)}
+
+
+def _folder_companions(root, folders, sources):
+    """Snapshot complete album folders, without expanding into shared audio."""
+    from . import AUDIO_EXTENSIONS
+    def walk_error(error):
+        raise error
+
+    companions = []
+    covered = set()
+    for folder, job_id in sorted(folders, key=lambda row: (len(row[0].parts), str(row[0]), row[1])):
+        # Files stored directly in Inbox never authorize clearing the Inbox root.
+        if folder == Path('.') or any(parent == folder or parent in folder.parents for parent in covered):
+            continue
+        directory = _path(root, folder.as_posix(), ancillary=True)
+        if not directory.exists():  # A completed portion of a partial action may already be pruned.
+            continue
+        files = []
+        safe = True
+        for current, directories, names in os.walk(directory, followlinks=False, onerror=walk_error):
+            directories.sort()
+            if any((Path(current) / name).is_symlink() for name in directories):
+                raise ValueError('Symlinked album folders cannot be cleared.')
+            for name in sorted(names):
+                relative = (Path(current) / name).relative_to(root).as_posix()
+                path = _path(root, relative, ancillary=True)
+                if path.suffix.lower() in AUDIO_EXTENSIONS:
+                    if relative not in sources:
+                        safe = False
+                        break
+                else:
+                    files.append({'root':str(root), 'path':relative, 'identity':identity(path),
+                                  'job_id':job_id, 'location':'Inbox accompanying file', 'ancillary':True})
+            if not safe:
+                break
+        if safe:
+            companions.extend(files)
+            covered.add(folder)
+    return companions
 
 
 def _digest(plan):
@@ -308,7 +356,7 @@ def _apply(app, inbox, values):
     for target in current['files']:
         file_deleted = False
         try:
-            path = _path(target['root'], target['path'], artwork=target.get('artifact',False))
+            path = _path(target['root'], target['path'], artwork=target.get('artifact',False), ancillary=target.get('ancillary',False))
             if identity(path) != target['identity']:
                 raise ValueError('File changed at the deletion boundary.')
             if 'item_id' in target:
@@ -318,7 +366,7 @@ def _apply(app, inbox, values):
             # _plan fully hashed the copies. Recheck their no-follow stat
             # fingerprints here without rereading every album for every unlink.
             for guard in current.get('library_guards', []):
-                if guard['job_id'] != target['job_id']:
+                if not target.get('ancillary') and guard['job_id'] != target['job_id']:
                     continue
                 managed = library.get_item(guard['item_id'])
                 if (managed is None or Path(os.fsdecode(managed.path)).resolve() != Path(current['library_root']) / guard['path']
@@ -330,7 +378,7 @@ def _apply(app, inbox, values):
                 album_id = item.album_id
                 item.remove(delete=False)
                 _reconcile(app, {'root':target['root'], 'album_id':album_id}, [{'id':item.id}])
-            if 'job_id' in target:
+            if 'job_id' in target and not target.get('ancillary'):
                 with _connect(app.config['APP_DB']) as db:
                     receipt = db.execute('SELECT manifest_json FROM inbox_copy_imports WHERE job_id=?', (target['job_id'],)).fetchone()
                     manifest = json.loads(receipt['manifest_json'])

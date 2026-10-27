@@ -38,7 +38,7 @@ export function InboxActionDialog({ inboxId, kind, jobs, onClose, onDone }: { in
   }
   return <dialog ref={ref} className="dialog inbox-action-dialog" aria-labelledby="inbox-action-title" onCancel={event => { if (busy) event.preventDefault(); else onClose(); }}>
     <header><h2 id="inbox-action-title">{kind === "undo" ? "Undo import" : "Remove imported originals"}</h2></header>
-    <div className="dialog-body"><p>{kind === "undo" ? "Remove only the Library copies created by this import and their Beets records. Inbox originals stay unchanged." : "Permanently delete the imported originals from Inbox. Library files stay unchanged. Undo will no longer be available."}</p>
+    <div className="dialog-body"><p>{kind === "undo" ? "Remove only the Library copies created by this import and their Beets records. Inbox originals stay unchanged." : "Permanently delete the imported originals and accompanying files in their album folders from Inbox. Folders containing other audio are kept. Library files stay unchanged. Undo will no longer be available."}</p>
       {!preview && !error && <p role="status">Checking files…</p>}
       {preview && <><p>{preview.count} {preview.count === 1 ? "file" : "files"}</p>{kind === "undo" && <ul>{preview.files.map(row => <li key={`${row.location}/${row.path}`}><strong>{row.location}</strong> · {row.path}</li>)}</ul>}</>}
       {error && <p role="alert" className="notice error">{error}</p>}

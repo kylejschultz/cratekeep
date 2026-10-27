@@ -603,6 +603,11 @@ def main() -> None:
         page.get_by_role("button",name="Start import",exact=True).click()
         page.get_by_role("heading",name="Import results",exact=True).wait_for()
         saved={path:sha256(path) for path in targets}
+        # Download-client sidecars must leave with the cleared album folder.
+        (copy_folder/"album.nfo").write_text("download metadata")
+        (copy_folder/"folder.jpg").write_bytes(b"disposable cover")
+        (copy_folder/"artwork").mkdir()
+        (copy_folder/"artwork"/"large.jpg").write_bytes(b"disposable artwork")
         page.screenshot(path=args.evidence_dir/"10a-copy-import-results.png",full_page=True)
         page.get_by_role("button",name="Clear imported from Inbox",exact=True).click()
         page.get_by_role("button",name="Permanently remove Inbox originals",exact=True).wait_for(state="visible")

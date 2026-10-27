@@ -293,3 +293,20 @@ selection with visible albums so counts and batch requests cannot contain hidden
 rows. Verify both directions of pagination, filtering/search, select-page, and
 actual submitted album IDs. Browser coverage must check retained Library bytes
 after results cleanup and no file changes on cancellation.
+
+## Candidate feedback — clear album folders — 2026-10-27
+
+Clear imported also removes accompanying files (.nfo, .jpg and other files,
+including nested artwork folders) within each imported album's physical source
+folder, then prunes empty directories. Never expand upward into artist/Inbox
+roots. Never clear non-audio contents when that folder contains unselected or
+unimported audio. Use the queue's existing physical album grouping, including conventional CD/Disc
+subfolders, without combining unrelated leaf albums under an artist. Files directly in the Inbox root authorize audio deletion only.
+
+Include accompanying files in the confirmed preview/fingerprint and use checked
+no-follow deletion, never blind recursive removal. Reject changed contents or
+unsafe links before mutation; keep late-arriving files rather than delete beyond
+the confirmed plan. Preserve Library guards, cancellation, durable partial/replay
+handling, and unrelated sibling folders. Update confirmation wording. Validate
+whole-folder removal, shared/root/multi-disc cases, preview races and partial
+recovery; add accompanying files to the real browser/container lifecycle fixture.
