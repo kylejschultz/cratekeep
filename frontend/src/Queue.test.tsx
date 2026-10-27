@@ -308,7 +308,7 @@ it("deletes only selected visible unimported albums after explicit confirmation"
   expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
 });
 it("opens exact single-track deletion from the independent Inbox files list and cancels safely", async () => {
-  const fetch=vi.fn(async(url:string)=>response(url.endsWith("/actions/preview") ? {preview_id:"delete",fingerprint:"hash",count:1,files:[{location:"Inbox",path:"One/Bad.wav"}]} : page([{...album(1,"One"),tracks:[{id:42,title:"Bad song",path:"One/Bad.wav"},{id:43,title:"Good song",path:"One/Good.wav"}]}])));
+  const fetch=vi.fn(async(url:string)=>response(url.endsWith("/actions/preview") ? {preview_id:"delete",fingerprint:"hash",count:1,albums:["One"],files:[{location:"Inbox",path:"One/Bad.wav"}]} : page([{...album(1,"One"),tracks:[{id:42,title:"Bad song",path:"One/Bad.wav"},{id:43,title:"Good song",path:"One/Good.wav"}]}])));
   vi.stubGlobal("fetch",fetch);
   render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
   fireEvent.click(await screen.findByRole("button",{name:"Review One"}));
@@ -316,6 +316,8 @@ it("opens exact single-track deletion from the independent Inbox files list and 
   fireEvent.click(screen.getByRole("button",{name:"Delete track Bad song"}));
   await screen.findByRole("heading",{name:"Delete track from Inbox"});
   expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-track",album_id:1,track_id:42})}));
+  await waitFor(()=>expect(screen.getByRole("button",{name:"Permanently delete from Inbox"})).toBeEnabled());
+  expect(screen.getByRole("dialog")).toHaveTextContent("Bad song");
   expect(screen.getByRole("dialog")).toHaveTextContent("Other tracks and accompanying files stay");
   fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
   expect(fetch.mock.calls.some(([url])=>url.endsWith("/apply"))).toBe(false);
