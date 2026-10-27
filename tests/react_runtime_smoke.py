@@ -42,7 +42,7 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def match_selected(page, endpoint, evidence_dir, *, cooldown=False):
+def match_selected(page, endpoint, evidence_dir, *, cooldown=False, expected_matches=1):
     page.get_by_role("button", name="Match Selected", exact=True).click()
     confirmation=page.get_by_role("dialog",name="Match selected albums",exact=True)
     confirmation.wait_for()
@@ -58,7 +58,9 @@ def match_selected(page, endpoint, evidence_dir, *, cooldown=False):
         page.set_viewport_size({"width":1440,"height":1000})
     results=page.get_by_role("dialog",name="Matching results",exact=True)
     results.wait_for(timeout=60000)
-    assert results.get_by_text("Matched",exact=True).is_visible()
+    matched_rows=results.get_by_text("Matched",exact=True)
+    assert matched_rows.count()==expected_matches
+    assert all(row.is_visible() for row in matched_rows.all())
     page.screenshot(path=evidence_dir/("06-inbox-matching-results.png" if cooldown else "06-library-matching-results.png"),full_page=True)
     results.get_by_role("button",name="Close results",exact=True).click()
     return matched.value
@@ -674,6 +676,38 @@ def main() -> None:
         assert not any(folder.exists() for folder in delete_folders)
         assert all(sha256(path)==saved[path] for path in targets)
         assert page.get_by_text(re.compile("Inbox updates waiting")).count()==0
+        # Symbol title changes must not block the actual selected bulk path.
+        symbol_sources=[]
+        for album_index, album_title in enumerate(("Symbol Pair One","Symbol Pair Two"),1):
+            for index,title in enumerate(("Opening","Human Heart","Rainbow"),1):
+                path=args.fixture_root/"inbox"/album_title/f"{index}.wav";write_wav(path)
+                media=MediaFile(path);media.album=album_title;media.artist=f"Symbol fixture {album_index}"
+                media.title=title;media.track=index;media.disc=1;media.save();symbol_sources.append(path)
+        symbol_before={path:sha256(path) for path in symbol_sources}
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.get_by_role("searchbox",name="Find an album").fill("Symbol Pair")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Symbol Pair One",exact=True).wait_for()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        match_selected(page,"/api/inbox/candidates",args.evidence_dir,expected_matches=2)
+        page.get_by_role("button",name="Review Symbol Pair One",exact=True).click()
+        coverage=page.locator(".review-track-coverage")
+        assert "3 / 3" in coverage.inner_text() and "2 / 3" not in coverage.inner_text()
+        page.get_by_text("Compare tracks (3)",exact=True).click()
+        assert page.get_by_text("Match needs review",exact=True).count()==0
+        assert page.get_by_role("table",name="Current and proposed track metadata").get_by_text("🌈",exact=True).is_visible()
+        page.screenshot(path=args.evidence_dir/"12-symbol-title-review.png",full_page=True)
+        page.locator("[data-review-close]").click()
+        page.get_by_role("button",name="Import selected",exact=True).click()
+        page.get_by_role("button",name="Start import",exact=True).click()
+        page.get_by_text("2 of 2 albums imported.",exact=True).wait_for()
+        page.screenshot(path=args.evidence_dir/"12a-symbol-bulk-results.png",full_page=True)
+        assert all(sha256(path)==symbol_before[path] for path in symbol_sources)
+        receipts=page.request.get(inbox_base+"/imports").json()["imports"]
+        symbol_receipts=[row for row in receipts if row['album'].startswith("Symbol Pair")]
+        assert len(symbol_receipts)==2
+        for receipt in symbol_receipts:
+            assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"Opening","♡","🌈"}
         browser_version = browser.version
         browser.close()
 
@@ -696,7 +730,7 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True,
+        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

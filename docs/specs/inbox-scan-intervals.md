@@ -323,3 +323,19 @@ unresolved paired rows Match needs review; genuinely one-sided rows say Not on
 disk or Not in MusicBrainz, without misleading aggregate missing-file claims.
 Verify equal totals with an unresolved title, genuine missing/extra rows,
 complete matches and unchanged conservative scoring/import behavior.
+
+## Candidate feedback — emoji title pairing and bulk import
+
+Kyle accepts the symbol-title release choices and expects bulk import to use
+them. Treat symbol-only versus textual titles as a changed pair when both
+releases have equal track counts, the same explicit positive disc/track position
+is unique on each side, and both known positive durations agree within three
+seconds. Reserve those pairs before generic title assignment. Keep the real title
+change and its score penalty visible; do not translate emoji or invent aliases.
+This shared matcher must apply to display, preview and execution, including saved
+candidates without a fresh MusicBrainz fetch. Bulk import must retain an explicit
+lower-ranked release choice. Keep unrelated text, ambiguous/duplicate positions,
+missing positions/durations, duration conflicts and actual missing tracks blocked
+by the existing pairing gate. Opening a candidate alone still is not approval.
+Verify valid symbol pairs, negative boundaries, reordered/multi-disc mappings and
+actual selected batch imports with unchanged retained originals.

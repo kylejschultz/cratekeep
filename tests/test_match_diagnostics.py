@@ -68,13 +68,14 @@ def test_search_exact_and_reuse_log_once_but_queue_reads_do_not(tmp_path, source
     assert path.read_bytes() == before
 
 
-def test_symbol_title_difference_is_unmatched_not_a_missing_track():
+def test_symbol_title_difference_is_a_changed_pair_when_position_and_duration_agree():
     tracks=[{'title':f'Track {index}', 'track':index, 'duration':200} for index in range(1,11)]
     tracks[5]['title']='Rainbow'
     result=score_release({'artist':'Artist','album':'Album','tracks':tracks},
                          {'artist':'Artist','album':'Album','tracks':[{**row,'title':'🌈' if index==5 else row['title']} for index,row in enumerate(tracks)]})
-    assert result['matched_track_count']==9 and not result['track_count_mismatch']
+    assert result['matched_track_count']==10 and not result['track_count_mismatch']
     assert len(result['track_details'])==10
-    unresolved=[row for row in result['track_details'] if row['status']=='unmatched']
-    assert len(unresolved)==1 and unresolved[0]['local']=='Rainbow' and unresolved[0]['proposed']=='🌈'
+    changed=[row for row in result['track_details'] if row['status']=='title-mismatch']
+    assert len(changed)==1 and changed[0]['local']=='Rainbow' and changed[0]['proposed']=='🌈'
+    assert result['unmatched_track_count']==0
     assert not any(row['status'] in {'missing','extra'} for row in result['track_details'])
