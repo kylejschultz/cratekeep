@@ -6907,7 +6907,8 @@ def _execute_inbox_bulk_ready(
                 _execute_inbox_album(app, album["id"], dry_run=True)
                 result = _execute_inbox_album(app, album["id"], dry_run=False)
                 imported.append({"album_review_id": album["id"], "artist": album["artist"],
-                                 "album": album["album"], "files": result["files"]})
+                                 "album": album["album"], "files": result["files"],
+                                 "job_id": result["id"] if result.get("copy_import") else None})
             except Exception as exc:
                 failed.append({"album_review_id": album["id"], "artist": album["artist"],
                                "album": album["album"], "error": str(exc)})
@@ -7538,7 +7539,8 @@ def _execute_inbox_selected(app, inbox, album_ids):
                 _update_album_review(app, album_id, choice, serialize=False, root=album.get("root_path", str(Path(inbox["path"]).resolve())), source_kind="inbox", source_id=inbox["id"])
                 _execute_inbox_album(app, album_id, dry_run=True)
                 result = _execute_inbox_album(app, album_id, dry_run=False)
-                imported.append({"album_review_id": album_id, "album": album["album"], "files": result["files"]})
+                imported.append({"album_review_id": album_id, "album": album["album"], "files": result["files"],
+                                 "job_id": result["id"] if result.get("copy_import") else None})
             except Exception as exc:
                 failed.append({"album_review_id": album_id, "error": str(exc)})
     finally:

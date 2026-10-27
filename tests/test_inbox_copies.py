@@ -305,6 +305,8 @@ def test_selected_inbox_import_uses_saved_choice_without_threshold_review(app,tm
     assert client.post(base+'/bulk/preview',json=body).json['importable_albums'][0]['id']==album['id']
     result=client.post(base+'/bulk/execute',json={**body,'confirmed':True})
     assert result.status_code==201 and len(result.json['imported'])==1,result.json
+    receipt=client.get(base+'/queue?status=imported').json['albums'][0]['imported']
+    assert result.json['imported'][0]['job_id']==receipt['job_id']
     assert source.read_bytes()==before
     library=Library(app.config['BEETS_DB'],directory=app.config['LIBRARY_PATH'])
     assert list(library.items())[0].album==expected

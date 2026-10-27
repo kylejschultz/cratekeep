@@ -73,6 +73,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
       if (!Array.isArray(next.albums)) throw new Error("The album response was invalid. Reload the page or try Refresh.");
       if (quiet && backgroundBlocked.current) throw new Error("Inbox update deferred during review");
       setResult(next);
+      setSelected(current => new Map(next.albums.filter(album => current.has(album.id)).map(album => [album.id, album])));
       setActive(current => current ? next.albums.find(album => album.id === current.id) || next.albums[0] || null : next.albums[0] || null);
     } catch (reason) {
       if (quiet) throw reason; // Keep the revision pending so polling can retry.
@@ -83,6 +84,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
   const discovery = useInboxDiscovery(source === "inbox" ? inboxId : undefined,
     locked || detailOpen || selected.size > 0 || loading, loadBackground);
   useEffect(() => { const timer = setTimeout(() => void load(), query ? 200 : 0); return () => { clearTimeout(timer); ++requestCounter.value; }; }, [load, query, requestCounter]);
+  useEffect(() => { setSelected(new Map()); }, [page, query, status, source, inboxId]);
   const visibleSelected = result.albums.filter(album => selected.has(album.id)).length;
   useEffect(() => { if (selectPage.current) selectPage.current.indeterminate = visibleSelected > 0 && visibleSelected < result.albums.length; }, [visibleSelected, result.albums.length]);
   const selectVisible = (checked: boolean) => setSelected(current => { const next = new Map(current); result.albums.forEach(album => checked ? next.set(album.id, album) : next.delete(album.id)); return next; });
@@ -118,7 +120,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
     finally { setOperation(null); }
   };
   return <section ref={workspaceRef} style={splitStyle} className={`desk-workspace${detailOpen ? " is-detail-open" : ""}`} aria-label={source === "inbox" ? "Inbox albums" : "Library adoption albums"}>{inboxAction && <InboxActionDialog inboxId={inboxId!} {...inboxAction} onClose={() => setInboxAction(null)} onDone={() => { setSelected(new Map()); void load(); }}/>}
-    {bulk && <BulkImportDialog source={source} rows={bulk.rows} onClose={() => setBulk(null)} onRunning={running => setOperation(running ? "import" : null)} execute={id => api(`${bulkBase}/execute`, { method: "POST", body: JSON.stringify({ ...bulk.body, album_ids: [id], confirmed: true }) })} onFinish={rows => {
+    {bulk && <BulkImportDialog source={source} rows={bulk.rows} onRemoveImported={jobs => { setBulk(null); setInboxAction({ kind: "delete-imported", jobs }); }} onClose={() => setBulk(null)} onRunning={running => setOperation(running ? "import" : null)} execute={id => api(`${bulkBase}/execute`, { method: "POST", body: JSON.stringify({ ...bulk.body, album_ids: [id], confirmed: true }) })} onFinish={rows => {
       const imported = new Set(rows.filter(row => row.status === "imported").map(row => row.id));
       notify(`${imported.size} albums imported.`);
       setSelected(current => new Map([...current].filter(([id]) => !imported.has(id))));

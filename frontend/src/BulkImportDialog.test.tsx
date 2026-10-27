@@ -45,3 +45,18 @@ it("does not retry an uncertain transport failure or start more albums", async (
   expect(screen.getByText("Check result")).toBeInTheDocument();
   expect(screen.getByText(/Check the Library and queue before retrying/)).toBeInTheDocument();
 });
+
+it("offers cleanup only for successful retained Inbox copies from this batch", async () => {
+  const remove=vi.fn();
+  show(vi.fn(async id => id===1 ? {imported:[{album_review_id:1,job_id:77}]} : {failed:[{error:"File changed"}]}),{source:"inbox",onRemoveImported:remove});
+  expect(screen.queryByRole("button",{name:"Clear imported from Inbox"})).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button",{name:"Start import"}));
+  fireEvent.click(await screen.findByRole("button",{name:"Clear imported from Inbox"}));
+  expect(remove).toHaveBeenCalledWith([77]);
+});
+it.each(["library-import","inbox"] as const)("omits cleanup for %s without retained originals", async source => {
+  show(vi.fn(async id => ({imported:[{album_review_id:id,...(source==="library-import"?{job_id:77}:{})}]})),{source,onRemoveImported:vi.fn()});
+  fireEvent.click(screen.getByRole("button",{name:"Start import"}));
+  await screen.findByRole("heading",{name:"Import results"});
+  expect(screen.queryByRole("button",{name:"Clear imported from Inbox"})).not.toBeInTheDocument();
+});

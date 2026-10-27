@@ -276,3 +276,20 @@ unchanged preferences. Done updates the summary; Cancel leaves it unchanged.
 Keep the grouped editor and stable IDs. Verify no checkbox/dropdown exists in a
 collapsed row, form submission retains each value, and rows shrink without losing
 readability at desktop/tablet/phone widths.
+
+## Candidate feedback — results cleanup and page selection — 2026-10-27
+
+Kyle accepted the Inbox settings and verified Lidarr arrivals. After a completed
+Inbox batch, offer Clear imported from Inbox beside Close results. Target only
+successful copy-import receipts from this batch, never failed/unknown/blocked or
+not-started albums, replacements, previous imports, or Library Import. Reuse the
+existing file-checking preview and explicit permanent-removal confirmation; retain
+Library copies, durable lost-response recovery, and safe refusal of changed files.
+Opening removal closes results; cancelling confirmation leaves files untouched.
+
+Checkbox selection is scoped to the visible page in Inbox and Library Import.
+Changing pages, filters, search, or source clears selection. Refresh reconciles
+selection with visible albums so counts and batch requests cannot contain hidden
+rows. Verify both directions of pagination, filtering/search, select-page, and
+actual submitted album IDs. Browser coverage must check retained Library bytes
+after results cleanup and no file changes on cancellation.
