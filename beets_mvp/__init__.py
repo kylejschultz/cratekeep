@@ -127,9 +127,17 @@ def create_app(test_config: dict | None = None) -> Flask:
         app.config.update(test_config)
 
     state_path = Path(app.config["STATE_PATH"])
-    state_path.mkdir(parents=True, exist_ok=True)
-    if not app.config["SECRET_KEY"]:
-        app.config["SECRET_KEY"] = _load_or_create_secret_key(state_path / "secret.key")
+    try:
+        state_path.mkdir(parents=True, exist_ok=True)
+        if not app.config["SECRET_KEY"]:
+            app.config["SECRET_KEY"] = _load_or_create_secret_key(state_path / "secret.key")
+    except PermissionError as exc:
+        identity = f"{os.geteuid()}:{os.getegid()}" if hasattr(os, "geteuid") else "the configured user"
+        raise RuntimeError(
+            f"Cratekeep cannot access its config directory {state_path} as UID:GID {identity}. "
+            "Set the container user to match the owner of the mounted AppData/config folder "
+            "and give that user read/write access. On a standard Unraid setup use --user=99:100."
+        ) from exc
     if app.config["MUSICBRAINZ_PROVIDER"] is search_releases:
         app.config["MUSICBRAINZ_PROVIDER"] = MusicBrainzClient(state_path / "metadata-cache.sqlite3")
     app.config["BEETS_DB"] = str(state_path / "library.db")
@@ -361,8 +369,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         except ValueError as exc:
             return jsonify(error=str(exc), code="inbox_scope_unavailable"), 409
 
+    @app.post("/api/inbox/<inbox_id>/queue/refresh", defaults={"cleanup": False})
     @app.post("/api/inbox/<inbox_id>/scopes/refresh")
-    def refresh_inbox_scopes(inbox_id: str):
+    def refresh_inbox_scopes(inbox_id: str, cleanup: bool = True):
         inbox = _configured_inbox(app, inbox_id)
         if inbox is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 404
@@ -378,13 +387,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             locks.append(lock)
         try:
             inventory = _scan_inbox_inventory(app, inbox)
-            cleanup = _cleanup_inbox_directories(app, inbox)
+            cleanup_result = _cleanup_inbox_directories(app, inbox) if cleanup else {"removed": [], "errors": []}
             with _connect(app.config["APP_DB"]) as db:
                 active = sorted({_scope_for_relative_path(row["relative_path"]) for row in db.execute(
                     "SELECT relative_path FROM library_inventory WHERE source_kind='inbox' AND source_id=? AND root_path=? AND present=1",
                     (inbox["id"], str(Path(inbox["path"]).resolve())),
                 )})
-            return jsonify(inventory=inventory, cleanup=cleanup, active_scopes=active)
+            return jsonify(inventory=inventory, cleanup=cleanup_result, active_scopes=active)
         except (OSError, ValueError) as exc:
             return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
         finally:
