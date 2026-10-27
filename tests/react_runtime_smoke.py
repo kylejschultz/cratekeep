@@ -695,6 +695,7 @@ def main() -> None:
         assert "3 / 3" in coverage.inner_text() and "2 / 3" not in coverage.inner_text()
         page.get_by_text("Compare tracks (3)",exact=True).click()
         assert page.get_by_text("Match needs review",exact=True).count()==0
+        assert page.get_by_text("Unpaired · keeps local track tags",exact=True).count()==0
         assert page.get_by_role("table",name="Current and proposed track metadata").get_by_text("🌈",exact=True).is_visible()
         page.screenshot(path=args.evidence_dir/"12-symbol-title-review.png",full_page=True)
         page.locator("[data-review-close]").click()
@@ -707,7 +708,7 @@ def main() -> None:
         symbol_receipts=[row for row in receipts if row['album'].startswith("Symbol Pair")]
         assert len(symbol_receipts)==2
         for receipt in symbol_receipts:
-            assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"Opening","♡","🌈"}
+            assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"Opening","❤️ feat. We Are KING & Jacob Collier","🌈"}
         # Metadata warnings remain advisory for an explicitly started import.
         page.get_by_role("button",name="Close results",exact=True).click()
         warning_sources=[]

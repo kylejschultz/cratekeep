@@ -161,7 +161,8 @@ def _explicit_position(track: object) -> tuple[int, int] | None:
 
 
 def _symbol_title(track: object) -> bool:
-    title = _track_title(track)
+    # Featured artists do not turn an emoji base title into a textual title.
+    title = _track_title_key(track)
     return (any(unicodedata.category(char).startswith("S") for char in title)
             and not any(char.isalnum() for char in title))
 

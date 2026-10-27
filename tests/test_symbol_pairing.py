@@ -26,6 +26,22 @@ def test_symbol_pairs_remain_title_changes_without_unmatched_tracks():
     assert result['confidence']<1  # Title differences still contribute to distance.
 
 
+@pytest.mark.parametrize('title',[
+    '❤️ feat. We Are KING & Jacob Collier',
+    '❤️ (featuring We Are KING & Jacob Collier)',
+    '❤️ [ft. We Are KING & Jacob Collier]',
+])
+def test_credited_symbol_title_pairs_without_discarding_full_proposed_title(title):
+    local,canonical=evidence()
+    local['tracks'][1]['title']='Heart Emoji With Jacos Collier & We Are KING'
+    canonical['tracks'][1]['title']=title
+    result=score_release(local,canonical)
+    row=result['track_details'][1]
+    assert row['status']=='title-mismatch'
+    assert row['proposed']==title
+    assert result['matched_track_count']==3
+
+
 @pytest.mark.parametrize('change',['missing-position','duplicate-local','duplicate-release','missing-duration','zero-duration','duration-conflict','wrong-position','ordinary-title','punctuation','track-count'])
 def test_symbol_exception_does_not_hide_missing_or_ambiguous_evidence(change):
     local,canonical=evidence()
@@ -74,7 +90,7 @@ def test_bulk_import_symbol_titles_uses_saved_release_and_keeps_originals(app,tm
     def provider(query,*,limit):
         candidate=exact_candidate(query,'symbol-best')
         for row in candidate['tracks']:
-            row['title']={'Human Heart':'♡','Rainbow':'🌈'}.get(row['title'],row['title'])
+            row['title']={'Human Heart':'❤️ feat. We Are KING & Jacob Collier','Rainbow':'🌈'}.get(row['title'],row['title'])
         return [candidate,{**deepcopy(candidate),'provider_id':'symbol-chosen','album':'Chosen edition'}]
     app.config['MUSICBRAINZ_PROVIDER']=provider
     result=client.post('/api/inbox/candidates',json={'album_id':album['id']});assert result.status_code==201,result.json
@@ -93,5 +109,5 @@ def test_bulk_import_symbol_titles_uses_saved_release_and_keeps_originals(app,tm
     assert executed.status_code==201 and len(executed.json['imported'])==1,executed.json
     items=list(Library(app.config['BEETS_DB'],directory=app.config['LIBRARY_PATH']).items())
     assert {item.album for item in items}=={expected}
-    assert {item.title for item in items}=={'Opening','♡','🌈'}
+    assert {item.title for item in items}=={'Opening','❤️ feat. We Are KING & Jacob Collier','🌈'}
     assert [path.read_bytes() for path in sources]==originals

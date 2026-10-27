@@ -85,7 +85,7 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
         if query["album"].startswith("Symbol Pair"):
             base["provider_id"] = "symbol-" + query["album"]
             for track in base["tracks"]:
-                track["title"] = {"Human Heart":"♡", "Rainbow":"🌈"}.get(track["title"],track["title"])
+                track["title"] = {"Human Heart":"❤️ feat. We Are KING & Jacob Collier", "Rainbow":"🌈"}.get(track["title"],track["title"])
         if query["album"] == "Shared Selection":
             base["provider_id"] = "123e4567-e89b-42d3-a456-426614174013"
             base["tracks"][0]["length_ms"] += 10_000

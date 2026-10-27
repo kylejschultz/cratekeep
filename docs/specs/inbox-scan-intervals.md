@@ -359,3 +359,12 @@ matching diagnostics remain honest while import is user-controlled. Verify
 Inbox and Library Import for fewer/more/different release tracks, warnings with
 an enabled Start import button, actual retained tags, all local files imported
 and unchanged Inbox originals.
+
+## Candidate correction — credited emoji titles
+
+Apply existing trailing featured-artist normalization when identifying a
+symbol-only base title. A title such as “❤️ feat. We Are KING & Jacob Collier”
+qualifies for the same position/duration evidence as a bare emoji. Preserve the
+full proposed title and artist credits for display and import. Keep all position,
+duration and count guards and advisory-only import behavior. Verify the reported
+local title, credit variants, saved-choice bulk imports and actual written tags.
