@@ -370,7 +370,11 @@ def main() -> None:
         page.get_by_role("button", name="Duplicates", exact=True).click()
         page.get_by_text("No albums match this view", exact=True).wait_for()
         page.get_by_role("button", name="All albums", exact=True).click()
-        page.get_by_role("checkbox", name="Select album Bulk Ready", exact=True).wait_for()
+        bulk_checkbox = page.get_by_role("checkbox", name="Select album Bulk Ready", exact=True)
+        bulk_checkbox.wait_for()
+        assert not bulk_checkbox.is_checked()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
+        bulk_checkbox.check()
         with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
             page.locator(".toolbar-actions").get_by_role("button", name="Import selected", exact=True).click()
         confirmation = page.get_by_role("dialog", name="Import selected albums", exact=True)
