@@ -433,3 +433,24 @@ def test_artist_alias_discovery_uses_canonical_identity_and_preserves_mismatch(c
     assert result[0]["retrieval"]["strategy"] == "artist-alias"
     assert result[0]["retrieval"]["search_score"] is None
     assert any(expression == f'release:"Album" AND (arid:{artist_id})' for expression in expressions)
+
+
+@pytest.mark.parametrize('release_title,recording_title,expected', [
+    ('A Place for My Head (live at Docklands Arena, London)', 'A Place for My Head', 'A Place for My Head (live at Docklands Arena, London)'),
+    ('Step Up (1999 demo)', 'Step Up', 'Step Up (1999 demo)'),
+    ('Buy Myself (Marilyn Manson remix)', 'Buy Myself Remix', 'Buy Myself (Marilyn Manson remix)'),
+    ('', 'Recording fallback', 'Recording fallback'),
+    (None, 'Recording fallback', 'Recording fallback'),
+    ('Release title', None, 'Release title'),
+])
+def test_release_track_title_precedes_recording_title(release_title, recording_title, expected):
+    document = release()
+    source = document['media'][0]['tracks'][0]
+    source.update(title=release_title, length=123000, **{'artist-credit':[{'name':'Track Artist'}]})
+    source['recording'].update(title=recording_title, length=999999)
+    candidate = mb._normalize_release(document, exact=True)
+    track = candidate['tracks'][0]
+    assert track['title'] == expected
+    assert candidate['media'][0]['tracks'][0]['title'] == expected
+    assert track['recording_id'] == 'recording-1'
+    assert track['length_ms'] == 123000 and track['track_artist'] == 'Track Artist'
