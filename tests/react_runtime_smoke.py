@@ -194,13 +194,23 @@ def main() -> None:
 
     page_errors: list[str] = []
     console_errors: list[str] = []
+    expected_reconnect_errors: list[str] = []
+    testing_reconnect = False
     route_results = {}
     with sync_playwright() as playwright:
         executable = os.environ.get("CHROMIUM_EXECUTABLE")
         browser = playwright.chromium.launch(executable_path=executable) if executable else playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
         page.on("pageerror", lambda error: page_errors.append(str(error)))
-        page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
+        def collect_console(message):
+            if message.type != "error":
+                return
+            if (testing_reconnect and "/discovery" in message.location.get("url", "")
+                    and "503" in message.text):
+                expected_reconnect_errors.append(message.text)
+            else:
+                console_errors.append(message.text)
+        page.on("console", collect_console)
         for index, (path, heading) in enumerate((("/", "Library overview"), ("/inbox", "Incoming music"),
                                                   ("/library-import", "Adoption queue"), ("/library", "Managed collection"),
                                                   ("/settings", "Cratekeep settings")), 1):
@@ -931,6 +941,18 @@ def main() -> None:
         receipt=next(row for row in page.request.get(inbox_base+"/imports").json()["imports"] if row['album']=="Warning Import")
         assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"First","Second","Third"}
         assert {MediaFile(args.fixture_root/"library"/relative).album for relative in receipt['destinations']}=={"Warning Import Chosen"}
+        page.get_by_role("button",name="Close results",exact=True).click()
+        # A simulated discovery outage is inline, survives review pause, and clears.
+        testing_reconnect = True
+        discovery_route = "**/api/inbox/*/discovery"
+        page.route(discovery_route, lambda route: route.fulfill(status=503, json={"error":"Simulated outage"}))
+        reconnecting = page.get_by_text("Live updates disconnected · Reconnecting…",exact=True)
+        reconnecting.wait_for(timeout=15000)
+        assert page.get_by_role("dialog").count()==0
+        page.screenshot(path=args.evidence_dir/"14-discovery-reconnecting.png",full_page=True)
+        page.unroute(discovery_route)
+        reconnecting.wait_for(state="hidden",timeout=10000)
+        testing_reconnect = False
         browser_version = browser.version
         # A confirmed batch survives closing its view, navigation and reload.
         for number in (1, 2):
@@ -1000,7 +1022,8 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True,
+        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True, "discovery_reconnects_inline": True,
+        "expected_reconnect_console_errors": expected_reconnect_errors,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

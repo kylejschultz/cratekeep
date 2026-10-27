@@ -53,3 +53,25 @@ it("does not live-refresh a manual-only Inbox", async () => {
   await tick();
   expect(onChange).not.toHaveBeenCalled();
 });
+
+
+it("shows reconnecting only after repeated failures, clears on recovery and isolates sources", async () => {
+  vi.useFakeTimers();
+  const fetch = vi.fn().mockRejectedValue(new Error("offline"));
+  vi.stubGlobal("fetch", fetch);
+  const onChange = vi.fn(async () => {});
+  const { result, rerender } = renderHook(({ source }) => useInboxDiscovery(source, true, onChange), { initialProps: { source: "one" } });
+  await tick(); expect(result.current.reconnecting).toBeFalsy();
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(result.current.reconnecting).toBe(true);
+  fetch.mockResolvedValue(response(status("new")));
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(result.current.reconnecting).toBe(false);
+  expect(result.current.pending).toBe(true);
+  expect(onChange).not.toHaveBeenCalled();
+  fetch.mockRejectedValue(new Error("offline"));
+  await act(async () => { await vi.advanceTimersByTimeAsync(7000); });
+  expect(result.current.reconnecting).toBe(true);
+  rerender({ source: "two" });
+  expect(result.current.reconnecting).toBe(false);
+});
