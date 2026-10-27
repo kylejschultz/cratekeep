@@ -78,6 +78,10 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
                         "length_ms": round(float(track.get("duration") or 1) * 1000)}
                        for index, track in enumerate(query.get("tracks", []), 1)],
         }
+        if query["album"] == "Warning Import":
+            base.update(provider_id="warning-import",album="Warning Import Chosen")
+            base["tracks"]=base["tracks"][:2]
+            base["tracks"][1]["title"]="Unrelated release recording"
         if query["album"].startswith("Symbol Pair"):
             base["provider_id"] = "symbol-" + query["album"]
             for track in base["tracks"]:

@@ -112,7 +112,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
       const preview = await api<any>(`${bulkBase}/preview`, { method: "POST", body: JSON.stringify(body) });
       const eligible = preview.importable_albums || preview.ready_albums || [];
       const rows: ImportRow[] = [
-        ...eligible.map((row: any) => ({ id: row.id, album: row.album, status: "queued" as const })),
+        ...eligible.map((row: any) => ({ id: row.id, album: row.album, status: "queued" as const, warnings: row.warnings })),
         ...(preview.exceptions || []).map((row: any) => ({ id: row.id, album: row.album, status: "blocked" as const, reason: row.reason })),
       ];
       if (!rows.length) { setError("The selected albums are no longer available. Refresh the queue."); return; }

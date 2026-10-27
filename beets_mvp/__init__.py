@@ -3658,13 +3658,6 @@ def _selected_library_choice(album: dict, *, inbox: bool = False) -> tuple[dict 
             candidate = max(pool, key=lambda row: row.get("confidence", 0), default=None)
         if candidate is None:
             return None, "choose a match or As Is"
-        details = {row.get("position"): row for row in candidate.get("track_details", []) if row.get("local") is not None}
-        included = [index for index, track in enumerate(album.get("tracks", []), 1)
-                    if track.get("exception") not in {"rejected", "skipped"}]
-        if any(position not in details or details[position].get("proposed") is None
-               or details[position].get("status") not in {"matched", "title-mismatch", "duration-mismatch", "order-mismatch"}
-               for position in included):
-            return None, "track pairing needs review"
     duplicate = candidate.get("duplicate_preflight", {"status": "clear"}) if candidate else album.get("duplicate_preflight", {"status": "clear"})
     if duplicate.get("status") == "ambiguous":
         return None, "managed recording identity is ambiguous"
@@ -3677,6 +3670,24 @@ def _selected_library_choice(album: dict, *, inbox: bool = False) -> tuple[dict 
     return selection, ""
 
 
+
+def _selected_import_warnings(app: Flask, album: dict, choice: dict) -> list[str]:
+    candidate = next((row for row in album.get("candidates", []) if row["id"] == choice.get("candidate_id")), None)
+    if candidate is None:
+        return []
+    warnings = []
+    details = candidate.get("track_details", [])
+    unpaired = sum(row.get("local") is not None and (row.get("proposed") is None or row.get("status") == "unmatched") for row in details)
+    if unpaired:
+        warnings.append(f"{unpaired} unpaired {'track' if unpaired == 1 else 'tracks'} will keep existing track tags.")
+    if any(row.get("local") is None for row in details) or candidate.get("track_count_mismatch"):
+        warnings.append("Track counts differ. Only files on disk will be imported.")
+    confidence = candidate.get("confidence")
+    if confidence is not None and confidence * 100 < app.config["MATCH_THRESHOLD"]:
+        warnings.append(f"Low match confidence ({confidence * 100:.1f}%). Your chosen release will still be used.")
+    return warnings
+
+
 def _bulk_selected_library_summary(app: Flask, scopes: list[str], album_ids: list[int]) -> dict:
     eligible, excluded = [], []
     for album in _album_review_payloads(app, album_ids):
@@ -3684,7 +3695,8 @@ def _bulk_selected_library_summary(app: Flask, scopes: list[str], album_ids: lis
         if choice is None:
             excluded.append({"id": album["id"], "album": album["album"], "reason": reason})
         else:
-            eligible.append({"id": album["id"], "album": album["album"], "tracks": len(album["tracks"])})
+            eligible.append({"id": album["id"], "album": album["album"], "tracks": len(album["tracks"]),
+                             "warnings": _selected_import_warnings(app, album, choice)})
     return {"selected_folder_count": len(scopes), "available_album_count": len(album_ids),
             "importable_album_count": len(eligible), "importable_albums": eligible,
             "exception_count": len(excluded), "exceptions": excluded}
@@ -6441,13 +6453,13 @@ def _validate_duplicate_item(app: Flask, *, root: Path, item: Item) -> Path:
 
 def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
     values = {}
+    unpaired = detail is None or detail.get("proposed") is None or detail.get("status") in {"unmatched", "missing", "extra"}
     artist = _normalize_metadata(candidate.get("artist"))
     album = _normalize_metadata(candidate.get("album"))
     if artist:
         values["albumartist"] = artist
-        values["artist"] = _normalize_metadata(detail.get("proposed_artist")) if detail else artist
-        if not values["artist"]:
-            values["artist"] = artist
+        if not unpaired:
+            values["artist"] = _normalize_metadata(detail.get("proposed_artist")) or artist
     if album:
         values["album"] = album
     genre = _candidate_genre(candidate)
@@ -6471,13 +6483,13 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
     if media and isinstance(media[0], dict) and media[0].get("format"):
         values["media"] = str(media[0]["format"])
     try:
-        if candidate.get("track_count") is not None:
+        if not unpaired and candidate.get("track_count") is not None:
             values["tracktotal"] = int(candidate["track_count"])
-        if media:
+        if not unpaired and media:
             values["disctotal"] = len(media)
     except (TypeError, ValueError):
         pass
-    if detail and detail.get("proposed") is not None:
+    if not unpaired:
         values["title"] = detail["proposed"]
         proposed_position = detail.get("proposed_position")
         if proposed_position:
@@ -7519,6 +7531,8 @@ def _inbox_selected_summary(app, inbox, album_ids):
     for album in _album_review_payloads(app, album_ids, root=str(Path(inbox["path"]).resolve()), source_kind="inbox", source_id=inbox["id"]):
         choice, reason = _selected_library_choice(album, inbox=True)
         row = {"id": album["id"], "album": album["album"], "tracks": len(album["tracks"])}
+        if choice:
+            row["warnings"] = _selected_import_warnings(app, album, choice)
         (eligible if choice else excluded).append(row if choice else {**row, "reason": reason})
     return {"importable_albums": eligible, "exceptions": excluded}
 

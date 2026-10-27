@@ -60,3 +60,15 @@ it.each(["library-import","inbox"] as const)("omits cleanup for %s without retai
   await screen.findByRole("heading",{name:"Import results"});
   expect(screen.queryByRole("button",{name:"Clear imported from Inbox"})).not.toBeInTheDocument();
 });
+
+it("shows metadata warnings while keeping Start import available", async () => {
+  const execute=vi.fn(async id=>({imported:[{album_review_id:id}]}));
+  show(execute,{rows:[{id:1,album:"Reviewed release",status:"queued",warnings:["Track counts differ. Only files on disk will be imported."]}]});
+  expect(screen.getByRole("note")).toHaveTextContent("Metadata warnings do not block import");
+  expect(screen.getByText(/Warning: Track counts differ/)).toBeInTheDocument();
+  expect(screen.getByRole("button",{name:"Start import"})).toBeEnabled();
+  fireEvent.click(screen.getByRole("button",{name:"Start import"}));
+  await screen.findByRole("heading",{name:"Import results"});
+  expect(execute).toHaveBeenCalledWith(1);
+  expect(screen.getByText("1 of 1 albums imported.")).toBeInTheDocument();
+});

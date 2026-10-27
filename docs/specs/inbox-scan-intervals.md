@@ -339,3 +339,23 @@ missing positions/durations, duration conflicts and actual missing tracks blocke
 by the existing pairing gate. Opening a candidate alone still is not approval.
 Verify valid symbol pairs, negative boundaries, reordered/multi-disc mappings and
 actual selected batch imports with unchanged retained originals.
+
+## Approved follow-up — metadata disagreements warn without blocking
+
+Kyle explicitly confirmed warnings/alerts must not block import for metadata
+disagreements. Remove the selected-bulk gate for unresolved/missing track pairs
+and unequal track counts. Keep chosen/default release selection and show
+non-blocking warnings in the existing import confirmation for unpaired local
+tracks, count differences and low confidence. Start import remains available.
+Import every included local file, never invent missing release files. Apply
+chosen album metadata but retain title, track artist, disc/track numbers and
+recording ID for local tracks without a reliable pair; do not apply the weak
+zip-assignment's guessed track tags. Reflect this in the track comparison.
+
+Preserve source-file validation, stale source evidence, exclusions, duplicate
+decisions, destination checks and recovery guards. This overrides the earlier
+acceptance statement that unresolved textual pairs must block selected imports;
+matching diagnostics remain honest while import is user-controlled. Verify
+Inbox and Library Import for fewer/more/different release tracks, warnings with
+an enabled Start import button, actual retained tags, all local files imported
+and unchanged Inbox originals.

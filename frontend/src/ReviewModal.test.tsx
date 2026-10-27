@@ -437,8 +437,8 @@ it("separates equal track totals from an unresolved title pair", () => {
   expect(document.querySelector(".review-track-coverage")).toHaveTextContent("On disk / MusicBrainz10 / 10Track matches9 / 10");
   expect(screen.getAllByRole("img",{name:"On disk / MusicBrainz unchanged"}).length).toBeGreaterThan(0);
   fireEvent.click(screen.getByText("Compare tracks (10)"));
-  expect(screen.getByText("Match needs review").closest("tr")).toHaveTextContent("Rainbow");
-  expect(screen.getByText("Match needs review").closest("tr")).toHaveTextContent("🌈");
+  expect(screen.getByText("Unpaired · keeps local track tags").closest("tr")).toHaveTextContent("Rainbow");
+  expect(screen.getByText("Unpaired · keeps local track tags").closest("tr")).toHaveTextContent("🌈");
   expect(screen.queryByText("Not on disk")).not.toBeInTheDocument();
 });
 it.each(["disk", "musicbrainz"])("distinguishes a track absent from %s from an unresolved title pair", missing => {
@@ -448,7 +448,8 @@ it.each(["disk", "musicbrainz"])("distinguishes a track absent from %s from an u
   expect(document.querySelector(".review-track-coverage")).toHaveTextContent(missing==="disk"?"1 / 2":"2 / 1");
   fireEvent.click(screen.getByText("Compare tracks (2)"));
   expect(screen.getByText(missing==="disk"?"Not on disk":"Not in MusicBrainz")).toBeInTheDocument();
-  expect(screen.queryByText("Match needs review")).not.toBeInTheDocument();
+  if (missing === "disk") expect(screen.queryByText("Unpaired · keeps local track tags")).not.toBeInTheDocument();
+  else expect(screen.getByText("Unpaired · keeps local track tags")).toBeInTheDocument();
 });
 
 it("shows complete and unknown coverage without inventing missing files", () => {
