@@ -266,7 +266,7 @@ it("defers live arrivals during selection then updates without a disk rescan", a
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(screen.getByRole("checkbox", { name: "Select album One" })).toBeChecked();
     expect(screen.queryByRole("checkbox", { name: "Select album New arrival" })).not.toBeInTheDocument();
-    expect(screen.getByText(/Inbox updates waiting/)).toBeInTheDocument();
+    expect(screen.queryByText(/Inbox updates waiting/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(screen.getByRole("checkbox", { name: "Select album New arrival" })).toBeInTheDocument();
@@ -288,4 +288,35 @@ it("opens scoped removal confirmation directly from successful Inbox results", a
   expect(screen.getByText(/Library files stay unchanged/)).toBeInTheDocument();
   fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
   expect(fetch.mock.calls.some(([url]) => url.endsWith("/apply"))).toBe(false);
+});
+
+it("deletes only selected visible unimported albums after explicit confirmation", async () => {
+  let deleted=false;
+  const fetch=vi.fn(async(url:string)=>response(url.endsWith("/actions/preview") ? {preview_id:"delete",fingerprint:"hash",count:1,albums:["One"],files:[{location:"Inbox",path:"Artist/One/Song.wav"}]} : url.endsWith("/actions/apply") ? (deleted=true,{status:"complete",message:"Deleted without importing"}) : page(deleted?[album(2,"Two")]:[album(1,"One"),album(2,"Two")])));
+  vi.stubGlobal("fetch",fetch);
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  await selectAlbum("Select album One");
+  fireEvent.click(within(screen.getByLabelText("Selected album actions")).getByRole("button",{name:"Delete from Inbox"}));
+  const confirm=await screen.findByRole("button",{name:"Permanently delete from Inbox"});
+  await waitFor(()=>expect(confirm).toBeEnabled());
+  expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-albums",album_ids:[1]})}));
+  expect(screen.getByRole("dialog")).toHaveTextContent("Artist/One/Song.wav");
+  expect(screen.getByRole("dialog")).toHaveTextContent("without importing");
+  fireEvent.click(confirm);
+  await waitFor(()=>expect(screen.queryByRole("checkbox",{name:"Select album One"})).not.toBeInTheDocument());
+  expect(fetch.mock.calls.some(([url])=>url.endsWith("/execute"))).toBe(false);
+  expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
+});
+it("opens exact single-track deletion from the independent Inbox files list and cancels safely", async () => {
+  const fetch=vi.fn(async(url:string)=>response(url.endsWith("/actions/preview") ? {preview_id:"delete",fingerprint:"hash",count:1,files:[{location:"Inbox",path:"One/Bad.wav"}]} : page([{...album(1,"One"),tracks:[{id:42,title:"Bad song",path:"One/Bad.wav"},{id:43,title:"Good song",path:"One/Good.wav"}]}])));
+  vi.stubGlobal("fetch",fetch);
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Review One"}));
+  fireEvent.click(screen.getByText("Inbox files (2)"));
+  fireEvent.click(screen.getByRole("button",{name:"Delete track Bad song"}));
+  await screen.findByRole("heading",{name:"Delete track from Inbox"});
+  expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-track",album_id:1,track_id:42})}));
+  expect(screen.getByRole("dialog")).toHaveTextContent("Other tracks and accompanying files stay");
+  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
+  expect(fetch.mock.calls.some(([url])=>url.endsWith("/apply"))).toBe(false);
 });

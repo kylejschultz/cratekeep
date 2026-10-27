@@ -608,3 +608,11 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 }
 
 .inbox-preferences-summary{display:flex;gap:4px 16px;flex-wrap:wrap;margin-top:4px;color:var(--muted);font-size:12px;line-height:18px}
+
+.inbox-local-tracks{margin:14px 0;color:var(--muted);font-size:13px}
+.inbox-local-tracks li{align-items:center;gap:10px;flex-wrap:wrap}
+.inbox-local-tracks li>div{min-width:0;flex:1;overflow-wrap:anywhere}
+.inbox-local-tracks strong,.inbox-local-tracks small{display:block}
+.inbox-local-tracks strong{color:var(--text)}
+.inbox-local-tracks button{flex-shrink:0}
+.inbox-action-dialog li{overflow-wrap:anywhere}

@@ -622,6 +622,51 @@ def main() -> None:
         assert not any(path.exists() for path in copy_sources) and not copy_folder.exists()
         assert all(sha256(path)==saved[path] for path in targets)
         page.screenshot(path=args.evidence_dir/"10b-imported-originals-removed.png",full_page=True)
+        # Unimported deletion: inspector cancellation, exact track, then page batch.
+        delete_folders=[args.fixture_root/"inbox"/name for name in ("Delete Download","Delete Other")]
+        delete_sources=[]
+        for folder in delete_folders:
+            for index in range(2 if folder.name=="Delete Download" else 1):
+                path=folder/f"{index+1}.wav";write_wav(path)
+                media=MediaFile(path);media.album=folder.name;media.artist="Delete fixture"
+                media.title="Bad song" if index==0 else "Keep song";media.track=index+1;media.save()
+                delete_sources.append(path)
+            (folder/"album.nfo").write_bytes(b"disposable metadata")
+            (folder/"artwork").mkdir();(folder/"artwork"/"back.jpg").write_bytes(b"disposable artwork")
+        expected={path:sha256(path) for path in delete_sources}
+        page.get_by_role("searchbox",name="Find an album").fill("Delete")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Delete Download",exact=True).click()
+        inspector=page.get_by_role("region",name="Delete Download",exact=True)
+        inspector.get_by_role("button",name="Delete from Inbox",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        deletion.get_by_role("button",name="Permanently delete from Inbox",exact=True).wait_for()
+        assert "without importing" in deletion.inner_text()
+        deletion.get_by_role("button",name="Cancel",exact=True).click()
+        assert all(sha256(path)==expected[path] for path in delete_sources)
+        inspector.get_by_text("Inbox files (2)",exact=True).click()
+        page.screenshot(path=args.evidence_dir/"11-inbox-files-desktop.png",full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        inspector.get_by_role("button",name="Delete track Bad song",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete track from Inbox",exact=True)
+        assert "Delete Download/1.wav" in deletion.inner_text()
+        page.screenshot(path=args.evidence_dir/"11a-delete-track-mobile.png",full_page=True)
+        deletion.get_by_role("button",name="Permanently delete from Inbox",exact=True).click()
+        page.wait_for_function("!document.querySelector('dialog[open]')")
+        page.get_by_role("button",name="Review Delete Download",exact=True).wait_for()
+        assert not delete_sources[0].exists() and sha256(delete_sources[1])==expected[delete_sources[1]]
+        assert (delete_folders[0]/"album.nfo").is_file()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        page.locator('[aria-label="Selected album actions"]').get_by_role("button",name="Delete from Inbox",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        assert "Delete Download" in deletion.inner_text() and "Delete Other" in deletion.inner_text()
+        page.screenshot(path=args.evidence_dir/"11b-delete-batch-mobile.png",full_page=True)
+        assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        deletion.get_by_role("button",name="Permanently delete from Inbox",exact=True).click()
+        page.get_by_text("No albums match this view",exact=True).wait_for()
+        assert not any(folder.exists() for folder in delete_folders)
+        assert all(sha256(path)==saved[path] for path in targets)
+        assert page.get_by_text(re.compile("Inbox updates waiting")).count()==0
         browser_version = browser.version
         browser.close()
 
@@ -644,7 +689,7 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True,
+        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

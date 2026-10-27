@@ -6,7 +6,7 @@ import { api, ApiError } from "./api";
 import { formatMatchPercent } from "./status";
 import type { Album, Candidate, DuplicatePreflight } from "./types";
 
-type Props = { album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onSelectionChange?: (album: Album) => void };
+type Props = { onDeleteAlbum?: () => void; onDeleteTrack?: (trackId: number, title: string) => void; album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onSelectionChange?: (album: Album) => void };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -142,7 +142,7 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
   </article>;
 }
 
-export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onSelectionChange }: Props) {
+export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onSelectionChange, onDeleteAlbum, onDeleteTrack }: Props) {
   const [album, setAlbum] = useState(seed);
   const notify = useToast();
   const [operation, setOperation] = useState<"match" | "search" | "import" | "selection" | null>(null);
@@ -258,6 +258,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
       <div className="dialog-body">
         <div className="review-tools"><button type="button" onClick={() => void match()} disabled={busy || moved} aria-busy={operation === "match"}>{operation === "match" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches" : "Match"}</button><button className="secondary" type="button" onClick={() => { setMbidOpen(value => !value); setError(""); }} disabled={busy || moved} aria-expanded={mbidOpen}>Search MBID</button></div>
         {mbidOpen && <form className="mbid-search" onSubmit={searchMbid}><label>MusicBrainz release UUID<input value={mbid} onChange={event => setMbid(event.target.value)} placeholder="123e4567-e89b-42d3-a456-426614174000" disabled={busy} autoFocus/></label><button type="submit" disabled={busy} aria-busy={operation === "search"}>{operation === "search" && <span className="spinner"/>}Search exact release</button></form>}
+        {source === "inbox" && onDeleteTrack && <details className="inbox-local-tracks"><summary>Inbox files ({(album.tracks || []).length})</summary><ul className="track-list">{(album.tracks || []).map(track => <li key={track.id}><div><strong>{track.title || fileName(track.path)}</strong><small>{track.path}</small></div><button type="button" className="danger-action" disabled={busy || moved || !Number.isInteger(track.id)} aria-label={`Delete track ${track.title || fileName(track.path)}`} onClick={() => onDeleteTrack(track.id, String(track.title || fileName(track.path)))}>Delete track</button></li>)}</ul></details>}
         <fieldset className="candidate-list" data-review-candidates><legend>Metadata choice</legend>
           {candidates(album).map(candidate => <CandidateCard key={candidate.id} album={album} candidate={candidate} chosen={chosen} expanded={String(expanded) === String(candidate.id)} busy={busy || moved} choose={choose} onExpand={() => setExpanded(current => String(current) === String(candidate.id) ? null : candidate.id)}/>) }
           <article className={`candidate-card as-is${chosen === null ? " selected" : ""}`}><div className="candidate-heading"><label><input type="radio" name="candidate" checked={chosen === null} disabled={busy || moved} onChange={() => { choose(null); setExpanded("as-is"); }}/><span className="sr-only">Select As Is</span></label><span className="candidate-artwork"><ArtworkPlaceholder/></span><button className="candidate-summary" type="button" aria-expanded={expanded === "as-is"} onClick={() => setExpanded(current => current === "as-is" ? null : "as-is")}><span className="candidate-title"><strong>As Is</strong><small>Retain incoming/local metadata unchanged</small></span><span className="candidate-change-icons" aria-label="No MusicBrainz association">—</span><span aria-hidden="true">{expanded === "as-is" ? "⌃" : "⌄"}</span></button></div>{expanded === "as-is" && <p className="as-is-detail">Do not associate a MusicBrainz release.</p>}</article>
@@ -269,7 +270,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
         {["artwork_fetch_failed", "artwork_finalize_failed"].includes(recovery) && <div className="notice"><p>{moved ? "You can retry the pending sidecar, or finish without it when no incoming artwork needs recovery. Already embedded artwork is retained." : "You can retry artwork retrieval or continue with the selected metadata while preserving existing artwork. This applies only to this import."}</p><button type="button" className="secondary" disabled={busy} onClick={() => void execute(true)}>{moved ? "Finish without new sidecar" : "Continue without new artwork"}</button></div>}
         {status && <p className="notice" aria-live="polite" data-review-status>{status}</p>}{error && <p className="notice error" role="alert" data-review-status>{error}</p>}
       </div>
-      <footer><button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button><button type="button" onClick={() => void execute()} disabled={busy || chosen === undefined || ["candidate_stale", "candidate_unavailable"].includes(recovery)} aria-busy={operation === "import"} data-review-execute>{operation === "import" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches before importing" : cleanupPending ? "Finish Inbox cleanup" : moved ? "Retry artwork finalization" : error ? "Retry import" : "Import to Library"}</button></footer>
+      <footer><button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button>{onDeleteAlbum && <button type="button" className="danger-action" disabled={busy || moved} onClick={onDeleteAlbum}>Delete from Inbox</button>}<button type="button" onClick={() => void execute()} disabled={busy || chosen === undefined || ["candidate_stale", "candidate_unavailable"].includes(recovery)} aria-busy={operation === "import"} data-review-execute>{operation === "import" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches before importing" : cleanupPending ? "Finish Inbox cleanup" : moved ? "Retry artwork finalization" : error ? "Retry import" : "Import to Library"}</button></footer>
     </div>
   </div>;
 }

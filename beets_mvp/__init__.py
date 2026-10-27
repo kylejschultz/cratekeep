@@ -5792,6 +5792,9 @@ def _execute_inbox_album(
                 "album_review_id": album_review_id, "status": "complete"
             }
             return {**result, "already_complete": True}
+        db.execute('BEGIN IMMEDIATE')
+        if db.execute("SELECT 1 FROM inbox_file_actions WHERE source_id=? AND status='running'", (context['inbox']['id'],)).fetchone():
+            raise LibraryImportExecutionError("An Inbox file action is running or interrupted; inspect its result before importing.", code="inbox_action_running", status=409)
         job_id = db.execute(
             "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES (?, ?, 'running', ?)",
             ("inbox_import_preview" if dry_run else "inbox_import_execute", str(root), _now()),
