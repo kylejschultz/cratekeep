@@ -265,3 +265,14 @@ all draft fields. The existing Save settings action remains the persistence step
 Preserve stable Inbox IDs, existing preferences, new-Inbox matching opt-in rules,
 validation and the single-editor guard. Verify edit/add/cancel/Done/save plus focus
 and no overflow at 1440, 768 and 390 pixels. Keep the surrounding design system.
+
+## Candidate feedback — compact read-only summaries — 2026-10-27
+
+Default Inbox rows show the name/path and static Discovery and Auto-match On/Off
+values. Remove editable controls from normal rows; all preference changes belong
+inside Edit. Use one compact summary line below the path, wrapping on phones.
+Retain hidden form fields for every Inbox so Save settings from any tab preserves
+unchanged preferences. Done updates the summary; Cancel leaves it unchanged.
+Keep the grouped editor and stable IDs. Verify no checkbox/dropdown exists in a
+collapsed row, form submission retains each value, and rows shrink without losing
+readability at desktop/tablet/phone widths.

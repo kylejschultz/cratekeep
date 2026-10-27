@@ -205,10 +205,9 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
             </tr> : <tr data-inbox-row key={inbox.key}>
               <td><input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/><strong>{inbox.name}</strong></td>
               <td><input type="hidden" name="inbox_path" value={inbox.path}/><code className="inbox-printed-path">{inbox.path}</code>
-                <label className="inbox-discovery-setting">Discovery for {inbox.name}<select name="inbox_discovery" value={inbox.discovery || "5"} onChange={event => setInboxes(rows => rows.map(row => row.key === inbox.key ? { ...row, discovery: event.target.value } : row))}>
-                  {inboxDiscoveryOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                </select></label>
-                <label className="check inbox-auto-match-setting"><input type="checkbox" name="inbox_auto_match_id" value={inbox.id} aria-label={`Automatically find matches for ${inbox.name}`} checked={Boolean(inbox.auto_match)} disabled={!inbox.id} onChange={event => setInboxes(rows => rows.map(row => row.key === inbox.key ? { ...row, auto_match: event.target.checked } : row))}/>Automatically find matches{!inbox.id && <small>(save this Inbox first)</small>}</label>
+                <input type="hidden" name="inbox_discovery" value={inbox.discovery || "5"}/>
+                {inbox.auto_match && inbox.id && <input type="hidden" name="inbox_auto_match_id" value={inbox.id}/>}
+                <div className="inbox-preferences-summary"><span>Discovery: {inboxDiscoveryOptions.find(([value]) => value === (inbox.discovery || "5"))?.[1]}</span><span>Auto-match: {inbox.auto_match ? "On" : "Off"}</span></div>
               </td>
               <td><div className="inbox-row-actions"><button className="text-button" type="button" aria-label={`Edit ${inbox.name}`} disabled={draft !== null} onClick={() => setDraft({ ...inbox })}>Edit</button><button className="text-button" type="button" aria-label={`Delete ${inbox.name}`} disabled={draft !== null} onClick={() => setInboxes(rows => rows.filter(row => row.key !== inbox.key))}>Delete</button></div></td>
             </tr>)}</tbody>

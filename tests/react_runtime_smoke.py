@@ -172,12 +172,17 @@ def main() -> None:
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.get_by_label("Matched threshold (%)").fill("50")
         page.get_by_role("tab", name="General").click()
+        summary_row = page.get_by_role("button", name="Edit Inbox", exact=True).locator("xpath=ancestor::tr")
+        assert summary_row.get_by_role("combobox").count() == 0
+        assert summary_row.get_by_role("checkbox").count() == 0
+        page.get_by_role("button", name="Edit Inbox", exact=True).click()
         match_inbox = page.get_by_role("checkbox", name="Automatically find matches for Inbox", exact=True)
         assert match_inbox.locator("xpath=ancestor::tr").get_by_role("combobox", name="Discovery for Inbox", exact=True).count() == 1
         match_inbox.check()
         assert match_inbox.is_checked()
         match_inbox.uncheck()
         assert not match_inbox.is_checked()
+        page.get_by_role("button", name="Done", exact=True).click()
         page.get_by_role("tab", name="Metadata").click()
         page.get_by_label("Fetch Cover Art Archive artwork").check()
         page.get_by_label("Save cover.jpg sidecars").check()
@@ -202,7 +207,8 @@ def main() -> None:
         page.get_by_role("tab", name="Metadata").click()
         assert page.get_by_label("Matched threshold (%)").input_value() == "50"
         page.get_by_role("tab", name="General").click()
-        assert not page.get_by_role("checkbox", name="Automatically find matches for Inbox", exact=True).is_checked()
+        assert page.get_by_text("Auto-match: Off", exact=True).count() == 1
+        assert page.get_by_role("table", name="Configured Inboxes").get_by_role("checkbox").count() == 0
 
         page.goto(base + "/inbox", wait_until="networkidle")
         assert page.get_by_role("button", name="Match Selected").count() == 0

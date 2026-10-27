@@ -575,12 +575,8 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .managed-release-id{display:grid;gap:4px;margin:0 0 18px;font-size:13px;color:var(--muted);min-width:0}
 .managed-release-id code{font-size:12px;overflow-wrap:anywhere;user-select:text}
 
-.inbox-discovery-setting{display:flex!important;align-items:center;gap:8px;font-size:12px;color:var(--muted);margin-top:8px!important;flex-wrap:wrap}
-.inbox-discovery-setting select{width:auto;max-width:100%;font-size:12px;padding:4px 8px}
 .inbox-discovery-status{display:flex;gap:6px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);padding:8px 0}
 
-.inbox-settings-table .inbox-auto-match-setting{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;margin:8px 0 0}
-.inbox-settings-table .inbox-auto-match-setting input{width:auto;margin:0}
 
 /* The editor spans the table; its fields share a grid instead of data columns. */
 .inbox-settings-table .inbox-editor-row>td{padding:12px 0}
@@ -610,3 +606,5 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
   .settings-form .inbox-editor input:not([type=checkbox]),.settings-form .inbox-editor select{height:44px}
   .inbox-settings-table .inbox-editor-matching .check{min-height:44px}
 }
+
+.inbox-preferences-summary{display:flex;gap:4px 16px;flex-wrap:wrap;margin-top:4px;color:var(--muted);font-size:12px;line-height:18px}
