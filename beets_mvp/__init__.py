@@ -7441,12 +7441,12 @@ def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, 
 
 
 @observe("Scanning Inbox")
-def _scan_inbox_inventory(app, inbox, *, scopes=None, trigger="request"):
+def _scan_inbox_inventory(app, inbox, *, scopes=None, trigger="request", settled_folders=None):
     with app.config["MUTATION_LOCK"], app.config["INBOX_SCAN_LOCK"]:
         current = _configured_inbox(app, inbox["id"])
         if current is None or current["path"] != inbox["path"]:
             raise ValueError("Inbox configuration changed; reload before scanning.")
-        result = _scan_inbox_inventory_locked(app, current, scopes=scopes)
+        result = _scan_inbox_inventory_locked(app, current, scopes=scopes, settled_folders=settled_folders)
         record_inbox_scan(result)
         service = app.extensions.get("inbox_discovery")
         if service:
@@ -7461,7 +7461,7 @@ def _scan_inbox_inventory(app, inbox, *, scopes=None, trigger="request"):
 
 
 def _scan_inbox_inventory_locked(
-    app: Flask, inbox: dict[str, str], *, scopes: list[str] | None = None,
+    app: Flask, inbox: dict[str, str], *, scopes: list[str] | None = None, settled_folders: set[str] | None = None,
 ) -> dict:
     configured = Path(inbox["path"])
     if configured.is_symlink():
@@ -7495,6 +7495,12 @@ def _scan_inbox_inventory_locked(
             )
         raise ValueError(f"Unable to inventory inbox: {exc}") from exc
 
+    if settled_folders is not None:
+        discovered = [(path, stat) for path, stat in discovered
+                      if (_inbox_album_folder(path.relative_to(root).as_posix()) or ".") in settled_folders]
+        previous = {relative: row for relative, row in previous.items()
+                    if (_inbox_album_folder(relative) or ".") in settled_folders}
+
     discovered_relatives = {path.relative_to(root).as_posix() for path, _ in discovered}
     wanted = set(scopes or [])
     changed_ids = [
@@ -7519,14 +7525,14 @@ def _scan_inbox_inventory_locked(
     added_ids = []
     with _connect(app.config["APP_DB"]) as db:
         # A stable source ID may be renamed, but a root change is a new snapshot.
-        if scopes is None:
+        if scopes is None and settled_folders is None:
             db.execute(
                 "UPDATE library_inventory SET present=0 WHERE source_kind='inbox' AND source_id=?",
                 (inbox["id"],),
             )
         else:
             scoped_ids = [(row["id"],) for relative, row in previous.items()
-                          if _scope_for_relative_path(relative) in wanted]
+                          if scopes is None or _scope_for_relative_path(relative) in wanted]
             if scoped_ids:
                 db.executemany("UPDATE library_inventory SET present=0 WHERE id=?", scoped_ids)
         report_progress("Saving inventory", 0, len(discovered))
