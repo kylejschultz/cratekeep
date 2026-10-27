@@ -40,6 +40,7 @@ from PIL import Image as PillowImage, UnidentifiedImageError
 
 from .musicbrainz import MusicBrainzClient, ProviderError, search_releases
 from .matching import score_release
+from .inbox_discovery import DISCOVERY_MODES, InboxDiscovery, scan_completed
 from . import match_diagnostics
 from .duplicates import duplicate_matches
 
@@ -145,6 +146,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.config["BEETS_CONFIG"] = str(state_path / "config.yaml")
     app.config["MANAGED_ARTWORK_PREVIEWS"] = {}
     app.config["MANAGED_ARTWORK_PREVIEW_LOCK"] = threading.RLock()
+    app.config["MUTATION_LOCK"] = threading.RLock()
+    app.config["INBOX_SCAN_LOCK"] = threading.RLock()
     app.config["INBOX_MATCH_LOCK"] = threading.Lock()
     app.config["INBOX_CANDIDATE_LOCK"] = threading.Lock()
     app.config["INBOX_MATCH_PENDING"] = set()
@@ -356,6 +359,19 @@ def create_app(test_config: dict | None = None) -> Flask:
         except (OSError, ValueError) as exc:
             return jsonify(error=str(exc), code="inventory_refresh_failed"), 409
 
+    @app.get("/api/inbox/<inbox_id>/discovery")
+    def inbox_discovery_status(inbox_id):
+        inbox = _configured_inbox(app, inbox_id)
+        if inbox is None:
+            return jsonify(error="unknown inbox_id", code="invalid_request"), 404
+        with _connect(app.config["APP_DB"]) as db:
+            scan = db.execute("""SELECT id, status, error, created_at, finished_at FROM adoption_jobs
+                                 WHERE kind='inbox_inventory' AND root_path=? ORDER BY id DESC LIMIT 1""",
+                              (inbox["path"],)).fetchone()
+        return jsonify(**app.extensions["inbox_discovery"].status(inbox),
+                       scanned_at=(scan["finished_at"] or scan["created_at"]) if scan else None,
+                       error=scan["error"] if scan and scan["status"] == "failed" else "")
+
     @app.get("/api/inbox/<inbox_id>/scopes")
     def inbox_scopes(inbox_id: str):
         inbox = _configured_inbox(app, inbox_id)
@@ -386,7 +402,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 return jsonify(error="Inbox matching or import is running; refresh after it finishes.", code="inbox_busy"), 409
             locks.append(lock)
         try:
-            inventory = _scan_inbox_inventory(app, inbox)
+            inventory = _scan_inbox_inventory(app, inbox, trigger="manual-refresh" if cleanup else "page-open")
             cleanup_result = _cleanup_inbox_directories(app, inbox) if cleanup else {"removed": [], "errors": []}
             with _connect(app.config["APP_DB"]) as db:
                 active = sorted({_scope_for_relative_path(row["relative_path"]) for row in db.execute(
@@ -1184,16 +1200,25 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     # The supported single-worker server serializes mutating HTTP requests so
     # removal cannot race imports, metadata/artwork edits or root changes.
-    mutation_lock = threading.RLock()
+    mutation_lock = app.config["MUTATION_LOCK"]
 
     @app.before_request
     def serialize_mutations():
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             mutation_lock.acquire()
             g.library_mutation_locked = True
+            if request.endpoint in {"settings", "setup"}:
+                # Automatic matching does network I/O outside the HTTP mutation
+                # lock. Root changes wait for that work before invalidating it.
+                g.inbox_settings_locks = []
+                for lock in (app.config["INBOX_CANDIDATE_LOCK"], app.config["INBOX_EXECUTION_LOCK"]):
+                    lock.acquire()
+                    g.inbox_settings_locks.append(lock)
 
     @app.teardown_request
     def release_mutation_lock(_error):
+        for lock in reversed(g.pop("inbox_settings_locks", [])):
+            lock.release()
         if g.pop("library_mutation_locked", False):
             mutation_lock.release()
 
@@ -1202,9 +1227,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     from .inbox_imports import register_routes as register_inbox_import_routes
     register_inbox_import_routes(app)
     from .analytics import Beacon
+    app.extensions["inbox_discovery"] = InboxDiscovery(app)
     app.extensions["beacon"] = Beacon(app)
     if not app.testing:
         app.extensions["beacon"].start()
+        app.extensions["inbox_discovery"].start()
     return app
 
 
@@ -1567,6 +1594,17 @@ def _load_settings(path: str) -> dict[str, str]:
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                 (settings["inboxes_json"],),
             )
+    with _connect(path) as db:
+        try:
+            raw_inboxes = json.loads(settings.get("inboxes_json", "[]"))
+        except (TypeError, json.JSONDecodeError):
+            raw_inboxes = []
+        if isinstance(raw_inboxes, list) and any(isinstance(row, dict) and "discovery" not in row for row in raw_inboxes):
+            for row in raw_inboxes:
+                if isinstance(row, dict):
+                    row.setdefault("discovery", "5")
+            settings["inboxes_json"] = json.dumps(raw_inboxes)
+            db.execute("UPDATE app_settings SET value=? WHERE key='inboxes_json'", (settings["inboxes_json"],))
     # Existing installations that opted into fetching retain beets' historical
     # cover.jpg behavior. Embedding and replacement always require a new opt-in.
     if settings.get("fetch_art") == "1" and "art_sidecar" not in settings:
@@ -1656,11 +1694,6 @@ def _apply_settings(app: Flask, settings: dict[str, str]) -> None:
         else ""
     )
     if app.config["SETUP_COMPLETE"]:
-        paths = [inbox["path"] for inbox in inboxes]
-        if not app.config["LIBRARY_ROOT_ERROR"]:
-            paths.append(app.config["LIBRARY_PATH"])
-        for path in paths:
-            Path(path).mkdir(parents=True, exist_ok=True)
         _write_beets_config(app)
         app.config["FTINTITLE"] = _ftintitle_settings(
             Path(app.config["BEETS_CONFIG"]).read_text(encoding="utf-8")
@@ -1744,6 +1777,8 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
         paths = set()
         roots = _browse_roots(app)
         for index, inbox in enumerate(inboxes, 1):
+            if inbox.get("discovery", "5") not in DISCOVERY_MODES:
+                errors.append(f"Inbox {index} discovery must be Manual only, Instant, or a preset interval.")
             if not inbox["name"]:
                 errors.append(f"Inbox {index} name is required.")
             elif inbox["name"].casefold() in names:
@@ -1850,8 +1885,10 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
             values["inboxes_json"] = json.dumps(inboxes)
             values["inbox_path"] = inboxes[0]["path"]
             try:
+                previous_roots = {row["id"]: row["path"] for row in _settings_inboxes(current)}
                 for inbox in inboxes:
-                    Path(inbox["path"]).mkdir(parents=True, exist_ok=True)
+                    if previous_roots.get(inbox["id"]) != inbox["path"]:
+                        Path(inbox["path"]).mkdir(parents=True, exist_ok=True)
                 Path(library_path).expanduser().mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 errors.append(f"Could not create a configured directory: {exc}")
@@ -1874,6 +1911,7 @@ def _settings_response(app: Flask, first_run: bool, *, active_tab: str = "genera
                 _apply_settings(app, current)
                 raise
             app.extensions["beacon"].wake.set()
+            app.extensions["inbox_discovery"].wake.set()
             flash("Settings saved.")
             if not first_run and request.form.get("settings_tab") == "about":
                 return redirect(url_for("settings") + "#about")
@@ -1927,6 +1965,7 @@ def _settings_inboxes(settings: dict[str, str]) -> list[dict[str, str]]:
                     and isinstance(row.get("name"), str) and isinstance(row.get("path"), str)):
                 inboxes.append({
                     **{key: row[key] for key in ("id", "name", "path")},
+                    "discovery": row.get("discovery") if row.get("discovery") in DISCOVERY_MODES else "5",
                     **({"auto_match": row["auto_match"]} if isinstance(row.get("auto_match"), bool) else {}),
                 })
     return inboxes
@@ -1949,18 +1988,22 @@ def _submitted_inboxes(form, current: dict[str, str]) -> list[dict[str, str]]:
     names = form.getlist("inbox_name")
     paths = form.getlist("inbox_path")
     ids = form.getlist("inbox_id")
+    modes = form.getlist("inbox_discovery")
+    previous = {row["id"]: row.get("discovery", "5") for row in _settings_inboxes(current)}
     if not names and len(paths) == 1:  # Compatibility for existing clients and tests.
         existing = _settings_inboxes(current)
         return [{
             "id": existing[0]["id"] if len(existing) == 1 else "",
             "name": existing[0]["name"] if len(existing) == 1 else "Inbox",
             "path": paths[0].strip(), "auto_match": bool(existing and existing[0].get("auto_match")),
+            "discovery": modes[0] if len(modes) == 1 else (existing[0].get("discovery", "5") if len(existing) == 1 else "5"),
         }]
-    if not (len(names) == len(paths) == len(ids)):
+    if not (len(names) == len(paths) == len(ids)) or (modes and len(modes) != len(ids)):
         return []
     return [
-        {"id": submitted_id.strip(), "name": name.strip(), "path": path.strip(), "auto_match": False}
-        for submitted_id, name, path in zip(ids, names, paths)
+        {"id": submitted_id.strip(), "name": name.strip(), "path": path.strip(), "auto_match": False,
+         "discovery": modes[index] if modes else previous.get(submitted_id.strip(), "5")}
+        for index, (submitted_id, name, path) in enumerate(zip(ids, names, paths))
     ]
 
 
@@ -6887,7 +6930,25 @@ def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, 
     return sorted(dict(discovered).items(), key=lambda item: str(item[0]).casefold())
 
 
-def _scan_inbox_inventory(
+def _scan_inbox_inventory(app, inbox, *, scopes=None, trigger="request"):
+    with app.config["MUTATION_LOCK"], app.config["INBOX_SCAN_LOCK"]:
+        current = _configured_inbox(app, inbox["id"])
+        if current is None or current["path"] != inbox["path"]:
+            raise ValueError("Inbox configuration changed; reload before scanning.")
+        result = _scan_inbox_inventory_locked(app, current, scopes=scopes)
+        service = app.extensions.get("inbox_discovery")
+        if service:
+            service.changed(inbox["id"])
+        # Inventory and review synchronization have committed before subscribers
+        # run. Counts/IDs are bounded; no raw watcher event or media path escapes.
+        try:
+            scan_completed.send(app, inbox_id=inbox["id"], trigger=trigger, **result)
+        except Exception:
+            app.logger.exception("Inbox scan completion subscriber failed")
+        return result
+
+
+def _scan_inbox_inventory_locked(
     app: Flask, inbox: dict[str, str], *, scopes: list[str] | None = None,
 ) -> dict:
     configured = Path(inbox["path"])
@@ -6930,6 +6991,7 @@ def _scan_inbox_inventory(
         and (scopes is None or _scope_for_relative_path(relative) in wanted)
     ]
     total_bytes = 0
+    added_ids = []
     with _connect(app.config["APP_DB"]) as db:
         # A stable source ID may be renamed, but a root change is a new snapshot.
         if scopes is None:
@@ -6966,6 +7028,8 @@ def _scan_inbox_inventory(
                 "SELECT id FROM library_inventory WHERE root_path=? AND relative_path=?",
                 (str(root), relative),
             ).fetchone()["id"]
+            if old is None or not old["present"]:
+                added_ids.append(inventory_id)
             db.execute(
                 "INSERT OR IGNORE INTO adoption_reviews(inventory_id, updated_at) VALUES (?, ?)",
                 (inventory_id, created_at),
@@ -6988,14 +7052,16 @@ def _scan_inbox_inventory(
                         AND execution_status NOT IN ('complete', 'artwork-pending', 'cleanup-pending', 'duplicate-executing')""",
                 (_now(), *changed_ids),
             )
+        summary = {"scan_id": job_id, "files": len(discovered), "bytes": total_bytes,
+                   "changed": len(changed_ids), "added": len(added_ids),
+                   "added_inventory_ids": added_ids[:100], "added_ids_truncated": len(added_ids) > 100,
+                   "scopes": scopes}
         db.execute(
             "UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
-            (json.dumps({"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids),
-                         "scopes": scopes}), _now(), job_id),
+            (json.dumps(summary), _now(), job_id),
         )
     _sync_inbox_album_reviews(app, inbox, root)
-    return {"files": len(discovered), "bytes": total_bytes, "changed": len(changed_ids),
-            "scopes": scopes}
+    return summary
 
 
 def _inbox_album_folder(relative: str) -> str | None:
@@ -7187,6 +7253,10 @@ def _inbox_review_groups(
 ) -> list[dict]:
     result = []
     new_album_ids = []
+    # Legacy discovery endpoints can be read while matching is in progress.
+    # Serve their last inventory instead of racing a candidate/import snapshot.
+    if app.config["INBOX_CANDIDATE_LOCK"].locked() or app.config["INBOX_EXECUTION_LOCK"].locked():
+        scan = False
     for inbox in app.config["INBOXES"]:
         if inbox_ids is not None and inbox["id"] not in inbox_ids:
             continue
@@ -7297,20 +7367,23 @@ def _start_inbox_auto_match(app: Flask, album_ids: list[int]) -> None:
                             return
                         album_id = min(pending)
                         pending.remove(album_id)
-                    with app.config["INBOX_CANDIDATE_LOCK"]:
+                    with app.config["INBOX_CANDIDATE_LOCK"], app.config["INBOX_SCAN_LOCK"]:
                         with _connect(app.config["APP_DB"]) as db:
                             album = db.execute(
                                 """SELECT id, root_path, source_id, state, candidate_status
                                      FROM album_reviews WHERE id=? AND source_kind='inbox'""",
                                 (album_id,),
                             ).fetchone()
-                        if (album is None or album["state"] != "pending"
+                        current = _configured_inbox(app, album["source_id"]) if album else None
+                        if (not current or current["path"] != album["root_path"]
+                                or album["state"] != "pending"
                                 or album["candidate_status"] not in {"not-run", "stale"}):
                             continue
                         _generate_musicbrainz_candidates(
                             app, 1, album_ids=[album["id"]], root=album["root_path"],
                             source_kind="inbox", source_id=album["source_id"],
                         )
+                        app.extensions["inbox_discovery"].changed(album["source_id"])
         except Exception:
             with lock:
                 app.config["INBOX_MATCH_RUNNING"] = False

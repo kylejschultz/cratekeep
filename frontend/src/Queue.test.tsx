@@ -233,3 +233,26 @@ it("shows scan errors instead of claiming the Inbox is empty", async () => {
   expect(screen.queryByText("Nothing waiting here")).not.toBeInTheDocument();
   expect(screen.queryByText("Scanning Inbox…")).not.toBeInTheDocument();
 });
+
+it("defers live arrivals during selection then updates without a disk rescan", async () => {
+  vi.useFakeTimers();
+  try {
+    let changed = false;
+    const fetch = vi.fn(async (url: string) => response(url.endsWith("/discovery")
+      ? { mode: "instant", revision: changed ? "two" : "one", scanned_at: null, error: "", watcher_error: "" }
+      : page(changed ? [album(1, "One"), album(2, "New arrival")] : [album(1, "One")])));
+    vi.stubGlobal("fetch", fetch);
+    render(<Queue source="inbox" inboxId="one" threshold={90}/>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select album One" }));
+    changed = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.getByRole("checkbox", { name: "Select album One" })).toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: "Select album New arrival" })).not.toBeInTheDocument();
+    expect(screen.getByText(/Inbox updates waiting/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(screen.getByRole("checkbox", { name: "Select album New arrival" })).toBeInTheDocument();
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith("/refresh"))).toHaveLength(1);
+  } finally { vi.useRealTimers(); }
+});

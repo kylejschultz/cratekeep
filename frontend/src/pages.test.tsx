@@ -336,3 +336,17 @@ describe("About settings", () => {
     location.hash = "";
   });
 });
+
+it("saves discovery independently for each Inbox, with a five-minute default and no custom interval", () => {
+  location.hash = "";
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Instant source", path: "/one", discovery: "instant" }, { id: "two", name: "Slow downloads", path: "/two" }] } }}/>);
+  const instant = screen.getByRole("combobox", { name: "Discovery for Instant source" });
+  const slow = screen.getByRole("combobox", { name: "Discovery for Slow downloads" });
+  expect(instant).toHaveValue("instant");
+  expect(slow).toHaveValue("5");
+  fireEvent.change(slow, { target: { value: "manual" } });
+  expect(instant).toHaveValue("instant");
+  const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
+  expect(new FormData(form).getAll("inbox_discovery")).toEqual(["instant", "manual"]);
+  expect(screen.queryByRole("option", { name: /Custom/ })).not.toBeInTheDocument();
+});

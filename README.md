@@ -84,6 +84,8 @@ Open **http://localhost:8788**, or use your server's address. During setup, choo
 
 Use **Inbox** for downloads and **Library → Import existing files** for music already in your Library folder. Inbox imports copy files and tag the copies; Library Import leaves files in place. Choose a match, review the changes and import individually or in batches.
 
+Each Inbox has its own discovery mode in Settings: Manual only, Instant, or a timed interval (five minutes by default). Choose an interval or Manual only for clients that download an album one file at a time. Instant briefly lets files settle and keeps a five-minute safety scan for missed events. It cannot tell whether a downloader has finished an album. Enabled Inboxes scan once at startup, and arrivals update the open Inbox after discovery. Background scans honor each Inbox's automatic matching setting without importing or tagging files. Manual Refresh remains available in every mode.
+
 Eligible copy imports can be undone; replacements cannot. **Remove imported** deletes the Inbox originals and keeps the Library copies.
 
 ## Analytics

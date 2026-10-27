@@ -1,3 +1,4 @@
+import { useInboxDiscovery } from "./useInboxDiscovery";
 import { useInspectorResize } from "./useInspectorResize";
 import { ArtworkPlaceholder } from "./ArtworkPlaceholder";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -48,13 +49,15 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
   const locked = busy || scanning || reviewBusy || bulk !== null || matching !== null || inboxAction !== null;
   useEffect(() => { onBusyChange?.(locked); }, [locked, onBusyChange]);
   useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
-  const load = useCallback(async () => {
+  const backgroundBlocked = useRef(true);
+  useEffect(() => { backgroundBlocked.current = locked || detailOpen || selected.size > 0 || loading; }, [locked, detailOpen, selected.size, loading]);
+  const load = useCallback(async (quiet = false) => {
     const version = ++requestCounter.value;
-    setLoading(true); setError("");
+    if (!quiet) { setLoading(true); setError(""); }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
-      if (source === "inbox") {
+      if (source === "inbox" && !quiet) {
         if (!inventoryScan.current) {
           setScanning(true);
           inventoryScan.current = api(`${queueBase}/refresh`, { method: "POST", body: "{}", signal: controller.signal })
@@ -68,11 +71,17 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
       if (version !== requestCounter.value) return;
       if (controller.signal.aborted) throw new Error("Album loading timed out.");
       if (!Array.isArray(next.albums)) throw new Error("The album response was invalid. Reload the page or try Refresh.");
+      if (quiet && backgroundBlocked.current) throw new Error("Inbox update deferred during review");
       setResult(next);
       setActive(current => current ? next.albums.find(album => album.id === current.id) || next.albums[0] || null : next.albums[0] || null);
-    } catch (reason) { if (version === requestCounter.value) setError(controller.signal.aborted ? "Album loading timed out. Reload the page or try Refresh." : (reason as Error).message); }
-    finally { clearTimeout(timeout); if (version === requestCounter.value) { setLoading(false); setScanning(false); } }
+    } catch (reason) {
+      if (quiet) throw reason; // Keep the revision pending so polling can retry.
+      if (version === requestCounter.value) setError(controller.signal.aborted ? "Album loading timed out. Reload the page or try Refresh." : (reason as Error).message);
+    } finally { clearTimeout(timeout); if (!quiet && version === requestCounter.value) { setLoading(false); setScanning(false); } }
   }, [queueBase, page, query, status, requestCounter, source]);
+  const loadBackground = useCallback(() => load(true), [load]);
+  const discovery = useInboxDiscovery(source === "inbox" ? inboxId : undefined,
+    locked || detailOpen || selected.size > 0 || loading, loadBackground);
   useEffect(() => { const timer = setTimeout(() => void load(), query ? 200 : 0); return () => { clearTimeout(timer); ++requestCounter.value; }; }, [load, query, requestCounter]);
   const visibleSelected = result.albums.filter(album => selected.has(album.id)).length;
   useEffect(() => { if (selectPage.current) selectPage.current.indeterminate = visibleSelected > 0 && visibleSelected < result.albums.length; }, [visibleSelected, result.albums.length]);
@@ -120,6 +129,13 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
       <div className="desk-filters"><div className="desk-tabs" aria-label="Album filter">{[["all", "All albums"], ["pending", "Pending"], ["matched", "Matched"], ...(source === "library-import" ? [["perfect", "Perfect match"], ["duplicates", "Duplicates"]] : [["imported", "Imported"]])].map(([key, label]) => <button key={key} className="text-button" aria-pressed={status === key} disabled={locked} onClick={() => { setStatus(key); setPage(1); }}>{label}</button>)}</div><label className="desk-search"><span className="sr-only">Find an album</span><input type="search" placeholder="Find an album" value={query} disabled={locked} onChange={event => { setQuery(event.target.value); setPage(1); }}/></label></div>
       <div className="desk-selection"><label><input ref={selectPage} type="checkbox" disabled={locked || loading} checked={result.albums.length > 0 && visibleSelected === result.albums.length} onChange={event => selectVisible(event.target.checked)}/> Select this page</label><span>{selected.size ? `${selected.size} selected` : `${result.total} albums`}</span><button className="text-button" disabled={locked || loading} onClick={refresh}>Refresh</button></div>
       {selected.size > 0 && <div className="desk-batch toolbar-actions" aria-label="Selected album actions"><button disabled={locked || !importableSelected.length} onClick={match} aria-busy={operation === "match"}>{operation === "match" && <span className="spinner"/>}{operation === "match" ? "Matching…" : "Match Selected"}</button><button disabled={locked || !importableSelected.length} onClick={importReady} aria-busy={operation === "import"}>{operation === "import" && <span className="spinner"/>}{operation === "import" ? "Importing…" : "Import selected"}</button>{source === "inbox" && importedSelected.length > 0 && <button className="danger-action" disabled={locked} onClick={() => setInboxAction({ kind: "delete-imported", jobs: importedSelected.map(album => album.imported.job_id) })}>Remove imported</button>}<button className="text-button" disabled={locked} onClick={() => setSelected(new Map())}>Clear selection</button></div>}
+      {discovery.status && <div className="inbox-discovery-status" role="status">
+        <span>{discovery.status.mode === "manual" ? "Manual discovery" : discovery.status.mode === "instant" ? "Instant discovery" : `Scan every ${discovery.status.mode} minutes`}</span>
+        <span>{discovery.status.scanned_at ? `Last scan: ${new Date(discovery.status.scanned_at).toLocaleString()}` : "Waiting for first scan"}</span>
+        {discovery.pending && <span>Inbox updates waiting. Finish your review or clear selection to show them.</span>}
+      </div>}
+      {discovery.status?.watcher_error && <Notice kind="error">{discovery.status.watcher_error}</Notice>}
+      {discovery.status?.error && <Notice kind="error">{discovery.status.error}</Notice>}
       {error && <Notice kind="error">{error}</Notice>}
       <div className="desk-column-head" aria-hidden="true"><span>Album / Artist</span><span>Tracks</span><span>Match</span><span>Status</span></div>
       <ul className="desk-albums" aria-busy={loading || busy}>{result.albums.map(album => { const state = albumStatus(album, threshold); const count = album.track_count ?? album.tracks?.length ?? album.files?.length ?? 0; return <li className={`desk-album${active?.id === album.id ? " is-active" : ""}`} data-album-id={album.id} key={album.id}>

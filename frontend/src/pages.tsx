@@ -138,7 +138,7 @@ export function Library({ data }: { data: Record<string, any> }) {
   </div>;
 }
 
-type InboxSetting = { key: string; id: string; name: string; path: string; auto_match: boolean };
+type InboxSetting = { key: string; id: string; name: string; path: string; auto_match: boolean; discovery?: string };
 type InboxDraft = Pick<InboxSetting, "key" | "name" | "path"> & { isNew?: boolean };
 
 export function Settings({ data, threshold }: { data: Record<string, any>; threshold: number }) {
@@ -167,7 +167,7 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
     setDraft(null);
   }
   function addInbox() {
-    const inbox = { key: `new-${nextInbox.current++}`, id: "", name: `Inbox ${inboxes.length + 1}`, path: data.default_inbox || "", auto_match: false };
+    const inbox = { key: `new-${nextInbox.current++}`, id: "", name: `Inbox ${inboxes.length + 1}`, path: data.default_inbox || "", auto_match: false, discovery: "5" };
     setInboxes(rows => [...rows, inbox]);
     setDraft({ ...inbox, isNew: true });
   }
@@ -181,7 +181,7 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
       <input type="hidden" name="settings_tab" value={tab}/>
       <section hidden={tab !== "general"} className="settings-section">
         <div className="settings-card inbox-settings-card">
-          <h2>Inboxes <Help label="Inboxes">Named source folders where new music waits before review and import. Each Inbox must be a separate container-visible path outside the managed Library. Edit or delete configuration rows, then Save settings. Deleting a row does not delete files.</Help></h2>
+          <h2>Inboxes <Help label="Inboxes">Named source folders where new music waits before review and import. Each Inbox must be a separate container-visible path outside the managed Library. Edit or delete configuration rows, then Save settings. Deleting a row does not delete files. Discovery is independent per Inbox. Choose a timed interval or Manual only for downloads that arrive one file at a time. Instant waits briefly for files to settle and keeps a five-minute safety scan; it cannot know whether a download is complete.</Help></h2>
           <table className="inbox-settings-table"><caption className="sr-only">Configured Inboxes</caption>
             <thead><tr><th scope="col">Name</th><th scope="col">Inbox path</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
             <tbody>{inboxes.map(inbox => <tr data-inbox-row key={inbox.key} ref={draft?.key === inbox.key ? editor : undefined}>
@@ -190,6 +190,9 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
               </td>
               <td><input type="hidden" name="inbox_path" value={inbox.path}/>
                 {draft?.key === inbox.key ? <label><span className="sr-only">Inbox path for {inbox.name}</span><input value={draft.path} pattern=".*\S.*" onChange={event => setDraft({ ...draft, path: event.target.value })} required/></label> : <code className="inbox-printed-path">{inbox.path}</code>}
+                <label className="inbox-discovery-setting">Discovery for {inbox.name}<select name="inbox_discovery" value={inbox.discovery || "5"} onChange={event => setInboxes(rows => rows.map(row => row.key === inbox.key ? { ...row, discovery: event.target.value } : row))}>
+                  {[["manual", "Manual only"], ["instant", "Instant"], ["5", "Every 5 minutes"], ["15", "Every 15 minutes"], ["30", "Every 30 minutes"], ["60", "Every hour"], ["360", "Every 6 hours"], ["1440", "Every 24 hours"]].map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select></label>
               </td>
               <td><div className="inbox-row-actions">{draft?.key === inbox.key ? <><button className="text-button" type="button" onClick={finishInbox}>Done</button><button className="text-button" type="button" onClick={cancelInbox}>Cancel</button></> : <><button className="text-button" type="button" aria-label={`Edit ${inbox.name}`} disabled={draft !== null} onClick={() => setDraft({ key: inbox.key, name: inbox.name, path: inbox.path })}>Edit</button><button className="text-button" type="button" aria-label={`Delete ${inbox.name}`} disabled={draft !== null} onClick={() => setInboxes(rows => rows.filter(row => row.key !== inbox.key))}>Delete</button></>}</div></td>
             </tr>)}</tbody>
