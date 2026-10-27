@@ -730,8 +730,9 @@ def main() -> None:
         confirmation.get_by_role("button",name="Start import",exact=True).click()
         page.get_by_text("1 of 1 albums imported.",exact=True).wait_for()
         assert all(sha256(path)==warning_before[path] for path in warning_sources)
-        receipt=next(row for row in page.request.get(inbox_base+"/imports").json()["imports"] if row['album']=="Warning Import Chosen")
+        receipt=next(row for row in page.request.get(inbox_base+"/imports").json()["imports"] if row['album']=="Warning Import")
         assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"First","Second","Third"}
+        assert {MediaFile(args.fixture_root/"library"/relative).album for relative in receipt['destinations']}=={"Warning Import Chosen"}
         browser_version = browser.version
         browser.close()
 
