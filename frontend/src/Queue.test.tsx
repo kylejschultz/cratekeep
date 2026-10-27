@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Queue } from "./Queue";
 import { albumStatus, formatMatchPercent } from "./status";
 const render = (ui: ReactElement) => renderComponent(ui, { wrapper: ToastProvider });
-const response = (body: unknown) => ({ ok: true, json: async () => body });
+const response = (body: unknown, status = 200) => ({ ok: status < 400, status, json: async () => body });
 const album = (id: number, title: string) => ({ id, album: title, artist: "Artist", tracks: [{ path: `Artist/${title}/Song.wav` }], source_paths: [`Artist/${title}`] });
 const page = (albums: unknown[], number = 1) => ({ albums, page: number, page_count: 2, total: 26 });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
@@ -47,14 +47,14 @@ it("lists albums flat and opens an inspector without approving or matching", asy
   expect(screen.getByRole("heading", { name: "Two" })).toBeInTheDocument();
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /Expand folder/ })).not.toBeInTheDocument();
-  expect(fetch.mock.calls).toHaveLength(1);
+  expect(fetch.mock.calls).toHaveLength(2);
   expect(screen.getByRole("region", { name: "Two" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Search MBID" })).toBeInTheDocument();
-  expect(fetch.mock.calls).toHaveLength(1);
+  expect(fetch.mock.calls).toHaveLength(2);
   expect(screen.getByRole("region", { name: "Two" }).closest(".desk-workspace")).toHaveClass("is-detail-open");
   fireEvent.click(screen.getByRole("button", { name: "Back to albums" }));
   expect(screen.getByRole("button", { name: "Review Two" }).closest(".desk-workspace")).not.toHaveClass("is-detail-open");
-  expect(fetch.mock.calls).toHaveLength(1);
+  expect(fetch.mock.calls).toHaveLength(2);
 });
 it("bulk import submits explicit album IDs, excluding unchecked siblings", async () => {
   const fetch = vi.fn(async (url: string) => response(url.endsWith("/preview") ? { importable_albums: [{ id:1, album:"One" }] } : url.endsWith("/execute") ? { imported: [{ album_review_id:1 }] } : page([album(1, "One"), album(2, "Two")])));
@@ -201,10 +201,35 @@ it("ends a stalled queue request with a retryable error instead of an endless lo
     })));
     render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
     await act(async()=>{ await vi.advanceTimersByTimeAsync(1); });
-    expect(screen.getByText("Loading albums…")).toBeInTheDocument();
+    expect(screen.getByText("Scanning Inbox…")).toBeInTheDocument();
     await act(async()=>{ await vi.advanceTimersByTimeAsync(30000); });
     expect(screen.getByRole("alert")).toHaveTextContent("Album loading timed out");
-    expect(screen.queryByText("Loading albums…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Scanning Inbox…")).not.toBeInTheDocument();
     expect(screen.getByRole("button",{name:"Refresh"})).toBeEnabled();
   } finally { vi.useRealTimers(); }
+});
+
+it("scans an Inbox on open before reading its saved album queue", async () => {
+  let finishScan!: (value: ReturnType<typeof response>) => void;
+  const fetch = vi.fn((url: string) => url.endsWith("/queue/refresh")
+    ? new Promise<ReturnType<typeof response>>(resolve => { finishScan = resolve; })
+    : Promise.resolve(response(page([album(1, "New download")]))));
+  vi.stubGlobal("fetch", fetch);
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  expect(await screen.findByText("Scanning Inbox…")).toBeInTheDocument();
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  expect(fetch.mock.calls[0][0]).toBe("/api/inbox/manual/queue/refresh");
+  await act(async () => finishScan(response({ inventory: { files: 1 } })));
+  expect(await screen.findByRole("button", { name: "Review New download" })).toBeInTheDocument();
+  expect(fetch.mock.calls[1][0]).toContain("/api/inbox/manual/queue?");
+  fireEvent.click(screen.getByRole("button", { name: "Matched" }));
+  await waitFor(() => expect(fetch.mock.calls.filter(([url]) => url.endsWith("/queue/refresh"))).toHaveLength(1));
+});
+
+it("shows scan errors instead of claiming the Inbox is empty", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => response({ error: "Unable to inventory inbox: permission denied" }, 409)));
+  render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
+  expect(await screen.findByText(/Unable to inventory inbox: permission denied/)).toBeInTheDocument();
+  expect(screen.queryByText("Nothing waiting here")).not.toBeInTheDocument();
+  expect(screen.queryByText("Scanning Inbox…")).not.toBeInTheDocument();
 });
