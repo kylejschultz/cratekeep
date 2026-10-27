@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/kylejschultz/cratekeep/compare/v1.0.0...v1.0.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* promote Inbox discovery and setup fixes for v1.0.1 ([#19](https://github.com/kylejschultz/cratekeep/issues/19)) ([94f796d](https://github.com/kylejschultz/cratekeep/commit/94f796d7bc9b6bbbe3138f228854dddd8ce8cf8e))
+
 ## 1.0.0 (2026-10-26)
 
 
