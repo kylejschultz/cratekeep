@@ -75,6 +75,9 @@ class InboxDiscovery:
         if observer:
             self._stop_observer(state)
             state["watcher_error"] = "Instant watcher stopped; using five-minute scans."
+            # Report a lost/replaced root promptly rather than leaving its last
+            # successful scan visible until the safety interval expires.
+            state["due"] = min(state["due"], now)
         if now < state.get("watch_retry", 0):
             return
         state["watch_retry"] = now + 30

@@ -304,3 +304,17 @@ def test_start_is_idempotent_and_reloader_parent_does_not_own_a_loop(tmp_path, m
     assert service.thread is thread
     service.stop()
     assert not thread.is_alive()
+
+
+def test_instant_root_loss_records_scoped_error_before_safety_interval(tmp_path):
+    app, service, clock, roots = setup(tmp_path, ('instant',))
+    tagged_inbox_wav(roots[0] / 'Album/Song.wav')
+    settle(service, clock)
+    inbox = app.config['INBOXES'][0]
+    roots[0].rename(tmp_path / 'lost-root')
+    service.step()
+    response = app.test_client().get(f"/api/inbox/{inbox['id']}/discovery")
+    assert response.json['error']
+    assert count(app, inbox) == 1
+    assert clock.value < 300
+    service.stop()
