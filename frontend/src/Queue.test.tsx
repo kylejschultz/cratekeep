@@ -285,7 +285,7 @@ it("opens scoped removal confirmation directly from successful Inbox results", a
   fireEvent.click(await screen.findByRole("button",{name:"Clear imported from Inbox"}));
   await screen.findByRole("heading",{name:"Remove imported originals"});
   expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-imported",job_ids:[77]})}));
-  expect(screen.getByText(/Library files stay unchanged/)).toBeInTheDocument();
+  expect(screen.getByText(/Library copies stay unchanged/)).toBeInTheDocument();
   fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
   expect(fetch.mock.calls.some(([url]) => url.endsWith("/apply"))).toBe(false);
 });
@@ -297,10 +297,13 @@ it("deletes only selected visible unimported albums after explicit confirmation"
   render(<Queue source="inbox" inboxId="manual" threshold={90}/>);
   await selectAlbum("Select album One");
   fireEvent.click(within(screen.getByLabelText("Selected album actions")).getByRole("button",{name:"Delete from Inbox"}));
-  const confirm=await screen.findByRole("button",{name:"Permanently delete from Inbox"});
+  const confirm=await screen.findByRole("button",{name:"Delete permanently"});
   await waitFor(()=>expect(confirm).toBeEnabled());
   expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-albums",album_ids:[1]})}));
-  expect(screen.getByRole("dialog")).toHaveTextContent("Artist/One/Song.wav");
+  expect(screen.getByRole("dialog")).toHaveTextContent("Artist/One");
+  expect(within(screen.getByRole("dialog")).getByText("Artist/One/Song.wav")).not.toBeVisible();
+  fireEvent.click(screen.getByText("Show files"));
+  expect(within(screen.getByRole("dialog")).getByText("Artist/One/Song.wav")).toBeVisible();
   expect(screen.getByRole("dialog")).toHaveTextContent("without importing");
   fireEvent.click(confirm);
   await waitFor(()=>expect(screen.queryByRole("checkbox",{name:"Select album One"})).not.toBeInTheDocument());
@@ -316,9 +319,9 @@ it("opens exact single-track deletion from the independent Inbox files list and 
   fireEvent.click(screen.getByRole("button",{name:"Delete track Bad song"}));
   await screen.findByRole("heading",{name:"Delete track from Inbox"});
   expect(fetch).toHaveBeenCalledWith("/api/inbox/manual/actions/preview",expect.objectContaining({body:JSON.stringify({kind:"delete-track",album_id:1,track_id:42})}));
-  await waitFor(()=>expect(screen.getByRole("button",{name:"Permanently delete from Inbox"})).toBeEnabled());
+  await waitFor(()=>expect(screen.getByRole("button",{name:"Delete permanently"})).toBeEnabled());
   expect(screen.getByRole("dialog")).toHaveTextContent("Bad song");
-  expect(screen.getByRole("dialog")).toHaveTextContent("Other tracks and accompanying files stay");
+  expect(screen.getByRole("dialog")).toHaveTextContent("Other files and your Library stay unchanged");
   fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
   expect(fetch.mock.calls.some(([url])=>url.endsWith("/apply"))).toBe(false);
 });

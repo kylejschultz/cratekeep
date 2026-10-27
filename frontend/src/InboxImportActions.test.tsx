@@ -35,8 +35,24 @@ it.each(["delete-albums","delete-track"] as const)("recovers a lost %s response 
   });
   vi.stubGlobal("fetch",fetch);const onDone=vi.fn(),onClose=vi.fn();
   render(<ToastProvider><InboxActionDialog inboxId="manual" kind={kind} albumIds={[3]} albumId={3} trackId={4} onDone={onDone} onClose={onClose}/></ToastProvider>);
-  const confirm=await screen.findByRole("button",{name:"Permanently delete from Inbox"});
+  const confirm=await screen.findByRole("button",{name:"Delete permanently"});
   await waitFor(()=>expect(confirm).toBeEnabled());fireEvent.click(confirm);
   await waitFor(()=>expect(onClose).toHaveBeenCalledOnce());
   expect(onDone).toHaveBeenCalledOnce();expect(fetch.mock.calls.filter(([url])=>url.endsWith("/apply"))).toHaveLength(1);
+});
+
+it.each(["delete-albums", "delete-imported"] as const)("summarizes %s by album folder while retaining collapsed exact paths", async kind => {
+  const paths=["Artist/Album/CD1/1.wav","Artist/Album/CD2/2.wav","Artist/Album/artwork/front.jpg","Artist/Album/album.nfo","Other/1.wav","Other/folder.jpg","root.wav","root.nfo"];
+  const files=paths.map(path=>({path,location:path.endsWith(".wav")?"Inbox":"Inbox accompanying file"}));
+  vi.stubGlobal("fetch",vi.fn(async()=>({ok:true,json:async()=>({preview_id:"delete",fingerprint:"hash",count:8,files,albums:["Long redundant album name"]})})));
+  render(<ToastProvider><InboxActionDialog inboxId="manual" kind={kind} albumIds={[1,2]} jobs={[7]} names={["Long redundant album name"]} onDone={()=>{}} onClose={()=>{}}/></ToastProvider>);
+  await screen.findByText("3 folders · 8 files");
+  expect(screen.getByText("Artist/Album").closest("li")).toHaveTextContent("4 files");
+  expect(screen.getByText("Other").closest("li")).toHaveTextContent("2 files");
+  expect(screen.getByText("Inbox root").closest("li")).toHaveTextContent("2 files");
+  expect(screen.queryByText("Long redundant album name")).not.toBeInTheDocument();
+  expect(screen.getByText(paths[0])).not.toBeVisible();
+  fireEvent.click(screen.getByText("Show files"));
+  expect(screen.getByText(paths[0])).toBeVisible();
+  expect(screen.getByText(paths[7])).toBeVisible();
 });

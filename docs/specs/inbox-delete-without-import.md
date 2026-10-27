@@ -93,3 +93,13 @@ folder cleanup and individual-file deletion as described above. Kyle approved th
 
 Remove the transient Inbox updates waiting message. Retain the background
 revision polling and review/selection deferral, along with actionable scan errors.
+
+## Candidate feedback — compact confirmation
+
+Shorten deletion copy and the confirm button. Album confirmations show folder
+paths and counts of the exact previewed files (including nested companions)
+instead of repeated album names and an expanded file list. Keep exact paths
+inside a collapsed Show files disclosure; single-track confirmation retains its
+name/path. Preserve the server preview, confirmation, selection, fingerprint and
+delete behavior. Verify nested artist/album paths, disc folders, root files,
+folder counts and disclosure on desktop/phone.

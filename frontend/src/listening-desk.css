@@ -616,3 +616,9 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .inbox-local-tracks strong{color:var(--text)}
 .inbox-local-tracks button{flex-shrink:0}
 .inbox-action-dialog li{overflow-wrap:anywhere}
+
+.inbox-delete-folders{list-style:none;padding:0;margin:12px 0}
+.inbox-delete-folders li{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid var(--border)}
+.inbox-delete-folders strong{min-width:0;font-weight:500;overflow-wrap:anywhere}
+.inbox-delete-folders small{flex-shrink:0;color:var(--muted);white-space:nowrap}
+.inbox-delete-files{margin-top:14px;color:var(--muted);font-size:13px}
