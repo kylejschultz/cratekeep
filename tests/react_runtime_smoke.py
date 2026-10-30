@@ -558,7 +558,7 @@ def main() -> None:
         assert applied.value.json()["sha256"] == artwork_preview["sha256"]
         assert applied.value.json()["sidecars_written"] == 1
         assert page.get_by_role("alert").count() == 0
-        page.get_by_role("button", name="Cancel changes").click()
+        assert page.get_by_role("dialog", name="Edit metadata", exact=True).count() == 0
         assert page.get_by_label("Upload replacement").is_visible()
         assert page.get_by_role("heading", name="MusicBrainz rematch").is_visible()
         page.screenshot(path=args.evidence_dir / "08-managed-album-read-only.png", full_page=True)
