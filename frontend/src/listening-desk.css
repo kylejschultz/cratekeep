@@ -622,3 +622,13 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .inbox-delete-folders strong{min-width:0;font-weight:500;overflow-wrap:anywhere}
 .inbox-delete-folders small{flex-shrink:0;color:var(--muted);white-space:nowrap}
 .inbox-delete-files{margin-top:14px;color:var(--muted);font-size:13px}
+
+.artist-credits{grid-column:1/-1;border:0;padding:0;margin:8px 0;min-width:0}
+.artist-credits legend{font-size:13px;font-weight:600;padding:0;margin-bottom:6px}
+.artist-credits small{display:block;color:var(--muted);font-size:12px;line-height:1.4;margin-bottom:8px}
+.artist-credit-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.artist-credit-row input{flex:1;min-width:0}
+.artist-credit-row button{flex:none}
+.track-artist-credits{margin-top:8px;text-align:left}
+.track-artist-credits summary{font-size:12px;cursor:pointer}
+.track-artist-credits .artist-credit-row{flex-wrap:wrap}

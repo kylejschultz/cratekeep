@@ -408,3 +408,17 @@ it("applies the full Inbox editor draft on Done before the settings form saves",
   expect(payload.getAll("inbox_discovery")).toEqual(["instant"]);
   expect(payload.getAll("inbox_auto_match_id")).toEqual(["one"]);
 });
+
+it("submits explicit album-credit removal without splitting artist names", async () => {
+  const album = { id: 7, album: "Record", albumartist: "gnash", albumartists: ["gnash", "Garrett Nash"], genre: "Pop", year: 2024, fingerprint: "fp", tracks: [] };
+  const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({ ok: true, json: async () => init?.method === "PATCH" ? { album: { ...album, albumartists: ["gnash"] } } : album }));
+  vi.stubGlobal("fetch", fetch);
+  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
+  fireEvent.click(screen.getByRole("button", { name: /Record gnash/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove Garrett Nash" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save album" }));
+  expect(await screen.findByText("Album metadata saved.")).toBeInTheDocument();
+  const saved = fetch.mock.calls.find(([, init]) => init?.method === "PATCH");
+  expect(JSON.parse(String(saved?.[1]?.body))).toMatchObject({ albumartist: "gnash", albumartists: ["gnash"] });
+});

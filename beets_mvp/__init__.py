@@ -46,8 +46,8 @@ from . import match_diagnostics
 from .duplicates import duplicate_matches
 
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
-EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc"}
-ALBUM_EDITABLE_FIELDS = {"album", "albumartist", "genre", "year"}
+EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc", "artists", "albumartists"}
+ALBUM_EDITABLE_FIELDS = {"album", "albumartist", "albumartists", "genre", "year"}
 INTEGER_FIELDS = {"year", "track", "disc"}
 LIBRARY_ALBUM_PAGE_SIZE = 25
 MAX_LEGACY_ALBUM_PROMOTIONS = 100
@@ -2379,6 +2379,7 @@ def _managed_track_payload(app: Flask, item: Item) -> dict:
         for key in ("id", "title", "artist", "album", "albumartist", "genre", "year", "track", "disc")
     }
     result["genre"] = _item_genre(item)
+    result["artists"] = item.get("artists") or []
     try:
         path = _managed_path(app, item.path) if item.get("path") else None
         result["bytes"] = path.stat().st_size if path else None
@@ -2442,6 +2443,9 @@ def _managed_album_fingerprint(album, items: list[Item] | None = None) -> str:
         "title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc",
         "mb_trackid", "mb_albumid", "mb_releasegroupid", "albumtype", "country", "media",
         "tracktotal", "disctotal", "artists", "albumartists",
+        "artist_credit", "artists_credit", "artist_sort", "artists_sort",
+        "albumartist_credit", "albumartists_credit", "albumartist_sort", "albumartists_sort",
+        "mb_artistid", "mb_albumartistid", "mb_artistids", "mb_albumartistids",
     )
     evidence = []
     for item in items:
@@ -2465,7 +2469,7 @@ def _managed_album_payload(app: Flask, album_id: int) -> dict | None:
         return None
     items = _album_items(album)
     summary = _managed_album_summary(app, album)
-    return {**summary, "mb_albumid": str(album.get("mb_albumid") or ""),
+    return {**summary, "albumartists": album.get("albumartists") or (items[0].get("albumartists") if items else []) or [], "mb_albumid": str(album.get("mb_albumid") or ""),
             "tracks": [_managed_track_payload(app, item) for item in items],
             "fingerprint": _managed_album_fingerprint(album, items)}
 
@@ -2819,7 +2823,16 @@ def _validated_edit_fields(values: object, allowed: set[str]) -> dict:
         raise ValueError("at least one editable field is required")
     normalized = {}
     for field, value in values.items():
-        if field in INTEGER_FIELDS:
+        if field in {"artists", "albumartists"}:
+            if not isinstance(value, list) or len(value) > 100 or any(
+                not isinstance(name, str) or not name.strip() or len(name) > 500 for name in value
+            ):
+                raise ValueError(f"{field} must be a list of non-empty artist names")
+            names = [_normalize_metadata(name) for name in value]
+            if len({name.casefold() for name in names}) != len(names):
+                raise ValueError(f"{field} must not contain duplicate artist names")
+            normalized[field] = names
+        elif field in INTEGER_FIELDS:
             if isinstance(value, bool):
                 raise ValueError(f"{field} must be an integer")
             if not isinstance(value, (int, str)):
@@ -2865,19 +2878,54 @@ def _write_metadata(item):
                 current.save()
 
 
-def _expanded_artist_edit(model, values, *, populate_missing=True):
-    """Keep explicit single-artist renames consistent without guessing separators."""
+def _expanded_artist_edit(model, values, *, populate_missing=True, edit_credits=False):
+    """Synchronize explicit credit edits without inferring artist identities."""
     values = dict(values)
-    for singular, plural in (('artist', 'artists'), ('albumartist', 'albumartists')):
-        if singular not in values or plural not in model._fields:
+    for singular, plural in (("artist", "artists"), ("albumartist", "albumartists")):
+        if plural not in model._fields:
             continue
         names = model.get(plural) or []
-        if not names and not populate_missing and model.get(singular) == values[singular]:
+        explicit_list = plural in values and edit_credits
+        if explicit_list:
+            selected = values[plural]
+        elif singular in values:
+            if not names and not populate_missing and model.get(singular) == values[singular]:
+                continue
+            if len(names) <= 1:
+                selected = [values[singular]] if values[singular] else []
+            elif model.get(singular) in names:
+                selected = [values[singular] if name == model.get(singular) else name for name in names]
+            else:
+                continue  # A compound display credit does not identify a collaborator.
+            values[plural] = selected
+        else:
             continue
-        if len(names) <= 1:
-            values[plural] = [values[singular]] if values[singular] else []
-        elif model.get(singular) in names:
-            values[plural] = [values[singular] if name == model.get(singular) else name for name in names]
+        if not edit_credits:
+            continue
+        known_names = names or ([model.get(singular)] if model.get(singular) else [])
+        if explicit_list:
+            indices = [known_names.index(name) if name in known_names else None for name in selected]
+        else:
+            indices = [index if index < len(known_names) else None for index in range(len(selected))]
+        old_sorts = model.get(plural + "_sort") or ([model.get(singular + "_sort")] if len(known_names) == 1 else [])
+        sorts = [old_sorts[index] if index is not None and index < len(old_sorts)
+                 and name == known_names[index] and old_sorts[index] else name
+                 for name, index in zip(selected, indices)]
+        display = values.get(singular, model.get(singular) or "")
+        if explicit_list and selected != names and display == model.get(singular):
+            display = ", ".join(selected)
+            values[singular] = display
+        values[singular + "_credit"] = display
+        values[plural + "_credit"] = selected
+        values[singular + "_sort"] = ", ".join(sorts)
+        values[plural + "_sort"] = sorts
+        if explicit_list:
+            old_ids = model.get("mb_" + singular + "ids") or []
+            if not old_ids and len(known_names) == 1 and model.get("mb_" + singular + "id"):
+                old_ids = [model.get("mb_" + singular + "id")]
+            ids = [old_ids[index] if index is not None and index < len(old_ids) else "" for index in indices]
+            values["mb_" + singular + "id"] = ids[0] if ids else ""
+            values["mb_" + singular + "ids"] = ids if all(ids) else []
     return values
 
 
@@ -2889,7 +2937,7 @@ def _mutate_managed_items(
     snapshots = []
     structured = []
     for item, values in changes:
-        values = _expanded_artist_edit(item, values)
+        values = _expanded_artist_edit(item, values, edit_credits=True)
         fields = set(values)
         if "genre" in fields and "genres" in item._fields:
             fields.add("genres")
@@ -2902,7 +2950,7 @@ def _mutate_managed_items(
                 item_changes[field] = {"from": current, "to": value}
             _set_item_value(item, field, value)
         structured.append({"item_id": item.id, "changes": item_changes})
-    album_values = _expanded_artist_edit(album, album_values or {}) if album is not None else {}
+    album_values = _expanded_artist_edit(album, album_values or {}, edit_credits=True) if album is not None else {}
     album_snapshot = {field: album.get(field) for field in album_values} if album is not None else {}
     moved = []
     copied_art = []

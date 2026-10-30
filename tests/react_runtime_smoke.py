@@ -465,10 +465,32 @@ def main() -> None:
         page.get_by_role("button", name="Edit metadata").click()
         assert page.get_by_label("Upload replacement").is_visible()
         assert page.get_by_role("table", name="Tracks on Bulk Ready").is_visible()
+        # Real UI membership edits must clear the related serialized credit tags.
+        page.get_by_role("button", name="Add artist", exact=True).click()
+        page.get_by_label("Album artist credits 2", exact=True).fill("Alias fixture")
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library/albums/" in response.url) as added_credit:
+            page.get_by_role("button", name="Save album", exact=True).click()
+        assert added_credit.value.status == 200, added_credit.value.json()
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.screenshot(path=args.evidence_dir / "08-album-credits-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=args.evidence_dir / "08-album-credits-mobile.png", full_page=True)
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.get_by_role("button", name="Remove Alias fixture", exact=True).click()
+        with page.expect_response(lambda response: response.request.method == "PATCH" and "/api/library/albums/" in response.url) as removed_credit:
+            page.get_by_role("button", name="Save album", exact=True).click()
+        assert removed_credit.value.status == 200, removed_credit.value.json()
+        assert "Alias fixture" not in removed_credit.value.json()["album"]["albumartists"]
+        saved_credit_id = removed_credit.value.json()["changes"][0]["item_id"]
+        saved_credit_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_credit_id)
+        library_bulk_track = args.fixture_root / "library" / Path(saved_credit_item["path"]).relative_to(args.app_library)
+        assert "Alias fixture" not in str(MediaFile(library_bulk_track).albumartists_credit)
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
         page.get_by_role("button", name=re.compile("^Edit track ")).first.click()
         assert page.get_by_label("Title", exact=True).input_value()
         inline_row = page.locator(".record-tracks tr.is-editing")
-        assert inline_row.locator("input").count() == 4
+        assert inline_row.locator('input[name="track"], input[name="disc"], input[name="title"], input[name="artist"]').count() == 4
         assert page.locator(".track-editor").count() == 0
         assert page.get_by_label("Title", exact=True).evaluate("el => el.form.id") == "track-form"
         page.screenshot(path=args.evidence_dir / "08-track-editor-desktop.png", full_page=True)

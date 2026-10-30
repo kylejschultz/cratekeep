@@ -90,7 +90,10 @@ Eligible copy imports can be undone; replacements cannot. **Remove imported** de
 
 Library metadata saves update the music files and catalog together, keeping
 Artist/Artists and Album Artist/Album Artists consistent. Artist and Album Artist
-remain separate credits. Saves and rematches also update folder/file names using
+remain separate credits. In Edit metadata, use **Album artist credits** to remove
+an extra credited name; each track's **Artist credits** list can be edited too.
+Explicit list changes update associated credit/sort tags and retain known IDs for
+kept names. Display-name edits alone preserve collaborators. Saves and rematches also update folder/file names using
 `paths:` in your Beets configuration: album/artist fields control folders and title/
 track fields control filenames wherever your template uses them. Owned lyric
 sidecars and artwork follow the audio; existing destination files are never overwritten.

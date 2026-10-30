@@ -286,3 +286,121 @@ def test_track_save_updates_artwork_reference_when_its_album_has_one_track(tmp_p
     assert not old.parent.exists()
     assert library.get_album(album.id).artpath==os.fsencode(new.parent/'cover.jpg')
     assert (new.parent/'cover.jpg').read_bytes()==b'fixture cover'
+
+
+@pytest.mark.parametrize('field,plural',[('artist','artists'),('albumartist','albumartists')])
+def test_explicit_credit_removal_clears_alias_credit_sort_and_ids(setup,field,plural):
+    app,library,ids,paths=setup
+    kept_id='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';removed_id='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+    values={field:'gnash',plural:['gnash','Garrett Nash'],field+'_credit':'gnash, Garrett Nash',
+            plural+'_credit':['gnash','Garrett Nash'],field+'_sort':'gnash, gnash',plural+'_sort':['gnash','gnash'],
+            'mb_'+field+'id':kept_id,'mb_'+field+'ids':[kept_id,removed_id]}
+    item=library.get_item(ids[0]);album=library.get_album(item.album_id)
+    targets=list(album.items()) if field=='albumartist' else [item]
+    for target in targets:
+        for key,value in values.items():target[key]=value
+        target.write();target.store()
+    if field=='albumartist':
+        for key,value in values.items():album[key]=value
+        album.store()
+    client=app.test_client();opened=client.get(f'/api/library/albums/{album.id}').json
+    if field=='albumartist':assert opened['albumartists']==['gnash','Garrett Nash']
+    else:assert opened['tracks'][0]['artists']==['gnash','Garrett Nash']
+    url=f'/api/library/albums/{album.id}'+(f'/tracks/{item.id}' if field=='artist' else '')
+    result=client.patch(url,json={field:'gnash',plural:['gnash'],'expected_fingerprint':opened['fingerprint']})
+    assert result.status_code==200,result.json
+    for target in targets:
+        stored=library.get_item(target.id);media=MediaFile(stored.path)
+        for key,expected in {field:'gnash',plural:['gnash'],field+'_credit':'gnash',plural+'_credit':['gnash'],
+                             field+'_sort':'gnash',plural+'_sort':['gnash'],
+                             'mb_'+field+'id':kept_id,'mb_'+field+'ids':[kept_id]}.items():
+            assert stored.get(key)==expected,(key,stored.get(key))
+        for key in (field,plural,field+'_credit',plural+'_credit',field+'_sort',plural+'_sort'):
+            assert 'Garrett Nash' not in str(getattr(media,key))
+    if field=='albumartist':assert library.get_album(album.id).albumartists_credit==['gnash']
+
+
+def test_explicit_credit_removal_also_updates_unchanged_compound_display(setup):
+    from beets_mvp import _expanded_artist_edit
+    app,library,ids,paths=setup;item=library.get_item(ids[0]);item.artist='Stage, Legal'
+    item.artists=['Stage','Legal'];item.artists_sort=['Stage','Legal']
+    values=_expanded_artist_edit(item,{'artist':'Stage, Legal','artists':['Stage']},edit_credits=True)
+    assert values['artist']==values['artist_credit']=='Stage'
+    assert values['artists_credit']==values['artists_sort']==['Stage']
+
+
+def test_credit_editor_preserves_commas_inside_names_and_validates_arrays(setup):
+    app,library,ids,paths=setup;item=library.get_item(ids[0]);album=library.get_album(item.album_id)
+    client=app.test_client();opened=client.get(f'/api/library/albums/{album.id}').json
+    url=f'/api/library/albums/{album.id}/tracks/{item.id}'
+    for invalid in ['First, Guest',[None],[''],['First','first']]:
+        response=client.patch(url,json={'artists':invalid,'expected_fingerprint':opened['fingerprint']})
+        assert response.status_code==400,response.json
+    response=client.patch(url,json={'artist':'Tyler, The Creator','artists':['Tyler, The Creator','Guest'],
+                                   'expected_fingerprint':opened['fingerprint']})
+    assert response.status_code==200,response.json
+    assert library.get_item(item.id).artists==['Tyler, The Creator','Guest']
+
+
+def test_flac_raw_album_credit_aliases_are_rewritten_together(setup):
+    app,library,ids,paths=setup
+    path=paths[0].with_suffix('.flac');path.write_bytes((Path(__file__).parent/'fixtures'/'artist-credit-silence.flac').read_bytes())
+    paths[0].unlink()
+    media=MediaFile(path);media.title='First';media.album='Album';media.artist=media.albumartist='gnash'
+    media.albumartists=['gnash','Garrett Nash'];media.albumartist_credit='gnash, Garrett Nash'
+    media.albumartists_credit=['gnash','Garrett Nash'];media.albumartist_sort='gnash, gnash'
+    media.albumartists_sort=['gnash','gnash'];media.track=1;media.save()
+    item=library.get_item(ids[0]);item.path=os.fsencode(path);item.read();item.store()
+    album=library.get_album(item.album_id)
+    album.albumartist='gnash';album.albumartists=['gnash','Garrett Nash'];album.store()
+    client=app.test_client();opened=client.get(f'/api/library/albums/{album.id}').json
+    result=client.patch(f'/api/library/albums/{album.id}',json={'albumartist':'gnash','albumartists':['gnash'],
+                       'expected_fingerprint':opened['fingerprint']})
+    assert result.status_code==200,result.json
+    tags=MediaFile(library.get_item(item.id).path).mgfile.tags
+    for key in ['albumartists','album_artists','albumartist_credit','albumartists_credit','albumartists_sort','albumartistsort']:
+        assert tags[key]==['gnash'],(key,tags.get(key))
+
+
+def test_unknown_new_credit_does_not_inherit_a_removed_artist_id(setup):
+    from beets_mvp import _expanded_artist_edit
+    app,library,ids,paths=setup;item=library.get_item(ids[0])
+    item.artists=['First','Removed'];item.mb_artistids=['first-id','removed-id'];item.mb_artistid='first-id'
+    values=_expanded_artist_edit(item,{'artists':['First','New']},edit_credits=True)
+    assert values['mb_artistid']=='first-id' and values['mb_artistids']==[]
+    assert 'removed-id' not in str(values)
+
+
+def test_explicit_credit_change_rolls_back_all_related_fields(setup,monkeypatch):
+    from beets.library import Item
+    app,library,ids,paths=setup;album=library.get_album(library.get_item(ids[0]).album_id)
+    values={'albumartist':'Stage','albumartists':['Stage','Legal'],'albumartist_credit':'Stage, Legal',
+            'albumartists_credit':['Stage','Legal'],'albumartist_sort':'Stage, Legal','albumartists_sort':['Stage','Legal'],
+            'mb_albumartistid':'stage-id','mb_albumartistids':['stage-id','legal-id']}
+    for item in album.items():
+        for key,value in values.items():item[key]=value
+        item.write();item.store()
+    for key,value in values.items():album[key]=value
+    album.store()
+    original=Item.write;calls=[]
+    def fail_second(item,*args,**kwargs):
+        calls.append(item.id)
+        if len(calls)==2:raise OSError('fixture credit write failure')
+        return original(item,*args,**kwargs)
+    monkeypatch.setattr(Item,'write',fail_second)
+    client=app.test_client();opened=client.get(f'/api/library/albums/{album.id}').json
+    result=client.patch(f'/api/library/albums/{album.id}',json={'albumartists':['Stage'],'expected_fingerprint':opened['fingerprint']})
+    assert result.status_code==500 and result.json['code']=='mutation_rolled_back'
+    for item in library.get_album(album.id).items():
+        assert all(item.get(key)==value for key,value in values.items())
+        media=MediaFile(item.path)
+        assert media.albumartists_credit==['Stage','Legal'] and media.albumartists_sort==['Stage','Legal']
+
+
+def test_display_alias_rename_keeps_collaborators_and_identity_fields(setup):
+    from beets_mvp import _expanded_artist_edit
+    app,library,ids,paths=setup;item=library.get_item(ids[0]);item.artist='Old'
+    item.artists=['Old','Guest'];item.artists_credit=['Old','Guest'];item.mb_artistids=['primary-id','guest-id']
+    values=_expanded_artist_edit(item,{'artist':'New'},edit_credits=True)
+    assert values['artists']==values['artists_credit']==values['artists_sort']==['New','Guest']
+    assert 'mb_artistids' not in values and item.mb_artistids==['primary-id','guest-id']
