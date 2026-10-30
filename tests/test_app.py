@@ -2666,14 +2666,12 @@ def test_managed_album_details_expose_stored_release_mbid(tmp_path):
     assert [path.read_bytes() for path in paths] == before
 
 
-def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path):
+def test_managed_album_and_track_edits_preserve_identity_and_update_artist_paths(tmp_path):
     app = make_app(tmp_path)
     library, album, paths = managed_wav_album(app, tmp_path)
     client = app.test_client()
     opened = client.get(f"/api/library/albums/{album.id}").json
     original_tracks = copy.deepcopy(opened["tracks"])
-    original_paths = [path.resolve() for path in paths]
-
     edited = client.patch(f"/api/library/albums/{album.id}", json={
         "album": "New Album", "albumartist": "New Album Artist", "genre": "Jazz", "year": 2024,
         "expected_fingerprint": opened["fingerprint"],
@@ -2687,7 +2685,8 @@ def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path
         assert (after["title"], after["artist"], after["track"], after["disc"]) == (
             before["title"], before["artist"], before["track"], before["disc"],
         )
-    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+    paths = paths_for_items(list(library.get_album(album.id).items()))
+    assert all(path.is_file() for path in paths)
     for path in paths:
         media = MediaFile(str(path))
         assert (media.album, media.albumartist, media.genre, media.year) == (
@@ -2702,9 +2701,10 @@ def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path
     })
     assert track_edit.status_code == 200
     assert [track["title"] for track in track_edit.json["album"]["tracks"]] == ["First", "Changed Second"]
+    paths = paths_for_items(list(library.get_album(album.id).items()))
     assert MediaFile(str(paths[0])).title == "First"
     assert (MediaFile(str(paths[1])).title, MediaFile(str(paths[1])).artist) == ("Changed Second", "Guest")
-    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+    assert all(path.is_file() for path in paths)
 
     assert client.patch(f"/api/library/albums/{album.id}", json={
         "genre": "Soul", "expected_fingerprint": opened["fingerprint"],
@@ -2805,8 +2805,10 @@ def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mut
     assert provider_calls == [(release_id, 1)]
     assert [item.title for item in library.get_album(album.id).items()] == ["First Song Remastered", "Second Song"]
     assert [item.mb_trackid for item in library.get_album(album.id).items()] == ["recording-1", "recording-2"]
-    assert [MediaFile(str(path)).title for path in paths] == ["First Song Remastered", "Second Song"]
-    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == [path.resolve() for path in paths]
+    updated_paths = paths_for_items(list(library.get_album(album.id).items()))
+    assert [MediaFile(str(path)).title for path in updated_paths] == ["First Song Remastered", "Second Song"]
+    assert updated_paths[0].name == "01 First Song Remastered.wav"
+    assert not paths[0].exists() and updated_paths[1] == paths[1]
     assert client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
         "preview_id": preview.json["preview_id"], "expected_fingerprint": preview.json["fingerprint"],
     }).status_code == 409

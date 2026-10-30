@@ -88,6 +88,15 @@ Each Inbox has its own discovery mode in Settings: Manual only, Instant, or a ti
 
 Eligible copy imports can be undone; replacements cannot. **Remove imported** deletes the Inbox originals and keeps the Library copies.
 
+Library metadata saves update the music files and catalog together, keeping
+Artist/Artists and Album Artist/Album Artists consistent. Artist and Album Artist
+remain separate credits. Saves and rematches also update folder/file names using
+`paths:` in your Beets configuration: album/artist fields control folders and title/
+track fields control filenames wherever your template uses them. Owned lyric
+sidecars and artwork follow the audio; existing destination files are never overwritten.
+Re-saving a corrected name repairs older companion tags and paths. Existing files
+are not automatically reorganized just by upgrading or changing configuration.
+
 ## Analytics
 
 Optional [Beacon analytics](https://github.com/kylejschultz/beacon) is off by default. It reports a random installation ID, build/platform details and collection totals at most once a day, without track names, media paths or listening history. The receiving server also sees the connection IP address. You can opt in under Settings → About.

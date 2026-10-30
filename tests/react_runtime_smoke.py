@@ -490,6 +490,12 @@ def main() -> None:
         with page.expect_response(lambda response: "/tracks/" in response.url and response.request.method == "PATCH") as saved_track:
             page.get_by_role("button", name="Save track", exact=True).click()
         assert saved_track.value.status == 200, saved_track.value.json()
+        saved_id = saved_track.value.json()["changes"][0]["item_id"]
+        saved_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        previous_track = library_bulk_track
+        library_bulk_track = args.fixture_root / "library" / Path(saved_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track != previous_track and not previous_track.exists()
+        assert MediaFile(str(library_bulk_track)).artists == ["Fixture Guest"]
         page.reload(wait_until="networkidle")
         page.locator(".library-record").filter(has_text="Bulk Ready").click()
         page.get_by_role("table", name="Tracks on Bulk Ready").get_by_text("Edited fixture title", exact=True).wait_for()

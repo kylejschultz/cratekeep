@@ -18,9 +18,11 @@ def app(tmp_path, monkeypatch):
     return make_app(tmp_path)
 
 
-def copied(app, tmp_path, *, folder='Incoming', title='Song', artist='Original', album='Original Album', mbid='123e4567-e89b-42d3-a456-426614174000', duplicate_action=None):
+def copied(app, tmp_path, *, folder='Incoming', title='Song', artist='Original', album='Original Album', mbid='123e4567-e89b-42d3-a456-426614174000', duplicate_action=None, artist_lists=False):
     source = tmp_path / 'inbox' / folder / f'{title}.wav'
     tagged_inbox_wav(source, artist=artist, album=album, title=title)
+    if artist_lists:
+        media=MediaFile(source);media.artists=[artist];media.albumartists=[artist];media.save()
     before = source.read_bytes()
     client = app.test_client()
     review = next(row for row in client.get('/api/inbox/reviews').json['albums'] if any(track['path'] == source.relative_to(tmp_path/'inbox').as_posix() for track in row['tracks']))
@@ -570,3 +572,14 @@ def test_clear_keeps_files_arriving_during_deletion(app,tmp_path,monkeypatch):
     action(app.test_client(),imports_base(app),{'kind':'delete-imported','job_ids':[result['id']]})
     assert not source.exists() and not companion.exists()
     assert late.read_bytes()==b'new file' and Path(result['items'][0]['path']).is_file()
+
+
+def test_copy_import_replaces_stale_single_artist_lists(app,tmp_path):
+    source,before,result,review=copied(app,tmp_path,artist_lists=True)
+    media=MediaFile(result['items'][0]['path'])
+    assert media.artist=='Canonical' and media.artists==['Canonical']
+    assert media.albumartist=='Canonical' and media.albumartists==['Canonical']
+    library=Library(app.config['BEETS_DB'],directory=app.config['LIBRARY_PATH'])
+    imported=library.get_item(result['items'][0]['beets_item_id'])
+    assert imported.artists==['Canonical'] and imported.albumartists==['Canonical']
+    assert source.read_bytes()==before

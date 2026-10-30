@@ -19,6 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from copy import deepcopy
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1172,7 +1173,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             abort(404)
         try:
             normalized = _validated_edit_fields(values, EDITABLE_FIELDS)
-            _mutate_managed_items([(item, normalized)])
+            _require_managed_item_paths(app, [item])
+            _mutate_managed_items([(item, normalized)], album=item.get_album(), relocate_app=app)
         except ValueError as exc:
             abort(400, str(exc))
         except ManagedMutationError as exc:
@@ -2439,7 +2441,7 @@ def _managed_album_fingerprint(album, items: list[Item] | None = None) -> str:
     fields = (
         "title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc",
         "mb_trackid", "mb_albumid", "mb_releasegroupid", "albumtype", "country", "media",
-        "tracktotal", "disctotal",
+        "tracktotal", "disctotal", "artists", "albumartists",
     )
     evidence = []
     for item in items:
@@ -2845,14 +2847,49 @@ def _validated_managed_edit(values: object, allowed: set[str]) -> tuple[dict, st
     return fields, expected
 
 
+def _write_metadata(item):
+    """Ordinary metadata edits must not serialize a stale catalog lyric value."""
+    media=MediaFile(item.path)
+    tags=media.mgfile.tags
+    frames={frame:deepcopy(tags.getall(frame)) for frame in ('USLT','SYLT')} if hasattr(tags,'getall') else None
+    # Passing the current file value also avoids creating a plain fallback frame
+    # when the catalog contains LRC for a synchronized-only ID3 track.
+    try:
+        item.write(tags={'lyrics':media.lyrics})
+    finally:
+        if frames is not None:
+            current=MediaFile(item.path)
+            if any(current.mgfile.tags.getall(frame)!=saved for frame,saved in frames.items()):
+                for frame,saved in frames.items():
+                    current.mgfile.tags.setall(frame,saved)
+                current.save()
+
+
+def _expanded_artist_edit(model, values, *, populate_missing=True):
+    """Keep explicit single-artist renames consistent without guessing separators."""
+    values = dict(values)
+    for singular, plural in (('artist', 'artists'), ('albumartist', 'albumartists')):
+        if singular not in values or plural not in model._fields:
+            continue
+        names = model.get(plural) or []
+        if not names and not populate_missing and model.get(singular) == values[singular]:
+            continue
+        if len(names) <= 1:
+            values[plural] = [values[singular]] if values[singular] else []
+        elif model.get(singular) in names:
+            values[plural] = [values[singular] if name == model.get(singular) else name for name in names]
+    return values
+
+
 def _mutate_managed_items(
     changes: list[tuple[Item, dict]], *, album=None, album_values: dict | None = None,
-    finalize=None,
+    finalize=None, relocate_app=None,
 ) -> list[dict]:
     """Write tags before DB state and restore every touched item on any failure."""
     snapshots = []
     structured = []
     for item, values in changes:
+        values = _expanded_artist_edit(item, values)
         fields = set(values)
         if "genre" in fields and "genres" in item._fields:
             fields.add("genres")
@@ -2865,14 +2902,48 @@ def _mutate_managed_items(
                 item_changes[field] = {"from": current, "to": value}
             _set_item_value(item, field, value)
         structured.append({"item_id": item.id, "changes": item_changes})
-    album_values = album_values or {}
+    album_values = _expanded_artist_edit(album, album_values or {}) if album is not None else {}
     album_snapshot = {field: album.get(field) for field in album_values} if album is not None else {}
+    moved = []
+    copied_art = []
+    destinations = []
     try:
+        if relocate_app is not None:
+            # Beets path templates read album fields from its stored Album.
+            # This update stays inside the same rollback boundary as file moves.
+            if album is not None:
+                for field, value in album_values.items():
+                    album[field] = value
+                album.store()
+            destinations, companions, artwork = _managed_metadata_destinations(relocate_app, snapshots, album)
+        else:
+            companions, artwork = [], []
         for item, _, _ in snapshots:
-            item.write()
+            _write_metadata(item)
+        # Create exclusively: a destination appearing after preflight must never
+        # be overwritten. Keep a reverse journal until tags and DB commit.
+        audio_moves = [(Path(path), target) for (_, _, path), target in zip(snapshots, destinations)
+                       if Path(path) != target]
+        for source, target in companions + audio_moves:
+            _copy_managed_exclusive(source, target)
+            entry = [source, target, False, _file_identity(target)]
+            moved.append(entry)
+            source.unlink()
+            entry[2] = True
+        for source, target in artwork:
+            _copy_managed_exclusive(source, target)
+            copied_art.append((target, _file_identity(target)))
+        for (item, _, _), target in zip(snapshots, destinations):
+            item.path = os.fsencode(target)
+        if album is not None and artwork and album.get("artpath"):
+            previous_art = Path(os.fsdecode(album.artpath))
+            replacement = next((target for source, target in artwork if source == previous_art), None)
+            if replacement:
+                album_snapshot["artpath"] = album.artpath
+                album.artpath = os.fsencode(replacement)
         for item, _, path in snapshots:
             item.store()
-            if os.fsdecode(item.path) != path:
+            if relocate_app is None and os.fsdecode(item.path) != path:
                 raise OSError("metadata write changed a managed path")
         if album is not None:
             for field, value in album_values.items():
@@ -2884,12 +2955,36 @@ def _mutate_managed_items(
             finalize()
     except Exception as exc:
         rollback_errors = []
+        retained = {}
+        for source, target, removed, identity in reversed(moved):
+            try:
+                if _file_identity(target) != identity:
+                    raise OSError(f"Moved file changed; recovery copy retained at {target}")
+                if removed:
+                    _copy_managed_exclusive(target, source)
+                target.unlink()
+            except Exception as rollback_exc:
+                retained[source] = target
+                rollback_errors.append(f"path rollback: {rollback_exc}; retained {target}")
+        for target, identity in copied_art:
+            try:
+                if _file_identity(target) != identity:
+                    raise OSError(f"Artwork changed; retained at {target}")
+                target.unlink()
+            except OSError as rollback_exc:
+                rollback_errors.append(f"artwork rollback: {rollback_exc}")
         for item, original, path in snapshots:
             try:
+                if Path(path) in retained:
+                    # Never retag a new file occupying an original path. Keep the
+                    # catalog pointing at the recovery copy and report failure.
+                    item.path = os.fsencode(retained[Path(path)])
+                    item.store()
+                    continue
                 for field, value in original.items():
                     item[field] = value
                 item.path = os.fsencode(path)
-                item.write()
+                _write_metadata(item)
                 item.store()
             except Exception as rollback_exc:
                 rollback_errors.append(f"item {item.id}: {rollback_exc}")
@@ -2911,7 +3006,98 @@ def _mutate_managed_items(
             f"metadata write failed; original tags and database values were restored: {exc}",
             code="mutation_rolled_back", status=500,
         ) from exc
+    if relocate_app is not None:
+        root = _validated_library_root(relocate_app)
+        referenced_art = {Path(os.fsdecode(record.artpath)) for record in _library(relocate_app).albums() if record.get("artpath")}
+        for source, _ in artwork:
+            if source not in referenced_art and not any(
+                path.suffix.lower() in AUDIO_EXTENSIONS for path in source.parent.rglob("*") if path.is_file()
+            ):
+                try:
+                    source.unlink()
+                except OSError:
+                    pass  # Retaining an extra old cover is safer than failing a completed edit.
+        for _, _, old in snapshots:
+            parent = Path(old).parent
+            while parent != root and root in parent.parents:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
     return structured
+
+
+def _file_identity(path: Path) -> tuple:
+    stat = path.lstat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _copy_managed_exclusive(source: Path, target: Path) -> None:
+    before = _file_identity(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("xb") as output:
+        try:
+            with source.open("rb") as incoming:
+                shutil.copyfileobj(incoming, output)
+            output.flush()
+            shutil.copystat(source, target)
+            if _file_identity(source) != before:
+                raise OSError("Source changed while preparing its managed move.")
+        except Exception:
+            target.unlink()
+            raise
+
+
+def _managed_metadata_destinations(app, snapshots, album):
+    """Plan metadata edits using Beets paths; preserve sidecars without clobbering."""
+    library = _library(app)
+    root = _validated_library_root(app)
+    targets, companions, artwork = [], [], []
+    planned = set()
+
+    def reserve(source, target):
+        if source == target:
+            return False
+        if target == root or root not in target.resolve().parents or target.is_symlink():
+            raise ValueError("Edited metadata produces an unsafe library destination.")
+        key = str(target).casefold()
+        occupied = target.parent.exists() and any(
+            sibling.name.casefold() == target.name.casefold() for sibling in target.parent.iterdir()
+        )
+        if key in planned or os.path.lexists(target) or occupied:
+            raise ManagedMutationError("Edited metadata conflicts with an existing library file; no files were moved.",
+                                       code="destination_collision", status=409)
+        planned.add(key)
+        return True
+
+    for item, _, old in snapshots:
+        source = Path(old)
+        target = Path(os.fsdecode(item.destination(basedir=library.directory, path_formats=library.path_formats))).absolute()
+        targets.append(target)
+        if not reserve(source, target):
+            continue
+        for suffix in (".lrc", ".txt"):
+            sidecar = source.with_suffix(suffix)
+            if not os.path.lexists(sidecar):
+                continue
+            if sidecar.is_symlink() or not sidecar.is_file() or any(
+                other != source and other.stem.casefold() == source.stem.casefold()
+                and other.suffix.lower() in AUDIO_EXTENSIONS for other in source.parent.iterdir()
+            ):
+                raise ValueError("Lyric sidecar ownership is unsafe or ambiguous.")
+            destination = target.with_suffix(suffix)
+            if reserve(sidecar, destination):
+                companions.append((sidecar, destination))
+        art_album = album if album is not None else item.get_album()
+        art = Path(os.fsdecode(art_album.artpath)) if art_album is not None and art_album.get("artpath") else source.parent / "cover.jpg"
+        destination = target.parent / art.name
+        if art.is_file() and art.parent != target.parent and (art, destination) not in artwork:
+            if art.is_symlink() or root not in art.resolve().parents:
+                raise ValueError("Artwork is outside the library or is a symbolic link.")
+            if reserve(art, destination):
+                artwork.append((art, destination))
+    return targets, companions, artwork
 
 
 def _require_current_album(album, expected: str, items: list[Item]) -> None:
@@ -2929,7 +3115,7 @@ def _edit_managed_album(app: Flask, album_id: int, values: dict, expected: str) 
     items = _album_items(album)
     _require_current_album(album, expected, items)
     _require_managed_item_paths(app, items)
-    changes = _mutate_managed_items([(item, values) for item in items], album=album, album_values=values)
+    changes = _mutate_managed_items([(item, values) for item in items], album=album, album_values=values, relocate_app=app)
     return {"changes": changes, "album": _managed_album_payload(app, album_id)}
 
 
@@ -2943,7 +3129,7 @@ def _edit_managed_track(app: Flask, album_id: int, item_id: int, values: dict, e
     item = next((candidate for candidate in items if candidate.id == item_id), None)
     if item is None:
         return False
-    changes = _mutate_managed_items([(item, values)])
+    changes = _mutate_managed_items([(item, values)], album=album, relocate_app=app)
     return {"changes": changes, "album": _managed_album_payload(app, album_id)}
 
 
@@ -3119,7 +3305,7 @@ def _apply_managed_rematch(app: Flask, album_id: int, preview_id: str, expected:
 
     try:
         _mutate_managed_items(
-            changes, album=album, album_values=album_values, finalize=finalize_rematch,
+            changes, album=album, album_values=album_values, finalize=finalize_rematch, relocate_app=app,
         )
     except Exception:
         with _connect(app.config["APP_DB"]) as db:
@@ -3925,7 +4111,8 @@ def _item_genre(item: Item) -> str:
 
 
 def _set_item_value(item: Item, field: str, value: object) -> None:
-    item[field] = value
+    for key, expanded in _expanded_artist_edit(item, {field: value}, populate_missing=False).items():
+        item[key] = expanded
     if field == "genre" and "genres" in item._fields:
         normalized = _normalize_metadata(value)
         item["genres"] = [normalized] if normalized else []
@@ -6410,6 +6597,7 @@ def _library_import_plans(
             elif duplicate_action == "merge":
                 action = "merge"
                 comparison_item = duplicate
+        values = _expanded_artist_edit(comparison_item, values, populate_missing=False)
         changes = {}
         for field, value in list(values.items()):
             current = _item_genre(comparison_item) if field == "genre" else comparison_item.get(field)
