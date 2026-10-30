@@ -3203,7 +3203,8 @@ def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *,
     expected = request_values.get("expected_fingerprint")
     if not isinstance(expected, str) or not expected:
         raise ValueError("expected_fingerprint is required")
-    album_values = _validated_edit_fields(request_values.get("album", {}), ALBUM_EDITABLE_FIELDS)
+    raw_album = request_values.get("album", {})
+    album_values = {} if isinstance(raw_album, dict) and not raw_album else _validated_edit_fields(raw_album, ALBUM_EDITABLE_FIELDS)
     track_values = request_values.get("tracks", [])
     if not isinstance(track_values, list) or len(track_values) > 1000:
         raise ValueError("tracks must be a list of at most 1000 edits")

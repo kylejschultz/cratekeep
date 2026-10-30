@@ -89,3 +89,19 @@ def test_preview_collision_and_foreign_track_rejected_before_writes(case):
     result = client.post(endpoint + 'apply', json={**draft, 'plan_fingerprint': plan['plan_fingerprint']})
     assert result.status_code == 409 and result.json['code'] == 'destination_collision'
     assert target.read_bytes() == b'occupied' and all(path.exists() for path in paths)
+
+
+def test_track_only_and_unchanged_drafts_can_be_previewed(case):
+    app, library, album, paths, client, draft = case
+    endpoint = f'/api/library/albums/{album.id}/metadata/'
+    track_only = {**draft, 'album': {}}
+    preview = client.post(endpoint + 'preview', json=track_only)
+    assert preview.status_code == 200, preview.json
+    assert len(preview.json['changes']) == 1
+    saved = client.post(endpoint + 'apply', json={**track_only, 'plan_fingerprint': preview.json['plan_fingerprint']})
+    assert saved.status_code == 200, saved.json
+    assert saved.json['album']['tracks'][0]['title'] == 'Renamed Track'
+    assert saved.json['album']['album'] != 'Renamed Album'
+    noop = client.post(endpoint + 'preview', json={'expected_fingerprint': saved.json['album']['fingerprint'], 'album': {}, 'tracks': []})
+    assert noop.status_code == 200, noop.json
+    assert not noop.json['changes'] and not noop.json['paths']
