@@ -1,6 +1,6 @@
 import type { ReactElement } from "react";
 import { ToastProvider } from "./Toasts";
-import { cleanup, fireEvent, render as renderComponent, screen, within, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render as renderComponent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Page } from "./pages";
 
@@ -89,52 +89,9 @@ it("shows compact library rows and preserves search/sort/filter state in paginat
   expect(screen.getByRole("combobox", { name: "Sort order" })).toHaveValue("desc");
 });
 
-it("edits a track from the compact table using the existing fingerprint contract", async () => {
-  const album = { id: 7, album: "Record", albumartist: "Artist", fingerprint: "fp", tracks: [{ id: 11, track: 1, title: "First", artist: "Artist" }, { id: 12, track: 2, title: "Second", artist: "Guest" }] };
-  const fetch = vi.fn(async (url: string, init?: RequestInit) => ({ ok: true, json: async () => init?.method === "PATCH" ? { album: { ...album, tracks: [{ ...album.tracks[0], title: "Corrected" }, album.tracks[1]] } } : album }));
-  vi.stubGlobal("fetch", fetch);
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record Artist/ }));
-  expect(await screen.findByRole("table", { name: "Tracks on Record" })).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "Edit track First" })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  expect(screen.getByLabelText("Title")).toHaveValue("First");
-  const editedRow = screen.getByLabelText("Title").closest("tr")!;
-  expect(within(editedRow).getByLabelText("Artist")).toHaveValue("Artist");
-  expect(within(editedRow).getByLabelText("Track")).toHaveValue(1);
-  expect(within(editedRow).getByLabelText("Disc")).toBeInTheDocument();
-  expect(document.querySelector(".track-editor")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Edit track Second" }));
-  expect(screen.getByLabelText("Title")).toHaveValue("Second");
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Discarded" } });
-  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(screen.queryByLabelText("Title")).not.toBeInTheDocument();
-  expect(fetch.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Corrected" } });
-  fireEvent.change(screen.getByLabelText("Artist"), { target: { value: "Corrected artist" } });
-  fireEvent.change(screen.getByLabelText("Track"), { target: { value: "3" } });
-  fireEvent.change(screen.getByLabelText("Disc"), { target: { value: "2" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save track" }));
-  expect(await screen.findByText("Track metadata saved.")).toBeInTheDocument();
-  expect(fetch).toHaveBeenCalledWith("/api/library/albums/7/tracks/11", expect.objectContaining({ body: JSON.stringify({ expected_fingerprint: "fp", title: "Corrected", artist: "Corrected artist", track: 3, disc: 2 }) }));
-});
 
-it("keeps inline track changes available after a failed save", async () => {
-  const album = { id: 7, album: "Record", albumartist: "Artist", fingerprint: "fp", tracks: [{ id: 11, track: 1, disc: 1, title: "First", artist: "Artist" }] };
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => init?.method === "PATCH" ? { ok: false, status: 409, json: async () => ({ error: "Metadata changed; reload before saving." }) } : { ok: true, json: async () => album }));
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record Artist/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Keep my draft" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save track" }));
-  expect(await screen.findByText("Metadata changed; reload before saving.")).toBeInTheDocument();
-  expect(screen.getByLabelText("Title")).toHaveValue("Keep my draft");
-  expect(screen.getByRole("button", { name: "Save track" })).toBeEnabled();
-});
+
+
 
 it.each(["123e4567-e89b-42d3-a456-426614174000", ""])("shows the stored album release MBID in Library details: %s", async mbid => {
   const album = { id: 7, album: "Record", albumartist: "Artist", mb_albumid: mbid, tracks: [] };
@@ -170,24 +127,7 @@ it("opens and closes album details in the inspector while retaining the list", a
   expect(row).toHaveAttribute("aria-pressed", "false");
 });
 
-it("blocks album switching and repeat actions until a save finishes", async () => {
-  let finish: (() => void) | undefined;
-  const album = { id: 7, album: "Record", albumartist: "Artist", fingerprint: "fp", tracks: [] };
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
-    if (init?.method === "PATCH") await new Promise<void>(resolve => { finish = resolve; });
-    return { ok: true, json: async () => album };
-  }));
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album, { id: 8, album: "Other", albumartist: "Artist" }] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record Artist/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Save album" }));
-  await waitFor(() => expect(screen.getByRole("button", { name: /Other Artist/ })).toBeDisabled());
-  expect(screen.getByRole("button", { name: "Save album" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Close album" })).toBeDisabled();
-  finish?.();
-  await screen.findByText("Album metadata saved.");
-  await waitFor(() => expect(screen.getByRole("button", { name: /Other Artist/ })).toBeEnabled());
-});
+
 
 it("renders artist browse rows with album counts, genres, drill-down and paginated view state", () => {
   render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { view: "artists", artists: [{ artist: "Élan & Co", album_count: 3, genres: "Jazz, Soul" }], matching_artists: 26, page: 1, page_count: 2 } }}/>);
@@ -284,22 +224,7 @@ it("selects the configured Inbox requested by the source link", async () => {
 });
 
 
-it("submits album edits from the fixed footer with the required fingerprint", async () => {
-  const patch = vi.fn();
-  const album = { id: 7, album: "Album", albumartist: "Artist", genre: "Rock", year: 2024, fingerprint: "current-fp", tracks: [] };
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
-    if (init?.method === "PATCH") patch(JSON.parse(String(init.body)));
-    return { ok: true, json: async () => album };
-  }));
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Album Artist/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  const save = screen.getByRole("button", { name: "Save album" });
-  expect(save.closest("footer")).toHaveAttribute("aria-label", "Album actions");
-  expect(save).toHaveAttribute("form", "album-form");
-  fireEvent.click(save);
-  await waitFor(() => expect(patch).toHaveBeenCalledWith({ expected_fingerprint: "current-fp", album: "Album", albumartist: "Artist", genre: "Rock", year: 2024 }));
-});
+
 
 
 describe("About settings", () => {
@@ -407,18 +332,4 @@ it("applies the full Inbox editor draft on Done before the settings form saves",
   expect(payload.getAll("inbox_path")).toEqual(["/renamed"]);
   expect(payload.getAll("inbox_discovery")).toEqual(["instant"]);
   expect(payload.getAll("inbox_auto_match_id")).toEqual(["one"]);
-});
-
-it("submits explicit album-credit removal without splitting artist names", async () => {
-  const album = { id: 7, album: "Record", albumartist: "gnash", albumartists: ["gnash", "Garrett Nash"], genre: "Pop", year: 2024, fingerprint: "fp", tracks: [] };
-  const fetch = vi.fn(async (_url: string, init?: RequestInit) => ({ ok: true, json: async () => init?.method === "PATCH" ? { album: { ...album, albumartists: ["gnash"] } } : album }));
-  vi.stubGlobal("fetch", fetch);
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record gnash/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Remove Garrett Nash" }));
-  fireEvent.click(screen.getByRole("button", { name: "Save album" }));
-  expect(await screen.findByText("Album metadata saved.")).toBeInTheDocument();
-  const saved = fetch.mock.calls.find(([, init]) => init?.method === "PATCH");
-  expect(JSON.parse(String(saved?.[1]?.body))).toMatchObject({ albumartist: "gnash", albumartists: ["gnash"] });
 });

@@ -49,3 +49,19 @@ Names with commas remain one list entry. IDs for retained, identifiable names ar
 kept; new names never inherit a removed credit's ID, and ambiguous ID lists are
 cleared rather than misattributed. Unknown new identities can be resolved by a
 later rematch. Album Artist and Track Artist credit lists remain separate.
+
+### Metadata modal — approved 2026-10-30
+
+Replace inline editing with one accessible modal, matching the existing app style.
+Album and track drafts persist when switching tabs/tracks; no writes until Review
+changes then Save changes. Show album title/artist/credits/year/genre and track
+title/artist/credits/disc/number. Preview actual tag differences, audio destinations,
+owned lyric sidecars and artwork using the same configured Beets planner as apply.
+Bind save to the reviewed draft/current album; retain stale/collision/rollback
+protections and preserve drafts after errors. Provide an explicit discard step for
+unsaved work, keyboard focus containment/restoration, busy protection, and mobile
+layout. Read-only stored IDs/file paths are available; arbitrary raw tag editing
+is excluded. Keep existing artwork/rematch/removal actions outside the editor.
+Validate combined writes/rollback, preview no writes, stale plans, collaborator
+semantics, draft retention, accessibility and responsive layout. Publish tested
+linux/amd64 candidate to local registry; do not deploy.

@@ -91,7 +91,11 @@ Eligible copy imports can be undone; replacements cannot. **Remove imported** de
 Library metadata saves update the music files and catalog together, keeping
 Artist/Artists and Album Artist/Album Artists consistent. Artist and Album Artist
 remain separate credits. In Edit metadata, use **Album artist credits** to remove
-an extra credited name; each track's **Artist credits** list can be edited too.
+an extra credited name; each track's **Track artist credits** list can be edited too.
+The editor keeps album and track drafts together. Choose **Review changes** to
+inspect tag updates and exact Beets file destinations, then **Save changes** to
+apply them together. Cancel asks before discarding unsaved work; switching between
+tracks keeps the draft. **Stored details** shows read-only IDs and file paths.
 Explicit list changes update associated credit/sort tags and retain known IDs for
 kept names. Display-name edits alone preserve collaborators. Saves and rematches also update folder/file names using
 `paths:` in your Beets configuration: album/artist fields control folders and title/

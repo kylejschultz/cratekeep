@@ -1,11 +1,11 @@
 import { useState } from "react";
 
-export function ArtistCredits({ name, label, names, display, form }: {
-  name: "artists" | "albumartists"; label: string; names?: string[]; display: string; form?: string;
+export function ArtistCredits({ name, label, names, display, form, onEdited }: {
+  name: "artists" | "albumartists"; label: string; names?: string[]; display: string; form?: string; onEdited?: () => void;
 }) {
   const [rows, setRows] = useState(() => (names?.length ? names : [display]).map((value, id) => ({ id, value })));
   const [edited, setEdited] = useState(false);
-  const update = (next: typeof rows) => { setRows(next); setEdited(true); };
+  const update = (next: typeof rows) => { setRows(next); setEdited(true); onEdited?.(); };
   return <fieldset className="artist-credits"><legend>{label}</legend>
     <small>One entry per artist. Remove a name here to remove its associated credits.</small>
     {edited && <input form={form} type="hidden" name={`${name}_edited`} value="1"/>}

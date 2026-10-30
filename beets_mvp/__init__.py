@@ -722,6 +722,20 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify(error="Managed album not found", code="album_not_found"), 404
         return jsonify(result)
 
+    @app.route("/api/library/albums/<int:album_id>/metadata/<action>", methods=["POST"])
+    def managed_metadata_editor(album_id: int, action: str):
+        if action not in {"preview", "apply"}:
+            abort(404)
+        try:
+            result = _managed_metadata_edit(app, album_id, request.get_json(silent=True), apply=action == "apply")
+        except ValueError as exc:
+            return jsonify(error=str(exc), code="invalid_request"), 400
+        except ManagedMutationError as exc:
+            return jsonify(error=str(exc), code=exc.code), exc.status
+        if result is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        return jsonify(result)
+
     @app.patch("/api/library/albums/<int:album_id>")
     def edit_managed_album(album_id: int):
         values = request.get_json(silent=True)
@@ -2380,6 +2394,11 @@ def _managed_track_payload(app: Flask, item: Item) -> dict:
     }
     result["genre"] = _item_genre(item)
     result["artists"] = item.get("artists") or []
+    result["mb_trackid"] = item.get("mb_trackid") or ""
+    try:
+        result["relative_path"] = str(_managed_path(app, item.path).relative_to(_validated_library_root(app)))
+    except (ManagedMutationError, OSError, TypeError, ValueError):
+        result["relative_path"] = None
     try:
         path = _managed_path(app, item.path) if item.get("path") else None
         result["bytes"] = path.stat().st_size if path else None
@@ -3154,6 +3173,93 @@ def _require_current_album(album, expected: str, items: list[Item]) -> None:
             "The album changed after it was opened. Refresh it before saving.",
             code="stale_fingerprint", status=409,
         )
+
+
+class _MetadataPreviewItem(Item):
+    """Use proposed album values when Beets formats a path, without catalog writes."""
+
+    def __init__(self, item, album):
+        super().__init__(db=item._db, **dict(item))
+        object.__setattr__(self, "_metadata_album", album)
+
+    @property
+    def _cached_album(self):
+        return self._metadata_album
+
+    @_cached_album.setter
+    def _cached_album(self, album):
+        object.__setattr__(self, "_metadata_album", album)
+
+    def get_album(self):
+        return self._metadata_album
+
+
+def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *, apply=False):
+    """Preview without writes; apply a bound album/track draft in one rollback boundary."""
+    if not isinstance(request_values, dict) or set(request_values) - {
+        "expected_fingerprint", "album", "tracks", "plan_fingerprint",
+    }:
+        raise ValueError("Expected album fields, track edits and the current fingerprint.")
+    expected = request_values.get("expected_fingerprint")
+    if not isinstance(expected, str) or not expected:
+        raise ValueError("expected_fingerprint is required")
+    album_values = _validated_edit_fields(request_values.get("album", {}), ALBUM_EDITABLE_FIELDS)
+    track_values = request_values.get("tracks", [])
+    if not isinstance(track_values, list) or len(track_values) > 1000:
+        raise ValueError("tracks must be a list of at most 1000 edits")
+    overrides = {}
+    for row in track_values:
+        if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] in overrides:
+            raise ValueError("Each track edit needs a unique integer id")
+        overrides[row["id"]] = _validated_edit_fields(
+            {key: value for key, value in row.items() if key != "id"},
+            {"title", "artist", "artists", "disc", "track"},
+        )
+    library = _library(app)
+    album = library.get_album(album_id)
+    if album is None:
+        return None
+    items = _album_items(album)
+    _require_current_album(album, expected, items)
+    _require_managed_item_paths(app, items)
+    if set(overrides) - {item.id for item in items}:
+        raise ValueError("A track edit does not belong to this album")
+    changes = [(item, {**album_values, **overrides.get(item.id, {})}) for item in items]
+    snapshots, tag_changes = [], []
+    for item, values in changes:
+        expanded = _expanded_artist_edit(item, values, edit_credits=True)
+        before = {key: (_item_genre(item) if key == "genre" else item.get(key)) for key in expanded}
+        snapshots.append((item, before, os.fsdecode(item.path)))
+        diff = {key: {"from": before[key], "to": value} for key, value in expanded.items() if before[key] != value}
+        if diff:
+            tag_changes.append({"item_id": item.id, "title": item.title, "changes": diff})
+        for key, value in expanded.items():
+            _set_item_value(item, key, value)
+    for key, value in _expanded_artist_edit(album, album_values, edit_credits=True).items():
+        album[key] = value
+    preview_snapshots = [(_MetadataPreviewItem(item, album), before, old) for item, before, old in snapshots]
+    destinations, companions, artwork = _managed_metadata_destinations(app, preview_snapshots, album)
+    root = _validated_library_root(app)
+    paths = [{"item_id": item.id, "from": str(Path(old).relative_to(root)), "to": str(target.relative_to(root))}
+             for (item, _, old), target in zip(snapshots, destinations) if Path(old) != target]
+    related = [{"kind": kind, "from": str(source.relative_to(root)), "to": str(target.relative_to(root)),
+                "identity": _file_identity(source)}
+               for kind, pairs in (("Lyrics sidecar", companions), ("Artwork", artwork)) for source, target in pairs]
+    plan = {"fingerprint": expected, "changes": tag_changes, "paths": paths, "related_files": related}
+    digest = hashlib.sha256(json.dumps(plan, sort_keys=True, default=str).encode()).hexdigest()
+    if not apply:
+        return {**plan, "plan_fingerprint": digest}
+    if request_values.get("plan_fingerprint") != digest:
+        raise ManagedMutationError("The draft or file destinations changed. Review changes again.",
+                                   code="metadata_preview_stale", status=409)
+    # Reload untouched models: planning only changes in-memory objects and never stores them.
+    album = library.get_album(album_id)
+    items = _album_items(album)
+    changes = _mutate_managed_items(
+        [(item, {**album_values, **overrides.get(item.id, {})}) for item in items],
+        album=album, album_values=album_values, relocate_app=app,
+    )
+    return {"changes": changes, "album": _managed_album_payload(app, album_id)}
 
 
 def _edit_managed_album(app: Flask, album_id: int, values: dict, expected: str) -> dict | None:
