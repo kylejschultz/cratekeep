@@ -871,7 +871,7 @@ def main() -> None:
         page.get_by_role("checkbox", name="Select album Background fixture 1", exact=True).wait_for()
         page.get_by_role("checkbox", name="Select this page", exact=True).check()
         page.get_by_role("button", name="Match Selected", exact=True).click()
-        with expect_operation(page, lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'matching') as accepted:
+        with page.expect_response(lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'matching') as accepted:
             page.get_by_role("button", name="Start matching", exact=True).click()
         matching_job = accepted.value.json()['id']
         page.get_by_role("button", name="Continue in background", exact=True).click()
@@ -891,7 +891,7 @@ def main() -> None:
         page.get_by_role("checkbox", name="Select album Background fixture 1", exact=True).wait_for()
         page.get_by_role("checkbox", name="Select this page", exact=True).check()
         page.get_by_role("button", name="Import selected", exact=True).click()
-        with expect_operation(page, lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'import') as accepted:
+        with page.expect_response(lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'import') as accepted:
             page.get_by_role("button", name="Start import", exact=True).click()
         importing_job = accepted.value.json()['id']
         page.get_by_role("button", name="Continue in background", exact=True).click()

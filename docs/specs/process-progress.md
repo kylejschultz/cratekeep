@@ -16,9 +16,10 @@ progress. Named Inbox discovery runs on the server, with committed scan events a
 last-scan status, but no user-facing work counters. Queue page loading also has a
 30-second abort path that must not misrepresent a continuing scan as failed.
 
-The artist/credits/location candidate remains separate in artist-tags-and-paths.
-This planning worktree is based on current origin/dev 04e95f2; it must not absorb
-that candidate, paused Lyrics, or broader Beets settings work as hidden dependencies.
+Originally planned from origin/dev 04e95f2. Kyle subsequently requested that the
+progress candidate build on the accepted artist/credits/location commits (28a60a7),
+so this task is stacked on that branch. Artist/location PR #26 remains independently
+reviewable. Paused Lyrics and broader Beets settings work remain excluded.
 
 ## Proposed user experience
 
