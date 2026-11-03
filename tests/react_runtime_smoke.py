@@ -7,6 +7,8 @@ touches non-fixture media.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from types import SimpleNamespace
 import argparse
 import hashlib
 import json
@@ -42,12 +44,48 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@contextmanager
+def expect_operation(page, predicate):
+    """Assert the real handler result whether returned directly or by Activity.
+
+    Async responses retain the validated step body and each handler's JSON/status;
+    this adapter changes transport expectations, not filesystem/result assertions.
+    """
+    captured = SimpleNamespace(value=None)
+    def matches(response):
+        if predicate(response):
+            captured.value = response
+            return True
+        if '/api/activity' not in response.url or response.status >= 400:
+            return False
+        try:
+            job = response.json()
+        except Exception:
+            return False
+        if job.get('status') in {None, 'queued', 'running', 'waiting', 'stopping'}:
+            return False
+        for index, step in enumerate(job.get('steps', [])):
+            rows = job.get('rows', [])
+            row = rows[index] if index < len(rows) else {}
+            result = row.get('result', job.get('result', {}))
+            status = row.get('http_status', job.get('http_status', 500))
+            operation = SimpleNamespace(url=step['path'], status=status, ok=status < 400,
+                request=SimpleNamespace(method=step.get('method', 'POST'), post_data_json=step.get('body', {})),
+                json=lambda result=result: result)
+            if predicate(operation):
+                captured.value = operation
+                return True
+        return False
+    with page.expect_response(matches):
+        yield captured
+
+
 def match_selected(page, endpoint, evidence_dir, *, cooldown=False, expected_matches=1):
     page.get_by_role("button", name="Match Selected", exact=True).click()
     confirmation=page.get_by_role("dialog",name="Match selected albums",exact=True)
     confirmation.wait_for()
     assert confirmation.evaluate("node => node.matches(':modal')")
-    with page.expect_response(lambda response: response.url.endswith(endpoint)) as matched:
+    with page.expect_response(lambda response: response.url.endswith("/api/activity") and response.request.method == "POST" and response.request.post_data_json.get("mode") == "matching") as matched:
         confirmation.get_by_role("button",name="Start matching",exact=True).click()
     if cooldown:
         page.get_by_text("Fixture MusicBrainz cooldown",exact=True).wait_for()
@@ -63,7 +101,11 @@ def match_selected(page, endpoint, evidence_dir, *, cooldown=False, expected_mat
     assert all(row.is_visible() for row in matched_rows.all())
     page.screenshot(path=evidence_dir/("06-inbox-matching-results.png" if cooldown else "06-library-matching-results.png"),full_page=True)
     results.get_by_role("button",name="Close results",exact=True).click()
-    return matched.value
+    accepted = matched.value.json()
+    assert accepted["id"]
+    step = matched.value.request.post_data_json["steps"][0]
+    assert step["path"] == endpoint
+    return SimpleNamespace(ok=matched.value.ok, request=SimpleNamespace(post_data_json=step["body"]))
 
 
 def main() -> None:
@@ -272,7 +314,7 @@ def main() -> None:
         tagged_return.title = "First"
         tagged_return.save()
         returned_before = [sha256(path) for path in returned_paths]
-        with page.expect_response(lambda response: response.url.endswith("/scopes/refresh")) as disk_refresh:
+        with expect_operation(page, lambda response: response.url.endswith("/scopes/refresh")) as disk_refresh:
             page.get_by_role("button", name="Refresh", exact=True).click()
         assert disk_refresh.value.ok, disk_refresh.value.json()
         assert disk_refresh.value.request.method == "POST"
@@ -315,14 +357,14 @@ def main() -> None:
         page.get_by_role("button", name="Search exact release").click()
         assert "canonical MusicBrainz release UUID" in page.get_by_role("alert").inner_text()
         page.get_by_label("MusicBrainz release UUID").fill("123e4567-e89b-42d3-a456-426614174002")
-        with page.expect_response(lambda response: response.url.endswith("/rematch")) as mbid_match:
+        with expect_operation(page, lambda response: response.url.endswith("/rematch")) as mbid_match:
             page.get_by_role("button", name="Search exact release").click()
         assert mbid_match.value.ok
         mbid_payload = mbid_match.value.json()
         assert any(candidate.get("artwork_url") for candidate in mbid_payload.get("candidates", [])), mbid_payload
         candidate_choice = page.locator("[data-review-candidates] input[type=radio]").first
         if not candidate_choice.is_checked():
-            with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.request.method == "PATCH") as candidate_selection:
+            with expect_operation(page, lambda response: "/api/library-import/albums/" in response.url and response.request.method == "PATCH") as candidate_selection:
                 candidate_choice.click()
             assert candidate_selection.value.ok, candidate_selection.value.json()
         page.locator(".candidate-artwork").first.wait_for()
@@ -381,7 +423,7 @@ def main() -> None:
         assert not bulk_checkbox.is_checked()
         assert page.get_by_text("1 selected", exact=True).count() == 0
         bulk_checkbox.check()
-        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
+        with expect_operation(page, lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
             page.locator(".toolbar-actions").get_by_role("button", name="Import selected", exact=True).click()
         confirmation = page.get_by_role("dialog", name="Import selected albums", exact=True)
         confirmation.wait_for()
@@ -391,7 +433,7 @@ def main() -> None:
         assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
         page.screenshot(path=args.evidence_dir / "08-bulk-confirmation-mobile.png", full_page=True)
         page.set_viewport_size({"width":1440,"height":1000})
-        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/execute")) as bulk_import:
+        with expect_operation(page, lambda response: response.url.endswith("/api/library-import/bulk/execute")) as bulk_import:
             confirmation.get_by_role("button", name="Start import", exact=True).click()
         results = page.get_by_role("dialog", name="Import results", exact=True)
         results.wait_for()
@@ -457,16 +499,16 @@ def main() -> None:
         assert page.get_by_text("MusicBrainz release MBID", exact=True).is_visible()
         assert page.get_by_role("button", name="Edit metadata").is_visible()
         assert page.get_by_label("Upload replacement").is_visible()
-        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as direct_upload:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/upload-preview")) as direct_upload:
             page.get_by_label("Upload replacement").set_input_files({"name":"direct-cover.jpg", "mimeType":"image/jpeg", "buffer":EXISTING_ARTWORK_JPEG})
         assert direct_upload.value.status == 201, direct_upload.value.json()
         assert page.get_by_label("Genre", exact=True).count() == 0
         page.get_by_role("button", name="Cancel", exact=True).click()
         def review_and_save():
-            with page.expect_response(lambda response: response.url.endswith("/metadata/preview")) as reviewed:
+            with expect_operation(page, lambda response: response.url.endswith("/metadata/preview")) as reviewed:
                 page.get_by_role("button", name="Review changes", exact=True).click()
             assert reviewed.value.status == 200, reviewed.value.json()
-            with page.expect_response(lambda response: response.url.endswith("/metadata/apply")) as saved:
+            with expect_operation(page, lambda response: response.url.endswith("/metadata/apply")) as saved:
                 page.get_by_role("button", name="Save changes", exact=True).click()
             return saved.value
 
@@ -515,12 +557,12 @@ def main() -> None:
         editor.get_by_label("Artist", exact=True).filter(visible=True).fill("Fixture Guest")
         editor.get_by_label("Track", exact=True).filter(visible=True).fill("3")
         editor.get_by_label("Disc", exact=True).filter(visible=True).fill("2")
-        with page.expect_response(lambda response: response.url.endswith("/metadata/preview")) as reviewed:
+        with expect_operation(page, lambda response: response.url.endswith("/metadata/preview")) as reviewed:
             page.get_by_role("button", name="Review changes", exact=True).click()
         assert reviewed.value.status == 200, reviewed.value.json()
         assert reviewed.value.json()["paths"], reviewed.value.json()
         page.screenshot(path=args.evidence_dir / "08-metadata-review.png", full_page=True)
-        with page.expect_response(lambda response: response.url.endswith("/metadata/apply")) as saved_track:
+        with expect_operation(page, lambda response: response.url.endswith("/metadata/apply")) as saved_track:
             page.get_by_role("button", name="Save changes", exact=True).click()
         assert saved_track.value.status == 200, saved_track.value.json()
         saved_id = saved_track.value.json()["changes"][0]["item_id"]
@@ -566,7 +608,7 @@ def main() -> None:
         organized_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
         library_bulk_track = args.fixture_root / "library" / Path(organized_item["path"]).relative_to(args.app_library)
         assert library_bulk_track.parent.name != "Manual fixture album"
-        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
             page.get_by_label("Upload replacement").set_input_files({
                 "name": "replacement.jpg", "mimeType": "image/jpeg", "buffer": EXISTING_ARTWORK_JPEG,
             })
@@ -576,13 +618,13 @@ def main() -> None:
         page.get_by_role("button", name="Apply artwork", exact=True).wait_for()
         page.get_by_role("button", name="Cancel", exact=True).click()
         assert page.get_by_role("button", name="Apply artwork", exact=True).count() == 0
-        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
             page.get_by_label("Upload replacement").set_input_files({
                 "name": "replacement-again.jpg", "mimeType": "image/jpeg", "buffer": EXISTING_ARTWORK_JPEG,
             })
         assert upload.value.status == 201, upload.value.json()
         artwork_preview = upload.value.json()
-        with page.expect_response(lambda response: response.url.endswith("/artwork/apply")) as applied:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/apply")) as applied:
             page.get_by_role("button", name="Apply artwork", exact=True).click()
         assert applied.value.request.post_data_json == {
             "preview_id": artwork_preview["preview_id"], "expected_fingerprint": artwork_preview["fingerprint"],
@@ -607,7 +649,7 @@ def main() -> None:
         page.get_by_role("button", name="Cancel removal").click()
         assert sha256(library_bulk_track) == kept_hash
         page.get_by_role("button", name="Remove from library", exact=True).click()
-        with page.expect_response(lambda response: response.url.endswith("/removal/apply")) as removed:
+        with expect_operation(page, lambda response: response.url.endswith("/removal/apply")) as removed:
             page.get_by_role("button", name="Remove from Cratekeep; keep files", exact=True).click()
         assert removed.value.status == 200 and removed.value.json()["status"] == "complete"
         assert not removed.value.request.post_data_json["delete_files"]
@@ -627,7 +669,7 @@ def main() -> None:
         page.locator(".album-card").filter(has_text="Bulk Ready").click()
         page.get_by_role("button", name="Remove from library", exact=True).click()
         page.get_by_label("Also delete files").check()
-        with page.expect_response(lambda response: response.url.endswith("/removal/apply")) as removed:
+        with expect_operation(page, lambda response: response.url.endswith("/removal/apply")) as removed:
             page.get_by_role("button", name="Delete listed files and remove album", exact=True).click()
         assert removed.value.status == 200 and removed.value.json()["status"] == "complete"
         assert removed.value.request.post_data_json["delete_files"]
@@ -645,7 +687,7 @@ def main() -> None:
             tags.album="Copy Lifecycle"; tags.title=path.stem[3:]; tags.track=number; tags.save()
         originals={path:sha256(path) for path in copy_sources}
         page.goto(base+"/inbox",wait_until="networkidle")
-        with page.expect_response(lambda response: response.url.endswith("/scopes/refresh")) as copied_refresh:
+        with expect_operation(page, lambda response: response.url.endswith("/scopes/refresh")) as copied_refresh:
             page.get_by_role("button", name="Refresh", exact=True).click()
         assert copied_refresh.value.ok
         page.get_by_role("searchbox",name="Find an album").fill("Copy Lifecycle")
@@ -653,7 +695,7 @@ def main() -> None:
         copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
         assert page.get_by_role("button",name="Review import",exact=True).count()==0
         assert page.get_by_role("button",name="Review selected",exact=True).count()==0
-        with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.request.method=="PATCH") as saved_choice:
+        with expect_operation(page, lambda response: "/api/inbox/albums/" in response.url and response.request.method=="PATCH") as saved_choice:
             page.get_by_label("Select As Is",exact=True).click()
         assert saved_choice.value.ok
         page.wait_for_function("[...document.querySelectorAll('.as-is input')].some(node=>node.checked)")
@@ -806,6 +848,49 @@ def main() -> None:
         assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"First","Second","Third"}
         assert {MediaFile(args.fixture_root/"library"/relative).album for relative in receipt['destinations']}=={"Warning Import Chosen"}
         browser_version = browser.version
+        # A confirmed batch survives closing its view, navigation and reload.
+        for number in (1, 2):
+            path = args.fixture_root / "inbox" / f"Background fixture {number}" / "01 Song.wav"
+            write_wav(path)
+            tags = MediaFile(path); tags.artist = tags.albumartist = "Background Artist"
+            tags.album = f"Background fixture {number}"; tags.title = "Song"; tags.track = 1; tags.save()
+        page.goto(base + "/inbox", wait_until="networkidle")
+        page.get_by_role("searchbox", name="Find an album").fill("Background fixture")
+        page.get_by_role("button", name="Refresh", exact=True).click()
+        page.get_by_role("checkbox", name="Select album Background fixture 1", exact=True).wait_for()
+        page.get_by_role("checkbox", name="Select this page", exact=True).check()
+        page.get_by_role("button", name="Match Selected", exact=True).click()
+        with expect_operation(page, lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'matching') as accepted:
+            page.get_by_role("button", name="Start matching", exact=True).click()
+        matching_job = accepted.value.json()['id']
+        page.get_by_role("button", name="Continue in background", exact=True).click()
+        page.goto(base + "/", wait_until="networkidle")
+        page.get_by_role("button", name=re.compile(r"^Activity")).click()
+        page.get_by_role("region", name="Activity monitor").get_by_text("Matching albums", exact=True).wait_for()
+        page.screenshot(path=args.evidence_dir / "15-activity-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=args.evidence_dir / "15-activity-mobile.png", full_page=True)
+        page.reload(wait_until="networkidle")
+        page.wait_for_function("async id => { const job = await (await fetch('/api/activity/' + id)).json(); return !['queued','running','waiting','stopping'].includes(job.status); }", arg=matching_job, timeout=60000)
+        matched_job = page.request.get(base + '/api/activity/' + matching_job).json()
+        assert [row['status'] for row in matched_job['rows']] == ['matched','matched'], matched_job
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.goto(base + "/inbox", wait_until="networkidle")
+        page.get_by_role("searchbox", name="Find an album").fill("Background fixture")
+        page.get_by_role("checkbox", name="Select album Background fixture 1", exact=True).wait_for()
+        page.get_by_role("checkbox", name="Select this page", exact=True).check()
+        page.get_by_role("button", name="Import selected", exact=True).click()
+        with expect_operation(page, lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'import') as accepted:
+            page.get_by_role("button", name="Start import", exact=True).click()
+        importing_job = accepted.value.json()['id']
+        page.get_by_role("button", name="Continue in background", exact=True).click()
+        page.goto(base + "/library", wait_until="networkidle")
+        page.reload(wait_until="networkidle")
+        page.wait_for_function("async id => { const job = await (await fetch('/api/activity/' + id)).json(); return !['queued','running','waiting','stopping'].includes(job.status); }", arg=importing_job, timeout=60000)
+        imported_job = page.request.get(base + '/api/activity/' + importing_job).json()
+        assert [row['status'] for row in imported_job['rows']] == ['imported','imported'], imported_job
+        assert all(row.get('jobId') for row in imported_job['rows'])
         browser.close()
 
     after = {"inbox_untagged": sha256(inbox_untagged), "inbox": sha256(inbox_track), "library": sha256(library_track),

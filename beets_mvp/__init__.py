@@ -43,6 +43,7 @@ from .musicbrainz import MusicBrainzClient, ProviderError, search_releases
 from .matching import score_release
 from .inbox_discovery import DISCOVERY_MODES, InboxDiscovery, scan_completed
 from . import locations
+from .activity import report as report_progress, observe
 from . import match_diagnostics
 from .duplicates import duplicate_matches
 
@@ -1247,9 +1248,12 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.before_request
     def serialize_mutations():
+        if (request.endpoint or "").startswith("activity_"):
+            return
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             mutation_lock.acquire()
             g.library_mutation_locked = True
+            report_progress("Preparing operation")
             if request.endpoint in {"settings", "setup"}:
                 # Automatic matching does network I/O outside the HTTP mutation
                 # lock. Root changes wait for that work before invalidating it.
@@ -1270,6 +1274,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     from .inbox_imports import register_routes as register_inbox_import_routes
     register_inbox_import_routes(app)
     from .analytics import Beacon
+    from .activity import register as register_activity
+    register_activity(app)
     app.extensions["inbox_discovery"] = InboxDiscovery(app)
     app.extensions["beacon"] = Beacon(app)
     if not app.testing:
@@ -1785,6 +1791,7 @@ def _render_ui(app: Flask, page: str, title: str, data: dict):
         "app.html",
         title=title,
         bootstrap={
+            "activityEnabled": True,
             "page": page,
             "buildSha": app.config["BUILD_SHA"],
             "threshold": app.config.get("MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD),
@@ -3916,7 +3923,8 @@ def _preview_folder_inventory(app: Flask, scope: str) -> dict:
                 db.executemany("UPDATE library_inventory SET present = 0, beets_item_id = NULL WHERE id = ?",
                                missing_ids)
             tracked = 0
-            for path, stat in discovered:
+            for position, (path, stat) in enumerate(discovered, 1):
+                report_progress("Reading file tags", position - 1, len(discovered), current=path.relative_to(root).as_posix())
                 relative = path.relative_to(root).as_posix()
                 item_id = beets_paths.get(str(path)); tracked += item_id is not None
                 db.execute(
@@ -3963,11 +3971,14 @@ def _preview_folder_inventory(app: Flask, scope: str) -> dict:
 def _scan_folder_scopes(app: Flask, scopes: list[str], *, match_candidates: bool = True, unmanaged_only: bool = False) -> dict:
     folders, errors = [], []
     successful = []
-    for scope in scopes:
+    report_progress("Scanning folders", 0, len(scopes), "folders")
+    for position, scope in enumerate(scopes, 1):
+        report_progress("Scanning folders", position - 1, len(scopes), "folders", scope)
         try:
             folders.append(_preview_folder_inventory(app, scope)); successful.append(scope)
         except ValueError as exc:
             errors.append({"folder": scope, "error": str(exc)})
+    report_progress("Synchronizing album reviews")
     # Repair older queue rows even when no file's stat changed. Managed files
     # may have been grouped before Inbox completion or by an earlier build.
     if successful and unmanaged_only:
@@ -4238,6 +4249,7 @@ def _library_audio_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
     if not root.is_dir():
         raise OSError("configured library path is not a directory")
     files = []
+    report_progress("Finding files", 0)
     for directory, names, filenames in os.walk(root, followlinks=False, onerror=_raise_os_error):
         names[:] = sorted(name for name in names if not (Path(directory) / name).is_symlink())
         for name in sorted(filenames):
@@ -4245,6 +4257,7 @@ def _library_audio_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
             if path.is_symlink() or path.suffix.lower() not in AUDIO_EXTENSIONS:
                 continue
             files.append((path.resolve(), path.stat()))
+            report_progress("Finding files", len(files))
     return files
 
 
@@ -4976,6 +4989,7 @@ def _rematch_album_by_musicbrainz_id(
         provider = app.config["MUSICBRAINZ_PROVIDER"]
         release_error = None
         try:
+            report_progress("Searching MusicBrainz")
             raw = provider({**query, "musicbrainz_id": musicbrainz_id, "force_refresh": True}, limit=1)
         except ProviderError as exc:
             if exc.code != "release_not_found":
@@ -5064,6 +5078,7 @@ def _rematch_album_by_musicbrainz_id(
         )), None)
 
 
+@observe("Matching albums")
 def _generate_musicbrainz_candidates(
     app: Flask, limit: int, *, album_ids: list[int] | None = None, root: str | None = None,
     source_kind: str = "library", source_id: str | None = None,
@@ -5079,7 +5094,8 @@ def _generate_musicbrainz_candidates(
             "INSERT INTO adoption_jobs(kind, root_path, status, created_at) VALUES ('musicbrainz_candidates', ?, 'running', ?)",
             (root or (albums[0]["root_path"] if albums else str(Path(app.config["LIBRARY_PATH"]).resolve())), _now()),
         ).lastrowid
-    for album in albums:
+    for position, album in enumerate(albums):
+        report_progress("Finding MusicBrainz matches", position, len(albums), "albums", album["album"])
         with _connect(app.config["APP_DB"]) as db:
             db.execute(
                 "UPDATE album_reviews SET candidate_status='running', candidate_error='', updated_at=? WHERE id=?",
@@ -6423,6 +6439,7 @@ def _execute_inbox_album(
                 copies = []
                 originals = {row["path"]: row for row in result["original_sources"]}
                 for index, path in enumerate(paths):
+                    report_progress("Copying audio files", index, len(paths), current=path.name)
                     original = originals[path.relative_to(root).as_posix()]
                     # Keep disc subfolders/duplicate basenames distinct without altering tags.
                     target = working / path.relative_to(root)
@@ -6449,6 +6466,7 @@ def _execute_inbox_album(
                         if detail.get("local") is not None
                     }
                     for position, path in enumerate(paths, 1):
+                        report_progress("Writing file tags", position - 1, len(paths), current=path.name)
                         item = Item.from_path(path)
                         for field, value in _candidate_item_values(effective, details.get(position)).items():
                             _set_item_value(item, field, value)
@@ -6783,7 +6801,8 @@ def _library_import_plans(
             if detail.get("local") is not None
         }
     plans = []
-    for (position, row), path in zip(rows, paths):
+    for index, ((position, row), path) in enumerate(zip(rows, paths)):
+        report_progress("Applying track metadata", index, len(paths), current=path.name)
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
         if item is not None and Path(os.fsdecode(item.path)).resolve() != path:
             raise LibraryImportExecutionError(
@@ -7368,6 +7387,7 @@ def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, 
     return sorted(dict(discovered).items(), key=lambda item: str(item[0]).casefold())
 
 
+@observe("Scanning Inbox")
 def _scan_inbox_inventory(app, inbox, *, scopes=None, trigger="request"):
     with app.config["MUTATION_LOCK"], app.config["INBOX_SCAN_LOCK"]:
         current = _configured_inbox(app, inbox["id"])
@@ -7442,7 +7462,9 @@ def _scan_inbox_inventory_locked(
                           if _scope_for_relative_path(relative) in wanted]
             if scoped_ids:
                 db.executemany("UPDATE library_inventory SET present=0 WHERE id=?", scoped_ids)
-        for path, stat in discovered:
+        report_progress("Reading file tags", 0, len(discovered))
+        for position, (path, stat) in enumerate(discovered, 1):
+            report_progress("Reading file tags", position - 1, len(discovered), current=path.relative_to(root).as_posix())
             relative = path.relative_to(root).as_posix()
             old = previous.get(relative)
             signature = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
@@ -7498,6 +7520,7 @@ def _scan_inbox_inventory_locked(
             "UPDATE adoption_jobs SET status='complete', summary_json=?, finished_at=? WHERE id=?",
             (json.dumps(summary), _now(), job_id),
         )
+    report_progress("Synchronizing album reviews")
     _sync_inbox_album_reviews(app, inbox, root)
     return summary
 

@@ -666,3 +666,11 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .library-folder-browser nav{font-size:13px;overflow-wrap:anywhere}.library-folder-browser nav button{display:inline;padding:2px;font-size:13px}
 .library-folder-browser ul{list-style:none;padding:0;max-height:200px;overflow:auto;margin:12px 0}.library-folder-browser li{border-bottom:1px solid var(--border)}.library-folder-browser li button{width:100%;text-align:left;white-space:normal;overflow-wrap:anywhere;padding:8px 0;font-size:13px}
 .library-folder-browser label{display:grid;gap:6px;margin-top:16px;font-size:13px}
+.activity-monitor{position:relative;margin-left:auto;font-size:13px}.activity-monitor>button{white-space:nowrap;color:var(--text);font-size:13px;padding:8px}
+.activity-panel{position:absolute;z-index:90;right:0;top:40px;width:360px;max-height:70vh;overflow:auto;padding:16px;border:1px solid var(--control);border-radius:6px;background:var(--surface);box-shadow:0 10px 28px #0003;color:var(--text)}
+.activity-panel>header{display:flex;justify-content:space-between;align-items:center}.activity-panel h2{font-size:16px;margin:0}.activity-panel article{padding:12px 0;border-top:1px solid var(--border)}
+.activity-open{display:grid;text-align:left;padding:0;color:var(--text);font-size:13px;white-space:normal}.activity-open small,.activity-progress small{color:var(--muted);display:block;overflow-wrap:anywhere}
+.activity-progress{display:grid;gap:6px;font-size:13px;margin:8px 0}.activity-progress progress{width:100%;height:6px;accent-color:var(--accent)}
+.page-activity:empty{display:none}.page-activity>div{padding:12px 0;border-bottom:1px solid var(--border);font-size:13px}.activity-results{padding:0;list-style:none}.activity-results li{display:grid;grid-template-columns:1fr auto;gap:4px 16px;padding:10px 0;border-bottom:1px solid var(--border)}.activity-results li p{grid-column:1/-1;margin:0;color:var(--muted)}
+.activity-dialog{margin:auto}.activity-dialog header p{margin:4px 0 0;color:var(--muted)}.activity-dialog footer{flex-wrap:wrap}
+@media(max-width:640px){.activity-monitor{margin-left:0}.activity-panel{position:fixed;top:62px;left:12px;right:12px;width:auto}.activity-dialog{width:calc(100vw - 16px);max-height:calc(100dvh - 16px)}.activity-panel button{min-height:44px}}
