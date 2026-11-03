@@ -1,0 +1,84 @@
+name: Bug report
+description: Report something in Cratekeep that is not working as expected.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem! Please search existing issues first.
+        Remove passwords, tokens, private URLs, and other sensitive details from logs and screenshots. You can anonymize folder names while keeping the path structure clear.
+  - type: input
+    id: version
+    attributes:
+      label: Version and build
+      description: Copy the version and build from Settings → About. If the app will not open, give your image tag instead.
+      placeholder: Version 1.x.x · Build abc123, or image tag if unavailable
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Unraid Community Applications
+        - Unraid manual Docker setup
+        - Docker Compose
+        - Plain Docker
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Optional host OS/version, browser/version, image tag, or details of another installation method.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include the page or action affected. If a list is empty, say whether loading finishes or keeps spinning.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: On-screen error
+      description: Copy the exact error, or write "No error shown".
+    validations:
+      required: true
+  - type: textarea
+    id: paths
+    attributes:
+      label: Inbox / Library paths and Docker mappings
+      description: For missing-file or import problems, include the paths in Cratekeep Settings and the corresponding host → container mappings. Confirm which mapped folder contains the music. Anonymized paths are fine; omit credentials and unrelated configuration.
+      placeholder: |
+        Inbox in Settings: /data/inbox
+        Library in Settings: /data/library
+        Host Inbox folder → /data/inbox
+        Host Library folder → /data/library
+        Existing music is in: …
+  - type: dropdown
+    id: refresh
+    attributes:
+      label: Does Refresh change the result?
+      description: For Inbox or Library → Import existing files, try that page's Refresh button and choose the result.
+      options:
+        - Files appear after Refresh
+        - Refresh finishes but the problem remains
+        - Refresh keeps loading
+        - Refresh shows an error (include it above)
+        - Not tried / not applicable
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant logs or screenshots
+      description: Optional container logs, browser errors, or screenshots. Include only the relevant section and remove sensitive details before posting.
