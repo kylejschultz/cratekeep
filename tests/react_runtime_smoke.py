@@ -533,6 +533,39 @@ def main() -> None:
         page.locator(".library-record").filter(has_text="Bulk Ready").click()
         page.get_by_role("table", name="Tracks on Bulk Ready").get_by_text("Edited fixture title", exact=True).wait_for()
         assert MediaFile(str(library_bulk_track)).title == "Edited fixture title"
+        # Explicit location-only move: stage a new folder, preview, save, and pin it.
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name="File location", exact=True).click()
+        page.get_by_role("button", name="Browse folders", exact=True).click()
+        page.get_by_label("New album folder", exact=True).fill("Manual fixture album")
+        page.get_by_role("button", name="Use new folder", exact=True).click()
+        assert not (args.fixture_root / "library" / "Manual fixture album").exists()
+        page.screenshot(path=args.evidence_dir / "08-location-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=args.evidence_dir / "08-location-mobile.png", full_page=True)
+        page.set_viewport_size({"width":1440,"height":1000})
+        before_move = sha256(library_bulk_track)
+        moved_album = review_and_save()
+        assert moved_album.status == 200, moved_album.json()
+        moved_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        library_bulk_track = args.fixture_root / "library" / Path(moved_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track.parent.name == "Manual fixture album"
+        assert sha256(library_bulk_track) == before_move
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_label("Genre", exact=True).fill("Fixture genre")
+        saved_pinned = review_and_save()
+        assert saved_pinned.status == 200, saved_pinned.json()
+        pinned_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        assert Path(pinned_item["path"]).parent.name == "Manual fixture album"
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name="File location", exact=True).click()
+        page.get_by_role("button", name="Use Beets naming", exact=True).click()
+        organized = review_and_save()
+        assert organized.status == 200, organized.json()
+        organized_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        library_bulk_track = args.fixture_root / "library" / Path(organized_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track.parent.name != "Manual fixture album"
         with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
             page.get_by_label("Upload replacement").set_input_files({
                 "name": "replacement.jpg", "mimeType": "image/jpeg", "buffer": EXISTING_ARTWORK_JPEG,

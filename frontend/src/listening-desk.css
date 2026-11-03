@@ -657,3 +657,12 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .metadata-path-change{display:grid;gap:4px;padding:10px 0;overflow-wrap:anywhere;font-size:13px}.metadata-path-change span,.metadata-path-change small{color:var(--muted)}
 .metadata-inline-actions{display:flex;gap:12px;justify-content:flex-end}
 @media(max-width:640px){.metadata-editor{width:calc(100vw - 16px);max-height:calc(100dvh - 16px)}.metadata-editor>header,.metadata-editor>footer,.metadata-editor-body{padding:16px}.metadata-tabs{gap:16px}.metadata-editor .edit-grid{grid-template-columns:1fr}.metadata-editor button,.metadata-editor input,.metadata-editor select{min-height:44px}.metadata-change-group dl>div{grid-template-columns:1fr;gap:2px}.metadata-editor>footer{gap:8px}.metadata-editor>footer button{flex:1}}
+
+.metadata-tabs{overflow-x:auto;flex:none}.metadata-tabs button{flex-shrink:0;white-space:nowrap}
+.file-location h3{font-size:14px;margin:0 0 8px}.file-location p{margin:6px 0;overflow-wrap:anywhere}.file-location small{display:block;font-size:12px;color:var(--muted);margin-top:8px}
+.location-path{font-size:14px}.location-files{font-size:12px;list-style:none;padding:0;overflow-wrap:anywhere}.location-files li{padding:6px 0;border-bottom:1px solid var(--border)}
+.location-policy{margin:20px 0 12px;padding:12px 0;border-block:1px solid var(--border)}.location-policy p{font-size:13px;color:var(--muted)}
+.location-beets-preview{margin:12px 0 20px}.library-folder-browser{margin-top:16px;padding:16px;border:1px solid var(--control);border-radius:4px}
+.library-folder-browser nav{font-size:13px;overflow-wrap:anywhere}.library-folder-browser nav button{display:inline;padding:2px;font-size:13px}
+.library-folder-browser ul{list-style:none;padding:0;max-height:200px;overflow:auto;margin:12px 0}.library-folder-browser li{border-bottom:1px solid var(--border)}.library-folder-browser li button{width:100%;text-align:left;white-space:normal;overflow-wrap:anywhere;padding:8px 0;font-size:13px}
+.library-folder-browser label{display:grid;gap:6px;margin-top:16px;font-size:13px}

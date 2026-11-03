@@ -42,6 +42,7 @@ from PIL import Image as PillowImage, UnidentifiedImageError
 from .musicbrainz import MusicBrainzClient, ProviderError, search_releases
 from .matching import score_release
 from .inbox_discovery import DISCOVERY_MODES, InboxDiscovery, scan_completed
+from . import locations
 from . import match_diagnostics
 from .duplicates import duplicate_matches
 
@@ -721,6 +722,32 @@ def create_app(test_config: dict | None = None) -> Flask:
         if result is None:
             return jsonify(error="Managed album not found", code="album_not_found"), 404
         return jsonify(result)
+
+    @app.get("/api/library/folders")
+    def library_folders():
+        try:
+            return jsonify(locations.browse(_validated_library_root(app), request.args.get("path", "")))
+        except (ValueError, OSError) as exc:
+            return jsonify(error=str(exc), code="library_folder_unavailable"), 400
+
+    @app.get("/api/library/albums/<int:album_id>/location")
+    def managed_album_location(album_id: int):
+        album = _library(app).get_album(album_id)
+        if album is None:
+            return jsonify(error="Managed album not found", code="album_not_found"), 404
+        items = _album_items(album)
+        root = _validated_library_root(app)
+        manual = album.get("cratekeep_directory") or ""
+        source, error = None, None
+        try:
+            source = str(locations.source_directory(root, items, manual).relative_to(root))
+        except ValueError as exc:
+            error = str(exc)
+        library = _library(app)
+        proposed = [{"item_id": item.id,
+                     "to": str(Path(os.fsdecode(item.destination(basedir=library.directory, path_formats=library.path_formats))).relative_to(root))}
+                    for item in items]
+        return jsonify(directory=manual, source_directory=source, manual_error=error, beets_paths=proposed)
 
     @app.route("/api/library/albums/<int:album_id>/metadata/<action>", methods=["POST"])
     def managed_metadata_editor(album_id: int, action: str):
@@ -2478,7 +2505,7 @@ def _managed_album_fingerprint(album, items: list[Item] | None = None) -> str:
             "id": item.id, "path": str(path), "stat": file_state,
             "metadata": {field: (_item_genre(item) if field == "genre" else item.get(field)) for field in fields},
         })
-    payload = {"album_id": album.id, "items": evidence}
+    payload = {"album_id": album.id, "items": evidence, "directory": album.get("cratekeep_directory") or ""}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -2950,7 +2977,7 @@ def _expanded_artist_edit(model, values, *, populate_missing=True, edit_credits=
 
 def _mutate_managed_items(
     changes: list[tuple[Item, dict]], *, album=None, album_values: dict | None = None,
-    finalize=None, relocate_app=None,
+    finalize=None, relocate_app=None, location=None,
 ) -> list[dict]:
     """Write tags before DB state and restore every touched item on any failure."""
     snapshots = []
@@ -2973,6 +3000,7 @@ def _mutate_managed_items(
     album_snapshot = {field: album.get(field) for field in album_values} if album is not None else {}
     moved = []
     copied_art = []
+    created_dirs = set()
     destinations = []
     try:
         if relocate_app is not None:
@@ -2982,11 +3010,19 @@ def _mutate_managed_items(
                 for field, value in album_values.items():
                     album[field] = value
                 album.store()
-            destinations, companions, artwork = _managed_metadata_destinations(relocate_app, snapshots, album)
+            destinations, companions, artwork = _managed_metadata_destinations(relocate_app, snapshots, album, location=location)
         else:
             companions, artwork = [], []
-        for item, _, _ in snapshots:
-            _write_metadata(item)
+        if relocate_app is not None:
+            root = _validated_library_root(relocate_app)
+            for target in destinations + [target for _, target in companions + artwork]:
+                parent = target.parent
+                while parent != root and root in parent.parents and not parent.exists():
+                    created_dirs.add(parent)
+                    parent = parent.parent
+        for item, original, _ in snapshots:
+            if original:
+                _write_metadata(item)
         # Create exclusively: a destination appearing after preflight must never
         # be overwritten. Keep a reverse journal until tags and DB commit.
         audio_moves = [(Path(path), target) for (_, _, path), target in zip(snapshots, destinations)
@@ -3051,7 +3087,8 @@ def _mutate_managed_items(
                 for field, value in original.items():
                     item[field] = value
                 item.path = os.fsencode(path)
-                _write_metadata(item)
+                if original:
+                    _write_metadata(item)
                 item.store()
             except Exception as rollback_exc:
                 rollback_errors.append(f"item {item.id}: {rollback_exc}")
@@ -3062,6 +3099,11 @@ def _mutate_managed_items(
                 album.store()
             except Exception as rollback_exc:
                 rollback_errors.append(f"album {album.id}: {rollback_exc}")
+        for folder in sorted(created_dirs, key=lambda folder: len(folder.parts), reverse=True):
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
         if rollback_errors:
             raise ManagedMutationError(
                 f"metadata write failed ({exc}); rollback was incomplete: {'; '.join(rollback_errors)}",
@@ -3116,12 +3158,16 @@ def _copy_managed_exclusive(source: Path, target: Path) -> None:
             raise
 
 
-def _managed_metadata_destinations(app, snapshots, album):
+def _managed_metadata_destinations(app, snapshots, album, *, location=None):
     """Plan metadata edits using Beets paths; preserve sidecars without clobbering."""
     library = _library(app)
     root = _validated_library_root(app)
     targets, companions, artwork = [], [], []
     planned = set()
+    if location is None and album is not None and album.get("cratekeep_directory"):
+        base = locations.directory(root, album.get("cratekeep_directory"))
+        location = {"directory": base, "base": base}
+    manual = location is not None and "directory" in location
 
     def reserve(source, target):
         if source == target:
@@ -3138,9 +3184,17 @@ def _managed_metadata_destinations(app, snapshots, album):
         planned.add(key)
         return True
 
-    for item, _, old in snapshots:
+    for item, original, old in snapshots:
         source = Path(old)
-        target = Path(os.fsdecode(item.destination(basedir=library.directory, path_formats=library.path_formats))).absolute()
+        beets_target = Path(os.fsdecode(item.destination(basedir=library.directory, path_formats=library.path_formats))).absolute()
+        target = beets_target
+        if manual:
+            if location["base"] not in source.parents:
+                raise ValueError("A managed file is outside the album folder; review its locations first.")
+            # Keep the disc layout; a metadata change can rename the leaf inside the pinned folder.
+            relative = source.relative_to(location["base"])
+            rename = any(value != item.get(key) for key, value in original.items())
+            target = location["directory"] / relative.parent / (beets_target.name if rename else source.name)
         targets.append(target)
         if not reserve(source, target):
             continue
@@ -3197,7 +3251,7 @@ class _MetadataPreviewItem(Item):
 def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *, apply=False):
     """Preview without writes; apply a bound album/track draft in one rollback boundary."""
     if not isinstance(request_values, dict) or set(request_values) - {
-        "expected_fingerprint", "album", "tracks", "plan_fingerprint",
+        "expected_fingerprint", "album", "tracks", "plan_fingerprint", "location",
     }:
         raise ValueError("Expected album fields, track edits and the current fingerprint.")
     expected = request_values.get("expected_fingerprint")
@@ -3225,6 +3279,27 @@ def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *,
     _require_managed_item_paths(app, items)
     if set(overrides) - {item.id for item in items}:
         raise ValueError("A track edit does not belong to this album")
+    root = _validated_library_root(app)
+    prior_directory = album.get("cratekeep_directory") or ""
+    chosen_directory = prior_directory
+    location_context = None
+    if "location" in request_values:
+        choice = request_values["location"]
+        if not isinstance(choice, dict):
+            raise ValueError("location must select manual or Beets naming")
+        if choice == {"mode": "beets"}:
+            chosen_directory = ""
+            location_context = {}
+        elif set(choice) == {"mode", "directory"} and choice["mode"] == "manual":
+            target = locations.directory(root, choice["directory"])
+            source = locations.source_directory(root, items, prior_directory)
+            chosen_directory = str(target.relative_to(root))
+            location_context = {"directory": target, "base": source}
+        else:
+            raise ValueError("location must select manual or Beets naming")
+    location_change = None
+    if prior_directory != chosen_directory:
+        location_change = {"from": prior_directory or "Beets naming", "to": chosen_directory or "Beets naming"}
     changes = [(item, {**album_values, **overrides.get(item.id, {})}) for item in items]
     snapshots, tag_changes = [], []
     for item, values in changes:
@@ -3238,15 +3313,18 @@ def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *,
             _set_item_value(item, key, value)
     for key, value in _expanded_artist_edit(album, album_values, edit_credits=True).items():
         album[key] = value
+    if "location" in request_values:
+        album_values["cratekeep_directory"] = chosen_directory
+        album["cratekeep_directory"] = chosen_directory
     preview_snapshots = [(_MetadataPreviewItem(item, album), before, old) for item, before, old in snapshots]
-    destinations, companions, artwork = _managed_metadata_destinations(app, preview_snapshots, album)
+    destinations, companions, artwork = _managed_metadata_destinations(app, preview_snapshots, album, location=location_context)
     root = _validated_library_root(app)
     paths = [{"item_id": item.id, "from": str(Path(old).relative_to(root)), "to": str(target.relative_to(root))}
              for (item, _, old), target in zip(snapshots, destinations) if Path(old) != target]
     related = [{"kind": kind, "from": str(source.relative_to(root)), "to": str(target.relative_to(root)),
                 "identity": _file_identity(source)}
                for kind, pairs in (("Lyrics sidecar", companions), ("Artwork", artwork)) for source, target in pairs]
-    plan = {"fingerprint": expected, "changes": tag_changes, "paths": paths, "related_files": related}
+    plan = {"fingerprint": expected, "changes": tag_changes, "paths": paths, "related_files": related, "location_change": location_change}
     digest = hashlib.sha256(json.dumps(plan, sort_keys=True, default=str).encode()).hexdigest()
     if not apply:
         return {**plan, "plan_fingerprint": digest}
@@ -3256,9 +3334,10 @@ def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *,
     # Reload untouched models: planning only changes in-memory objects and never stores them.
     album = library.get_album(album_id)
     items = _album_items(album)
+    item_album_values = {key: value for key, value in album_values.items() if key != "cratekeep_directory"}
     changes = _mutate_managed_items(
-        [(item, {**album_values, **overrides.get(item.id, {})}) for item in items],
-        album=album, album_values=album_values, relocate_app=app,
+        [(item, {**item_album_values, **overrides.get(item.id, {})}) for item in items],
+        album=album, album_values=album_values, relocate_app=app, location=location_context,
     )
     return {"changes": changes, "album": _managed_album_payload(app, album_id)}
 

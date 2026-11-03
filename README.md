@@ -94,7 +94,13 @@ remain separate credits. In Edit metadata, use **Album artist credits** to remov
 an extra credited name; each track's **Track artist credits** list can be edited too.
 The editor keeps album and track drafts together. Choose **Review changes** to
 inspect tag updates and exact Beets file destinations, then **Save changes** to
-apply them together. Cancel asks before discarding unsaved work; switching between
+apply them together. **File location** shows existing files and configured Beets
+destinations. Browse Library folders to select an exact album folder, or stage a
+new folder; nothing is created until save. Manual folders are remembered for the
+album, preserving filenames and disc subfolders during relocation. Later metadata
+edits can rename track files inside that folder. Choose **Use Beets naming** to
+return to your configured layout, including for already-renamed albums.
+Cancel asks before discarding unsaved work; switching between
 tracks keeps the draft. **Stored details** shows read-only IDs and file paths.
 Explicit list changes update associated credit/sort tags and retain known IDs for
 kept names. Display-name edits alone preserve collaborators. Saves and rematches also update folder/file names using

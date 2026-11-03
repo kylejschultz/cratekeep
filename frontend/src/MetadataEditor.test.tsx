@@ -77,3 +77,25 @@ it("locks close and review while a request is pending", async () => {
   finish?.({ ok: true, json: async () => plan });
   await screen.findByRole("button", { name: "Save changes" });
 });
+
+it("reviews and saves a location-rule change even when no files or tags move", async () => {
+  const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+    void init;
+    return { ok: true, json: async () => url.endsWith('/location') ? { directory: 'Pinned/Album', source_directory: 'Pinned/Album', beets_paths: [] }
+      : url.endsWith('/preview') ? { changes: [], paths: [], related_files: [], location_change: { from: 'Pinned/Album', to: 'Beets naming' }, plan_fingerprint: 'folder-plan' }
+      : { album } };
+  });
+  vi.stubGlobal('fetch', fetch);
+  const saved = vi.fn();
+  render(<MetadataEditor album={album} onClose={vi.fn()} onSaved={saved} onBusyChange={vi.fn()}/>);
+  fireEvent.click(screen.getByRole('button', { name: 'File location' }));
+  await screen.findByText('Manual album folder');
+  fireEvent.click(screen.getByRole('button', { name: 'Use Beets naming' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Album details' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Review changes' }));
+  const save = await screen.findByRole('button', { name: 'Save changes' });
+  expect(save).toBeEnabled();
+  expect(JSON.parse(String(fetch.mock.calls.find(([url]) => url.endsWith('/preview'))?.[1]?.body))).toMatchObject({ location: { mode: 'beets' } });
+  fireEvent.click(save);
+  await waitFor(() => expect(saved).toHaveBeenCalledWith(album));
+});
