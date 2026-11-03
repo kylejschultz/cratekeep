@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import time
 import sys
 import urllib.parse
 import urllib.request
@@ -42,6 +43,16 @@ def post_form(url: str, values: dict) -> None:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def wait_activity(page, base, job_id, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = page.request.get(base + '/api/activity/' + job_id).json()
+        if job['status'] not in {'queued', 'running', 'waiting', 'stopping'}:
+            return job
+        page.wait_for_timeout(200)
+    raise AssertionError(f'Activity {job_id} did not finish within {timeout}s')
 
 
 @contextmanager
@@ -866,14 +877,13 @@ def main() -> None:
         page.get_by_role("button", name="Continue in background", exact=True).click()
         page.goto(base + "/", wait_until="networkidle")
         page.get_by_role("button", name=re.compile(r"^Activity")).click()
-        page.get_by_role("region", name="Activity monitor").get_by_text("Matching albums", exact=True).wait_for()
+        page.locator(f'[data-activity-id="{matching_job}"]').get_by_text("Matching albums", exact=True).wait_for()
         page.screenshot(path=args.evidence_dir / "15-activity-desktop.png", full_page=True)
         page.set_viewport_size({"width":390,"height":844})
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         page.screenshot(path=args.evidence_dir / "15-activity-mobile.png", full_page=True)
         page.reload(wait_until="networkidle")
-        page.wait_for_function("async id => { const job = await (await fetch('/api/activity/' + id)).json(); return !['queued','running','waiting','stopping'].includes(job.status); }", arg=matching_job, timeout=60000)
-        matched_job = page.request.get(base + '/api/activity/' + matching_job).json()
+        matched_job = wait_activity(page, base, matching_job)
         assert [row['status'] for row in matched_job['rows']] == ['matched','matched'], matched_job
         page.set_viewport_size({"width":1440,"height":1000})
         page.goto(base + "/inbox", wait_until="networkidle")
@@ -887,8 +897,7 @@ def main() -> None:
         page.get_by_role("button", name="Continue in background", exact=True).click()
         page.goto(base + "/library", wait_until="networkidle")
         page.reload(wait_until="networkidle")
-        page.wait_for_function("async id => { const job = await (await fetch('/api/activity/' + id)).json(); return !['queued','running','waiting','stopping'].includes(job.status); }", arg=importing_job, timeout=60000)
-        imported_job = page.request.get(base + '/api/activity/' + importing_job).json()
+        imported_job = wait_activity(page, base, importing_job)
         assert [row['status'] for row in imported_job['rows']] == ['imported','imported'], imported_job
         assert all(row.get('jobId') for row in imported_job['rows'])
         browser.close()

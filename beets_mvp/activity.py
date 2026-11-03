@@ -273,7 +273,8 @@ class Activity:
                             rows[index]['status'] = 'complete' if last_status < 400 and not (last_result.get('errors') or last_result.get('failed') or last_result.get('cleanup', {}).get('errors')) else 'failed'
                             if last_status >= 400:
                                 rows[index]['reason'] = last_result.get('error', 'Operation failed.')
-                        rows[index]['result'] = last_result
+                        if mode != 'matching':
+                            rows[index]['result'] = last_result
                         rows[index]['http_status'] = last_status
                         break
                     self.update(job_id, rows=deepcopy(rows), processed=index + 1, resume_at=None)
