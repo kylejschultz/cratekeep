@@ -7115,9 +7115,9 @@ def test_explicit_matching_rescans_only_the_reviewed_folder_for_new_tracks(tmp_p
         return [exact_candidate(query, mbid)]
     app.config["MUSICBRAINZ_PROVIDER"] = provider
     original = beets_mvp._library_audio_stats
-    def only_target(path):
+    def only_target(path, **kwargs):
         assert Path(path) == first.parent, "A single review must not scan the entire root or unrelated folders"
-        return original(path)
+        return original(path, **kwargs)
     monkeypatch.setattr("beets_mvp._library_audio_stats", only_target)
     if action == "match":
         response = client.post(f"/api/{api_source}/candidates", json={"album_id": album["id"]})
