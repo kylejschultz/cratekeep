@@ -138,3 +138,10 @@ def test_restart_retains_committed_album_results_and_marks_inflight_uncertain(tm
     assert restored['status'] == 'interrupted'
     assert [row['status'] for row in restored['rows']] == ['imported', 'unknown', 'not-started']
     assert restored['rows'][0]['jobId'] == 9
+
+
+def test_inbox_saved_match_reuse_is_reported_as_cached(tmp_path):
+    app = make_app(tmp_path); client = app.test_client()
+    app.view_functions['generate_inbox_candidates'] = lambda: {'result': {'already_matched': True, 'errors': []}, 'album': {'candidate_status': 'complete', 'candidates': [1]}}
+    job = submit(client, [{'path': '/api/inbox/candidates', 'id': 1, 'body': {'album_id': 1}}], mode='matching')
+    assert wait(client, job['id'])['rows'][0]['status'] == 'cached'
