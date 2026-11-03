@@ -145,3 +145,43 @@ def test_inbox_saved_match_reuse_is_reported_as_cached(tmp_path):
     app.view_functions['generate_inbox_candidates'] = lambda: {'result': {'already_matched': True, 'errors': []}, 'album': {'candidate_status': 'complete', 'candidates': [1]}}
     job = submit(client, [{'path': '/api/inbox/candidates', 'id': 1, 'body': {'album_id': 1}}], mode='matching')
     assert wait(client, job['id'])['rows'][0]['status'] == 'cached'
+
+
+def test_refresh_keeps_cumulative_track_count_through_folders_and_finalization(tmp_path, monkeypatch):
+    from test_app import tagged_inbox_wav
+    app = make_app(tmp_path)
+    for name in ('Root.wav', 'Artist/One.wav', 'Artist/Two.wav', 'Other/Three.wav'):
+        tagged_inbox_wav(tmp_path / 'library' / name, album='Count fixture')
+    service = app.extensions['activity']
+    snapshots = []
+    original = service.update
+    def record(job_id, **values):
+        original(job_id, **values)
+        snapshots.append(dict(service.jobs[job_id]))
+    monkeypatch.setattr(service, 'update', record)
+    client = app.test_client()
+    # A fresh and unchanged refresh must each count all tracks, not reset per folder.
+    for index in range(2):
+        snapshots.clear()
+        job = submit(client, [{'path': '/api/library-import/queue/refresh', 'body': {}}],
+                     request_id=f'cumulative-refresh-{index}')
+        result = wait(client, job['id'])
+        counts = [row['files_found'] for row in snapshots if 'files_found' in row]
+        assert counts == sorted(counts)
+        assert counts[0] == 0 and counts[-1] == 4
+        assert result['status'] == 'complete' and result['files_found'] == 4
+        syncing = [row for row in snapshots if row['stage'] == 'Synchronizing album reviews']
+        assert syncing and syncing[-1]['files_found'] == 4
+
+
+def test_scoped_inbox_discovery_counts_unique_tracks_across_overlapping_folders(tmp_path, monkeypatch):
+    from test_app import write_wav
+    import beets_mvp
+    root = tmp_path / 'inbox'
+    for name in ('Root.wav', 'Artist/One.wav', 'Artist/Album/Two.wav'):
+        write_wav(root / name)
+    counts = []
+    monkeypatch.setattr(beets_mvp, 'report_progress', lambda *args, **values: counts.append(values['files_found']))
+    files = beets_mvp._inbox_scope_audio_stats(root, ['.', 'Artist', 'Artist/Album'])
+    assert len(files) == 3
+    assert counts == sorted(counts) and counts[-1] == 3

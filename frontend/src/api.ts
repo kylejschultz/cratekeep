@@ -32,7 +32,7 @@ export function formatBytes(value: number | null | undefined) {
 }
 
 export type ActivityStep = { path: string; method?: string; body: Record<string, unknown>; id?: number; album?: string };
-export type ActivityJob = { created_at?: number; finished_at?: number; id: string; label: string; scope: string; href: string; status: string; stage: string; stage_done?: number; stage_total?: number; stage_unit?: string; current?: string; processed: number; total: number; rows: any[]; result?: any; http_status?: number; error?: string; resume_at?: number; mode?: string; inbox_id?: string; steps?: ActivityStep[] };
+export type ActivityJob = { created_at?: number; finished_at?: number; id: string; label: string; scope: string; href: string; status: string; stage: string; stage_done?: number; stage_total?: number; stage_unit?: string; files_found?: number; current?: string; processed: number; total: number; rows: any[]; result?: any; http_status?: number; error?: string; resume_at?: number; mode?: string; inbox_id?: string; steps?: ActivityStep[] };
 export let activityEnabled = false;
 export function configureActivity(enabled: boolean) { activityEnabled = enabled; }
 export const activityRunning = (job: ActivityJob) => ["queued", "running", "waiting", "stopping"].includes(job.status);

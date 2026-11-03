@@ -4,6 +4,12 @@ import { api, activityEnabled, activityRunning, type ActivityJob } from "./api";
 import { useActivity } from "./activityStore";
 import { InboxActionDialog } from "./InboxImportActions";
 
+function workCount(job: ActivityJob) {
+  if (["matching", "import"].includes(job.mode || "")) return `${job.processed} / ${job.total} albums`;
+  if (job.files_found != null) return `${job.files_found} tracks found`;
+  if (job.stage_done == null) return "";
+  return `${job.stage_done}${job.stage_total != null ? ` / ${job.stage_total}` : ""} ${job.stage_unit || "files"}${job.stage_total == null ? " found" : " processed"}`;
+}
 function Progress({ job }: { job: ActivityJob }) {
   const [now, setNow] = useState(() => Date.now() / 1000);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now() / 1000), 1000); return () => clearInterval(timer); }, []);
@@ -12,7 +18,7 @@ function Progress({ job }: { job: ActivityJob }) {
   const value = batch ? job.processed : job.stage_done;
   return <div className="activity-progress"><span aria-live="polite">{job.status === "waiting" && job.resume_at ? `MusicBrainz cooldown · resumes ${new Date(job.resume_at * 1000).toLocaleTimeString()}` : job.stage}</span>
     {activityRunning(job) && <progress aria-label={`${job.label} progress`} {...(total != null && total > 0 ? { value: value || 0, max: total } : {})}/>}
-    <small>{job.created_at ? `${Math.floor(((job.finished_at || now) - job.created_at) / 60)}m ${Math.floor(((job.finished_at || now) - job.created_at) % 60)}s elapsed · ` : ""}{batch ? `${job.processed} / ${job.total} albums processed` : job.stage_done != null ? `${job.stage_done}${job.stage_total != null ? ` / ${job.stage_total}` : ""} ${job.stage_unit || "files"}${job.stage_total == null ? " found" : " processed"}` : ""}{job.current ? ` · ${job.current}` : ""}</small>
+    <small>{[job.created_at ? `${Math.floor(((job.finished_at || now) - job.created_at) / 60)}m ${Math.floor(((job.finished_at || now) - job.created_at) % 60)}s elapsed` : "", workCount(job), job.current].filter(Boolean).join(" · ")}</small>
   </div>;
 }
 function Details({ job, onClose }: { job: ActivityJob; onClose: () => void }) {
@@ -42,8 +48,8 @@ export function ActivityMonitor() {
   const chosen = jobs.find(job => job.id === selected);
   return <div className="activity-monitor"><button type="button" className="text-button" aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}>Activity{active.length ? ` (${active.length})` : ""}</button>
     {open && <section id="activity-panel" className="activity-panel" aria-label="Activity monitor"><header><h2>Activity</h2><button type="button" className="text-button" onClick={() => setOpen(false)}>Close</button></header>
-      {error && <p role="status">{error}</p>}{!active.length && <p>No active jobs.</p>}
-      {[...active, ...recent].map(job => <article key={job.id} data-activity-id={job.id}><button type="button" className="text-button activity-open" onClick={() => { setSelected(job.id); setOpen(false); }}><strong>{job.label}</strong><small>{job.scope} · {job.status}</small></button><Progress job={job}/>{!activityRunning(job) && <button type="button" className="text-button" onClick={() => { const next = [...hidden, job.id].slice(-100); setHidden(next); localStorage.setItem("cratekeep-dismissed-activity", JSON.stringify(next)); }}>Dismiss</button>}</article>)}
+      {error && <p role="status">{error}</p>}{!active.length && !recent.length && <p>No recent activity.</p>}
+      {[...active, ...recent].map(job => <article key={job.id} data-activity-id={job.id}><button type="button" className="text-button activity-open" onClick={() => { setSelected(job.id); setOpen(false); }}><strong>{job.label}<span>{job.scope}</span></strong><small>{[activityRunning(job) ? job.stage : job.status, workCount(job)].filter(Boolean).join(" · ")}</small></button>{!activityRunning(job) && <button type="button" className="text-button activity-dismiss" aria-label={`Dismiss ${job.label}`} title="Dismiss" onClick={() => { const next = [...hidden, job.id].slice(-100); setHidden(next); localStorage.setItem("cratekeep-dismissed-activity", JSON.stringify(next)); }}>×</button>}</article>)}
     </section>}{chosen && <Details job={chosen} onClose={() => setSelected(undefined)}/>}</div>;
 }
 export function ActivityInline({ scope }: { scope: "library" | string }) {

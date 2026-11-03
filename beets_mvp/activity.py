@@ -21,12 +21,13 @@ _current = ContextVar('cratekeep_activity', default=None)
 ACTIVE = {'queued', 'running', 'waiting', 'stopping'}
 
 
-def report(stage, done=None, total=None, unit='files', current=None):
+def report(stage, done=None, total=None, unit='files', current=None, files_found=None):
     active = _current.get()
     if active:
         service, job_id = active
         service.update(job_id, stage=stage, stage_done=done, stage_total=total,
-                       stage_unit=unit, current=current)
+                       stage_unit=unit, current=current,
+                       **({'files_found': files_found} if files_found is not None else {}))
 
 
 @contextmanager

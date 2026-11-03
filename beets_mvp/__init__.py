@@ -3860,17 +3860,20 @@ def _folder_queue_page(app: Flask, *, page: int, query: str, status: str) -> dic
             "total": total, "limit": FOLDER_PAGE_SIZE, "query": query, "status": status}
 
 
-def _scope_audio_stats(root: Path, scope: str) -> list[tuple[Path, os.stat_result]]:
+def _scope_audio_stats(root: Path, scope: str, *, found: set[Path] | None = None) -> list[tuple[Path, os.stat_result]]:
     if scope != ".":
-        return _library_audio_stats(root / scope)
+        return _library_audio_stats(root / scope, found=found)
     files = []
     for path in sorted(root.iterdir(), key=lambda item: (item.name.casefold(), item.name)):
         if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS:
             files.append((path.resolve(), path.stat()))
+            if found is not None:
+                found.add(path.resolve())
+                report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
     return files
 
 
-def _preview_folder_inventory(app: Flask, scope: str) -> dict:
+def _preview_folder_inventory(app: Flask, scope: str, *, found: set[Path] | None = None) -> dict:
     root = _validated_library_root(app)
     created_at = _now()
     with _connect(app.config["APP_DB"]) as db:
@@ -3879,7 +3882,7 @@ def _preview_folder_inventory(app: Flask, scope: str) -> dict:
             (str(root), created_at),
         ).lastrowid
     try:
-        discovered = _scope_audio_stats(root, scope)
+        discovered = _scope_audio_stats(root, scope, found=found)
         discovered_by_path = {path.relative_to(root).as_posix(): (path, stat) for path, stat in discovered}
         with _connect(app.config["APP_DB"]) as db:
             existing = db.execute(
@@ -3923,8 +3926,8 @@ def _preview_folder_inventory(app: Flask, scope: str) -> dict:
                 db.executemany("UPDATE library_inventory SET present = 0, beets_item_id = NULL WHERE id = ?",
                                missing_ids)
             tracked = 0
-            for position, (path, stat) in enumerate(discovered, 1):
-                report_progress("Reading file tags", position - 1, len(discovered), current=path.relative_to(root).as_posix())
+            for path, stat in discovered:
+                report_progress("Reading file tags", current=path.relative_to(root).as_posix())
                 relative = path.relative_to(root).as_posix()
                 item_id = beets_paths.get(str(path)); tracked += item_id is not None
                 db.execute(
@@ -3971,11 +3974,11 @@ def _preview_folder_inventory(app: Flask, scope: str) -> dict:
 def _scan_folder_scopes(app: Flask, scopes: list[str], *, match_candidates: bool = True, unmanaged_only: bool = False) -> dict:
     folders, errors = [], []
     successful = []
-    report_progress("Scanning folders", 0, len(scopes), "folders")
-    for position, scope in enumerate(scopes, 1):
-        report_progress("Scanning folders", position - 1, len(scopes), "folders", scope)
+    found: set[Path] = set()
+    report_progress("Finding tracks", 0, unit="tracks", files_found=0)
+    for scope in scopes:
         try:
-            folders.append(_preview_folder_inventory(app, scope)); successful.append(scope)
+            folders.append(_preview_folder_inventory(app, scope, found=found)); successful.append(scope)
         except ValueError as exc:
             errors.append({"folder": scope, "error": str(exc)})
     report_progress("Synchronizing album reviews")
@@ -4245,11 +4248,13 @@ def _preview_library_inventory(app: Flask) -> dict:
     return summary
 
 
-def _library_audio_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
+def _library_audio_stats(root: Path, *, found: set[Path] | None = None) -> list[tuple[Path, os.stat_result]]:
     if not root.is_dir():
         raise OSError("configured library path is not a directory")
     files = []
-    report_progress("Finding files", 0)
+    if found is None:
+        found = set()
+    report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
     for directory, names, filenames in os.walk(root, followlinks=False, onerror=_raise_os_error):
         names[:] = sorted(name for name in names if not (Path(directory) / name).is_symlink())
         for name in sorted(filenames):
@@ -4257,7 +4262,8 @@ def _library_audio_stats(root: Path) -> list[tuple[Path, os.stat_result]]:
             if path.is_symlink() or path.suffix.lower() not in AUDIO_EXTENSIONS:
                 continue
             files.append((path.resolve(), path.stat()))
-            report_progress("Finding files", len(files))
+            found.add(path.resolve())
+            report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
     return files
 
 
@@ -7376,6 +7382,7 @@ def _execute_inbox_bulk_ready(
 
 def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, os.stat_result]]:
     discovered = []
+    found: set[Path] = set()
     for scope in scopes:
         if scope == ".":
             discovered.extend(
@@ -7383,7 +7390,9 @@ def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, 
                 if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS
             )
         else:
-            discovered.extend(_library_audio_stats(root / scope))
+            discovered.extend(_library_audio_stats(root / scope, found=found))
+        found.update(path for path, _ in discovered)
+        report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
     return sorted(dict(discovered).items(), key=lambda item: str(item[0]).casefold())
 
 

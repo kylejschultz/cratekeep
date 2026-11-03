@@ -128,3 +128,12 @@ repository gates, build the frontend, review the diff and attempt exact-head amd
 container/browser checks. Deliver a local candidate and focused manual checklist
 for Kyle after spec approval. PR/publication/deployment remain separate authority;
 no issue comments or GitHub changes are authorized by this planning request.
+
+## Candidate feedback — 2026-11-03
+
+Kyle approved the combined behavior and requested cumulative audio-track discovery
+across folders, retained through finalization and completion. Count unique audio
+paths for the whole refresh; do not reset the displayed discovery count for each
+folder or invent a total before discovery finishes. Compact the Activity popup
+into short summary rows with inline dismissal; opening a job retains full details,
+progress, results and existing actions.
