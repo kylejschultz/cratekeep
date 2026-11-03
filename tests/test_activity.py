@@ -89,13 +89,17 @@ def test_matching_retries_cooldown_and_resumes_only_unfinished_albums(tmp_path, 
     calls = []
     def execute():
         album_id = request.json['album_id']; calls.append(album_id)
+        if calls == [1]:
+            return {'album': None, 'errors': [{'error': 'Transient fixture', 'retryable': True}]}, 207
         return {'album': {'candidate_status': 'complete', 'candidates': [1]}, 'errors': []}
     app.view_functions['generate_library_import_candidates'] = execute
+    monkeypatch.setattr(app.extensions['activity'], 'wait_retry', lambda event, seconds: None)
     client = app.test_client()
     steps = [{'path': '/api/library-import/candidates', 'body': {'album_id': i}, 'id': i, 'album': str(i)} for i in (1, 2)]
     job = submit(client, steps, mode='matching')
     finished = wait(client, job['id'])
-    assert finished['status'] == 'complete' and calls == [1, 2]
+    assert finished['status'] == 'complete' and calls == [1, 1, 2]
+    assert all(not row.get('reason') for row in finished['rows'])
     assert client.post('/api/activity/' + job['id'] + '/resume', json={}).status_code == 409
 
 

@@ -246,6 +246,8 @@ class Activity:
                         if mode == 'matching':
                             data = last_result.get('album')
                             success = last_status < 400 and data and data.get('candidate_status') == 'complete' and not error
+                            if success:
+                                rows[index]['reason'] = ''
                             rows[index]['status'] = ('cached' if last_result.get('already_matched') else 'matched' if data.get('candidates') else 'no-match') if success else 'failed'
                             reason = error.get('error') or last_result.get('error') or (data or {}).get('candidate_error') or 'Matching did not complete.'
                             retryable = error.get('retryable', last_result.get('retryable', last_status in {429, 502, 503, 504}))
