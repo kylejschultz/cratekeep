@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest an improvement or a new capability for Cratekeep.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing requests first. For something that is broken, use the bug report form instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe what you are trying to do and where your current workflow gets difficult.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Cratekeep to do?
+      description: Describe the behavior or outcome you would like. A concrete example helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: Optional approaches you have tried or other ways to solve the problem.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Optional examples or screenshots. Remove sensitive information before posting.
