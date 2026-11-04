@@ -46,6 +46,17 @@ export function ActivityMonitor() {
   const { jobs, error } = useActivity();
   const [open, setOpen] = useState(false), [selected, setSelected] = useState<ActivityJob>();
   const [detailError, setDetailError] = useState("");
+  const monitor = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent) => {
+      if (event.target instanceof Node && !monitor.current?.contains(event.target)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("pointerdown", dismiss); document.removeEventListener("keydown", escape); };
+  }, [open]);
   useEffect(() => {
     const show = (event: Event) => { const id = (event as CustomEvent<string>).detail; void api<ActivityJob>(`/api/activity/${id}`).then(job => { setSelected(job); setDetailError(""); }).catch(reason => { setDetailError(reason.message); setOpen(true); }); };
     window.addEventListener("cratekeep:show-activity", show);
@@ -53,14 +64,14 @@ export function ActivityMonitor() {
   }, []);
   if (!activityEnabled) return null;
   const active = jobs.filter(activityRunning);
-  return <div className="activity-monitor"><button type="button" className={`header-icon${active.length ? " is-running" : ""}`} aria-label={`Activity${active.length ? ` (${active.length})` : ""}`} title={active.length ? `Activity: ${active.length} running` : "Activity"} aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}><HeaderIcon name="activity"/></button>
+  return <div className="activity-monitor" ref={monitor}><button type="button" className={`header-icon${active.length ? " is-running" : ""}`} aria-label={`Activity${active.length ? ` (${active.length})` : ""}`} title={active.length ? `Activity: ${active.length} running` : "Activity"} aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}><HeaderIcon name="activity"/></button>
     {(error || detailError) && open && <p role="status">{error || detailError}</p>}<ActivityHistory open={open} onClose={() => setOpen(false)} onOpen={setSelected}/>
     {selected && <Details key={selected.id} job={selected} onClose={() => setSelected(undefined)}/>}</div>;
 }
-export function ActivityInline({ scope }: { scope: "library" | string }) {
+export function ActivityInline({ scope, excludeId }: { scope: "library" | string; excludeId?: string }) {
   const { jobs, error } = useActivity();
   if (!activityEnabled) return null;
   const relevant = jobs.filter(job => scope === "library" ? job.href.startsWith("/library") : scope === "all" ? job.href.startsWith("/inbox") : job.href === `/inbox?source=${scope}` || job.inbox_ids?.includes(scope));
-  const shown = relevant.filter(activityRunning);
+  const shown = relevant.filter(job => activityRunning(job) && job.id !== excludeId);
   return <div className="page-activity" aria-label="Page activity">{error && shown.length > 0 && <p role="status">{error}</p>}{shown.map(job => <div key={job.id}><strong>{job.label} · {job.scope}</strong><ActivityProgress job={job}/><button type="button" className="text-button" onClick={() => window.dispatchEvent(new CustomEvent("cratekeep:show-activity", { detail: job.id }))}>View activity</button></div>)}</div>;
 }

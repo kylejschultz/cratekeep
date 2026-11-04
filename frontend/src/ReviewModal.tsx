@@ -7,7 +7,7 @@ import { api, ApiError, activityRunning, type ActivityJob } from "./api";
 import { formatMatchPercent } from "./status";
 import type { Album, Candidate, DuplicatePreflight } from "./types";
 
-type Props = { onDeleteAlbum?: () => void; onDeleteTrack?: (trackId: number, title: string) => void; album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onSelectionChange?: (album: Album) => void };
+type Props = { onDeleteAlbum?: () => void; onDeleteTrack?: (trackId: number, title: string) => void; album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onActivityChange?: (id: string | undefined) => void; onSelectionChange?: (album: Album) => void };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -143,7 +143,7 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
   </article>;
 }
 
-export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onSelectionChange, onDeleteAlbum, onDeleteTrack }: Props) {
+export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onActivityChange, onSelectionChange, onDeleteAlbum, onDeleteTrack }: Props) {
   const [album, setAlbum] = useState(seed);
   const notify = useToast();
   const [operation, setOperation] = useState<"match" | "search" | "import" | "selection" | null>(null);
@@ -161,6 +161,10 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
   const [expanded, setExpanded] = useState<number | string | null>(initialExpanded);
   const dialog = useRef<HTMLDivElement>(null);
   const base = source === "inbox" ? "/api/inbox/albums" : "/api/library-import/albums";
+  useEffect(() => {
+    onActivityChange?.(busy && activity && activityRunning(activity) ? activity.id : undefined);
+    return () => onActivityChange?.(undefined);
+  }, [busy, activity, onActivityChange]);
   useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
   useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
   useEffect(() => { if (embedded) dialog.current?.focus(); }, [embedded]);

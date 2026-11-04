@@ -1,0 +1,47 @@
+# Activity usability follow-up — 2026-11-04
+
+## Approved corrections
+
+Kyle accepted All Inboxes and requested the following candidate adjustments:
+
+- A live operation owned by the album inspector displays progress there once;
+  omit that exact job from the left queue while preserving unrelated jobs and
+  the global Activity indicator. Release ownership when the inspector finishes
+  or unmounts. Retain the existing three-second detailed-progress threshold.
+- Activity closes on a click/tap outside, Escape, or its toggle. Controls inside
+  remain usable; opening grouped history closes the popover without closing history.
+- The feed shows approximately three compact rows and scrolls internally, with
+  keyboard access. Keep Clear all and pagination accessible outside the scroller.
+  All history remains available; this is a viewport bound, not a retention limit.
+
+## Proposed next increment — awaiting Kyle's review and approval
+
+The popover should answer: **What is running, and does anything need me?**
+Use the existing Cratekeep type, neutral surfaces, accent and heartbeat control.
+No new settings, dependencies or separate Activity dashboard.
+
+1. Order active work first, then attention-required outcomes, then recent success.
+   Keep at most three rows visible in the scrollable viewport. Use one status
+   mark per row, a concrete action/source, and a quiet latest timestamp.
+2. Name operations by user intent: importing an album, deleting Inbox files,
+   saving metadata or moving files. Replace generic "Updating library files"
+   where the request supplies enough context. Keep unknown legacy entries honest.
+3. Show one entry per user action: successful internal preflight/check stages
+   belong to that action's details. Never hide failed checks or lose their receipts.
+   Do not group independent mutations merely because their endpoint is similar.
+4. Show meaningful outcomes, such as imported albums or deleted files. Omit a
+   misleading "0 / 1 albums processed" or "1 / 1 Inboxes" when the job's counters
+   do not describe that operation. Missing counts are omitted, never invented.
+5. Keep routine empty Inbox scans as the existing one quiet health/time entry;
+   new arrivals and failures remain distinct. Completed work should recede.
+6. Keep Clear all; replace repeated trailing "Clear" text with an accessible
+   compact dismiss control. Preserve individual clearing, paged unlimited history,
+   details, recovery/resume and import cleanup controls.
+
+Acceptance: a mixed fixture with active import, failed match, successful metadata
+edit, arrivals, repeated previews and quiet scans makes the active/failed jobs
+identifiable without reading every row. One import is one feed item; a failed
+preflight remains discoverable. Clearing preserves active jobs and execution
+receipts. Verify desktop/tablet/phone, keyboard, outside click, empty/error/loading
+states and existing pagination/recovery tests. Deliver a local amd64 candidate
+before PR delivery. No redesign implementation is approved by this document.

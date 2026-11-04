@@ -184,3 +184,34 @@ it("buffers detailed progress for three seconds without delaying fast completion
   expect(screen.getByText("Finished")).toBeInTheDocument();
   expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
 });
+
+
+it("dismisses the popover on outside pointer or Escape, while inside clicks keep it open", async () => {
+  configureActivity(true);
+  vi.stubGlobal("fetch", vi.fn(activityFetch()));
+  render(<><ActivityMonitor/><button>Outside</button></>);
+  const toggle = await screen.findByRole("button", { name: "Activity (1)" });
+  fireEvent.click(toggle);
+  const panel = await screen.findByRole("region", { name: "Activity monitor" });
+  expect(await screen.findByRole("region", { name: "Recent activity" })).toHaveAttribute("tabindex", "0");
+  fireEvent.pointerDown(panel);
+  expect(panel).toBeInTheDocument();
+  fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
+  expect(screen.queryByRole("region", { name: "Activity monitor" })).not.toBeInTheDocument();
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(toggle);
+  fireEvent.keyDown(document, { key: "Escape" });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+});
+
+it("excludes only the inspector-owned job from page progress and restores it on release", async () => {
+  configureActivity(true);
+  const other = { ...job, id: "other-job", label: "Matching albums" };
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ jobs: [job, other] }) })));
+  const view = render(<><ActivityMonitor/><ActivityInline scope="library" excludeId={job.id}/></>);
+  expect(await screen.findByRole("button", { name: "Activity (2)" })).toBeInTheDocument();
+  expect(await screen.findByText("Matching albums · Library")).toBeInTheDocument();
+  expect(screen.queryByText("Refreshing files · Library")).not.toBeInTheDocument();
+  view.rerender(<><ActivityMonitor/><ActivityInline scope="library"/></>);
+  expect(await screen.findByText("Refreshing files · Library")).toBeInTheDocument();
+});
