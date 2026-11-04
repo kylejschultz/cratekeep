@@ -80,3 +80,17 @@ required frontend/backend checks and focused synthetic browser checks across
 390/768/1440px. Build and publish the updated combined linux/amd64 local-registry
 candidate under existing task authority; verify its source/digest and provide a
 short checklist. No merge, release, live deployment or progress PR is authorized.
+
+## Approved follow-up — quieter Inbox checks, 2026-11-04
+
+Kyle approved replacing routine Inbox scan repeat counts/results with one Success
+row and latest check time. Successful newly discovered tracks and failed scans get
+standalone entries. Coalesce routine automatic successes in storage too; preserve
+explicit API request receipts/idempotency. Existing known zero-arrival successes
+compact on upgrade, while unknown legacy outcomes remain intact. Other activity
+retains uncapped paged history. Scan arrivals come from committed inventory deltas,
+not the total files already present; rescanning unchanged content creates no new
+arrival. One latest-success status is replaceable/clearable; clear must not cancel
+active work. Discarded automatic status IDs cannot strand the busy indicator or
+prevent the queue from refreshing. SQLite can reuse freed pages; no forced VACUUM
+or changes to import receipts/inventory scan jobs are part of this refinement.

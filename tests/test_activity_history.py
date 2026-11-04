@@ -11,25 +11,32 @@ def scan(service, name='Manual', state='complete'):
     return job
 
 
-def test_grouping_combines_inboxes_and_keeps_failures_visible(tmp_path):
+def test_failed_scans_stay_separate_from_active_scan_status(tmp_path):
     app = make_app(tmp_path); service = app.extensions['activity']
-    scan(service, 'Manual', 'failed'); scan(service, 'slskd'); scan(service, 'Lidarr', None)
+    failed = scan(service, 'Manual', 'failed'); scan(service, 'slskd'); scan(service, 'Lidarr', None)
     for scope in ('Library', 'Library', 'Manual'):
         job = service.new_external('Matching albums', scope, '/library-import' if scope == 'Library' else '/inbox')
         service.finish(job['id'], 'complete')
-    response = app.test_client().get('/api/activity/history').json
-    groups = response['groups']
-    inbox = next(row for row in groups if row['key'] == 'inbox-scans')
-    assert inbox['label'] == 'Inbox scans' and inbox['count'] == 3
-    assert inbox['active'] == 1 and inbox['attention'] == 1 and inbox['finished'] == 2
-    assert inbox['latest']['scope'] == 'Lidarr' and inbox['timestamp'] > 0
-    assert sorted(row['count'] for row in groups) == [1, 2, 3]
+    groups = app.test_client().get('/api/activity/history').json['groups']
+    active = next(row for row in groups if row['key'] == 'inbox-scans')
+    assert active['count'] == active['active'] == 1
+    assert active['latest']['scope'] == 'Lidarr'
+    failure = next(row for row in groups if row['latest']['id'] == failed['id'])
+    assert failure['attention'] == 1 and failure['active'] == 0
+    assert any(row['label'] == 'Matching albums' and row['count'] == 2 for row in groups)
 
 
 def test_more_than_100_runs_survive_restart_with_stable_bounded_pagination(tmp_path):
     app = make_app(tmp_path); service = app.extensions['activity']
-    for index in range(127):
-        scan(service, ('Manual', 'slskd', 'Lidarr')[index % 3])
+    def repeat():
+        job = service.new_external('Matching albums', 'Library', '/library-import')
+        service.finish(job['id'], 'complete')
+        return job
+    first_repeat = repeat()
+    from beets_mvp.activity_history import group_key
+    repeat_group = group_key(service.get(first_repeat['id']))
+    for index in range(126):
+        repeat()
     for index in range(25):
         job = service.new_external('Operation ' + str(index), 'Library', '/library')
         service.finish(job['id'], 'complete')
@@ -37,14 +44,15 @@ def test_more_than_100_runs_survive_restart_with_stable_bounded_pagination(tmp_p
     first = restarted.history.page()
     assert len(first['groups']) == 20 and first['next_before']
     # New runs belong to the latest page, not to this ongoing historical snapshot.
-    scan(restarted)
+    new = restarted.new_external('Matching albums', 'Library', '/library-import')
+    restarted.finish(new['id'], 'complete')
     second = restarted.history.page(before=first['next_before'], snapshot=first['snapshot'])
     assert len(second['groups']) == 6
     assert not {g['key'] for g in first['groups']} & {g['key'] for g in second['groups']}
-    assert next(g['count'] for g in second['groups'] if g['key'] == 'inbox-scans') == 127
+    assert next(g['count'] for g in second['groups'] if g['key'] == repeat_group) == 127
     runs, cursor = [], None
     while True:
-        page = restarted.history.page(group='inbox-scans', before=cursor, snapshot=first['snapshot'])
+        page = restarted.history.page(group=repeat_group, before=cursor, snapshot=first['snapshot'])
         assert len(page['jobs']) <= 20
         runs.extend(job['id'] for job in page['jobs'])
         cursor = page['next_before']
@@ -78,11 +86,16 @@ def test_clear_all_is_global_persistent_and_preserves_active_and_later_completio
 
 def test_group_clear_and_old_dismissal_migration_do_not_remove_other_groups(tmp_path):
     app = make_app(tmp_path); service = app.extensions['activity']; client = app.test_client()
-    one = scan(service); scan(service, 'Lidarr')
+    one = service.new_external('Repeat fixture', 'Library', '/library')
+    service.finish(one['id'], 'complete')
+    two = service.new_external('Repeat fixture', 'Library', '/library')
+    service.finish(two['id'], 'complete')
+    from beets_mvp.activity_history import group_key
+    key = group_key(service.get(one['id']))
     other = service.new_external('Matching albums', 'Library', '/library-import')
     service.finish(other['id'], 'failed')
     assert client.post('/api/activity/history/clear', json={'ids': [one['id']]}).json == {'cleared': 1}
-    assert client.post('/api/activity/history/clear', json={'group': 'inbox-scans'}).json == {'cleared': 1}
+    assert client.post('/api/activity/history/clear', json={'group': key}).json == {'cleared': 1}
     assert [row['label'] for row in client.get('/api/activity/history').json['groups']] == ['Matching albums']
     for body in (None, {'ids': []}, {'ids': 'all'}, {'group': 123}, {'surprise': True}, {'group': 'x', 'ids': ['y']}):
         assert client.post('/api/activity/history/clear', json=body).status_code == 400
@@ -109,7 +122,7 @@ def test_duplicate_submission_still_returns_saved_result_after_clear(tmp_path):
 def test_polling_and_history_summaries_omit_execution_payloads(tmp_path):
     app = make_app(tmp_path); service = app.extensions['activity']
     job = scan(service)
-    for item in (service.list()[0], service.history.page()['groups'][0]['latest'], service.history.page(group='inbox-scans')['jobs'][0]):
+    for item in (service.list()[0], service.history.page()['groups'][0]['latest'], service.history.page(group='inbox-scan-' + job['id'])['jobs'][0]):
         assert item['rows'] == [] and 'result' not in item and 'steps' not in item
     assert service.get(job['id'])['result'] == {'files': 3}
 

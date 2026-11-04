@@ -43,7 +43,7 @@ from .musicbrainz import MusicBrainzClient, ProviderError, search_releases
 from .matching import score_release
 from .inbox_discovery import DISCOVERY_MODES, InboxDiscovery, scan_completed
 from . import locations
-from .activity import report as report_progress, observe
+from .activity import report as report_progress, observe, record_inbox_scan
 from . import match_diagnostics
 from .duplicates import duplicate_matches
 
@@ -7403,6 +7403,7 @@ def _scan_inbox_inventory(app, inbox, *, scopes=None, trigger="request"):
         if current is None or current["path"] != inbox["path"]:
             raise ValueError("Inbox configuration changed; reload before scanning.")
         result = _scan_inbox_inventory_locked(app, current, scopes=scopes)
+        record_inbox_scan(result)
         service = app.extensions.get("inbox_discovery")
         if service:
             service.changed(inbox["id"])

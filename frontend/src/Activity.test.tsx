@@ -61,13 +61,13 @@ it("keeps completed activity compact with an inline dismiss action and opens ful
   expect(screen.getByText("Finished")).toBeInTheDocument();
 });
 
-it("groups scans with timestamps and clears all finished history beyond the loaded page", async () => {
+it("groups repeated operations with timestamps and clears all finished history beyond the loaded page", async () => {
   configureActivity(true);
-  const scan = { ...job, id: "scan-1", label: "Scanning Inbox", href: "/inbox?source=manual", scope: "Manual", status: "complete", stage: "Finished" };
+  const scan = { ...job, id: "scan-1", label: "Matching albums", href: "/library-import", scope: "Library", status: "complete", stage: "Finished" };
   let cleared = false;
   const fetch = vi.fn(async (url: string, init?: RequestInit) => ({ ok: true, json: async () => {
     if (url === "/api/activity/history/clear" && init?.method === "POST") { cleared = true; return { cleared: 120 }; }
-    if (url.startsWith("/api/activity/history?")) return { groups: cleared ? [] : [{ key: "inbox-scans", label: "Inbox scans", scope: "All Inboxes", count: 120, active: 0, attention: 1, finished: 120, timestamp: scan.created_at, latest: scan }], clearable: cleared ? 0 : 120, snapshot: 120, next_before: 100 };
+    if (url.startsWith("/api/activity/history?")) return { groups: cleared ? [] : [{ key: "matching-group", label: "Matching albums", scope: "Library", count: 120, active: 0, attention: 1, finished: 120, timestamp: scan.created_at, latest: scan }], clearable: cleared ? 0 : 120, snapshot: 120, next_before: 100 };
     return url === "/api/activity" ? { jobs: [scan] } : scan;
   } }));
   vi.stubGlobal("fetch", fetch);
@@ -84,19 +84,19 @@ it("groups scans with timestamps and clears all finished history beyond the load
 
 it("opens grouped history, pages older runs and preserves full run details", async () => {
   configureActivity(true);
-  const scan = { ...job, label: "Scanning Inbox", scope: "Manual", status: "complete", stage: "Finished" };
+  const scan = { ...job, label: "Matching albums", scope: "Library", status: "complete", stage: "Finished" };
   const fetch = vi.fn(async (url: string) => ({ ok: true, json: async () => {
-    if (url.includes("group=inbox-scans")) return { jobs: [{ ...scan, id: url.includes("before=") ? "old-run" : "new-run" }], snapshot: 30, next_before: url.includes("before=") ? null : 10 };
-    if (url.startsWith("/api/activity/history")) return { groups: [{ key: "inbox-scans", label: "Inbox scans", scope: "All Inboxes", count: 30, active: 0, attention: 0, finished: 30, timestamp: scan.created_at, latest: scan }], clearable: 30, snapshot: 30, next_before: null };
+    if (url.includes("group=matching-group")) return { jobs: [{ ...scan, id: url.includes("before=") ? "old-run" : "new-run" }], snapshot: 30, next_before: url.includes("before=") ? null : 10 };
+    if (url.startsWith("/api/activity/history")) return { groups: [{ key: "matching-group", label: "Matching albums", scope: "Library", count: 30, active: 0, attention: 0, finished: 30, timestamp: scan.created_at, latest: scan }], clearable: 30, snapshot: 30, next_before: null };
     return url === "/api/activity" ? { jobs: [scan] } : { ...scan, id: "old-run", rows: [{ album: "Saved album", status: "imported", jobId: 42 }] };
   } }));
   vi.stubGlobal("fetch", fetch);
   render(<ActivityMonitor/>);
   fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
-  fireEvent.click(await screen.findByRole("button", { name: /^Inbox scans/ }));
-  expect(await screen.findByRole("dialog", { name: "Inbox scans history" })).toBeInTheDocument();
+  fireEvent.click(await screen.findByRole("button", { name: /^Matching albums/ }));
+  expect(await screen.findByRole("dialog", { name: "Matching albums history" })).toBeInTheDocument();
   fireEvent.click(await screen.findByRole("button", { name: "Older" }));
-  fireEvent.click(await screen.findByRole("button", { name: /Scanning Inbox Manual/ }));
+  fireEvent.click(await screen.findByRole("button", { name: /Matching albums Library/ }));
   expect(await screen.findByText("Saved album")).toBeInTheDocument();
   expect(fetch.mock.calls.some(([url]) => url.includes("before=10") && url.includes("snapshot=30"))).toBe(true);
 });
@@ -110,4 +110,35 @@ it("migrates known old dismissals to persisted clearing before removing the loca
   await waitFor(() => expect(localStorage.getItem("cratekeep-dismissed-activity")).toBeNull());
   const migrated = fetch.mock.calls.find(([url]) => url === "/api/activity/history/clear")!;
   expect(JSON.parse(String(migrated[1]?.body))).toEqual({ ids: ["previously-dismissed"] });
+});
+
+it("shows a quiet latest success without repeat or empty results, with arrivals and failures separate", async () => {
+  configureActivity(true);
+  const latest = { ...job, id: "inbox-scan-status", label: "Inbox scans", status: "complete", is_inbox_status: true, files_found: 0 };
+  const groups = [
+    { key: "inbox-scans", label: "Inbox scans", scope: "All Inboxes", count: 109, active: 0, attention: 0, finished: 109, timestamp: job.created_at, latest },
+    { key: "arrival-1", label: "Inbox arrivals", scope: "Lidarr", count: 1, active: 0, attention: 0, finished: 1, timestamp: job.created_at, latest: { ...job, id: "arrival", label: "Scanning Inbox", status: "complete", scan_added: 2 } },
+    { key: "failed-1", label: "Scanning Inbox", scope: "Manual", count: 1, active: 0, attention: 1, finished: 1, timestamp: job.created_at, latest: { ...job, id: "failure", status: "failed" } },
+  ];
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => ({ ok: true, json: async () => url.startsWith("/api/activity/history") ? { groups, snapshot: 110, clearable: 111, next_before: null } : { jobs: [] } })));
+  render(<ActivityMonitor/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+  expect(await screen.findByText("Success")).toBeInTheDocument();
+  expect(screen.queryByText("×109")).not.toBeInTheDocument();
+  expect(screen.queryByText(/0 tracks found/)).not.toBeInTheDocument();
+  expect(screen.getByText(/2 new tracks/)).toBeInTheDocument();
+  expect(screen.getByText(/^failed/)).toBeInTheDocument();
+});
+
+it("clears busy UI when an automatic success was coalesced before the next poll", async () => {
+  configureActivity(true); vi.useFakeTimers();
+  const automatic = { ...job, id: "automatic", label: "Scanning Inbox", automatic_scan: true };
+  let finished = false;
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url === "/api/activity/automatic" ? { ok: false, status: 404, json: async () => ({ error: "Activity not found" }) } : { ok: true, json: async () => ({ jobs: finished ? [] : [automatic] }) }));
+  render(<ActivityMonitor/>);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(screen.getByRole("button", { name: "Activity (1)" })).toBeInTheDocument();
+  finished = true;
+  await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
+  expect(screen.getByRole("button", { name: "Activity" })).not.toHaveClass("is-running");
 });

@@ -32,6 +32,16 @@ def report(stage, done=None, total=None, unit='files', current=None, files_found
                        **({'files_found': files_found} if files_found is not None else {}))
 
 
+def record_inbox_scan(result):
+    active = _current.get()
+    if active:
+        service, job_id = active
+        with service.lock:
+            job = service.jobs[job_id]
+            if job['label'] == 'Scanning Inbox':
+                service.update(job_id, scan_added=job.get('scan_added', 0) + result['added'])
+
+
 @contextmanager
 def observed(app, label, scope, href):
     service = app.extensions.get('activity')
@@ -117,6 +127,7 @@ class Activity:
         try:
             with self.db() as db:
                 db.execute('UPDATE activity_jobs SET snapshot=?,history_group=?,history_status=? WHERE id=?', (json.dumps(job), group_key(job), job['status'], job_id))
+                self.history.compact_scan(db, job)
         except sqlite3.Error:
             self.app.logger.exception('Activity result persistence failed; retaining live result')
             return
@@ -128,7 +139,7 @@ class Activity:
         job = dict(id=uuid.uuid4().hex, label=label, scope=scope, href=href, status='queued',
                    stage='Waiting for an available worker', stage_done=None, stage_total=None,
                    stage_unit='files', current=None, processed=0, total=len(rows), rows=rows,
-                   created_at=time.time(), updated_at=time.time(), stop_requested=False, work_key=key)
+                   created_at=time.time(), updated_at=time.time(), stop_requested=False, work_key=key, automatic_scan=label == 'Scanning Inbox' and steps is None)
         if steps is not None:
             job.update(steps=steps, mode=mode, inbox_id=inbox_id)
         with self.db() as db:
