@@ -795,9 +795,9 @@ def main() -> None:
         deletion.get_by_role("progressbar").wait_for()
         assert not page.locator(".page-activity").is_visible()
         page.screenshot(path=args.evidence_dir/"11b-delete-preview-progress.png",full_page=True)
-        page.unroute(action_status_pattern, hold_action_status)
         for route in held_action_status:
             route.continue_()
+        page.unroute(action_status_pattern, hold_action_status)
         deletion.locator("li").first.wait_for()
         assert "Delete Download" in deletion.inner_text() and "Delete Other" in deletion.inner_text()
         assert "2 folders · 6 files" in deletion.inner_text()
@@ -814,9 +814,9 @@ def main() -> None:
         assert not page.locator(".page-activity").is_visible()
         assert not deletion.get_by_role("button",name="Working…",exact=True).is_enabled()
         page.screenshot(path=args.evidence_dir/"11b-delete-apply-progress.png",full_page=True)
-        page.unroute(action_status_pattern, hold_action_status)
         for route in held_action_status:
             route.continue_()
+        page.unroute(action_status_pattern, hold_action_status)
         page.get_by_text("No albums match this view",exact=True).wait_for()
         assert not any(folder.exists() for folder in delete_folders)
         assert all(sha256(path)==saved[path] for path in targets)
