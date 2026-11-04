@@ -137,3 +137,9 @@ paths for the whole refresh; do not reset the displayed discovery count for each
 folder or invent a total before discovery finishes. Compact the Activity popup
 into short summary rows with inline dismissal; opening a job retains full details,
 progress, results and existing actions.
+
+Kyle's further UI feedback: replace the header Settings, Activity and theme text
+with accessible gear, heartbeat and sun/moon controls. An indeterminate rotating
+ring surrounds Activity while jobs are active; stop animation when idle and use
+a static ring for reduced-motion preference. Preserve the popup interaction,
+settings navigation, theme persistence, keyboard labels and mobile touch targets.

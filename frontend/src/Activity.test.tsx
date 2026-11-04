@@ -10,7 +10,10 @@ it("shows the same live job in the header and relevant page without inventing a 
   configureActivity(true);
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ jobs: [job] }) })));
   render(<><ActivityMonitor/><ActivityInline scope="library"/></>);
-  fireEvent.click(await screen.findByRole("button", { name: "Activity (1)" }));
+  const activity = await screen.findByRole("button", { name: "Activity (1)" });
+  expect(activity).toHaveClass("is-running");
+  expect(activity).toHaveAttribute("title", "Activity: 1 running");
+  fireEvent.click(activity);
   expect(screen.getAllByText(/12 tracks found/)).toHaveLength(2);
   expect(screen.getAllByRole("progressbar").every(bar => !bar.hasAttribute("value"))).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "View activity" }));
@@ -42,6 +45,7 @@ it("keeps completed activity compact with an inline dismiss action and opens ful
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ jobs: [{ ...job, id: "completed-compact", status: "complete", stage: "Finished", files_found: 42 }] }) })));
   render(<ActivityMonitor/>);
   fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+  expect(screen.getByRole("button", { name: "Activity" })).not.toHaveClass("is-running");
   expect(await screen.findByText("complete · 42 tracks found")).toBeInTheDocument();
   expect(screen.queryByText("Finished")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Dismiss Refreshing files" }).closest("article")).toBe(screen.getByText("complete · 42 tracks found").closest("article"));

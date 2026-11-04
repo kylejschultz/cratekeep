@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { HeaderIcon } from "./HeaderIcon";
 import { createPortal } from "react-dom";
 import { api, activityEnabled, activityRunning, type ActivityJob } from "./api";
 import { useActivity } from "./activityStore";
@@ -46,7 +47,7 @@ export function ActivityMonitor() {
   if (!activityEnabled) return null;
   const active = jobs.filter(activityRunning), recent = jobs.filter(job => !activityRunning(job) && !hidden.includes(job.id)).slice(0, 5);
   const chosen = jobs.find(job => job.id === selected);
-  return <div className="activity-monitor"><button type="button" className="text-button" aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}>Activity{active.length ? ` (${active.length})` : ""}</button>
+  return <div className="activity-monitor"><button type="button" className={`header-icon${active.length ? " is-running" : ""}`} aria-label={`Activity${active.length ? ` (${active.length})` : ""}`} title={active.length ? `Activity: ${active.length} running` : "Activity"} aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}><HeaderIcon name="activity"/></button>
     {open && <section id="activity-panel" className="activity-panel" aria-label="Activity monitor"><header><h2>Activity</h2><button type="button" className="text-button" onClick={() => setOpen(false)}>Close</button></header>
       {error && <p role="status">{error}</p>}{!active.length && !recent.length && <p>No recent activity.</p>}
       {[...active, ...recent].map(job => <article key={job.id} data-activity-id={job.id}><button type="button" className="text-button activity-open" onClick={() => { setSelected(job.id); setOpen(false); }}><strong>{job.label}<span>{job.scope}</span></strong><small>{[activityRunning(job) ? job.stage : job.status, workCount(job)].filter(Boolean).join(" · ")}</small></button>{!activityRunning(job) && <button type="button" className="text-button activity-dismiss" aria-label={`Dismiss ${job.label}`} title="Dismiss" onClick={() => { const next = [...hidden, job.id].slice(-100); setHidden(next); localStorage.setItem("cratekeep-dismissed-activity", JSON.stringify(next)); }}>×</button>}</article>)}

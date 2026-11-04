@@ -171,7 +171,8 @@ def main() -> None:
             asset_build = page.evaluate("window.__CRATEKEEP_BOOTSTRAP__.buildSha")
             assert page.locator('script[type="module"]').get_attribute('src') == f"/static/ui/cratekeep.js?v={asset_build}"
             assert page.locator('link[rel="stylesheet"]').get_attribute('href') == f"/static/ui/cratekeep.css?v={asset_build}"
-            assert page.get_by_role("navigation", name="Primary navigation").get_by_role("link").all_inner_texts() == ["Overview", "Inbox", "Library", "Settings"]
+            assert page.get_by_role("navigation", name="Primary navigation").get_by_role("link").all_inner_texts() == ["Overview", "Inbox", "Library"]
+            assert page.get_by_role("link", name="Settings", exact=True).get_attribute("href") == "/settings"
             assert page.evaluate("document.documentElement.scrollHeight <= innerHeight"), f"document scrolls on {path}"
             desktop_ok = page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
             desktop_fill = page.locator(".app-content").evaluate("node => document.body.getBoundingClientRect().height >= innerHeight")

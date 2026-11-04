@@ -1,7 +1,8 @@
+import { HeaderIcon } from "./HeaderIcon";
 import { ActivityMonitor } from "./Activity";
 import { useEffect, useState, type ReactNode } from "react";
 
-const links = [["overview", "/", "Overview"], ["inbox", "/inbox", "Inbox"], ["library", "/library", "Library"], ["settings", "/settings", "Settings"]] as const;
+const links = [["overview", "/", "Overview"], ["inbox", "/inbox", "Inbox"], ["library", "/library", "Library"]] as const;
 
 export function Shell({ page, buildSha, children }: { page: string; buildSha: string; children: ReactNode }) {
   const [dark, setDark] = useState(() => localStorage.getItem("cratekeep-theme") !== "light");
@@ -11,8 +12,11 @@ export function Shell({ page, buildSha, children }: { page: string; buildSha: st
     <header className="desk-header">
       <a className="desk-brand" href="/"><img src="/static/cratekeep-logo.png" alt=""/><span>cratekeep</span></a>
       <nav aria-label="Primary navigation">{links.map(([key, href, label]) => <a key={key} href={href} aria-current={(page === key || (page === "library-import" && key === "library")) ? "page" : undefined}>{label}</a>)}</nav>
-      <ActivityMonitor/>
-      <button id="theme-toggle" className="secondary" type="button" onClick={() => setDark(v => !v)} aria-label="Dark mode" aria-pressed={dark}>{dark ? "Light" : "Dark"}</button>
+      <div className="header-controls" role="group" aria-label="Header controls">
+        <a className="header-icon" href="/settings" aria-label="Settings" title="Settings" aria-current={page === "settings" ? "page" : undefined}><HeaderIcon name="settings"/></a>
+        <ActivityMonitor/>
+        <button id="theme-toggle" className="header-icon" type="button" onClick={() => setDark(v => !v)} aria-label="Dark mode" aria-pressed={dark} title={dark ? "Switch to light mode" : "Switch to dark mode"}><HeaderIcon name={dark ? "sun" : "moon"}/></button>
+      </div>
       <code className="build-label" title={buildSha}>build {buildSha.slice(0, 7)}</code>
     </header>
     <div className="app-content"><main id="main-content">{children}</main></div>
