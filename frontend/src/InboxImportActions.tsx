@@ -1,3 +1,4 @@
+import { runInboxBatch } from "./allInboxes";
 import { useEffect, useRef, useState } from "react";
 import { ActivityProgress } from "./ActivityProgress";
 import { api, activityRunning, type ActivityJob } from "./api";
@@ -19,33 +20,76 @@ function folderCounts(files: Preview["files"]) {
   return [...counts].sort(([a], [b]) => a.localeCompare(b));
 }
 
-export type InboxActionSelection = { kind: "undo" | "delete-imported" | "delete-albums" | "delete-track"; jobs?: number[]; albumIds?: number[]; albumId?: number; trackId?: number; names?: string[] };
-export function InboxActionDialog({ inboxId, kind, jobs, albumIds, albumId, trackId, names, onClose, onDone }: InboxActionSelection & { inboxId: string; onClose: () => void; onDone: () => void }) {
+type Action = { kind: "undo" | "delete-imported" | "delete-albums" | "delete-track"; jobs?: number[]; albumIds?: number[]; albumId?: number; trackId?: number; names?: string[] };
+export type InboxActionSelection = Action & { groups?: Array<Action & { inboxId: string; inboxName: string }> };
+type Plan = { inboxId: string; inboxName: string; preview: Preview };
+export function InboxActionDialog({ inboxId, kind, groups, jobs, albumIds, albumId, trackId, names, onClose, onDone }: InboxActionSelection & { inboxId: string; onClose: () => void; onDone: (complete: boolean) => void }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const [plans, setPlans] = useState<Plan[]>([]);
   const [preview, setPreview] = useState<Preview | null>(null), [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [activity, setActivity] = useState<ActivityJob | null>(null);
   const notify = useToast();
   const unimported = kind === "delete-albums" || kind === "delete-track";
   const grouped = kind === "delete-albums" || kind === "delete-imported";
-  const folders = preview && grouped ? folderCounts(preview.files) : [];
+  const folders = preview && grouped ? plans.length ? plans.flatMap(plan => folderCounts(plan.preview.files).map(([folder, count]) => [`${plan.inboxName} · ${folder || "Inbox root"}`, count] as [string, number])) : folderCounts(preview.files) : [];
   const [remaining, setRemaining] = useState<{path: string; location: string}[]>([]);
   const base = `/api/inbox/${encodeURIComponent(inboxId)}/actions`;
   useEffect(() => {
     const node = ref.current!; node.showModal();
     let current = true;
-    api<Preview>(`${base}/preview`, { method: "POST", body: JSON.stringify(kind === "delete-albums" ? { kind, album_ids: albumIds } : kind === "delete-track" ? { kind, album_id: albumId, track_id: trackId } : { kind, job_ids: jobs }) }, job => { if (current) setActivity(job); }).then(value => { if (current) setPreview(value); }).catch(reason => { if (current) setError(reason.message); });
+    const body = (selection: Action) => selection.kind === "delete-albums" ? { kind: selection.kind, album_ids: selection.albumIds } : selection.kind === "delete-track" ? { kind: selection.kind, album_id: selection.albumId, track_id: selection.trackId } : { kind: selection.kind, job_ids: selection.jobs };
+    const progress = (job: ActivityJob) => { if (current) setActivity(job); };
+    const load = async () => {
+      if (!groups) return api<Preview>(`${base}/preview`, { method: "POST", body: JSON.stringify(body({ kind, albumIds, albumId, trackId, jobs })) }, progress);
+      if (!groups.length) throw new Error("No Inbox files selected. Reload the queue.");
+      const rows = await runInboxBatch(groups.map(group => ({ id: group.inboxId, album: group.inboxName, path: `/api/inbox/${encodeURIComponent(group.inboxId)}/actions/preview`, body: body(group) })), progress);
+      const prepared = groups.map(group => {
+        const row = rows.find(row => row.id === group.inboxId);
+        if (!row?.result.preview_id || row.http_status >= 400) throw new Error(`${group.inboxName}: ${row?.result.error || "Preview unavailable"}`);
+        return { inboxId: group.inboxId, inboxName: group.inboxName, preview: row.result as Preview };
+      });
+      if (current) setPlans(prepared);
+      return { ...prepared[0].preview, count: prepared.reduce((sum, plan) => sum + plan.preview.count, 0),
+        files: prepared.flatMap(plan => plan.preview.files.map(file => ({ ...file, path: `${plan.inboxName} · ${file.path}` }))) };
+    };
+    void load().then(value => { if (current) setPreview(value); }).catch(reason => { if (current) setError(reason.message); });
     return () => { current = false; node.close(); };
-  }, [base, kind, jobs, albumIds, albumId, trackId]);
+  }, [base, kind, groups, jobs, albumIds, albumId, trackId]);
   function finish(result: any) {
     setRemaining(result.remaining || []);
-    if (result.status !== "complete") { setError(result.message + " " + (result.errors || []).map((row: any) => row.error).join("; ")); setPreview(null); onDone(); }
-    else { notify(result.message); onDone(); onClose(); }
+    if (result.status !== "complete") { setError(result.message + " " + (result.errors || []).map((row: any) => row.error).join("; ")); setPreview(null); onDone(false); }
+    else { notify(result.message); onDone(true); onClose(); }
+  }
+  async function applyGroups() {
+    let results: any[] = [];
+    try {
+      const rows = await runInboxBatch(plans.map(plan => ({ id: plan.inboxId, album: plan.inboxName,
+        path: `/api/inbox/${encodeURIComponent(plan.inboxId)}/actions/apply`,
+        body: { preview_id: plan.preview.preview_id, expected_fingerprint: plan.preview.fingerprint, confirmed: true } })), setActivity);
+      results = plans.map(plan => rows.find(row => row.id === plan.inboxId)?.result);
+      if (results.some(result => !["complete", "partial"].includes(result?.status))) throw new Error("Read saved results");
+    } catch {
+      // Recover each real receipt, never repeat a destructive batch after a lost response.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try { results = await Promise.all(plans.map(async plan => {
+        try {
+          const saved = await api<any>(`/api/inbox/${encodeURIComponent(plan.inboxId)}/actions/${encodeURIComponent(plan.preview.preview_id)}`, { signal: controller.signal });
+          return { ...saved.result, status: saved.status };
+        } catch { return { status: "unknown", message: "Result uncertain; check Activity and saved files before another action." }; }
+      })); } finally { clearTimeout(timeout); }
+    }
+    const complete = results.every(result => result.status === "complete");
+    finish({ status: complete ? "complete" : "partial", message: complete ? "Inbox actions completed." : "Some Inbox files need attention.",
+      errors: results.flatMap((result, index) => result.status === "complete" ? [] : [{ error: `${plans[index].inboxName}: ${result.message || result.status}` }]),
+      remaining: results.flatMap((result, index) => result.status === "complete" ? [] : (result.remaining || plans[index].preview.files).map((file: any) => ({ ...file, path: `${plans[index].inboxName} · ${file.path}` }))) });
   }
   async function apply() {
     if (!preview) return;
     setBusy(true); setError("");
     try {
+      if (plans.length) { await applyGroups(); return; }
       finish(await api<any>(`${base}/apply`, { method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, expected_fingerprint: preview.fingerprint, confirmed: true }) }, setActivity));
     } catch (reason) {
       // A lost response must never resubmit deletion. Read the durable result.

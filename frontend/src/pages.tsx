@@ -20,11 +20,11 @@ export function Overview({ data }: { data: Record<string, any> }) {
 
 export function Inbox({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const inboxes = data.inboxes || [];
-  const [selected, setSelected] = useState(() => { const requested = new URLSearchParams(location.search).get("source"); return inboxes.find((row: any) => row.id === requested)?.id || inboxes[0]?.id || ""; });
+  const [selected, setSelected] = useState(() => { const requested = new URLSearchParams(location.search).get("source"); return (requested === "all" && inboxes.length > 1 ? "all" : inboxes.find((row: any) => row.id === requested)?.id) || inboxes[0]?.id || ""; });
   const [busy, setBusy] = useState(false);
   return <><PageHeader eyebrow="A place for every record" title="Incoming music">Review the details. Give every album its place.</PageHeader>
-    {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{inboxes.map((inbox: any) => <button role="tab" disabled={busy} aria-selected={selected === inbox.id} onClick={() => { setSelected(inbox.id); history.replaceState(null, "", `?source=${encodeURIComponent(inbox.id)}`); }} key={inbox.id}>{inbox.name}</button>)}</div>}
-    {selected ? <Queue key={selected} source="inbox" threshold={threshold} inboxId={selected} onBusyChange={setBusy} sourceName={inboxes.find((row: any) => row.id === selected)?.name}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
+    {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{[{ id: "all", name: "All Inboxes" }, ...inboxes].map((inbox: any) => <button role="tab" disabled={busy} aria-selected={selected === inbox.id} onClick={() => { setSelected(inbox.id); history.replaceState(null, "", `?source=${encodeURIComponent(inbox.id)}`); }} key={inbox.id}>{inbox.name}</button>)}</div>}
+    {selected ? <Queue key={selected} source="inbox" threshold={threshold} inboxId={selected} inboxes={inboxes} onBusyChange={setBusy} sourceName={inboxes.find((row: any) => row.id === selected)?.name}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
   </>;
 }
 

@@ -714,3 +714,10 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 /* Modal-owned progress stays with its controls; header Activity remains global. */
 body:has(dialog[open]) .page-activity,
 body:has(.modal[data-review-modal]) .page-activity { display: none; }
+
+.desk-album-open .album-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.album-title-line strong { min-width: 0; }
+.inbox-source-pill { display: inline-block; flex: 0 1 auto; min-width: 0; max-width: min(140px, 45%); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; line-height: 18px; font-weight: 400; }
+
+.page-inbox .segmented { max-width: 100%; overflow-x: auto; white-space: nowrap; }
+.page-inbox .segmented button { flex-shrink: 0; }

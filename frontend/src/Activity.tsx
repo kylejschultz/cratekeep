@@ -5,7 +5,8 @@ import { createPortal } from "react-dom";
 import { api, activityEnabled, activityRunning, type ActivityJob } from "./api";
 import { useActivity } from "./activityStore";
 import { ActivityHistory } from "./ActivityHistory";
-import { InboxActionDialog } from "./InboxImportActions";
+import { groupInboxActions } from "./allInboxes";
+import { InboxActionDialog, type InboxActionSelection } from "./InboxImportActions";
 
 function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => void }) {
   const [job, setJob] = useState(initial);
@@ -23,19 +24,23 @@ function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => v
     return () => { cancelled = true; clearTimeout(timer); };
   }, [initial.id]);
   const dialog = useRef<HTMLDialogElement>(null);
-  const [clearing, setClearing] = useState(false);
+  const [clearing, setClearing] = useState<InboxActionSelection | null>(null);
   const stop = async () => { try { await api(`/api/activity/${job.id}/stop`, { method: "POST", body: "{}" }); } catch (reason) { setError((reason as Error).message); } };
   useEffect(() => { const previous = document.activeElement as HTMLElement | null; const node = dialog.current!; node.showModal(); return () => { node.close(); previous?.focus(); }; }, []);
   const receipts = job.rows.filter(row => row.status === "imported" && row.jobId).map(row => row.jobId);
   return createPortal(<><dialog className="dialog activity-dialog" ref={dialog} aria-labelledby="activity-details-title" onCancel={onClose}>
     <header><div><h2 id="activity-details-title">{job.label}</h2><p>{job.scope} · {job.status}</p></div><button type="button" aria-label="Close activity details" onClick={onClose}>×</button></header>
     <div className="dialog-body"><ActivityProgress job={job}/>{(error || job.error) && <p role="alert">{error || job.error}</p>}
-      <ul className="activity-results">{job.rows.map((row, index) => <li key={index}><strong>{row.album || job.label}</strong><span>{row.status.replaceAll("-", " ")}</span>{row.reason && <p>{row.reason}</p>}</li>)}</ul>
+      <ul className="activity-results">{job.rows.map((row, index) => <li key={index}><strong>{row.album || job.label}</strong>{job.inbox_ids && job.inbox_ids.length > 1 && <small>{row.inbox_name}</small>}<span>{row.status.replaceAll("-", " ")}</span>{row.reason && <p>{row.reason}</p>}</li>)}</ul>
       {job.result?.errors?.map((row: any, index: number) => <p key={index}>{row.error}</p>)}
     </div><footer><a href={job.href}>Open {job.scope}</a>{activityRunning(job) && ["matching", "import"].includes(job.mode || "") && <button type="button" className="secondary" disabled={job.status === "stopping"} onClick={() => void stop()}>Stop after current album</button>}
     {!activityRunning(job) && job.mode === "matching" && job.rows.some(row => ["failed", "needs-retry", "not-started"].includes(row.status)) && <button type="button" onClick={() => void api(`/api/activity/${job.id}/resume`, { method: "POST", body: "{}" }).then(onClose).catch(reason => setError(reason.message))}>Resume unfinished</button>}
-    {job.inbox_id && receipts.length > 0 && <button type="button" className="danger-action" onClick={() => setClearing(true)}>Clear imported from Inbox</button>}</footer>
-  </dialog>{clearing && <InboxActionDialog inboxId={job.inbox_id!} kind="delete-imported" jobs={receipts} onClose={() => setClearing(false)} onDone={() => { setClearing(false); onClose(); }}/>}</>, document.body);
+    {(job.inbox_id || job.inbox_ids?.length) && receipts.length > 0 && <button type="button" className="danger-action" onClick={() => {
+      const selection: InboxActionSelection = { kind: "delete-imported", jobs: receipts };
+      if (!job.inbox_id) selection.groups = groupInboxActions(selection, job.rows.filter(row => row.jobId).map(row => ({ id: row.id, album: row.album, source_id: row.inbox_id, inbox_name: row.inbox_name, imported: { job_id: row.jobId } })));
+      setClearing(selection);
+    }}>Clear imported from Inbox</button>}</footer>
+  </dialog>{clearing && <InboxActionDialog inboxId={job.inbox_id || "all"} {...clearing} onClose={() => setClearing(null)} onDone={complete => { if (complete) { setClearing(null); onClose(); } }}/>}</>, document.body);
 }
 export function ActivityMonitor() {
   const { jobs, error } = useActivity();
@@ -55,7 +60,7 @@ export function ActivityMonitor() {
 export function ActivityInline({ scope }: { scope: "library" | string }) {
   const { jobs, error } = useActivity();
   if (!activityEnabled) return null;
-  const relevant = jobs.filter(job => scope === "library" ? job.href.startsWith("/library") : job.href === `/inbox?source=${scope}`);
+  const relevant = jobs.filter(job => scope === "library" ? job.href.startsWith("/library") : scope === "all" ? job.href.startsWith("/inbox") : job.href === `/inbox?source=${scope}` || job.inbox_ids?.includes(scope));
   const shown = relevant.filter(activityRunning);
   return <div className="page-activity" aria-label="Page activity">{error && shown.length > 0 && <p role="status">{error}</p>}{shown.map(job => <div key={job.id}><strong>{job.label} · {job.scope}</strong><ActivityProgress job={job}/><button type="button" className="text-button" onClick={() => window.dispatchEvent(new CustomEvent("cratekeep:show-activity", { detail: job.id }))}>View activity</button></div>)}</div>;
 }

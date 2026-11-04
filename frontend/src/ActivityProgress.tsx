@@ -7,7 +7,7 @@ export function ActivityProgress({ job }: { job: ActivityJob }) {
   useEffect(() => { const timer = setInterval(() => setNow(Date.now() / 1000), 1000); return () => clearInterval(timer); }, []);
   const running = activityRunning(job);
   const detailed = useProgressDelay(running, job.id, job.created_at);
-  const batch = ["matching", "import"].includes(job.mode || "");
+  const batch = ["matching", "import", "batch"].includes(job.mode || "");
   const total = batch ? job.total : job.stage_total;
   const value = batch ? job.processed : job.stage_done;
   if (running && !detailed) return <div className="activity-progress" role="status">Loading…</div>;

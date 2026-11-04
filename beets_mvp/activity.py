@@ -163,10 +163,13 @@ class Activity:
         if not isinstance(steps, list) or not 1 <= len(steps) <= 1000:
             raise ValueError('Provide between 1 and 1000 operation steps.')
         mode = values.get('mode', 'operation')
-        if mode not in {'operation', 'matching', 'import'} or (mode == 'operation' and len(steps) != 1):
+        if mode not in {'operation', 'matching', 'import', 'batch'} or (mode == 'operation' and len(steps) != 1):
             raise ValueError('Invalid operation mode.')
+        if mode != 'operation' and any(not isinstance(step, dict) or type(step.get('id')) is not (str if mode == 'batch' else int) for step in steps):
+            raise ValueError('Batch steps require valid source or album IDs.')
         if mode != "operation" and len({step.get("id") for step in steps if isinstance(step, dict)}) != len(steps):
             raise ValueError("Batch albums must be unique.")
+        batch_sources, batch_actions = [], set()
         for step in steps:
             if not isinstance(step, dict) or set(step) - {'path', 'method', 'body', 'id', 'album'}:
                 raise ValueError('Invalid operation step.')
@@ -179,6 +182,14 @@ class Activity:
                 self.app.url_map.bind('').match(path, method=method)
             except HTTPException:
                 raise ValueError('Unsupported operation route.') from None
+            if mode == 'batch':
+                match = re.fullmatch(r'/api/inbox/([a-zA-Z0-9_-]+)/(actions/(?:preview|apply)|(?:queue|scopes)/refresh)', path)
+                if not match or not any(inbox['id'] == match[1] for inbox in self.app.config['INBOXES']):
+                    raise ValueError('Inbox operation batches require configured source routes.')
+                if step.get('id') != match[1]:
+                    raise ValueError('An Inbox operation step must identify its actual source.')
+                batch_sources.append(match[1])
+                batch_actions.add(match[2])
             if mode == 'matching' and not path.endswith('/candidates'):
                 raise ValueError('Matching batches may contain only matching requests.')
             if mode == 'import' and not path.endswith('/bulk/execute'):
@@ -191,6 +202,8 @@ class Activity:
                     raise ValueError('Each import step must identify one album.')
             if not isinstance(step.get('album', ''), str) or len(step.get('album', '')) > 500:
                 raise ValueError('Invalid album label.')
+        if mode == 'batch' and (len(batch_actions) != 1 or len(set(batch_sources)) != len(batch_sources)):
+            raise ValueError('Use one action per Inbox and the same action type throughout a batch.')
         return steps, mode
 
     def submit(self, values):
@@ -209,19 +222,30 @@ class Activity:
             first = steps[0]['path']
             inbox_id = first.split('/')[3] if first.startswith('/api/inbox/') and first.split('/')[3] not in {'albums', 'candidates', 'reviews', 'scan'} else None
             inbox = next((row for row in self.app.config['INBOXES'] if row['id'] == inbox_id), None)
+            album_sources = {}
             if first == '/api/inbox/candidates':
+                identities = [step['body'].get('album_id') for step in steps]
                 with self.db() as db:
-                    row = db.execute('SELECT source_id FROM album_reviews WHERE id=?', (steps[0]['body'].get('album_id'),)).fetchone()
-                inbox = next((entry for entry in self.app.config['INBOXES'] if row and entry['id'] == row[0]), None)
-            scope = inbox['name'] if inbox else 'Inbox' if first.startswith('/api/inbox/') else 'Library'
-            href = '/inbox' + ('?source=' + inbox['id'] if inbox else '') if first.startswith('/api/inbox/') else '/library-import' if first.startswith('/api/library-import/') else '/library'
+                    album_sources = dict(db.execute('SELECT id,source_id FROM album_reviews WHERE id IN (' + ','.join('?' for _ in identities) + ')', identities))
+            source_ids = set(album_sources.values()) or {step['path'].split('/')[3] for step in steps if step['path'].startswith('/api/inbox/')}
+            sources = [entry for entry in self.app.config['INBOXES'] if entry['id'] in source_ids]
+            inbox = sources[0] if len(sources) == 1 else None
+            mixed = len(sources) > 1
+            scope = 'All Inboxes' if mixed else inbox['name'] if inbox else 'Inbox' if first.startswith('/api/inbox/') else 'Library'
+            href = '/inbox?source=all' if mixed else '/inbox' + ('?source=' + inbox['id'] if inbox else '') if first.startswith('/api/inbox/') else '/library-import' if first.startswith('/api/library-import/') else '/library'
             label = {'matching': 'Matching albums', 'import': 'Importing albums'}.get(mode)
             if not label:
                 label = 'Refreshing files' if first.endswith('/refresh') else 'Finding matches' if '/candidates' in first or '/rematch/' in first else 'Updating library files'
             if first.startswith('/api/inbox/') and first.endswith(('/refresh', '/scan')):
                 label = 'Scanning Inbox'
             rows = [dict(id=step.get('id'), album=step.get('album', ''), status='queued', attempts=0) for step in steps]
+            for step, row in zip(steps, rows):
+                source_id = album_sources.get(step.get('id')) if album_sources else step['path'].split('/')[3] if step['path'].startswith('/api/inbox/') else None
+                row['inbox_id'] = source_id
+                row['inbox_name'] = next((entry['name'] for entry in sources if entry['id'] == source_id), '')
             job = self.create(label, scope, href, values['request_id'], key, rows, steps=steps, mode=mode, inbox_id=inbox['id'] if inbox else None)
+            job['inbox_ids'] = [entry['id'] for entry in sources]
+            self.update(job['id'], inbox_ids=job['inbox_ids'])
         threading.Thread(target=self.run, args=(job['id'], steps, mode), daemon=True, name='cratekeep-activity').start()
         return self.get(job['id'])
 

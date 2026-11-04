@@ -273,6 +273,8 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/api/inbox/<inbox_id>/queue")
     def inbox_album_queue(inbox_id: str):
+        if inbox_id == "all":
+            return album_queue_response("inbox", "", "", all_inboxes=True)
         inbox = _configured_inbox(app, inbox_id)
         if inbox is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 404
@@ -286,7 +288,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify(error=str(exc), code="inventory_unavailable"), 409
         return album_queue_response("library", "", str(root))
 
-    def album_queue_response(source_kind: str, source_id: str, root: str):
+    def album_queue_response(source_kind: str, source_id: str, root: str, *, all_inboxes=False):
         try:
             page = int(request.args.get("page", "1"))
             if page < 1:
@@ -300,15 +302,19 @@ def create_app(test_config: dict | None = None) -> Flask:
         query = request.args.get("q", "").strip().casefold()
         # Read persisted groups only. Refresh is the explicit disk reconciliation
         # boundary; loading/paging/searching never triggers provider work.
-        where = """root_path=? AND source_kind=? AND
+        contexts = {inbox["id"]: str(Path(inbox["path"]).resolve()) for inbox in app.config["INBOXES"]} if all_inboxes else {source_id: root}
+        where = """source_kind=? AND
             (execution_status!='complete' OR EXISTS (SELECT 1 FROM inbox_copy_imports receipt WHERE receipt.album_review_id=album_reviews.id AND receipt.status='imported'))
             AND state NOT IN ('rejected','skipped') AND EXISTS
             (SELECT 1 FROM album_review_tracks WHERE album_review_id=album_reviews.id)"""
-        params = [root, source_kind]
+        params = [source_kind]
         if source_kind == "inbox":
-            where += " AND source_id=?"
-            params.append(source_id)
+            where += " AND (" + (" OR ".join("(source_id=? AND root_path=?)" for _ in contexts) or "0") + ")"
+            for identity, directory in contexts.items():
+                params.extend([identity, directory])
         else:
+            where += " AND root_path=?"
+            params.append(root)
             where += """ AND EXISTS (SELECT 1 FROM album_review_tracks AS tracks
                 JOIN library_inventory AS inventory ON inventory.id=tracks.inventory_id
                 WHERE tracks.album_review_id=album_reviews.id AND inventory.present=1
@@ -318,14 +324,26 @@ def create_app(test_config: dict | None = None) -> Flask:
         with _connect(app.config["APP_DB"]) as db:
             # SQLite lower() is ASCII-only; apply Unicode casefold to inexpensive
             # identity rows before fetching at most 25 full review payloads.
-            rows = db.execute(f"SELECT id, artist, album FROM album_reviews WHERE {where} ORDER BY artist_key, album_key, id", params).fetchall()
+            rows = db.execute(f"SELECT id, artist, album, source_id FROM album_reviews WHERE {where} ORDER BY artist_key, album_key, id", params).fetchall()
         ids = [row["id"] for row in rows if not query or query in f"{row['artist']} {row['album']}".casefold()]
+        by_id = {row["id"]: row["source_id"] for row in rows}
+        def payloads(identities):
+            if not all_inboxes:
+                return _album_review_payloads(app, identities, root=root, source_kind=source_kind,
+                                              source_id=source_id if source_kind == "inbox" else None)
+            found = {}
+            for identity, directory in contexts.items():
+                group = [item_id for item_id in identities if by_id[item_id] == identity]
+                if group:
+                    for album in _album_review_payloads(app, group, root=directory, source_kind="inbox", source_id=identity):
+                        found[album["id"]] = album
+            return [found[item_id] for item_id in identities if item_id in found]
         if status in {"perfect", "duplicates", "pending", "matched", "imported"}:
             filtered = []
             # Recompute from persisted evidence in bounded batches, before pagination.
             # No disk scan or MusicBrainz request is needed for these filters.
             for start in range(0, len(ids), 100):
-                for album in _album_review_payloads(app, ids[start:start+100], root=root, source_kind=source_kind, source_id=source_id if source_kind == "inbox" else None):
+                for album in payloads(ids[start:start+100]):
                     duplicate = album.get("duplicate_preflight", {}).get("status") != "clear"
                     if status in {"pending", "matched", "imported"}:
                         matches = _queue_match_state(album) == status
@@ -344,8 +362,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         total = len(ids)
         pages = max(1, (total + 24) // 25)
         page = min(page, pages)
-        albums = _album_review_payloads(app, ids[(page-1)*25:page*25], root=root,
-                                        source_kind=source_kind, source_id=source_id if source_kind == "inbox" else None)
+        albums = payloads(ids[(page-1)*25:page*25])
         return jsonify(albums=[_with_readiness(album, app.config["MATCH_THRESHOLD"]) for album in albums],
                        total=total, page=page, page_count=pages, page_size=25)
 
@@ -377,6 +394,14 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/api/inbox/<inbox_id>/discovery")
     def inbox_discovery_status(inbox_id):
+        if inbox_id == "all":
+            statuses = [{"inbox_id": inbox["id"], "name": inbox["name"], **inbox_discovery_status(inbox["id"]).get_json()}
+                        for inbox in app.config["INBOXES"]]
+            return jsonify(mode="all", revision=json.dumps([(row["inbox_id"], row["revision"]) for row in statuses]),
+                           scanned_at=max((row["scanned_at"] for row in statuses if row["scanned_at"]), default=None),
+                           error="; ".join(f"{row['name']}: {row['error']}" for row in statuses if row["error"]),
+                           watcher_error="; ".join(f"{row['name']}: {row['watcher_error']}" for row in statuses if row["watcher_error"]),
+                           inboxes=statuses)
         inbox = _configured_inbox(app, inbox_id)
         if inbox is None:
             return jsonify(error="unknown inbox_id", code="invalid_request"), 404
@@ -5430,6 +5455,7 @@ def _album_review_payloads(
                 "imported": imported,
                 "id": row["id"], "artist": row["artist"], "album": row["album"], "decision": row["state"],
                 "source_kind": row["source_kind"], "source_id": row["source_id"],
+                "inbox_name": next((inbox["name"] for inbox in app.config["INBOXES"] if inbox["id"] == row["source_id"]), "") if row["source_kind"] == "inbox" else "",
                 "duplicate_action": row["duplicate_action"],
                 "duplicate_actions": (["keep-existing", "replace", "keep-both"] if row["source_kind"] == "inbox" else ["keep-existing", "keep-both"]),
                 "source_paths": sorted({str(Path(track["relative_path"]).parent.as_posix()) for track in tracks}, key=str.casefold),
