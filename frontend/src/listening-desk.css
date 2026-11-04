@@ -685,3 +685,13 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 @keyframes activity-spin{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.header-icon.is-running::after{animation:none;border-color:var(--accent)}}
 @media(max-width:640px){.desk-header .header-icon{width:44px;height:44px;min-height:44px}.header-controls{gap:2px}.desk-header{column-gap:8px}}
+
+.activity-panel>header>div{display:flex;gap:16px;align-items:center}
+.activity-repeat{font-size:12px;font-weight:500;color:var(--muted)}
+.activity-row-meta{display:flex;align-items:baseline;justify-content:space-between;gap:12px;min-width:0}
+.activity-row-meta small{min-width:0}.activity-row-meta time{flex:none;font-size:11px;color:var(--muted);white-space:nowrap}
+.activity-clear{padding:4px 0;flex:none;font-size:12px}
+.activity-paging{display:flex;gap:20px;justify-content:space-between;margin-top:8px}
+.activity-run-history{list-style:none;padding:0;margin:0}.activity-run-history li{display:flex;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
+.activity-run-history small{white-space:normal}.activity-dialog footer .activity-paging{margin:0 auto 0 0}
+@media(max-width:640px){.activity-row-meta{flex-wrap:wrap;gap:2px 8px}.activity-row-meta time{font-size:12px}.activity-open strong{flex-wrap:wrap;gap:2px 6px}}

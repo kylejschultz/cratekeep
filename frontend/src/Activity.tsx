@@ -1,16 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { HeaderIcon } from "./HeaderIcon";
 import { createPortal } from "react-dom";
-import { api, activityEnabled, activityRunning, type ActivityJob } from "./api";
+import { api, activityEnabled, activityRunning, type ActivityJob, workCount } from "./api";
 import { useActivity } from "./activityStore";
+import { ActivityHistory } from "./ActivityHistory";
 import { InboxActionDialog } from "./InboxImportActions";
 
-function workCount(job: ActivityJob) {
-  if (["matching", "import"].includes(job.mode || "")) return `${job.processed} / ${job.total} albums`;
-  if (job.files_found != null) return `${job.files_found} tracks found`;
-  if (job.stage_done == null) return "";
-  return `${job.stage_done}${job.stage_total != null ? ` / ${job.stage_total}` : ""} ${job.stage_unit || "files"}${job.stage_total == null ? " found" : " processed"}`;
-}
 function Progress({ job }: { job: ActivityJob }) {
   const [now, setNow] = useState(() => Date.now() / 1000);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now() / 1000), 1000); return () => clearInterval(timer); }, []);
@@ -22,9 +17,22 @@ function Progress({ job }: { job: ActivityJob }) {
     <small>{[job.created_at ? `${Math.floor(((job.finished_at || now) - job.created_at) / 60)}m ${Math.floor(((job.finished_at || now) - job.created_at) % 60)}s elapsed` : "", workCount(job), job.current].filter(Boolean).join(" · ")}</small>
   </div>;
 }
-function Details({ job, onClose }: { job: ActivityJob; onClose: () => void }) {
-  const dialog = useRef<HTMLDialogElement>(null);
+function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => void }) {
+  const [job, setJob] = useState(initial);
   const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const load = async () => {
+      try {
+        const next = await api<ActivityJob>(`/api/activity/${initial.id}`);
+        if (!cancelled) { setJob(next); if (activityRunning(next)) timer = setTimeout(() => void load(), 1500); }
+      } catch (reason) { if (!cancelled) { setError((reason as Error).message); timer = setTimeout(() => void load(), 1500); } }
+    };
+    void load();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [initial.id]);
+  const dialog = useRef<HTMLDialogElement>(null);
   const [clearing, setClearing] = useState(false);
   const stop = async () => { try { await api(`/api/activity/${job.id}/stop`, { method: "POST", body: "{}" }); } catch (reason) { setError((reason as Error).message); } };
   useEffect(() => { const previous = document.activeElement as HTMLElement | null; const node = dialog.current!; node.showModal(); return () => { node.close(); previous?.focus(); }; }, []);
@@ -41,17 +49,18 @@ function Details({ job, onClose }: { job: ActivityJob; onClose: () => void }) {
 }
 export function ActivityMonitor() {
   const { jobs, error } = useActivity();
-  const [open, setOpen] = useState(false), [selected, setSelected] = useState<string>();
-  const [hidden, setHidden] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem("cratekeep-dismissed-activity") || "[]"); } catch { return []; } });
-  useEffect(() => { const show = (event: Event) => { setSelected((event as CustomEvent<string>).detail); }; window.addEventListener("cratekeep:show-activity", show); return () => window.removeEventListener("cratekeep:show-activity", show); }, []);
+  const [open, setOpen] = useState(false), [selected, setSelected] = useState<ActivityJob>();
+  const [detailError, setDetailError] = useState("");
+  useEffect(() => {
+    const show = (event: Event) => { const id = (event as CustomEvent<string>).detail; void api<ActivityJob>(`/api/activity/${id}`).then(job => { setSelected(job); setDetailError(""); }).catch(reason => { setDetailError(reason.message); setOpen(true); }); };
+    window.addEventListener("cratekeep:show-activity", show);
+    return () => window.removeEventListener("cratekeep:show-activity", show);
+  }, []);
   if (!activityEnabled) return null;
-  const active = jobs.filter(activityRunning), recent = jobs.filter(job => !activityRunning(job) && !hidden.includes(job.id)).slice(0, 5);
-  const chosen = jobs.find(job => job.id === selected);
+  const active = jobs.filter(activityRunning);
   return <div className="activity-monitor"><button type="button" className={`header-icon${active.length ? " is-running" : ""}`} aria-label={`Activity${active.length ? ` (${active.length})` : ""}`} title={active.length ? `Activity: ${active.length} running` : "Activity"} aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}><HeaderIcon name="activity"/></button>
-    {open && <section id="activity-panel" className="activity-panel" aria-label="Activity monitor"><header><h2>Activity</h2><button type="button" className="text-button" onClick={() => setOpen(false)}>Close</button></header>
-      {error && <p role="status">{error}</p>}{!active.length && !recent.length && <p>No recent activity.</p>}
-      {[...active, ...recent].map(job => <article key={job.id} data-activity-id={job.id}><button type="button" className="text-button activity-open" onClick={() => { setSelected(job.id); setOpen(false); }}><strong>{job.label}<span>{job.scope}</span></strong><small>{[activityRunning(job) ? job.stage : job.status, workCount(job)].filter(Boolean).join(" · ")}</small></button>{!activityRunning(job) && <button type="button" className="text-button activity-dismiss" aria-label={`Dismiss ${job.label}`} title="Dismiss" onClick={() => { const next = [...hidden, job.id].slice(-100); setHidden(next); localStorage.setItem("cratekeep-dismissed-activity", JSON.stringify(next)); }}>×</button>}</article>)}
-    </section>}{chosen && <Details job={chosen} onClose={() => setSelected(undefined)}/>}</div>;
+    {(error || detailError) && open && <p role="status">{error || detailError}</p>}<ActivityHistory open={open} onClose={() => setOpen(false)} onOpen={setSelected}/>
+    {selected && <Details key={selected.id} job={selected} onClose={() => setSelected(undefined)}/>}</div>;
 }
 export function ActivityInline({ scope }: { scope: "library" | string }) {
   const { jobs, error } = useActivity();

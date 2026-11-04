@@ -67,3 +67,10 @@ export async function api<T>(url: string, init?: RequestInit): Promise<T> {
   }
   return result.result as T;
 }
+
+export function workCount(job: ActivityJob) {
+  if (["matching", "import"].includes(job.mode || "")) return `${job.processed} / ${job.total} albums`;
+  if (job.files_found != null) return `${job.files_found} tracks found`;
+  if (job.stage_done == null) return "";
+  return `${job.stage_done}${job.stage_total != null ? ` / ${job.stage_total}` : ""} ${job.stage_unit || "files"}${job.stage_total == null ? " found" : " processed"}`;
+}

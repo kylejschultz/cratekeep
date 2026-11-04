@@ -17,6 +17,8 @@ import uuid
 from flask import jsonify, request
 from werkzeug.exceptions import HTTPException
 
+from .activity_history import History, group_key, summary
+
 _current = ContextVar('cratekeep_activity', default=None)
 ACTIVE = {'queued', 'running', 'waiting', 'stopping'}
 
@@ -63,7 +65,7 @@ class Activity:
         self.slots = threading.Semaphore(4)
         with self.db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS activity_jobs (id TEXT PRIMARY KEY, request_id TEXT UNIQUE, work_key TEXT, snapshot TEXT NOT NULL)')
-            for row in db.execute('SELECT id,snapshot FROM activity_jobs'):
+            for row in db.execute("SELECT id,snapshot FROM activity_jobs WHERE json_extract(snapshot,'$.status') IN ('queued','running','waiting','stopping')"):
                 job = json.loads(row[1])
                 if job['status'] in ACTIVE:
                     for item in job.get('rows', []):
@@ -75,6 +77,8 @@ class Activity:
                                error='Check saved results before restarting unfinished work.', finished_at=time.time())
                     db.execute('UPDATE activity_jobs SET snapshot=? WHERE id=?', (json.dumps(job), row[0]))
 
+        self.history = History(self)
+
     def db(self):
         return sqlite3.connect(self.app.config['APP_DB'], timeout=10)
 
@@ -82,8 +86,8 @@ class Activity:
         with self.lock:
             live = deepcopy(self.jobs)
         with self.db() as db:
-            saved = [json.loads(row[0]) for row in db.execute('SELECT snapshot FROM activity_jobs ORDER BY rowid DESC LIMIT 30')]
-        return sorted([live.pop(job['id'], job) for job in saved] + list(live.values()), key=lambda job: job['created_at'], reverse=True)
+            saved = [json.loads(row[0]) for row in db.execute("SELECT snapshot FROM activity_jobs WHERE history_cleared=0 AND history_status NOT IN ('queued','running','waiting','stopping') ORDER BY rowid DESC LIMIT 20")]
+        return [summary(job) for job in sorted([live.pop(job['id'], job) for job in saved] + list(live.values()), key=lambda job: job['created_at'], reverse=True)]
 
     def get(self, job_id):
         with self.lock:
@@ -98,7 +102,7 @@ class Activity:
             snapshot = json.dumps(self.jobs[job_id])
         try:
             with sqlite3.connect(self.app.config['APP_DB'], timeout=.2) as db:
-                db.execute('UPDATE activity_jobs SET snapshot=? WHERE id=?', (snapshot, job_id))
+                db.execute('UPDATE activity_jobs SET snapshot=?,history_group=?,history_status=? WHERE id=?', (snapshot, group_key(json.loads(snapshot)), json.loads(snapshot)['status'], job_id))
         except sqlite3.Error:
             self.app.logger.warning('Activity checkpoint unavailable; live results retained')
 
@@ -112,8 +116,7 @@ class Activity:
             job = deepcopy(self.jobs[job_id])
         try:
             with self.db() as db:
-                db.execute('UPDATE activity_jobs SET snapshot=? WHERE id=?', (json.dumps(job), job_id))
-                db.execute("DELETE FROM activity_jobs WHERE id IN (SELECT id FROM activity_jobs WHERE json_extract(snapshot,'$.status') NOT IN ('queued','running','waiting','stopping') ORDER BY rowid DESC LIMIT -1 OFFSET 100)")
+                db.execute('UPDATE activity_jobs SET snapshot=?,history_group=?,history_status=? WHERE id=?', (json.dumps(job), group_key(job), job['status'], job_id))
         except sqlite3.Error:
             self.app.logger.exception('Activity result persistence failed; retaining live result')
             return
@@ -121,13 +124,15 @@ class Activity:
             self.jobs.pop(job_id, None)
             self.stops.pop(job_id, None)
 
-    def create(self, label, scope, href, request_id, key, rows):
+    def create(self, label, scope, href, request_id, key, rows, *, steps=None, mode=None, inbox_id=None):
         job = dict(id=uuid.uuid4().hex, label=label, scope=scope, href=href, status='queued',
                    stage='Waiting for an available worker', stage_done=None, stage_total=None,
                    stage_unit='files', current=None, processed=0, total=len(rows), rows=rows,
-                   created_at=time.time(), updated_at=time.time(), stop_requested=False)
+                   created_at=time.time(), updated_at=time.time(), stop_requested=False, work_key=key)
+        if steps is not None:
+            job.update(steps=steps, mode=mode, inbox_id=inbox_id)
         with self.db() as db:
-            db.execute('INSERT INTO activity_jobs VALUES (?,?,?,?)', (job['id'], request_id, key, json.dumps(job)))
+            db.execute('INSERT INTO activity_jobs(id,request_id,work_key,snapshot,history_group,history_status) VALUES (?,?,?,?,?,?)', (job['id'], request_id, key, json.dumps(job), group_key(job), job['status']))
         with self.lock:
             self.jobs[job['id']] = job
             self.stops[job['id']] = threading.Event()
@@ -202,9 +207,10 @@ class Activity:
             label = {'matching': 'Matching albums', 'import': 'Importing albums'}.get(mode)
             if not label:
                 label = 'Refreshing files' if first.endswith('/refresh') else 'Finding matches' if '/candidates' in first or '/rematch/' in first else 'Updating library files'
+            if first.startswith('/api/inbox/') and first.endswith(('/refresh', '/scan')):
+                label = 'Scanning Inbox'
             rows = [dict(id=step.get('id'), album=step.get('album', ''), status='queued', attempts=0) for step in steps]
-            job = self.create(label, scope, href, values['request_id'], key, rows)
-            self.update(job['id'], work_key=key, mode=mode, steps=steps, inbox_id=inbox['id'] if inbox else None)
+            job = self.create(label, scope, href, values['request_id'], key, rows, steps=steps, mode=mode, inbox_id=inbox['id'] if inbox else None)
         threading.Thread(target=self.run, args=(job['id'], steps, mode), daemon=True, name='cratekeep-activity').start()
         return self.get(job['id'])
 
@@ -303,6 +309,27 @@ def register(app):
     @app.get('/api/activity')
     def activity_list():
         return jsonify(jobs=service.list())
+
+    @app.get('/api/activity/history')
+    def activity_history():
+        try:
+            def cursor(name):
+                value = request.args.get(name)
+                if value is None:
+                    return None
+                if not value.isdecimal() or len(value) > 18:
+                    raise ValueError('Invalid history cursor.')
+                return int(value)
+            return jsonify(service.history.page(group=request.args.get('group'), before=cursor('before'), snapshot=cursor('snapshot')))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+
+    @app.post('/api/activity/history/clear')
+    def activity_clear_history():
+        try:
+            return jsonify(service.history.clear(request.get_json(silent=True)))
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
 
     @app.post('/api/activity')
     def activity_submit():

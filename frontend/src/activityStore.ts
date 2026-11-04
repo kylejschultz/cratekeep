@@ -10,8 +10,13 @@ async function poll() {
   polling = true;
   try {
     const result = await api<{ jobs: ActivityJob[] }>("/api/activity");
-    const ended = result.jobs.filter(job => !activityRunning(job) && state.jobs.some(previous => previous.id === job.id && activityRunning(previous)));
-    state = { jobs: result.jobs, error: "" };
+    // A busy interval can move a completed run beyond the bounded recent feed.
+    // Recover only previously active IDs; history itself is loaded separately.
+    const missing = state.jobs.filter(job => activityRunning(job) && !result.jobs.some(next => next.id === job.id));
+    const recovered = await Promise.all(missing.map(job => api<ActivityJob>(`/api/activity/${job.id}`)));
+    const jobs = [...result.jobs, ...recovered];
+    const ended = jobs.filter(job => !activityRunning(job) && state.jobs.some(previous => previous.id === job.id && activityRunning(previous)));
+    state = { jobs, error: "" };
     ended.forEach(job => window.dispatchEvent(new CustomEvent("cratekeep:activity-finished", { detail: job })));
   } catch { state = { ...state, error: "Activity unavailable. Reconnecting…" }; }
   finally {
