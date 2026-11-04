@@ -1,10 +1,11 @@
+import { AnalyticsBanner } from "./AnalyticsBanner";
 import { HeaderIcon } from "./HeaderIcon";
 import { ActivityMonitor } from "./Activity";
 import { useEffect, useState, type ReactNode } from "react";
 
 const links = [["overview", "/", "Overview"], ["inbox", "/inbox", "Inbox"], ["library", "/library", "Library"]] as const;
 
-export function Shell({ page, buildSha, children }: { page: string; buildSha: string; children: ReactNode }) {
+export function Shell({ page, buildSha, analyticsInvitation = false, children }: { page: string; buildSha: string; analyticsInvitation?: boolean; children: ReactNode }) {
   const [dark, setDark] = useState(() => localStorage.getItem("cratekeep-theme") !== "light");
   useEffect(() => { document.documentElement.dataset.theme = dark ? "dark" : "light"; localStorage.setItem("cratekeep-theme", dark ? "dark" : "light"); }, [dark]);
   return <div className={`app listening-desk page-${page}`}>
@@ -19,7 +20,7 @@ export function Shell({ page, buildSha, children }: { page: string; buildSha: st
       </div>
       <code className="build-label" title={buildSha}>build {buildSha.slice(0, 7)}</code>
     </header>
-    <div className="app-content"><main id="main-content">{children}</main></div>
+    <div className="app-content"><main id="main-content">{analyticsInvitation && <AnalyticsBanner/>}{children}</main></div>
   </div>;
 }
 

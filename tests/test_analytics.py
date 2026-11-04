@@ -106,3 +106,33 @@ def test_transport_has_short_timeout_fixed_endpoint_and_no_redirect_handler(monk
     assert request.full_url == 'https://beacon.kjschultz.com/ping'
     assert request.method == 'POST' and timeout == 3
     assert request.data == b'{"project": "cratekeep"}'
+
+
+def test_banner_setup_consent_and_narrow_enable_endpoint(tmp_path):
+    app = create_app({'TESTING': True, 'STATE_PATH': str(tmp_path / 'config'), 'BROWSE_ROOTS': [str(tmp_path)]})
+    client = app.test_client()
+    assert 'Help improve Cratekeep' not in client.get('/setup').get_data(as_text=True)
+    assert client.post('/api/analytics/enable', json={}).status_code == 503
+    client.post('/setup', data={'inbox_path': str(tmp_path / 'inbox'), 'library_path': str(tmp_path / 'library')})
+    assert ui_bootstrap(client.get('/'))['analyticsInvitation']
+    # Ordinary settings saves and reading the disclosure are not answers.
+    client.post('/settings', data=settings_values(app))
+    assert ui_bootstrap(client.get('/settings'))['analyticsInvitation']
+    before = settings_values(app)
+    sent = []
+    app.config['BEACON_TRANSPORT'] = sent.append
+    assert client.post('/api/analytics/enable', data={}).status_code == 400
+    assert client.post('/api/analytics/enable', json={'enabled': False}).status_code == 400
+    assert setting(app, 'analytics_enabled') != '1'
+    assert client.post('/api/analytics/enable', json={}).json == {'enabled': True}
+    assert client.post('/api/analytics/enable', json={}).status_code == 200
+    assert app.extensions['beacon'].wake.is_set()
+    assert not sent and setting(app, 'analytics_install_id') is None
+    assert {key: value for key, value in settings_values(app).items() if key != 'analytics_enabled'} == {
+        key: value for key, value in before.items() if key != 'analytics_enabled'}
+    assert not ui_bootstrap(app.test_client().get('/inbox'))['analyticsInvitation']
+    restarted = create_app({'TESTING': True, 'STATE_PATH': app.config['STATE_PATH'], 'BEACON_TRANSPORT': sent.append})
+    assert not ui_bootstrap(restarted.test_client().get('/library'))['analyticsInvitation']
+    assert restarted.extensions['beacon'].run_once(NOW)
+    assert len(sent) == 1
+    assert not restarted.extensions['beacon'].run_once(NOW)

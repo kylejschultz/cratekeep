@@ -179,6 +179,19 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("setup"))
         return _settings_response(app, first_run=False)
 
+    @app.post("/api/analytics/enable")
+    def enable_analytics():
+        if not request.is_json or request.get_json(silent=True) != {}:
+            return jsonify(error="Expected an empty JSON object"), 400
+        # A narrow consent write avoids replacing settings from a stale page.
+        with _connect(app.config["APP_DB"]) as db:
+            db.execute(
+                "INSERT INTO app_settings(key, value) VALUES ('analytics_enabled', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+        app.extensions["beacon"].wake.set()
+        return jsonify(enabled=True)
+
     @app.get("/")
     def index():
         return _render_ui(app, "overview", "Overview", _overview_data(app))
@@ -1792,6 +1805,8 @@ def _render_ui(app: Flask, page: str, title: str, data: dict):
         title=title,
         bootstrap={
             "activityEnabled": True,
+            "analyticsInvitation": bool(app.config["SETUP_COMPLETE"]) and
+                _load_settings(app.config["APP_DB"]).get("analytics_enabled") != "1",
             "page": page,
             "buildSha": app.config["BUILD_SHA"],
             "threshold": app.config.get("MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD),

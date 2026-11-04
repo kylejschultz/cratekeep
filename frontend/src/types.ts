@@ -1,5 +1,6 @@
 export type Bootstrap = {
   activityEnabled?: boolean;
+  analyticsInvitation?: boolean;
   page: "overview" | "inbox" | "library-import" | "library" | "settings";
   buildSha: string;
   threshold: number;
