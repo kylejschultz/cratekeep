@@ -1470,6 +1470,9 @@ def _build_beets_config(
 
 def _init_db(path: str) -> None:
     with _connect(path) as db:
+        # Readers keep the last committed inventory while a large scan spills
+        # dirty pages. Rollback journaling would block them until scan commit.
+        db.execute("PRAGMA journal_mode=WAL")
         from .inbox_imports import init_schema
         init_schema(db)
         db.execute("""CREATE TABLE IF NOT EXISTS app_settings (
@@ -7473,6 +7476,19 @@ def _scan_inbox_inventory_locked(
         if row["present"] and relative not in discovered_relatives
         and (scopes is None or _scope_for_relative_path(relative) in wanted)
     ]
+    snapshots = {}
+    report_progress("Reading file tags", 0, len(discovered))
+    for position, (path, stat) in enumerate(discovered, 1):
+        report_progress("Reading file tags", position - 1, len(discovered), current=path.relative_to(root).as_posix())
+        relative = path.relative_to(root).as_posix()
+        old = previous.get(relative)
+        signature = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+        unchanged = bool(old and signature == (
+            old["size_bytes"], old["mtime_ns"], old["device"], old["inode"]
+        ))
+        snapshots[relative] = (unchanged, old["candidates_json"] if unchanged
+                               else json.dumps([_inbox_tag_snapshot(path)]))
+
     total_bytes = 0
     added_ids = []
     with _connect(app.config["APP_DB"]) as db:
@@ -7487,16 +7503,13 @@ def _scan_inbox_inventory_locked(
                           if _scope_for_relative_path(relative) in wanted]
             if scoped_ids:
                 db.executemany("UPDATE library_inventory SET present=0 WHERE id=?", scoped_ids)
-        report_progress("Reading file tags", 0, len(discovered))
+        report_progress("Saving inventory", 0, len(discovered))
         for position, (path, stat) in enumerate(discovered, 1):
-            report_progress("Reading file tags", position - 1, len(discovered), current=path.relative_to(root).as_posix())
+            report_progress("Saving inventory", position - 1, len(discovered), current=path.relative_to(root).as_posix())
             relative = path.relative_to(root).as_posix()
             old = previous.get(relative)
             signature = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
-            unchanged = bool(old and signature == (
-                old["size_bytes"], old["mtime_ns"], old["device"], old["inode"]
-            ))
-            snapshot_json = old["candidates_json"] if unchanged else json.dumps([_inbox_tag_snapshot(path)])
+            unchanged, snapshot_json = snapshots[relative]
             db.execute(
                 """INSERT INTO library_inventory(
                        root_path, relative_path, size_bytes, mtime_ns, device, inode, beets_item_id,
@@ -7615,6 +7628,13 @@ def _sync_inbox_album_reviews(app: Flask, inbox: dict[str, str], root: Path) -> 
             "SELECT id,artist,album,execution_status FROM album_reviews WHERE source_kind='inbox' AND source_id=?",
             (inbox["id"],),
         )}
+        # Index completed memberships once, rather than checking every prior
+        # album for every group on each unchanged scan (quadratic in albums).
+        completed_by_track = {}
+        for identity, old_members in prior_members.items():
+            if prior_albums[identity]["execution_status"] == "complete":
+                for member in old_members:
+                    completed_by_track.setdefault(member, []).append(identity)
         existing_exceptions = {
             row["inventory_id"]: row["exception_state"] for row in db.execute(
                 """SELECT tracks.inventory_id, tracks.exception_state
@@ -7690,10 +7710,9 @@ def _sync_inbox_album_reviews(app: Flask, inbox: dict[str, str], root: Path) -> 
                                           (compatible[0],)).fetchone()
             # The completed job manifest retains its audit; current inventory
             # membership now belongs to the new review of returned source files.
-            for identity, old_members in prior_members.items():
-                if prior_albums[identity]["execution_status"] == "complete":
-                    db.executemany("DELETE FROM album_review_tracks WHERE album_review_id=? AND inventory_id=?",
-                                   [(identity, member) for member in members & old_members])
+            db.executemany("DELETE FROM album_review_tracks WHERE album_review_id=? AND inventory_id=?",
+                           [(identity, member) for member in members
+                            for identity in completed_by_track.get(member, [])])
             if previous and previous["execution_status"] == "complete":
                 db.execute("UPDATE album_reviews SET artist_key=artist_key || ? WHERE id=?",
                            (f"\x1fcompleted:{previous['id']}", previous["id"]))

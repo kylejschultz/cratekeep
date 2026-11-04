@@ -33,7 +33,9 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
   const [page, setPage] = useState(1), [query, setQuery] = useState(""), [status, setStatus] = useState("all");
   const [loading, setLoading] = useState(true), [reviewBusy, setReviewBusy] = useState(false);
   const [scanning, setScanning] = useState(source === "inbox");
-  const inventoryScan = useRef<Promise<unknown> | null>(null);
+  const inventoryScan = useRef<{ base: string; request: Promise<unknown> } | null>(null);
+  const [scanError, setScanError] = useState("");
+  const [scanReload, setScanReload] = useState(false);
   const [operation, setOperation] = useState<"refresh" | "match" | "import" | null>(null);
   const busy = operation !== null;
   const [matching, setMatching] = useState<Album[] | null>(null);
@@ -47,29 +49,23 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
   const selectPage = useRef<HTMLInputElement>(null);
   const queueBase = source === "inbox" ? `/api/inbox/${encodeURIComponent(inboxId || "")}/queue` : "/api/library-import/queue";
   const bulkBase = source === "inbox" ? `/api/inbox/${encodeURIComponent(inboxId || "")}/bulk` : "/api/library-import/bulk";
-  const locked = busy || scanning || reviewBusy || bulk !== null || matching !== null || inboxAction !== null;
+  const locked = busy || reviewBusy || bulk !== null || matching !== null || inboxAction !== null;
   useEffect(() => { onBusyChange?.(locked); }, [locked, onBusyChange]);
   useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
+  const backgroundPaused = locked || detailOpen || selected.size > 0 || loading;
   const backgroundBlocked = useRef(true);
-  useEffect(() => { backgroundBlocked.current = locked || detailOpen || selected.size > 0 || loading; }, [locked, detailOpen, selected.size, loading]);
+  useEffect(() => { backgroundBlocked.current = backgroundPaused; }, [backgroundPaused]);
   const load = useCallback(async (quiet = false) => {
     const version = ++requestCounter.value;
     if (!quiet) { setLoading(true); setError(""); }
     const controller = new AbortController();
     const timeout = activityEnabled ? undefined : setTimeout(() => controller.abort(), 30000);
     try {
-      if (source === "inbox" && !quiet) {
-        if (!inventoryScan.current) {
-          setScanning(true);
-          inventoryScan.current = api(`${queueBase}/refresh`, { method: "POST", body: "{}", signal: controller.signal })
-            .catch(reason => { inventoryScan.current = null; throw reason; });
-        }
-        await inventoryScan.current;
-        if (version !== requestCounter.value) return;
-        setScanning(false);
-      }
       const next = await api<QueuePage>(`${queueBase}?${new URLSearchParams({ page: String(page), q: query, status })}`, { signal: controller.signal });
-      if (version !== requestCounter.value) return;
+      if (version !== requestCounter.value) {
+        if (quiet) throw new Error("Inbox update superseded by another request");
+        return;
+      }
       if (controller.signal.aborted) throw new Error("Album loading timed out.");
       if (!Array.isArray(next.albums)) throw new Error("The album response was invalid. Reload the page or try Refresh.");
       if (quiet && backgroundBlocked.current) throw new Error("Inbox update deferred during review");
@@ -79,12 +75,39 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
     } catch (reason) {
       if (quiet) throw reason; // Keep the revision pending so polling can retry.
       if (version === requestCounter.value) setError(controller.signal.aborted ? "Album loading timed out. Reload the page or try Refresh." : (reason as Error).message);
-    } finally { clearTimeout(timeout); if (!quiet && version === requestCounter.value) { setLoading(false); setScanning(false); } }
-  }, [queueBase, page, query, status, requestCounter, source]);
+    } finally { clearTimeout(timeout); if (!quiet && version === requestCounter.value) setLoading(false); }
+  }, [queueBase, page, query, status, requestCounter]);
   const loadBackground = useCallback(() => load(true), [load]);
   const discovery = useInboxDiscovery(source === "inbox" ? inboxId : undefined,
-    locked || detailOpen || selected.size > 0 || loading, loadBackground);
+    backgroundPaused, loadBackground);
   useEffect(() => { const timer = setTimeout(() => void load(), query ? 200 : 0); return () => { clearTimeout(timer); ++requestCounter.value; }; }, [load, query, requestCounter]);
+  // Disk discovery must never gate the persisted queue. Keep its lifetime and
+  // errors separate from page/search requests, including the 30-second read limit.
+  useEffect(() => {
+    if (source !== "inbox") return;
+    let stopped = false;
+    setScanning(true); setScanError("");
+    if (inventoryScan.current?.base !== queueBase) {
+      inventoryScan.current = { base: queueBase, request: api(`${queueBase}/refresh`, { method: "POST", body: "{}" }) };
+    }
+    void inventoryScan.current.request.then(() => { if (!stopped) setScanReload(true); })
+      .catch(reason => { if (!stopped) setScanError(`Inbox scan failed: ${(reason as Error).message}`); })
+      .finally(() => { if (!stopped) setScanning(false); });
+    return () => { stopped = true; };
+  }, [queueBase, source]);
+  // Manual-only sources also catch up after their opening scan. Defer replacing
+  // rows while someone is selecting or reviewing, then retry transient failures.
+  useEffect(() => {
+    if (!scanReload || backgroundPaused) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const reload = async () => {
+      try { await loadBackground(); if (!stopped) setScanReload(false); }
+      catch { if (!stopped) timer = setTimeout(() => { void reload(); }, 2000); }
+    };
+    void reload();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [scanReload, backgroundPaused, loadBackground]);
   useEffect(() => { setSelected(new Map()); }, [page, query, status, source, inboxId]);
   const visibleSelected = result.albums.filter(album => selected.has(album.id)).length;
   useEffect(() => { if (selectPage.current) selectPage.current.indeterminate = visibleSelected > 0 && visibleSelected < result.albums.length; }, [visibleSelected, result.albums.length]);
@@ -103,7 +126,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
     try {
       const url = source === "inbox" ? `/api/inbox/${encodeURIComponent(inboxId || "")}/scopes/refresh` : `${queueBase}/refresh`;
       const refreshed = await api<any>(url, { method: "POST", body: "{}" });
-      if (source === "inbox") inventoryScan.current = Promise.resolve(refreshed);
+      setScanError("");
       setSelected(new Map()); setActive(null); setDetailOpen(false); await load();
       if (refreshed.errors?.length || refreshed.cleanup?.errors?.length) setError(refreshed.errors?.[0]?.error || refreshed.cleanup.errors[0].error);
       else notify(source === "inbox" ? `Inbox refreshed: ${refreshed.inventory.files} tracks found; ${refreshed.cleanup.removed.length} empty folders removed.` : "Library files refreshed. Ready to review.");
@@ -136,7 +159,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
     {matching && <MatchingDialog activity={activityEnabled ? { path: source === "inbox" ? "/api/inbox/candidates" : "/api/library-import/candidates", body: source === "library-import" ? { limit: 1 } : {} } : undefined} albums={matching} onClose={() => { setMatching(null); setOperation(null); }} onRunning={running => setOperation(running ? "match" : null)} execute={(id, reuseCurrent) => api(source === "inbox" ? "/api/inbox/candidates" : "/api/library-import/candidates", { method: "POST", body: JSON.stringify({ album_id: id, ...(source === "library-import" ? { limit: 1 } : {}), reuse_current: reuseCurrent }) })} onFinish={rows => { notify(rows.some(row => ["needs-retry", "not-started"].includes(row.status)) ? "Matching paused. Successful results have been kept." : "Matching finished. Review the album results.", "info"); setDetailOpen(false); void load(); }}/>}
     <div className="desk-queue"><ActivityInline scope={source === "inbox" ? inboxId || "" : "library"}/>
       <div className="desk-filters"><div className="desk-tabs" aria-label="Album filter">{[["all", "All albums"], ["pending", "Pending"], ["matched", "Matched"], ...(source === "library-import" ? [["perfect", "Perfect match"], ["duplicates", "Duplicates"]] : [["imported", "Imported"]])].map(([key, label]) => <button key={key} className="text-button" aria-pressed={status === key} disabled={locked} onClick={() => { setStatus(key); setPage(1); }}>{label}</button>)}</div><label className="desk-search"><span className="sr-only">Find an album</span><input type="search" placeholder="Find an album" value={query} disabled={locked} onChange={event => { setQuery(event.target.value); setPage(1); }}/></label></div>
-      <div className="desk-selection"><label><input ref={selectPage} type="checkbox" disabled={locked || loading} checked={result.albums.length > 0 && visibleSelected === result.albums.length} onChange={event => selectVisible(event.target.checked)}/> Select this page</label><span>{selected.size ? `${selected.size} selected` : `${result.total} albums`}</span><button className="text-button" disabled={locked || loading} onClick={refresh}>Refresh</button></div>
+      <div className="desk-selection"><label><input ref={selectPage} type="checkbox" disabled={locked || loading} checked={result.albums.length > 0 && visibleSelected === result.albums.length} onChange={event => selectVisible(event.target.checked)}/> Select this page</label><span>{selected.size ? `${selected.size} selected` : `${result.total} albums`}</span><button className="text-button" disabled={locked || loading || scanning} onClick={refresh}>Refresh</button></div>
       {selected.size > 0 && <div className="desk-batch toolbar-actions" aria-label="Selected album actions"><button disabled={locked || !importableSelected.length} onClick={match} aria-busy={operation === "match"}>{operation === "match" && <span className="spinner"/>}{operation === "match" ? "Matching…" : "Match Selected"}</button><button disabled={locked || !importableSelected.length} onClick={importReady} aria-busy={operation === "import"}>{operation === "import" && <span className="spinner"/>}{operation === "import" ? "Importing…" : "Import selected"}</button>{source === "inbox" && deletableSelected.length > 0 && <button className="danger-action" disabled={locked} onClick={() => setInboxAction({ kind: "delete-albums", albumIds: deletableSelected.map(album => album.id), names: deletableSelected.map(album => String(album.album)) })}>Delete from Inbox</button>}{source === "inbox" && importedSelected.length > 0 && <button className="danger-action" disabled={locked} onClick={() => setInboxAction({ kind: "delete-imported", jobs: importedSelected.map(album => album.imported.job_id) })}>Remove imported</button>}<button className="text-button" disabled={locked} onClick={() => setSelected(new Map())}>Clear selection</button></div>}
       {discovery.status && <div className="inbox-discovery-status" role="status">
         <span>{discovery.status.mode === "manual" ? "Manual discovery" : discovery.status.mode === "instant" ? "Instant discovery" : `Scan every ${discovery.status.mode} minutes`}</span>
@@ -144,6 +167,8 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
       </div>}
       {discovery.status?.watcher_error && <Notice kind="error">{discovery.status.watcher_error}</Notice>}
       {discovery.status?.error && <Notice kind="error">{discovery.status.error}</Notice>}
+      {scanning && <p role="status">Scanning Inbox…</p>}
+      {scanError && <Notice kind="error">{scanError}</Notice>}
       {error && <Notice kind="error">{error}</Notice>}
       <div className="desk-column-head" aria-hidden="true"><span>Album / Artist</span><span>Tracks</span><span>Match</span><span>Status</span></div>
       <ul className="desk-albums" aria-busy={loading || busy}>{result.albums.map(album => { const state = albumStatus(album, threshold); const count = album.track_count ?? album.tracks?.length ?? album.files?.length ?? 0; return <li className={`desk-album${active?.id === album.id ? " is-active" : ""}`} data-album-id={album.id} key={album.id}>
@@ -151,8 +176,8 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
         <button type="button" className="desk-album-open" aria-label={`Review ${album.album}`} aria-pressed={active?.id === album.id} disabled={locked || loading} onClick={() => { setActive(album); setDetailOpen(true); }}><Artwork album={album}/><span><strong>{album.album || "Untitled album"}</strong><small>{album.artist || "Unknown artist"}<span className="queue-mobile-meta"> · {count} tracks</span></small><span className="desk-source-path">{album.source_paths?.join(" · ")}</span></span></button>
         <span className="desk-track-count">{count}</span><span className="desk-match">{state.score == null ? "—" : formatMatchPercent(state.score)}</span><span className={`desk-decision ${state.key}`} title={album.execution_error || album.candidate_error || album.readiness_reason}>{state.label}</span>
       </li>; })}</ul>
-      {loading && <p className="loading" role="status">{scanning ? "Scanning Inbox…" : "Loading albums…"}</p>}
-      {!loading && !error && !result.albums.length && <div className="empty-state"><strong>{query || status !== "all" ? "No albums match this view" : "Nothing waiting here"}</strong><p>{query || status !== "all" ? "Try another search or All albums." : "No audio files found. Check the Inbox path in Settings and your folder mount, then Refresh."}</p></div>}
+      {loading && <p className="loading" role="status">Loading albums…</p>}
+      {!loading && !scanning && !scanError && !error && !result.albums.length && <div className="empty-state"><strong>{query || status !== "all" ? "No albums match this view" : "Nothing waiting here"}</strong><p>{query || status !== "all" ? "Try another search or All albums." : "No audio files found. Check the Inbox path in Settings and your folder mount, then Refresh."}</p></div>}
       <div className="desk-pagination"><span>Page {result.page} of {result.page_count} · 25 per page</span><button className="text-button" disabled={result.page <= 1 || loading || locked} onClick={() => setPage(result.page - 1)}>Previous</button><button className="text-button" disabled={result.page >= result.page_count || loading || locked} onClick={() => setPage(result.page + 1)}>Next</button></div>
     </div>
     {divider}    <aside className="desk-inspector" aria-label="Album inspector"><button type="button" className="inspector-back text-button" disabled={locked} onClick={() => setDetailOpen(false)}>Back to albums</button>{active ? active.imported ? <div className="embedded-review"><div className="dialog"><header><h2>{active.album}</h2><button type="button" className="text-button" disabled={locked} aria-label="Close imported album" onClick={() => { setActive(null); setDetailOpen(false); }}>×</button></header><div className="dialog-body"><Artwork album={active}/><h3>Imported</h3><p>{active.artist}</p><p>Library copies are managed. The original files remain in Inbox.</p><p>{active.imported.originals?.length || 0} retained originals</p>{active.imported.undo_reason && <p>{active.imported.undo_reason}</p>}</div><footer><button disabled={locked || !active.imported.undoable} onClick={() => setInboxAction({ kind: "undo", jobs: [active.imported.job_id] })}>Undo import</button><button className="danger-action" disabled={locked} onClick={() => setInboxAction({ kind: "delete-imported", jobs: [active.imported.job_id] })}>Remove imported</button></footer></div></div> : <ReviewModal embedded key={`${source}-${active.id}-${active.candidate_status}-${(active.candidates || []).map(row => row.id).join(",")}-${active.execution_status}`} album={active} source={source} onDeleteAlbum={source === "inbox" && (!active.execution_status || active.execution_status === "not-run") ? () => setInboxAction({ kind: "delete-albums", albumIds: [active.id], names: [String(active.album)] }) : undefined} onDeleteTrack={source === "inbox" && (!active.execution_status || active.execution_status === "not-run") ? (trackId, title) => setInboxAction({ kind: "delete-track", albumId: active.id, trackId, names: [String(active.album), title] }) : undefined} onBusyChange={setReviewBusy} onSelectionChange={updated => { setActive(updated); setResult(current => ({ ...current, albums: current.albums.map(album => album.id === updated.id ? updated : album) })); setSelected(current => current.has(updated.id) ? new Map(current).set(updated.id, updated) : current); }} onClose={() => { setActive(null); setDetailOpen(false); }} onComplete={message => { notify(message); setSelected(current => { const next = new Map(current); next.delete(active.id); return next; }); void load(); }}/>
