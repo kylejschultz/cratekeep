@@ -78,3 +78,12 @@ Implementation validation: frontend consent/error/storage regression tests, back
 setup/consent/restart/privacy tests and real-browser checks at 1440/768/390 in dark
 and light themes. Network transport stubbed; no live installation opted in. User
 acceptance remains pending, including the final candidate in Kyle's environment.
+
+### Same-page disclosure correction — 2026-11-04
+
+Kyle found that “What’s shared” did not open About when already on Settings.
+Reproduced in a real browser: the hash changed but About stayed unselected because
+Settings only read the hash on mount. Settings must follow hash changes (including
+history navigation and the existing matching alias) without remounting or losing
+unsaved fields. Added a regression test and repeated the banner flow starting on
+Settings, rather than relying only on the previous Overview-to-Settings check.

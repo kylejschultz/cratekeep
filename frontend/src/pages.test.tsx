@@ -228,6 +228,23 @@ it("selects the configured Inbox requested by the source link", async () => {
 
 
 describe("About settings", () => {
+  it("follows same-page disclosure links and browser history without remounting settings", () => {
+    history.replaceState(null, "", "/settings");
+    render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { settings: {} } }}/>);
+    expect(screen.getByRole("tab", { name: "General" })).toHaveAttribute("aria-selected", "true");
+    history.replaceState(null, "", "/settings#about");
+    fireEvent(window, new HashChangeEvent("hashchange"));
+    expect(screen.getByRole("tab", { name: "About" })).toHaveAttribute("aria-selected", "true");
+    const consent = screen.getByRole("checkbox", { name: "Share anonymous install analytics" });
+    fireEvent.click(consent);
+    for (const [hash, tab] of [["matching", "Metadata"], ["", "General"], ["about", "About"]]) {
+      history.replaceState(null, "", `/settings#${hash}`);
+      fireEvent(window, new HashChangeEvent("hashchange"));
+      expect(screen.getByRole("tab", { name: tab })).toHaveAttribute("aria-selected", "true");
+    }
+    expect(consent).toBeChecked();
+    history.replaceState(null, "", "/settings");
+  });
   it("shows the real build, community links and an explicit default-off analytics choice", () => {
     location.hash = "about";
     render(<Page boot={{ page: "settings", buildSha: "abcdef1234567890", threshold: 90, data: { settings: {}, about: { build: "abcdef1234567890", discord_url: "https://discord.gg/cratekeep-test" } } }}/>);

@@ -124,6 +124,11 @@ type InboxSetting = { key: string; id: string; name: string; path: string; auto_
 type InboxDraft = InboxSetting & { isNew?: boolean };
 const inboxDiscoveryOptions = [["manual", "Manual only"], ["instant", "Instant"], ["5", "Every 5 minutes"], ["15", "Every 15 minutes"], ["30", "Every 30 minutes"], ["60", "Every hour"], ["360", "Every 6 hours"], ["1440", "Every 24 hours"]];
 
+function settingsTabFromHash() {
+  const hash = location.hash.slice(1);
+  return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
+}
+
 export function Settings({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const settings = data.settings || {}, initial = data.inboxes || [];
   const notify = useToast(), flashed = useRef(false);
@@ -136,10 +141,12 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
   const [inboxes, setInboxes] = useState<InboxSetting[]>(() => initial.map((inbox: InboxSetting) => ({ ...inbox, key: inbox.id })));
   const [draft, setDraft] = useState<InboxDraft | null>(null);
   const editor = useRef<HTMLDivElement>(null);
-  const [tab, setTab] = useState(() => {
-    const hash = location.hash.slice(1);
-    return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
-  });
+  const [tab, setTab] = useState(settingsTabFromHash);
+  useEffect(() => {
+    const syncTab = () => setTab(settingsTabFromHash());
+    window.addEventListener("hashchange", syncTab);
+    return () => window.removeEventListener("hashchange", syncTab);
+  }, []);
   function finishInbox() {
     if (!draft || !Array.from(editor.current?.querySelectorAll("input:not([type=hidden])") || []).every(input => (input as HTMLInputElement).reportValidity())) return;
     setInboxes(rows => rows.map(row => row.key === draft.key ? { ...row, name: draft.name.trim(), path: draft.path.trim(), discovery: draft.discovery || "5", auto_match: Boolean(draft.auto_match) } : row));
