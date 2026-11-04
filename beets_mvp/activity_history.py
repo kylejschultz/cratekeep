@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from copy import deepcopy
 
 ACTIVE = ('queued', 'running', 'waiting', 'stopping')
 ATTENTION = ('partial', 'failed', 'interrupted')
@@ -90,13 +91,16 @@ class History:
             # Automatic success rows may be compacted concurrently. Pin this
             # read snapshot until representative IDs and summaries are resolved.
             db.execute('BEGIN')
+            def read_job(snapshot):
+                saved = json.loads(snapshot)
+                return deepcopy(self.activity.jobs.get(saved['id'], saved))
             ceiling = db.execute('SELECT COALESCE(MAX(rowid),0) FROM activity_jobs').fetchone()[0]
             snapshot = min(snapshot, ceiling) if snapshot is not None else ceiling
             before = before if before is not None else snapshot + 1
             clearable = db.execute("SELECT COUNT(*) FROM activity_jobs WHERE history_cleared=0 AND history_status NOT IN ('queued','running','waiting','stopping')").fetchone()[0]
             if group is not None:
-                rows = db.execute('SELECT rowid,id FROM activity_jobs WHERE history_group=? AND history_cleared=0 AND rowid<=? AND rowid<? ORDER BY rowid DESC LIMIT ?', (group, snapshot, before, PAGE_SIZE + 1)).fetchall()
-                jobs = [summary(self.activity.get(row[1])) for row in rows[:PAGE_SIZE]]
+                rows = db.execute('SELECT rowid,snapshot FROM activity_jobs WHERE history_group=? AND history_cleared=0 AND rowid<=? AND rowid<? ORDER BY rowid DESC LIMIT ?', (group, snapshot, before, PAGE_SIZE + 1)).fetchall()
+                jobs = [summary(read_job(row[1])) for row in rows[:PAGE_SIZE]]
                 return dict(jobs=jobs, snapshot=snapshot, next_before=rows[PAGE_SIZE - 1][0] if len(rows) > PAGE_SIZE else None)
             rows = db.execute("""SELECT history_group, MAX(rowid) AS anchor,
                 SUM(history_cleared=0) AS count,
@@ -108,12 +112,10 @@ class History:
                 HAVING count>0 AND anchor<? ORDER BY anchor DESC LIMIT ?""", (snapshot, before, PAGE_SIZE + 1)).fetchall()
             groups = []
             for key, anchor, count, active, attention, latest, working in rows[:PAGE_SIZE]:
-                latest_id = db.execute('SELECT id FROM activity_jobs WHERE rowid=?', (latest,)).fetchone()[0]
-                job = self.activity.get(latest_id)
+                job = read_job(db.execute('SELECT snapshot FROM activity_jobs WHERE rowid=?', (latest,)).fetchone()[0])
                 representative = job
                 if working:
-                    working_id = db.execute('SELECT id FROM activity_jobs WHERE rowid=?', (working,)).fetchone()[0]
-                    representative = self.activity.get(working_id)
+                    representative = read_job(db.execute('SELECT snapshot FROM activity_jobs WHERE rowid=?', (working,)).fetchone()[0])
                 label = 'Inbox scans' if key == 'inbox-scans' else 'Inbox arrivals' if job['label'] == 'Scanning Inbox' and job['status'] == 'complete' and (added_tracks(job) or 0) > 0 else job['label']
                 latest_summary = summary(representative)
                 if representative['label'] == 'Scanning Inbox' and (added_tracks(representative) or 0) > 0:
