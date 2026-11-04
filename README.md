@@ -88,6 +88,28 @@ Each Inbox has its own discovery mode in Settings: Manual only, Instant, or a ti
 
 Eligible copy imports can be undone; replacements cannot. **Remove imported** deletes the Inbox originals and keeps the Library copies.
 
+Library metadata saves update the music files and catalog together, keeping
+Artist/Artists and Album Artist/Album Artists consistent. Artist and Album Artist
+remain separate credits. In Edit metadata, use **Album artist credits** to remove
+an extra credited name; each track's **Track artist credits** list can be edited too.
+The editor keeps album and track drafts together. Choose **Review changes** to
+inspect tag updates and exact Beets file destinations, then **Save changes** to
+apply them together. **File location** shows existing files and configured Beets
+destinations. Browse Library folders to select an exact album folder, or stage a
+new folder; nothing is created until save. Manual folders are remembered for the
+album, preserving filenames and disc subfolders during relocation. Later metadata
+edits can rename track files inside that folder. Choose **Use Beets naming** to
+return to your configured layout, including for already-renamed albums.
+Cancel asks before discarding unsaved work; switching between
+tracks keeps the draft. **Stored details** shows read-only IDs and file paths.
+Explicit list changes update associated credit/sort tags and retain known IDs for
+kept names. Display-name edits alone preserve collaborators. Saves and rematches also update folder/file names using
+`paths:` in your Beets configuration: album/artist fields control folders and title/
+track fields control filenames wherever your template uses them. Owned lyric
+sidecars and artwork follow the audio; existing destination files are never overwritten.
+Re-saving a corrected name repairs older companion tags and paths. Existing files
+are not automatically reorganized just by upgrading or changing configuration.
+
 ## Analytics
 
 Optional [Beacon analytics](https://github.com/kylejschultz/beacon) is off by default. It reports a random installation ID, build/platform details and collection totals at most once a day, without track names, media paths or listening history. The receiving server also sees the connection IP address. You can opt in under Settings → About.

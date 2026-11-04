@@ -622,3 +622,47 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
 .inbox-delete-folders strong{min-width:0;font-weight:500;overflow-wrap:anywhere}
 .inbox-delete-folders small{flex-shrink:0;color:var(--muted);white-space:nowrap}
 .inbox-delete-files{margin-top:14px;color:var(--muted);font-size:13px}
+
+.artist-credits{grid-column:1/-1;border:0;padding:0;margin:8px 0;min-width:0}
+.artist-credits legend{font-size:13px;font-weight:600;padding:0;margin-bottom:6px}
+.artist-credits small{display:block;color:var(--muted);font-size:12px;line-height:1.4;margin-bottom:8px}
+.artist-credit-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.artist-credit-row input{flex:1;min-width:0}
+.artist-credit-row button{flex:none}
+.track-artist-credits{margin-top:8px;text-align:left}
+.track-artist-credits summary{font-size:12px;cursor:pointer}
+.track-artist-credits .artist-credit-row{flex-wrap:wrap}
+
+/* The metadata editor floats independently of the embedded album inspector. */
+.metadata-editor{width:min(880px,calc(100vw - 32px));max-height:calc(100dvh - 48px);margin:auto;padding:0;color:var(--text);background:var(--surface);border:1px solid var(--control);border-radius:6px;overflow:hidden}
+.metadata-editor[open]{display:flex;flex-direction:column}
+.metadata-editor::backdrop{background:#000a}
+.metadata-editor>header,.metadata-editor>footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px;flex:none}
+.metadata-editor>header{border-bottom:1px solid var(--border)}
+.metadata-editor h2{font-size:20px;margin:0}.metadata-editor>header p{color:var(--muted);margin:4px 0 0;overflow-wrap:anywhere}
+.metadata-editor>header>button{font-size:24px;width:36px;height:36px;flex:none;padding:0}
+.metadata-editor>footer{border-top:1px solid var(--border)}
+.metadata-editor-body{overflow:auto;overscroll-behavior:contain;padding:20px 24px;min-height:0}
+.metadata-tabs{display:flex;gap:20px;margin:0 0 20px;border-bottom:1px solid var(--border)}
+.metadata-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;padding:8px 0;color:var(--muted);background:transparent;font-size:13px}
+.metadata-tabs button[aria-pressed=true]{color:var(--text);border-bottom-color:var(--text)}
+.metadata-fields{border:0;padding:0;margin:0;min-width:0}.metadata-editor [hidden]{display:none!important}
+.metadata-editor .edit-grid{gap:12px 20px}.metadata-editor .edit-grid label{margin-top:0;font-size:13px}
+.metadata-editor input,.metadata-editor select{width:100%;min-width:0;padding:8px 10px;border:1px solid var(--control);border-radius:4px;background:var(--surface);color:var(--text);font:inherit}
+.metadata-editor .artist-credits{margin-top:20px}.metadata-editor .muted{color:var(--muted);font-size:13px;margin-top:16px}
+.metadata-track-picker{display:grid;gap:6px;margin-bottom:20px;font-size:13px}
+.metadata-file-path,.metadata-stored-track p{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.metadata-stored-track{padding:12px 0;border-bottom:1px solid var(--border)}.metadata-stored-track p{margin:4px 0}.metadata-stored-track small{color:var(--muted)}
+.metadata-change-group{padding:12px 0;border-bottom:1px solid var(--border)}.metadata-change-group h4{margin:0 0 8px}.metadata-change-group dl{margin:0;display:grid;gap:8px}.metadata-change-group dl>div{display:grid;grid-template-columns:150px 1fr;gap:12px}.metadata-change-group dd{overflow-wrap:anywhere}.metadata-change-group dd>span:first-child{color:var(--muted)}
+.metadata-path-change{display:grid;gap:4px;padding:10px 0;overflow-wrap:anywhere;font-size:13px}.metadata-path-change span,.metadata-path-change small{color:var(--muted)}
+.metadata-inline-actions{display:flex;gap:12px;justify-content:flex-end}
+@media(max-width:640px){.metadata-editor{width:calc(100vw - 16px);max-height:calc(100dvh - 16px)}.metadata-editor>header,.metadata-editor>footer,.metadata-editor-body{padding:16px}.metadata-tabs{gap:16px}.metadata-editor .edit-grid{grid-template-columns:1fr}.metadata-editor button,.metadata-editor input,.metadata-editor select{min-height:44px}.metadata-change-group dl>div{grid-template-columns:1fr;gap:2px}.metadata-editor>footer{gap:8px}.metadata-editor>footer button{flex:1}}
+
+.metadata-tabs{overflow-x:auto;flex:none}.metadata-tabs button{flex-shrink:0;white-space:nowrap}
+.file-location h3{font-size:14px;margin:0 0 8px}.file-location p{margin:6px 0;overflow-wrap:anywhere}.file-location small{display:block;font-size:12px;color:var(--muted);margin-top:8px}
+.location-path{font-size:14px}.location-files{font-size:12px;list-style:none;padding:0;overflow-wrap:anywhere}.location-files li{padding:6px 0;border-bottom:1px solid var(--border)}
+.location-policy{margin:20px 0 12px;padding:12px 0;border-block:1px solid var(--border)}.location-policy p{font-size:13px;color:var(--muted)}
+.location-beets-preview{margin:12px 0 20px}.library-folder-browser{margin-top:16px;padding:16px;border:1px solid var(--control);border-radius:4px}
+.library-folder-browser nav{font-size:13px;overflow-wrap:anywhere}.library-folder-browser nav button{display:inline;padding:2px;font-size:13px}
+.library-folder-browser ul{list-style:none;padding:0;max-height:200px;overflow:auto;margin:12px 0}.library-folder-browser li{border-bottom:1px solid var(--border)}.library-folder-browser li button{width:100%;text-align:left;white-space:normal;overflow-wrap:anywhere;padding:8px 0;font-size:13px}
+.library-folder-browser label{display:grid;gap:6px;margin-top:16px;font-size:13px}

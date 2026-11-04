@@ -462,39 +462,110 @@ def main() -> None:
         assert direct_upload.value.status == 201, direct_upload.value.json()
         assert page.get_by_label("Genre", exact=True).count() == 0
         page.get_by_role("button", name="Cancel", exact=True).click()
+        def review_and_save():
+            with page.expect_response(lambda response: response.url.endswith("/metadata/preview")) as reviewed:
+                page.get_by_role("button", name="Review changes", exact=True).click()
+            assert reviewed.value.status == 200, reviewed.value.json()
+            with page.expect_response(lambda response: response.url.endswith("/metadata/apply")) as saved:
+                page.get_by_role("button", name="Save changes", exact=True).click()
+            return saved.value
+
         page.get_by_role("button", name="Edit metadata").click()
-        assert page.get_by_label("Upload replacement").is_visible()
-        assert page.get_by_role("table", name="Tracks on Bulk Ready").is_visible()
-        page.get_by_role("button", name=re.compile("^Edit track ")).first.click()
-        assert page.get_by_label("Title", exact=True).input_value()
-        inline_row = page.locator(".record-tracks tr.is-editing")
-        assert inline_row.locator("input").count() == 4
-        assert page.locator(".track-editor").count() == 0
-        assert page.get_by_label("Title", exact=True).evaluate("el => el.form.id") == "track-form"
-        page.screenshot(path=args.evidence_dir / "08-track-editor-desktop.png", full_page=True)
+        editor = page.get_by_role("dialog", name="Edit metadata", exact=True)
+        editor.wait_for()
+        assert page.evaluate("document.querySelector('.metadata-editor').matches(':modal')")
+        page.get_by_role("button", name="Add artist", exact=True).click()
+        page.get_by_label("Album artist credits 2", exact=True).fill("Alias fixture")
+        added_credit = review_and_save()
+        assert added_credit.status == 200, added_credit.json()
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.screenshot(path=args.evidence_dir / "08-metadata-album-desktop.png", full_page=True)
         page.set_viewport_size({"width":390,"height":844})
         page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
-        inline_row.scroll_into_view_if_needed()
-        assert inline_row.evaluate("el => [...el.querySelectorAll('input')].every(input => { const r = input.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; })")
-        page.screenshot(path=args.evidence_dir / "08-track-editor-mobile.png", full_page=True)
-        original_title = page.get_by_label("Title", exact=True).input_value()
-        page.get_by_label("Title", exact=True).fill("Discard this title")
-        page.get_by_role("button", name="Cancel", exact=True).click()
+        page.screenshot(path=args.evidence_dir / "08-metadata-album-mobile.png", full_page=True)
         page.set_viewport_size({"width":1440,"height":1000})
-        page.get_by_role("button", name=re.compile("^Edit track ")).first.click()
-        assert page.get_by_label("Title", exact=True).input_value() == original_title
-        page.get_by_label("Title", exact=True).fill("Edited fixture title")
-        page.get_by_label("Artist", exact=True).fill("Fixture Guest")
-        page.get_by_label("Track", exact=True).fill("3")
-        page.get_by_label("Disc", exact=True).fill("2")
-        with page.expect_response(lambda response: "/tracks/" in response.url and response.request.method == "PATCH") as saved_track:
-            page.get_by_role("button", name="Save track", exact=True).click()
+        page.get_by_role("button", name="Remove Alias fixture", exact=True).click()
+        removed_credit = review_and_save()
+        assert removed_credit.status == 200, removed_credit.json()
+        assert "Alias fixture" not in removed_credit.json()["album"]["albumartists"]
+        saved_credit_id = removed_credit.json()["changes"][0]["item_id"]
+        saved_credit_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_credit_id)
+        library_bulk_track = args.fixture_root / "library" / Path(saved_credit_item["path"]).relative_to(args.app_library)
+        assert "Alias fixture" not in str(MediaFile(library_bulk_track).albumartists_credit)
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name=re.compile("^Tracks ")).click()
+        original_title = editor.get_by_label("Title", exact=True).filter(visible=True).input_value()
+        page.screenshot(path=args.evidence_dir / "08-metadata-track-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
+        assert editor.evaluate("el => [...el.querySelectorAll('input')].filter(input => input.offsetParent).every(input => { const r = input.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; })")
+        page.screenshot(path=args.evidence_dir / "08-metadata-track-mobile.png", full_page=True)
+        editor.get_by_label("Title", exact=True).filter(visible=True).fill("Discard this title")
+        page.get_by_role("button", name="Cancel changes", exact=True).click()
+        page.get_by_role("button", name="Keep editing", exact=True).click()
+        assert editor.get_by_label("Title", exact=True).filter(visible=True).input_value() == "Discard this title"
+        page.keyboard.press("Escape")
+        page.get_by_role("button", name="Discard changes", exact=True).click()
+        assert page.get_by_role("button", name="Edit metadata", exact=True).evaluate("el => el === document.activeElement")
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name=re.compile("^Tracks ")).click()
+        assert editor.get_by_label("Title", exact=True).filter(visible=True).input_value() == original_title
+        editor.get_by_label("Title", exact=True).filter(visible=True).fill("Edited fixture title")
+        editor.get_by_label("Artist", exact=True).filter(visible=True).fill("Fixture Guest")
+        editor.get_by_label("Track", exact=True).filter(visible=True).fill("3")
+        editor.get_by_label("Disc", exact=True).filter(visible=True).fill("2")
+        with page.expect_response(lambda response: response.url.endswith("/metadata/preview")) as reviewed:
+            page.get_by_role("button", name="Review changes", exact=True).click()
+        assert reviewed.value.status == 200, reviewed.value.json()
+        assert reviewed.value.json()["paths"], reviewed.value.json()
+        page.screenshot(path=args.evidence_dir / "08-metadata-review.png", full_page=True)
+        with page.expect_response(lambda response: response.url.endswith("/metadata/apply")) as saved_track:
+            page.get_by_role("button", name="Save changes", exact=True).click()
         assert saved_track.value.status == 200, saved_track.value.json()
+        saved_id = saved_track.value.json()["changes"][0]["item_id"]
+        saved_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        previous_track = library_bulk_track
+        library_bulk_track = args.fixture_root / "library" / Path(saved_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track != previous_track and not previous_track.exists()
+        assert MediaFile(str(library_bulk_track)).artists == ["Fixture Guest"]
         page.reload(wait_until="networkidle")
         page.locator(".library-record").filter(has_text="Bulk Ready").click()
         page.get_by_role("table", name="Tracks on Bulk Ready").get_by_text("Edited fixture title", exact=True).wait_for()
         assert MediaFile(str(library_bulk_track)).title == "Edited fixture title"
+        # Explicit location-only move: stage a new folder, preview, save, and pin it.
         page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name="File location", exact=True).click()
+        page.get_by_role("button", name="Browse folders", exact=True).click()
+        page.get_by_label("New album folder", exact=True).fill("Manual fixture album")
+        page.get_by_role("button", name="Use new folder", exact=True).click()
+        assert not (args.fixture_root / "library" / "Manual fixture album").exists()
+        page.screenshot(path=args.evidence_dir / "08-location-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=args.evidence_dir / "08-location-mobile.png", full_page=True)
+        page.set_viewport_size({"width":1440,"height":1000})
+        before_move = sha256(library_bulk_track)
+        moved_album = review_and_save()
+        assert moved_album.status == 200, moved_album.json()
+        moved_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        library_bulk_track = args.fixture_root / "library" / Path(moved_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track.parent.name == "Manual fixture album"
+        assert sha256(library_bulk_track) == before_move
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_label("Genre", exact=True).fill("Fixture genre")
+        saved_pinned = review_and_save()
+        assert saved_pinned.status == 200, saved_pinned.json()
+        pinned_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        assert Path(pinned_item["path"]).parent.name == "Manual fixture album"
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name="File location", exact=True).click()
+        page.get_by_role("button", name="Use Beets naming", exact=True).click()
+        organized = review_and_save()
+        assert organized.status == 200, organized.json()
+        organized_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        library_bulk_track = args.fixture_root / "library" / Path(organized_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track.parent.name != "Manual fixture album"
         with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
             page.get_by_label("Upload replacement").set_input_files({
                 "name": "replacement.jpg", "mimeType": "image/jpeg", "buffer": EXISTING_ARTWORK_JPEG,
@@ -520,7 +591,7 @@ def main() -> None:
         assert applied.value.json()["sha256"] == artwork_preview["sha256"]
         assert applied.value.json()["sidecars_written"] == 1
         assert page.get_by_role("alert").count() == 0
-        page.get_by_role("button", name="Cancel changes").click()
+        assert page.get_by_role("dialog", name="Edit metadata", exact=True).count() == 0
         assert page.get_by_label("Upload replacement").is_visible()
         assert page.get_by_role("heading", name="MusicBrainz rematch").is_visible()
         page.screenshot(path=args.evidence_dir / "08-managed-album-read-only.png", full_page=True)
