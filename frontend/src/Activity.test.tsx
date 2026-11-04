@@ -142,3 +142,26 @@ it("clears busy UI when an automatic success was coalesced before the next poll"
   await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
   expect(screen.getByRole("button", { name: "Activity" })).not.toHaveClass("is-running");
 });
+
+
+it("loads completed match details before notifying a queue from the compact feed", async () => {
+  configureActivity(true); vi.useFakeTimers();
+  let finished = false;
+  const matching = { ...job, id: "summary-match", mode: "matching", label: "Matching albums", href: "/inbox", rows: [] };
+  const fetch = vi.fn(async (url: string) => ({ ok: true, json: async () => url === "/api/activity"
+    ? { jobs: [{ ...matching, status: finished ? "complete" : "running" }] }
+    : { ...matching, status: "complete", rows: [{ id: 42, status: "matched" }] } }));
+  vi.stubGlobal("fetch", fetch);
+  const received: any[] = [];
+  const listener = (event: Event) => { const completed = (event as CustomEvent).detail; if (completed.id === matching.id) received.push(completed); };
+  window.addEventListener("cratekeep:activity-finished", listener);
+  try {
+    render(<ActivityMonitor/>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    finished = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+    expect(received).toHaveLength(1);
+    expect(received[0].rows).toEqual([{ id: 42, status: "matched" }]);
+    expect(fetch.mock.calls.some(([url]) => url === "/api/activity/summary-match")).toBe(true);
+  } finally { window.removeEventListener("cratekeep:activity-finished", listener); }
+});

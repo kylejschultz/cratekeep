@@ -24,8 +24,12 @@ async function poll() {
     }));
     const jobs = [...result.jobs, ...recovered];
     const ended = jobs.filter(job => !activityRunning(job) && state.jobs.some(previous => previous.id === job.id && activityRunning(previous)));
+    // The feed is deliberately compact. Match completion needs affected album
+    // IDs even after reload, when no matching dialog is watching the full run.
+    const completed = await Promise.all(ended.map(job => job.mode === "matching"
+      ? api<ActivityJob>(`/api/activity/${job.id}`) : job));
     state = { jobs, error: "" };
-    ended.forEach(job => window.dispatchEvent(new CustomEvent("cratekeep:activity-finished", { detail: job })));
+    completed.forEach(job => window.dispatchEvent(new CustomEvent("cratekeep:activity-finished", { detail: job })));
   } catch { state = { ...state, error: "Activity unavailable. Reconnecting…" }; }
   finally {
     polling = false; listeners.forEach(listener => listener());
