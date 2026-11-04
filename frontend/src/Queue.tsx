@@ -3,7 +3,7 @@ import { useInboxDiscovery } from "./useInboxDiscovery";
 import { useInspectorResize } from "./useInspectorResize";
 import { ArtworkPlaceholder } from "./ArtworkPlaceholder";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, activityEnabled } from "./api";
+import { api, activityEnabled, type ActivityJob } from "./api";
 import { useToast } from "./toastContext";
 import { Notice } from "./Shell";
 import { ReviewModal } from "./ReviewModal";
@@ -36,6 +36,7 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
   const inventoryScan = useRef<{ base: string; request: Promise<unknown> } | null>(null);
   const [scanError, setScanError] = useState("");
   const [scanReload, setScanReload] = useState(false);
+  const [completedMatches, setCompletedMatches] = useState<number[]>([]);
   const [operation, setOperation] = useState<"refresh" | "match" | "import" | null>(null);
   const busy = operation !== null;
   const [matching, setMatching] = useState<Album[] | null>(null);
@@ -117,10 +118,39 @@ export function Queue({ source, threshold, inboxId, onBusyChange }: QueueProps) 
   const importedSelected = [...selected.values()].filter(album => album.imported);
   const bulkBody = () => ({ [source === "inbox" ? "scopes" : "folders"]: [...new Set(importableSelected.map(scopeFor))], album_ids: importableSelected.map(album => album.id) });
   useEffect(() => {
-    const finished = () => { if (!backgroundBlocked.current) void load(true); };
+    const finished = (event: Event) => {
+      // Remember completion even while selection/review defers a full queue reload.
+      setScanReload(true);
+      const job = (event as CustomEvent<ActivityJob>).detail;
+      if (job?.mode === "matching") {
+        const ids = job.rows.map(row => row.id).filter((id): id is number => Number.isInteger(id));
+        setCompletedMatches(current => [...new Set([...current, ...ids])]);
+      }
+    };
     window.addEventListener("cratekeep:activity-finished", finished);
     return () => window.removeEventListener("cratekeep:activity-finished", finished);
-  }, [load]);
+  }, []);
+  useEffect(() => {
+    if (!completedMatches.length || locked || detailOpen || loading) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const ids = completedMatches.filter(id => result.albums.some(album => album.id === id));
+    const reload = async () => {
+      try {
+        // Read affected albums directly: a matched album may no longer belong to
+        // the Pending filter. Keep rows and selection stable until the full reload.
+        const albums = await Promise.all(ids.map(id => api<Album>(`/api/${source === "inbox" ? "inbox" : "library-import"}/albums/${id}`)));
+        if (stopped) return;
+        const updates = new Map(albums.map(album => [album.id, album]));
+        setResult(current => ({ ...current, albums: current.albums.map(album => updates.get(album.id) || album) }));
+        setSelected(current => new Map([...current].map(([id, album]) => [id, updates.get(id) || album])));
+        setActive(current => current ? updates.get(current.id) || current : null);
+        setCompletedMatches(current => current.filter(id => !completedMatches.includes(id)));
+      } catch { if (!stopped) timer = setTimeout(() => { void reload(); }, 2000); }
+    };
+    void reload();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [completedMatches, locked, detailOpen, loading, result.albums, source]);
   const refresh = async () => {
     setOperation("refresh"); setError("");
     try {

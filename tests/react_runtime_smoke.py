@@ -876,6 +876,12 @@ def main() -> None:
             page.get_by_role("button", name="Start matching", exact=True).click()
         matching_job = accepted.value.json()['id']
         page.get_by_role("button", name="Continue in background", exact=True).click()
+        # Stay on the same selected queue: completion must patch match results
+        # without requiring navigation/reload or clearing the import selection.
+        same_page_match = wait_activity(page, base, matching_job)
+        for row in same_page_match['rows']:
+            page.locator(f'.desk-album[data-album-id="{row["id"]}"] .desk-decision.matched').wait_for()
+            assert page.locator(f'.desk-album[data-album-id="{row["id"]}"] input[type="checkbox"]').is_checked()
         page.goto(base + "/", wait_until="networkidle")
         page.get_by_role("button", name=re.compile(r"^Activity")).click()
         page.locator(f'[data-activity-id="{matching_job}"]').get_by_role("button", name=re.compile(r"^Matching albums")).wait_for()

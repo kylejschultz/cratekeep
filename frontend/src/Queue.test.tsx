@@ -364,3 +364,40 @@ it("opens exact single-track deletion from the independent Inbox files list and 
   fireEvent.click(within(screen.getByRole("dialog")).getByRole("button",{name:"Cancel"}));
   expect(fetch.mock.calls.some(([url])=>url.endsWith("/apply"))).toBe(false);
 });
+
+it.each(["inbox", "library-import"] as const)("%s applies background matching results without losing selection or filtering out the selected row", async source => {
+  let matched = false;
+  const current = () => ({ ...album(1, "Background album"), candidate_status: matched ? "complete" : "not-run", candidates: matched ? [{ id: 11, confidence: .99, artist: "Artist", album: "Background album" }] : [] });
+  const fetch = vi.fn(async (url: string) => response(url.includes("/albums/1") ? current() : page([current()])));
+  vi.stubGlobal("fetch", fetch);
+  render(<Queue source={source} inboxId="manual" threshold={90}/>);
+  fireEvent.click(screen.getByRole("button", { name: "Pending" }));
+  await selectAlbum("Select album Background album");
+  await waitFor(() => expect(screen.queryByText("Scanning Inbox…")).not.toBeInTheDocument());
+  expect(screen.getByText("Pending", { selector: ".desk-decision" })).toBeInTheDocument();
+  matched = true;
+  act(() => window.dispatchEvent(new CustomEvent("cratekeep:activity-finished", { detail: { mode: "matching", rows: [{ id: 1, status: "matched" }] } })));
+  await waitFor(() => expect(screen.getByText("Matched", { selector: ".desk-decision" })).toBeInTheDocument());
+  expect(screen.getByRole("checkbox", { name: "Select album Background album" })).toBeChecked();
+  expect(screen.getByText("1 selected")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Pending" })).toHaveAttribute("aria-pressed", "true");
+});
+
+it("retains a background completion during review and retries fetching its saved result", async () => {
+  let matched = false, reads = 0;
+  const current = () => ({ ...album(1, "Reviewed album"), candidate_status: matched ? "complete" : "not-run", candidates: matched ? [{ id: 11, confidence: .99, artist: "Artist", album: "Reviewed album" }] : [] });
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.includes("/albums/1")
+    ? ++reads === 1 ? response({ error: "Temporary unavailable" }, 503) : response(current())
+    : response(page([current()]))));
+  render(<Queue source="library-import" threshold={90}/>);
+  await selectAlbum("Select album Reviewed album");
+  fireEvent.click(screen.getByRole("button", { name: "Review Reviewed album" }));
+  matched = true;
+  act(() => window.dispatchEvent(new CustomEvent("cratekeep:activity-finished", { detail: { mode: "matching", rows: [{ id: 1, status: "matched" }] } })));
+  expect(reads).toBe(0);
+  expect(screen.getByRole("region", { name: "Reviewed album" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Back to albums" }));
+  await waitFor(() => expect(screen.getByText("Matched", { selector: ".desk-decision" })).toBeInTheDocument(), { timeout: 3500 });
+  expect(reads).toBe(2);
+  expect(screen.getByRole("checkbox", { name: "Select album Reviewed album" })).toBeChecked();
+});

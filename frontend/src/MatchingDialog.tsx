@@ -47,7 +47,11 @@ export function MatchingDialog({ activity, albums, execute, onRunning, onFinish,
           setRows(rows.map(row => ({ ...row, ...update.rows.find(current => current.id === row.id) })));
           setReadyAt(update.resume_at ? update.resume_at * 1000 : 0);
         });
-        if (!mounted.current) return;
+        if (!mounted.current) {
+          // A fast background run may finish between shared Activity polls.
+          window.dispatchEvent(new CustomEvent("cratekeep:activity-finished", { detail: finished }));
+          return;
+        }
         const final = rows.map(row => ({ ...row, ...finished.rows.find(current => current.id === row.id) }));
         setRows(final); running.current = false; setReadyAt(0); onRunning(false); setPhase(final.some(pending) ? "paused" : "done"); onFinish(final);
       } catch (reason) { if (mounted.current) { setRows(rows.map(row => pending(row) ? { ...row, status: "needs-retry", reason: `${(reason as Error).message} Check Activity before retrying.` } : row)); running.current = false; onRunning(false); setPhase("paused"); } }

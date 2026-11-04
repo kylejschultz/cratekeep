@@ -143,3 +143,16 @@ with accessible gear, heartbeat and sun/moon controls. An indeterminate rotating
 ring surrounds Activity while jobs are active; stop animation when idle and use
 a static ring for reduced-motion preference. Preserve the popup interaction,
 settings navigation, theme persistence, keyboard labels and mobile touch targets.
+
+
+### Background matching completion correction — 2026-11-04
+
+Kyle found that “Continue in background” finished matching but left selected queue
+rows Pending until manual refresh. Completion events must remain pending during
+selection/review instead of being discarded. Once not editing/reviewing, patch
+finished visible albums from their saved review endpoints while preserving row
+order, filters and selection, including Pending-filter rows. Apply the full queue
+reload once selection/review is cleared. Retry transient reads. Detached matching
+must signal completion even when the run finishes between Activity feed polls.
+Validate Inbox and Library Import, review deferral, selection and same-page
+background completion in the real container flow before publishing the candidate.
