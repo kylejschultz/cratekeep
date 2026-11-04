@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { api } from "./api";
+import { ActivityProgress } from "./ActivityProgress";
+import { api, activityRunning, type ActivityJob } from "./api";
 import { useToast } from "./toastContext";
 
 type Preview = { preview_id: string; fingerprint: string; files: { path: string; location: string }[]; count: number; albums?: string[] };
@@ -23,6 +24,7 @@ export function InboxActionDialog({ inboxId, kind, jobs, albumIds, albumId, trac
   const ref = useRef<HTMLDialogElement>(null);
   const [preview, setPreview] = useState<Preview | null>(null), [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [activity, setActivity] = useState<ActivityJob | null>(null);
   const notify = useToast();
   const unimported = kind === "delete-albums" || kind === "delete-track";
   const grouped = kind === "delete-albums" || kind === "delete-imported";
@@ -32,7 +34,7 @@ export function InboxActionDialog({ inboxId, kind, jobs, albumIds, albumId, trac
   useEffect(() => {
     const node = ref.current!; node.showModal();
     let current = true;
-    api<Preview>(`${base}/preview`, { method: "POST", body: JSON.stringify(kind === "delete-albums" ? { kind, album_ids: albumIds } : kind === "delete-track" ? { kind, album_id: albumId, track_id: trackId } : { kind, job_ids: jobs }) }).then(value => { if (current) setPreview(value); }).catch(reason => { if (current) setError(reason.message); });
+    api<Preview>(`${base}/preview`, { method: "POST", body: JSON.stringify(kind === "delete-albums" ? { kind, album_ids: albumIds } : kind === "delete-track" ? { kind, album_id: albumId, track_id: trackId } : { kind, job_ids: jobs }) }, job => { if (current) setActivity(job); }).then(value => { if (current) setPreview(value); }).catch(reason => { if (current) setError(reason.message); });
     return () => { current = false; node.close(); };
   }, [base, kind, jobs, albumIds, albumId, trackId]);
   function finish(result: any) {
@@ -44,7 +46,7 @@ export function InboxActionDialog({ inboxId, kind, jobs, albumIds, albumId, trac
     if (!preview) return;
     setBusy(true); setError("");
     try {
-      finish(await api<any>(`${base}/apply`, { method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, expected_fingerprint: preview.fingerprint, confirmed: true }) }));
+      finish(await api<any>(`${base}/apply`, { method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, expected_fingerprint: preview.fingerprint, confirmed: true }) }, setActivity));
     } catch (reason) {
       // A lost response must never resubmit deletion. Read the durable result.
       const controller = new AbortController();
@@ -61,7 +63,7 @@ export function InboxActionDialog({ inboxId, kind, jobs, albumIds, albumId, trac
     <header><h2 id="inbox-action-title">{kind === "undo" ? "Undo import" : unimported ? kind === "delete-track" ? "Delete track from Inbox" : "Delete from Inbox" : "Remove imported originals"}</h2></header>
     <div className="dialog-body"><p>{kind === "undo" ? "Remove only the Library copies created by this import and their Beets records. Inbox originals stay unchanged." : unimported ? kind === "delete-track" ? "Delete this track without importing? Other files and your Library stay unchanged. This is permanent." : "Delete these albums and accompanying files without importing? Library files stay unchanged. This is permanent." : "Delete these Inbox originals and accompanying files? Library copies stay unchanged. This is permanent."}</p>
       {!grouped && (names || preview?.albums)?.length ? <p>{(names || preview?.albums)!.join(" · ")}</p> : null}
-      {!preview && !error && <p role="status">Checking files…</p>}
+      {activity && activityRunning(activity) ? <ActivityProgress job={activity}/> : !preview && !error ? <p role="status">Checking files…</p> : busy ? <p role="status">Working…</p> : null}
       {preview && <><p>{grouped ? `${folders.length} ${folders.length === 1 ? "folder" : "folders"} · ` : ""}{preview.count} {preview.count === 1 ? "file" : "files"}</p>{grouped ? <>
         <ul className="inbox-delete-folders" aria-label="Folders to clear">{folders.map(([folder, count]) => <li key={folder}><strong>{folder || "Inbox root"}</strong><small>{count} {count === 1 ? "file" : "files"}</small></li>)}</ul>
         <details className="inbox-delete-files"><summary>Show files</summary><ul>{preview.files.map(row => <li key={row.path}>{row.path}</li>)}</ul></details>

@@ -710,3 +710,7 @@ button.text-button{background:none;border-color:transparent;font-weight:500}
   .listening-desk .analytics-banner { align-items: flex-start; flex-direction: column; }
   .listening-desk .analytics-banner-actions { flex-wrap: wrap; }
 }
+
+/* Modal-owned progress stays with its controls; header Activity remains global. */
+body:has(dialog[open]) .page-activity,
+body:has(.modal[data-review-modal]) .page-activity { display: none; }

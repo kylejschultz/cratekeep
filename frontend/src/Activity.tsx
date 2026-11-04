@@ -1,22 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { ActivityProgress } from "./ActivityProgress";
 import { HeaderIcon } from "./HeaderIcon";
 import { createPortal } from "react-dom";
-import { api, activityEnabled, activityRunning, type ActivityJob, workCount } from "./api";
+import { api, activityEnabled, activityRunning, type ActivityJob } from "./api";
 import { useActivity } from "./activityStore";
 import { ActivityHistory } from "./ActivityHistory";
 import { InboxActionDialog } from "./InboxImportActions";
 
-function Progress({ job }: { job: ActivityJob }) {
-  const [now, setNow] = useState(() => Date.now() / 1000);
-  useEffect(() => { const timer = setInterval(() => setNow(Date.now() / 1000), 1000); return () => clearInterval(timer); }, []);
-  const batch = ["matching", "import"].includes(job.mode || "");
-  const total = batch ? job.total : job.stage_total;
-  const value = batch ? job.processed : job.stage_done;
-  return <div className="activity-progress"><span aria-live="polite">{job.status === "waiting" && job.resume_at ? `MusicBrainz cooldown · resumes ${new Date(job.resume_at * 1000).toLocaleTimeString()}` : job.stage}</span>
-    {activityRunning(job) && <progress aria-label={`${job.label} progress`} {...(total != null && total > 0 ? { value: value || 0, max: total } : {})}/>}
-    <small>{[job.created_at ? `${Math.floor(((job.finished_at || now) - job.created_at) / 60)}m ${Math.floor(((job.finished_at || now) - job.created_at) % 60)}s elapsed` : "", workCount(job), job.current].filter(Boolean).join(" · ")}</small>
-  </div>;
-}
 function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => void }) {
   const [job, setJob] = useState(initial);
   const [error, setError] = useState("");
@@ -39,7 +29,7 @@ function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => v
   const receipts = job.rows.filter(row => row.status === "imported" && row.jobId).map(row => row.jobId);
   return createPortal(<><dialog className="dialog activity-dialog" ref={dialog} aria-labelledby="activity-details-title" onCancel={onClose}>
     <header><div><h2 id="activity-details-title">{job.label}</h2><p>{job.scope} · {job.status}</p></div><button type="button" aria-label="Close activity details" onClick={onClose}>×</button></header>
-    <div className="dialog-body"><Progress job={job}/>{(error || job.error) && <p role="alert">{error || job.error}</p>}
+    <div className="dialog-body"><ActivityProgress job={job}/>{(error || job.error) && <p role="alert">{error || job.error}</p>}
       <ul className="activity-results">{job.rows.map((row, index) => <li key={index}><strong>{row.album || job.label}</strong><span>{row.status.replaceAll("-", " ")}</span>{row.reason && <p>{row.reason}</p>}</li>)}</ul>
       {job.result?.errors?.map((row: any, index: number) => <p key={index}>{row.error}</p>)}
     </div><footer><a href={job.href}>Open {job.scope}</a>{activityRunning(job) && ["matching", "import"].includes(job.mode || "") && <button type="button" className="secondary" disabled={job.status === "stopping"} onClick={() => void stop()}>Stop after current album</button>}
@@ -67,5 +57,5 @@ export function ActivityInline({ scope }: { scope: "library" | string }) {
   if (!activityEnabled) return null;
   const relevant = jobs.filter(job => scope === "library" ? job.href.startsWith("/library") : job.href === `/inbox?source=${scope}`);
   const shown = relevant.filter(activityRunning);
-  return <div className="page-activity" aria-label="Page activity">{error && shown.length > 0 && <p role="status">{error}</p>}{shown.map(job => <div key={job.id}><strong>{job.label} · {job.scope}</strong><Progress job={job}/><button type="button" className="text-button" onClick={() => window.dispatchEvent(new CustomEvent("cratekeep:show-activity", { detail: job.id }))}>View activity</button></div>)}</div>;
+  return <div className="page-activity" aria-label="Page activity">{error && shown.length > 0 && <p role="status">{error}</p>}{shown.map(job => <div key={job.id}><strong>{job.label} · {job.scope}</strong><ActivityProgress job={job}/><button type="button" className="text-button" onClick={() => window.dispatchEvent(new CustomEvent("cratekeep:show-activity", { detail: job.id }))}>View activity</button></div>)}</div>;
 }

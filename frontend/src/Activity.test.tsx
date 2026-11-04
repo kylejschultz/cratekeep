@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { ActivityProgress } from "./ActivityProgress";
 import { ActivityMonitor, ActivityInline } from "./Activity";
 import { configureActivity, api, startActivity } from "./api";
 
@@ -164,4 +165,22 @@ it("loads completed match details before notifying a queue from the compact feed
     expect(received[0].rows).toEqual([{ id: 42, status: "matched" }]);
     expect(fetch.mock.calls.some(([url]) => url === "/api/activity/summary-match")).toBe(true);
   } finally { window.removeEventListener("cratekeep:activity-finished", listener); }
+});
+
+
+it("buffers detailed progress for three seconds without delaying fast completion", async () => {
+  vi.useFakeTimers();
+  const current = { ...job, id: "buffered", created_at: Date.now() / 1000 };
+  const view = render(<ActivityProgress job={current}/>);
+  expect(screen.getByRole("status")).toHaveTextContent("Loading…");
+  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  await act(async () => { await vi.advanceTimersByTimeAsync(2999); });
+  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(screen.getByRole("progressbar")).toBeInTheDocument();
+  view.rerender(<ActivityProgress job={{ ...current, id: "fast", created_at: Date.now() / 1000 }}/>);
+  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  view.rerender(<ActivityProgress job={{ ...current, id: "fast", status: "complete", stage: "Finished" }}/>);
+  expect(screen.getByText("Finished")).toBeInTheDocument();
+  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
 });

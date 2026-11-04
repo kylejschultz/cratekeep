@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FileLocation } from "./FileLocation";
 import { ArtistCredits } from "./ArtistCredits";
-import { api } from "./api";
+import { ActivityProgress } from "./ActivityProgress";
+import { api, activityRunning, type ActivityJob } from "./api";
 import { Notice } from "./Shell";
 
 const albumFields = ["album", "albumartist", "genre", "year"];
@@ -28,6 +29,7 @@ export function MetadataEditor({ album, onClose, onSaved, onBusyChange }: {
   const trackForms = useRef(new Map<number, HTMLFormElement>());
   const [tab, setTab] = useState("album"), [selected, setSelected] = useState(album.tracks?.[0]?.id);
   const [dirty, setDirty] = useState(false), [discard, setDiscard] = useState(false);
+  const [activity, setActivity] = useState<ActivityJob | null>(null);
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const [review, setReview] = useState<any>(null), [draft, setDraft] = useState<any>(null);
   const [location, setLocation] = useState<{ mode: "beets" } | { mode: "manual"; directory: string }>();
@@ -61,17 +63,18 @@ export function MetadataEditor({ album, onClose, onSaved, onBusyChange }: {
       tracks: tracks.map((track: any) => ({ id: track.id, ...changedFields(trackForms.current.get(track.id)!, track, trackFields, "artists") })).filter((row: any) => Object.keys(row).length > 1),
     };
     setBusy(true); setError("");
-    try { setReview(await api<any>(`/api/library/albums/${album.id}/metadata/preview`, { method: "POST", body: JSON.stringify(payload) })); setDraft(payload); }
+    try { setReview(await api<any>(`/api/library/albums/${album.id}/metadata/preview`, { method: "POST", body: JSON.stringify(payload) }, setActivity)); setDraft(payload); }
     catch (reason) { setError((reason as Error).message); } finally { setBusy(false); }
   };
   const save = async () => {
     setBusy(true); setError("");
-    try { const result = await api<any>(`/api/library/albums/${album.id}/metadata/apply`, { method: "POST", body: JSON.stringify({ ...draft, plan_fingerprint: review.plan_fingerprint }) }); onSaved(result.album); }
+    try { const result = await api<any>(`/api/library/albums/${album.id}/metadata/apply`, { method: "POST", body: JSON.stringify({ ...draft, plan_fingerprint: review.plan_fingerprint }) }, setActivity); onSaved(result.album); }
     catch (reason) { setError((reason as Error).message); setReview(null); } finally { setBusy(false); }
   };
   return createPortal(<dialog className="metadata-editor" ref={dialog} aria-labelledby="metadata-title" onCancel={event => { event.preventDefault(); close(); }}>
     <header><div><h2 id="metadata-title">Edit metadata</h2><p>{album.album} · {album.albumartist || "Unknown artist"}</p></div><button type="button" className="text-button" aria-label="Close metadata editor" disabled={busy} onClick={close}>×</button></header>
     <div className="metadata-editor-body">
+      {busy && activity && activityRunning(activity) && <ActivityProgress job={activity}/>}
       {error && <Notice kind="error">{error}</Notice>}
       <section hidden={!discard} aria-label="Discard changes"><h3>Discard unsaved changes?</h3><p>Your files have not been changed.</p><div className="metadata-inline-actions"><button type="button" className="secondary" onClick={() => setDiscard(false)}>Keep editing</button><button type="button" className="danger-action" onClick={onClose}>Discard changes</button></div></section><div hidden={discard}>
       <div hidden={!!review}>

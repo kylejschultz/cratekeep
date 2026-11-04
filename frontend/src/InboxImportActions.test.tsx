@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { configureActivity, type ActivityJob } from "./api";
 import { InboxActionDialog } from "./InboxImportActions";
 import { ToastProvider } from "./Toasts";
 
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); configureActivity(false); vi.useRealTimers(); vi.unstubAllGlobals(); });
 it.each(["complete", "partial", "running", "unavailable"])("reads the saved %s result after losing the removal response without retrying deletion", async status => {
   const fetch = vi.fn(async (url: string) => {
     if (url.endsWith("/preview")) return { ok:true, json:async()=>({preview_id:"action-1",fingerprint:"hash",count:2,files:[]}) };
@@ -55,4 +56,45 @@ it.each(["delete-albums", "delete-imported"] as const)("summarizes %s by album f
   fireEvent.click(screen.getByText("Show files"));
   expect(screen.getByText(paths[0])).toBeVisible();
   expect(screen.getByText(paths[7])).toBeVisible();
+});
+
+
+it.each(["undo", "delete-imported", "delete-albums", "delete-track"] as const)("keeps %s preview and execution progress inside its confirmation dialog", async kind => {
+  configureActivity(true); vi.useFakeTimers();
+  let phase = 0;
+  let finish!: (value: unknown) => void;
+  let job!: ActivityJob;
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+    if (url === "/api/activity") {
+      phase++;
+      job = { id: String(phase), created_at: Date.now() / 1000, label: phase === 1 ? "Checking files" : "Removing files", scope: "Inbox", href: "/inbox", status: "running", stage: phase === 1 ? "Inspecting source files" : "Removing confirmed files", stage_done: 1, stage_total: 4, processed: 0, total: 1, rows: [] };
+      return { ok: true, json: async () => job };
+    }
+    return new Promise(resolve => { finish = value => resolve({ ok: true, json: async () => value }); });
+  }));
+  const onDone = vi.fn(), onClose = vi.fn();
+  render(<ToastProvider><InboxActionDialog inboxId="manual" kind={kind} albumIds={[3]} jobs={[1]} albumId={3} trackId={4} onDone={onDone} onClose={onClose}/></ToastProvider>);
+  const dialog = screen.getByRole("dialog");
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(within(dialog).queryByRole("progressbar")).not.toBeInTheDocument();
+  expect(within(dialog).getByRole("status")).toHaveTextContent("Loading…");
+  await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+  const previewProgress = within(dialog).getByRole("progressbar", { name: "Checking files progress" });
+  expect(previewProgress).toHaveAttribute("value", "1");
+  expect(within(dialog).getByText("Inspecting source files")).toBeInTheDocument();
+  expect(finish).toBeTypeOf("function");
+  await act(async () => finish({ ...job, status: "complete", result: { preview_id: "p", fingerprint: "fp", files: [], count: 0 } }));
+  const confirm = within(dialog).getAllByRole("button")[1];
+  expect(confirm).toBeEnabled();
+  fireEvent.click(confirm);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(within(dialog).queryByRole("progressbar")).not.toBeInTheDocument();
+  await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+  expect(within(dialog).getByRole("progressbar", { name: "Removing files progress" })).toBeInTheDocument();
+  expect(within(dialog).getByText("Removing confirmed files")).toBeInTheDocument();
+  expect(confirm).toBeDisabled();
+  await act(async () => finish({ ...job, status: "complete", result: { status: "complete", message: "Done" } }));
+  expect(onDone).toHaveBeenCalledOnce();
+  expect(onClose).toHaveBeenCalledOnce();
+  expect(phase).toBe(2);
 });

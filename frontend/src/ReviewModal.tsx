@@ -2,7 +2,8 @@ import { ArtworkPlaceholder } from "./ArtworkPlaceholder";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useToast } from "./toastContext";
-import { api, ApiError } from "./api";
+import { ActivityProgress } from "./ActivityProgress";
+import { api, ApiError, activityRunning, type ActivityJob } from "./api";
 import { formatMatchPercent } from "./status";
 import type { Album, Candidate, DuplicatePreflight } from "./types";
 
@@ -147,6 +148,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
   const notify = useToast();
   const [operation, setOperation] = useState<"match" | "search" | "import" | "selection" | null>(null);
   const busy = operation !== null;
+  const [activity, setActivity] = useState<ActivityJob | null>(null);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [mbidOpen, setMbidOpen] = useState(false);
@@ -235,9 +237,9 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
         const saved = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify({ decision: "approved", ...selection }) });
         setAlbum(albumPayload(saved));
       }
-      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption, dry_run: true }) });
+      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption, dry_run: true }) }, setActivity);
       setStatus(cleanupPending ? "Finishing Inbox cleanup…" : moved ? "Finalizing artwork…" : "Preflight passed. Importing…");
-      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption }) });
+      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption }) }, setActivity);
       onComplete(result.message || `${album.album || album.name || "Album"} imported successfully.`);
     } catch (reason) {
       const code = reason instanceof ApiError ? reason.code || "" : "";
@@ -256,6 +258,7 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
     <div className="dialog" role={embedded ? "region" : "dialog"} aria-modal={embedded ? undefined : "true"} aria-labelledby="review-title" tabIndex={-1} ref={dialog} data-review-dialog>
       <header><div><p className="eyebrow">Album review</p><h2 id="review-title" data-review-title>{album.album || album.name || album.path || "Album"}</h2></div><button type="button" onClick={onClose} disabled={busy} aria-label="Close review" data-review-close>×</button></header>
       <div className="dialog-body">
+        {busy && activity && activityRunning(activity) && <ActivityProgress job={activity}/>}
         <div className="review-tools"><button type="button" onClick={() => void match()} disabled={busy || moved} aria-busy={operation === "match"}>{operation === "match" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches" : "Match"}</button><button className="secondary" type="button" onClick={() => { setMbidOpen(value => !value); setError(""); }} disabled={busy || moved} aria-expanded={mbidOpen}>Search MBID</button></div>
         {mbidOpen && <form className="mbid-search" onSubmit={searchMbid}><label>MusicBrainz release UUID<input value={mbid} onChange={event => setMbid(event.target.value)} placeholder="123e4567-e89b-42d3-a456-426614174000" disabled={busy} autoFocus/></label><button type="submit" disabled={busy} aria-busy={operation === "search"}>{operation === "search" && <span className="spinner"/>}Search exact release</button></form>}
         {source === "inbox" && onDeleteTrack && <details className="inbox-local-tracks"><summary>Inbox files ({(album.tracks || []).length})</summary><ul className="track-list">{(album.tracks || []).map(track => <li key={track.id}><div><strong>{track.title || fileName(track.path)}</strong><small>{track.path}</small></div><button type="button" className="danger-action" disabled={busy || moved || !Number.isInteger(track.id)} aria-label={`Delete track ${track.title || fileName(track.path)}`} onClick={() => onDeleteTrack(track.id, String(track.title || fileName(track.path)))}>Delete track</button></li>)}</ul></details>}

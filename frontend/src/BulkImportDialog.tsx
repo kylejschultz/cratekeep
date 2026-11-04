@@ -1,3 +1,4 @@
+import { useProgressDelay } from "./useProgressDelay";
 import { useEffect, useRef, useState } from "react";
 import { startActivity, watchActivity, api } from "./api";
 import { ApiError } from "./api";
@@ -10,6 +11,8 @@ export function BulkImportDialog({ activity, rows: initialRows, source, execute,
   const [rows, setRows] = useState(initialRows);
   const [phase, setPhase] = useState<"confirm" | "running" | "done">("confirm");
   const [jobId, setJobId] = useState<string>();
+  const [startedAt, setStartedAt] = useState<number>();
+  const showProgress = useProgressDelay(phase === "running", jobId || "batch", startedAt);
   const [stopping, setStopping] = useState(false);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -24,7 +27,7 @@ export function BulkImportDialog({ activity, rows: initialRows, source, execute,
   const run = async () => {
     if (started.current) return;
     started.current = true;
-    setPhase("running"); onRunning(true);
+    setStartedAt(Date.now() / 1000); setPhase("running"); onRunning(true);
     if (activity) {
       try {
         const job = await startActivity(rows.filter(row => row.status === "queued").map(row => ({ path: activity.path, body: { ...activity.body, album_ids: [row.id], confirmed: true }, id: row.id, album: row.album })), "import");
@@ -70,7 +73,7 @@ export function BulkImportDialog({ activity, rows: initialRows, source, execute,
     <div className="dialog-body">
       <p>{phase === "confirm" ? `${queued} ${queued === 1 ? "album" : "albums"} queued · ${rows.length - queued} blocked. ${source === "inbox" ? "Audio is copied into your Library. Inbox originals are kept." : "Saved matches will be applied; audio files stay in place."}` : `${imported} of ${rows.length} albums imported.`}</p>
       {phase === "confirm" && rows.some(row => row.warnings?.length) && <p role="note">Metadata warnings do not block import. Unpaired tracks keep their existing track tags.</p>}
-      {phase === "running" && <><progress aria-label="Albums processed" value={settled} max={rows.length}/><p role="status">{stopping ? "Stopping after the current album finishes…" : "Importing one album at a time. You can stop before the next album."}</p></>}
+      {phase === "running" && <>{showProgress && <progress aria-label="Albums processed" value={settled} max={rows.length}/>}<p role="status">{stopping ? "Stopping after the current album finishes…" : "Importing one album at a time. You can stop before the next album."}</p></>}
       <ul className="bulk-import-rows" aria-label="Album import progress">{rows.map(row => <li key={row.id}><div><strong>{row.album}</strong>{row.reason && <small>{row.reason}</small>}{row.warnings?.map(warning => <small key={warning}>Warning: {warning}</small>)}</div><span className={`bulk-result ${row.status}`}>{row.status === "importing" && <span className="spinner"/>}{labels[row.status]}</span></li>)}</ul>
     </div>
     <footer>{phase === "running" && activity && <button type="button" className="secondary" onClick={onClose}>Continue in background</button>}{phase === "running" ? <button type="button" className="secondary" disabled={stopping} onClick={() => { stop.current = true; setStopping(true); if (jobId) void api(`/api/activity/${jobId}/stop`, { method: "POST", body: "{}" }); }}>Stop after current album</button> : <><button type="button" className="secondary" onClick={onClose}>{phase === "confirm" ? "Cancel" : "Close results"}</button>{phase === "done" && source === "inbox" && removableJobs.length > 0 && onRemoveImported && <button type="button" className="danger-action" onClick={() => onRemoveImported(removableJobs)}>Clear imported from Inbox</button>}{phase === "confirm" && queued > 0 && <button type="button" onClick={() => void run()}>Start import</button>}</>}</footer>

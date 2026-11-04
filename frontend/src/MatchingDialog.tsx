@@ -1,3 +1,4 @@
+import { useProgressDelay } from "./useProgressDelay";
 import { useEffect, useRef, useState } from "react";
 import { startActivity, watchActivity, api } from "./api";
 import { ApiError } from "./api";
@@ -13,6 +14,8 @@ export function MatchingDialog({ activity, albums, execute, onRunning, onFinish,
   const [rows, setRows] = useState<MatchRow[]>(() => albums.map(album => ({ id: album.id, album: album.album || album.name || "Album", status: "queued", attempts: 0 })));
   const [phase, setPhase] = useState<"confirm" | "running" | "paused" | "done">("confirm");
   const [jobId, setJobId] = useState<string>();
+  const [startedAt, setStartedAt] = useState<number>();
+  const showProgress = useProgressDelay(phase === "running", jobId || "batch", startedAt);
   const [refreshSaved, setRefreshSaved] = useState(false), [stopping, setStopping] = useState(false);
   const [readyAt, setReadyAt] = useState(0), [now, setNow] = useState(Date.now());
   const stop = useRef(false), running = useRef(false), mounted = useRef(false);
@@ -37,7 +40,7 @@ export function MatchingDialog({ activity, albums, execute, onRunning, onFinish,
   });
   const run = async () => {
     if (running.current || Date.now() < readyAt) return;
-    running.current = true; stop.current = false; setStopping(false); setPhase("running"); onRunning(true);
+    running.current = true; stop.current = false; setStopping(false); setStartedAt(Date.now() / 1000); setPhase("running"); onRunning(true);
     if (activity) {
       try {
         const job = await startActivity(rows.filter(pending).map(row => ({ path: activity.path, body: { ...activity.body, album_id: row.id, reuse_current: !refreshSaved }, id: row.id, album: row.album })), "matching");
@@ -118,7 +121,7 @@ export function MatchingDialog({ activity, albums, execute, onRunning, onFinish,
     <header><div><p className="eyebrow">MusicBrainz</p><h2 id="matching-title">{phase === "confirm" ? "Match selected albums" : phase === "running" ? "Matching your albums" : phase === "paused" ? "Matching paused" : "Matching results"}</h2></div></header>
     <div className="dialog-body"><p>{complete} of {rows.length} {rows.length === 1 ? "album" : "albums"} checked. Successful matches are saved.</p>
       {phase === "confirm" && <><p>Reuse current saved results unless refreshed below. Matching does not import or modify audio.</p><label className="check"><input type="checkbox" checked={refreshSaved} onChange={event => setRefreshSaved(event.target.checked)}/>Refresh saved matches</label></>}
-      {phase !== "confirm" && <progress aria-label="Albums matched" value={complete} max={rows.length}/>}
+      {(showProgress || phase === "paused") && <progress aria-label="Albums matched" value={complete} max={rows.length}/>}
       <p role="status">{remaining ? `MusicBrainz cooldown: ${remaining}s remaining.` : phase === "running" ? stopping ? "Stopping after the current album finishes…" : "Matching one album at a time." : phase === "paused" ? "You can resume unfinished albums; successful results will be skipped." : phase === "done" ? "Matching finished. Review the results before importing." : "Start when ready. Temporary failures get two retries; sustained failures pause the queue."}</p>
       <ul className="bulk-import-rows" aria-label="Album matching progress">{rows.map(row => <li key={row.id}><div><strong>{row.album}</strong>{row.reason && <small>{row.reason}</small>}</div><span className={`bulk-result ${row.status}`}>{row.status === "matching" && <span className="spinner"/>}{labels[row.status]}</span></li>)}</ul>
     </div>

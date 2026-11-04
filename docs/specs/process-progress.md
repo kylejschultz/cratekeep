@@ -156,3 +156,21 @@ reload once selection/review is cleared. Retry transient reads. Detached matchin
 must signal completion even when the run finishes between Activity feed polls.
 Validate Inbox and Library Import, review deferral, selection and same-page
 background completion in the real container flow before publishing the candidate.
+
+
+### Modal-owned progress correction — 2026-11-04
+
+Kyle found Inbox deletion progress behind the confirmation dialog during both
+preview and apply. Show live job stages/progress in that dialog for deletion,
+imported-original removal and undo. Reuse the renderer in metadata preview/save
+and individual import review. Suppress obscured page indicators while a modal is
+open, keeping header Activity global and batch matching/import progress in their
+existing dialogs. Browser checks must exercise both deletion phases with progress
+inside the modal and preserve confirmation/disabled controls and exact-once apply.
+
+
+Kyle also requested a 3–5 second buffer; use three seconds. Quick operations show
+only loading/status text and finish immediately. Page/modal detailed progress and
+batch matching/import bars appear only if still running after that threshold.
+Opening an already-running Activity job uses its existing start time. Do not add a
+minimum duration or postpone actual completion/results.

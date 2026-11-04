@@ -785,8 +785,19 @@ def main() -> None:
         assert not delete_sources[0].exists() and sha256(delete_sources[1])==expected[delete_sources[1]]
         assert (delete_folders[0]/"album.nfo").is_file()
         page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        held_action_status = []
+        action_status_pattern = re.compile(r"/api/activity/[0-9a-f]{32}$")
+        def hold_action_status(route):
+            held_action_status.append(route)
+        page.route(action_status_pattern, hold_action_status)
         page.locator('[aria-label="Selected album actions"]').get_by_role("button",name="Delete from Inbox",exact=True).click()
         deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        deletion.get_by_role("progressbar").wait_for()
+        assert not page.locator(".page-activity").is_visible()
+        page.screenshot(path=args.evidence_dir/"11b-delete-preview-progress.png",full_page=True)
+        page.unroute(action_status_pattern, hold_action_status)
+        for route in held_action_status:
+            route.continue_()
         deletion.locator("li").first.wait_for()
         assert "Delete Download" in deletion.inner_text() and "Delete Other" in deletion.inner_text()
         assert "2 folders · 6 files" in deletion.inner_text()
@@ -796,7 +807,16 @@ def main() -> None:
         assert deletion.get_by_text("Delete Download/2.wav",exact=True).is_visible()
         deletion.get_by_text("Show files",exact=True).click()
         assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        held_action_status.clear()
+        page.route(action_status_pattern, hold_action_status)
         deletion.get_by_role("button",name="Delete permanently",exact=True).click()
+        deletion.get_by_role("progressbar").wait_for()
+        assert not page.locator(".page-activity").is_visible()
+        assert not deletion.get_by_role("button",name="Working…",exact=True).is_enabled()
+        page.screenshot(path=args.evidence_dir/"11b-delete-apply-progress.png",full_page=True)
+        page.unroute(action_status_pattern, hold_action_status)
+        for route in held_action_status:
+            route.continue_()
         page.get_by_text("No albums match this view",exact=True).wait_for()
         assert not any(folder.exists() for folder in delete_folders)
         assert all(sha256(path)==saved[path] for path in targets)

@@ -32,7 +32,7 @@ export function formatBytes(value: number | null | undefined) {
 }
 
 export type ActivityStep = { path: string; method?: string; body: Record<string, unknown>; id?: number; album?: string };
-export type ActivityJob = { created_at?: number; finished_at?: number; automatic_scan?: boolean; is_inbox_status?: boolean; scan_added?: number; id: string; label: string; scope: string; href: string; status: string; stage: string; stage_done?: number; stage_total?: number; stage_unit?: string; files_found?: number; current?: string; processed: number; total: number; rows: any[]; result?: any; http_status?: number; error?: string; resume_at?: number; mode?: string; inbox_id?: string; steps?: ActivityStep[] };
+export type ActivityJob = { created_at?: number; finished_at?: number; automatic_scan?: boolean; is_inbox_status?: boolean; scan_added?: number; id: string; label: string; scope: string; href: string; status: string; stage: string; stage_done?: number; stage_total?: number | null; stage_unit?: string; files_found?: number; current?: string; processed: number; total: number; rows: any[]; result?: any; http_status?: number; error?: string; resume_at?: number; mode?: string; inbox_id?: string; steps?: ActivityStep[] };
 export let activityEnabled = false;
 export function configureActivity(enabled: boolean) { activityEnabled = enabled; }
 export const activityRunning = (job: ActivityJob) => ["queued", "running", "waiting", "stopping"].includes(job.status);
@@ -58,10 +58,11 @@ export function activityPath(path: string, init?: RequestInit) {
     && !/\/candidates$/.test(path) && !/^\/api\/(?:inbox|library-import)\/albums\/\d+$/.test(path); // Review-choice saves and matching batches retain their caller contracts.
 }
 
-export async function api<T>(url: string, init?: RequestInit): Promise<T> {
+export async function api<T>(url: string, init?: RequestInit, onProgress?: (job: ActivityJob) => void): Promise<T> {
   if (!activityPath(url, init)) return rawApi<T>(url, init);
   const job = await startActivity([{ path: url, method: init?.method, body: JSON.parse(String(init?.body)) }]);
-  const result = await watchActivity(job.id);
+  onProgress?.(job);
+  const result = await watchActivity(job.id, onProgress);
   if ((result.http_status || 200) >= 400 || ["failed", "interrupted"].includes(result.status)) {
     throw new ApiError(result.error || result.result?.error || "Operation could not be confirmed. Check Activity before retrying.", result.http_status || 500, result.result?.code);
   }
