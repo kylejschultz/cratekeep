@@ -28,7 +28,7 @@ def operation_details(steps, mode):
     intent = None
     if mode == 'matching' or path.endswith('/candidates') or '/rematch/' in path:
         intent, label = 'match', 'Matching albums'
-    elif mode == 'import' or path.endswith('/execute'):
+    elif mode == 'import' or path.endswith('/execute') or path.endswith('/bulk/preview'):
         intent, label = 'import', 'Importing albums'
     elif '/metadata/' in path:
         moving = bool(body.get('location'))

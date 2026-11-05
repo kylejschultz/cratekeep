@@ -271,3 +271,33 @@ def test_apply_links_its_quiet_check_but_invalid_references_do_not_start_work(tm
         assert client.post('/api/activity', json={**request_body, 'request_id': 'invalid-check-ref', 'check_id': value}).status_code == 400
     assert client.post('/api/activity', json={**request_body, 'steps': [{'path': '/api/inbox/albums/2/execute', 'body': {}}]}).status_code == 400
     assert len(calls) == 1
+
+
+def test_multi_inbox_bulk_previews_are_quiet_and_linked_to_one_import(tmp_path):
+    from flask import request
+    from test_app import configure_named_inboxes
+    app = make_app(tmp_path)
+    configure_named_inboxes(app, [tmp_path/'left', tmp_path/'right'], ['Lidarr', 'Manual'])
+    service = app.extensions['activity']; client = app.test_client(); checks = []
+    sources = app.config['INBOXES']
+    for source in sources:
+        job = service.create('Preview', source['name'], '/inbox', source['id']+'-check', '', [],
+                             steps=[{'path': f"/api/inbox/{source['id']}/bulk/preview", 'body': {}}], mode='operation')
+        service.finish(job['id'], 'complete', result={'ready': 'retained'})
+        checks.append(job['id'])
+    def execute(inbox_id):
+        album_id = request.json['album_ids'][0]
+        return {'imported': [{'album_review_id': album_id, 'job_id': album_id}]}
+    endpoint = app.url_map.bind('').match(f"/api/inbox/{sources[0]['id']}/bulk/execute", method='POST')[0]
+    app.view_functions[endpoint] = execute
+    steps = [{'path': f"/api/inbox/{sources[index % 2]['id']}/bulk/execute", 'id': index+1,
+              'body': {'album_ids': [index+1]}} for index in range(3)]
+    accepted = client.post('/api/activity', json={'request_id': 'mixed-checks-import', 'mode': 'import', 'steps': steps, 'check_ids': checks})
+    assert accepted.status_code == 202, accepted.json
+    finished = wait(client, accepted.json['id'])
+    assert finished['status'] == 'complete' and finished['check_ids'] == checks
+    assert finished['scope'] == 'All Inboxes'
+    history = service.history.page()['groups']
+    assert len(history) == 1 and history[0]['count'] == 1
+    assert history[0]['latest']['outcome'] == '3 imported'
+    assert all(service.get(check)['result']['ready'] == 'retained' for check in checks)

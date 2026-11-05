@@ -54,7 +54,7 @@ before PR delivery. Kyle approved this scope in chat on 2026-11-04. Also fix sho
 - Concrete intent labels for import, matching, metadata, explicit file moves,
   artwork and Inbox actions; independent mutations keep their own entries.
 - Successful internal checks are quiet but retain their request/results. Current
-  import, metadata and Inbox-action flows link them from action details; failed
+  single/bulk import (including All Inboxes), metadata and Inbox-action flows link them from action details; failed
   checks remain visible. Existing legacy receipts migrate once without deleting
   mutation evidence. Unknown jobs keep their honest original labels.
 - Compact SVG state marks and accessible dismiss buttons, meaningful terminal
@@ -73,3 +73,10 @@ before PR delivery. Kyle approved this scope in chat on 2026-11-04. Also fix sho
 
 Final full gates and registry identity are recorded in the excluded local handoff
 and the dated candidate report; image packaging follows the clean checkpoint.
+
+Bulk previews use the same quiet-success policy. A mixed import retains a list
+of successful per-Inbox check references under its one action entry. Bounded
+reference validation checks those source routes before attaching the links;
+original action steps, fingerprints, mutation validation and idempotency remain.
+Final native All Inboxes regression also passed mixed imports, imported cleanup,
+deleting companions, selection/pagination, offline sources and long-name bounds.

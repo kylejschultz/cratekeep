@@ -4,7 +4,7 @@ import { startActivity, watchActivity, api } from "./api";
 import { ApiError } from "./api";
 
 export type ImportRow = { inboxId?: string; inboxName?: string; path?: string; body?: Record<string, unknown>; id: number; album: string; status: "queued" | "blocked" | "importing" | "imported" | "failed" | "not-started" | "unknown"; reason?: string; warnings?: string[]; jobId?: number };
-type Props = { activity?: { path: string; body: Record<string, unknown> }; rows: ImportRow[]; source: "inbox" | "library-import"; execute: (id: number) => Promise<any>; onRunning: (running: boolean) => void; onFinish: (rows: ImportRow[]) => void; onClose: () => void; onRemoveImported?: (jobs: number[], rows: ImportRow[]) => void };
+type Props = { activity?: { checkIds?: string[]; path: string; body: Record<string, unknown> }; rows: ImportRow[]; source: "inbox" | "library-import"; execute: (id: number) => Promise<any>; onRunning: (running: boolean) => void; onFinish: (rows: ImportRow[]) => void; onClose: () => void; onRemoveImported?: (jobs: number[], rows: ImportRow[]) => void };
 const labels = { queued: "Queued", blocked: "Blocked", importing: "Importing…", imported: "Imported", failed: "Failed", "not-started": "Not started", unknown: "Check result" };
 
 export function BulkImportDialog({ activity, rows: initialRows, source, execute, onRunning, onFinish, onClose, onRemoveImported }: Props) {
@@ -30,7 +30,7 @@ export function BulkImportDialog({ activity, rows: initialRows, source, execute,
     setStartedAt(Date.now() / 1000); setPhase("running"); onRunning(true);
     if (activity) {
       try {
-        const job = await startActivity(rows.filter(row => row.status === "queued").map(row => ({ path: row.path || activity.path, body: { ...(row.body || activity.body), album_ids: [row.id], confirmed: true }, id: row.id, album: row.album })), "import");
+        const job = await startActivity(rows.filter(row => row.status === "queued").map(row => ({ path: row.path || activity.path, body: { ...(row.body || activity.body), album_ids: [row.id], confirmed: true }, id: row.id, album: row.album })), "import", activity.checkIds);
         setJobId(job.id);
         const finished = await watchActivity(job.id, update => { if (mounted.current) setRows(rows.map(row => ({ ...row, ...update.rows.find(current => current.id === row.id) }))); });
         if (!mounted.current) return;

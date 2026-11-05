@@ -904,7 +904,7 @@ def main() -> None:
             assert page.locator(f'.desk-album[data-album-id="{row["id"]}"] input[type="checkbox"]').is_checked()
         page.goto(base + "/", wait_until="networkidle")
         page.get_by_role("button", name=re.compile(r"^Activity")).click()
-        page.locator(f'[data-activity-id="{matching_job}"]').get_by_role("button", name=re.compile(r"^Matching albums")).wait_for()
+        page.locator(f'[data-activity-id="{matching_job}"]').get_by_role("button", name=re.compile(r"^Album matching")).wait_for()
         page.screenshot(path=args.evidence_dir / "15-activity-desktop.png", full_page=True)
         page.set_viewport_size({"width":390,"height":844})
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

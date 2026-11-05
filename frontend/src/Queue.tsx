@@ -43,7 +43,7 @@ export function Queue({ source, threshold, inboxId, inboxes, onBusyChange }: Que
   const [operation, setOperation] = useState<"refresh" | "match" | "import" | null>(null);
   const busy = operation !== null;
   const [matching, setMatching] = useState<Album[] | null>(null);
-  const [bulk, setBulk] = useState<{ body: Record<string, unknown>; rows: ImportRow[] } | null>(null);
+  const [bulk, setBulk] = useState<{ body: Record<string, unknown>; rows: ImportRow[]; checkIds: string[] } | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Map<number, Album>>(new Map());
   const [active, setActive] = useState<Album | null>(null);
@@ -173,11 +173,13 @@ export function Queue({ source, threshold, inboxId, inboxes, onBusyChange }: Que
       const body = { ...bulkBody(), mode: "selected" };
       const groups = all ? groupInboxActions({ kind: "delete-albums" }, importableSelected) : [];
       const previews = [];
+      const checkIds = new Set<string>();
+      const checked = (job: ActivityJob) => { checkIds.add(job.id); };
       for (const group of groups) {
         const albums = importableSelected.filter(album => album.source_id === group.inboxId);
-        previews.push(await api<any>(`/api/inbox/${encodeURIComponent(group.inboxId)}/bulk/preview`, { method: "POST", body: JSON.stringify({ ...body, album_ids: albums.map(album => album.id), scopes: [...new Set(albums.map(scopeFor))] }) }));
+        previews.push(await api<any>(`/api/inbox/${encodeURIComponent(group.inboxId)}/bulk/preview`, { method: "POST", body: JSON.stringify({ ...body, album_ids: albums.map(album => album.id), scopes: [...new Set(albums.map(scopeFor))] }) }, checked));
       }
-      const preview = all ? { importable_albums: previews.flatMap(value => value.importable_albums || []), exceptions: previews.flatMap(value => value.exceptions || []) } : await api<any>(`${bulkBase}/preview`, { method: "POST", body: JSON.stringify(body) });
+      const preview = all ? { importable_albums: previews.flatMap(value => value.importable_albums || []), exceptions: previews.flatMap(value => value.exceptions || []) } : await api<any>(`${bulkBase}/preview`, { method: "POST", body: JSON.stringify(body) }, checked);
       const eligible = preview.importable_albums || preview.ready_albums || [];
       const rows: ImportRow[] = [
         ...eligible.map((row: any) => ({ id: row.id, album: row.album, status: "queued" as const, warnings: row.warnings })),
@@ -190,7 +192,7 @@ export function Queue({ source, threshold, inboxId, inboxes, onBusyChange }: Que
           path: `/api/inbox/${encodeURIComponent(album.source_id)}/bulk/execute`,
           body: { mode: "selected", scopes: [scopeFor(album)], album_ids: [album.id] } });
       }
-      setBulk({ body, rows });
+      setBulk({ body, rows, checkIds: [...checkIds] });
     } catch (reason) { setError((reason as Error).message); }
     finally { setOperation(null); }
   };
@@ -198,7 +200,7 @@ export function Queue({ source, threshold, inboxId, inboxes, onBusyChange }: Que
     return all ? { ...selection, groups: groupInboxActions(selection, albums) } : selection;
   }
   return <section ref={workspaceRef} style={splitStyle} className={`desk-workspace${detailOpen ? " is-detail-open" : ""}`} aria-label={source === "inbox" ? "Inbox albums" : "Library adoption albums"}>{inboxAction && <InboxActionDialog inboxId={inboxId!} {...inboxAction} onClose={() => setInboxAction(null)} onDone={() => { setSelected(new Map()); setActive(null); setDetailOpen(false); void load(); }}/>}
-    {bulk && <BulkImportDialog activity={activityEnabled ? { path: `${bulkBase}/execute`, body: bulk.body } : undefined} source={source} rows={bulk.rows} onRemoveImported={(jobs, rows) => { setBulk(null); setInboxAction(action({ kind: "delete-imported", jobs }, rows.filter(row => row.jobId && jobs.includes(row.jobId)).map(row => ({ id: row.id, album: row.album, source_id: row.inboxId, inbox_name: row.inboxName, imported: { job_id: row.jobId } })))); }} onClose={() => { setBulk(null); setOperation(null); }} onRunning={running => setOperation(running ? "import" : null)} execute={id => { const row = bulk.rows.find(row => row.id === id)!; return api(row.path || `${bulkBase}/execute`, { method: "POST", body: JSON.stringify({ ...(row.body || bulk.body), album_ids: [id], confirmed: true }) }); }} onFinish={rows => {
+    {bulk && <BulkImportDialog activity={activityEnabled ? { path: `${bulkBase}/execute`, body: bulk.body, checkIds: bulk.checkIds } : undefined} source={source} rows={bulk.rows} onRemoveImported={(jobs, rows) => { setBulk(null); setInboxAction(action({ kind: "delete-imported", jobs }, rows.filter(row => row.jobId && jobs.includes(row.jobId)).map(row => ({ id: row.id, album: row.album, source_id: row.inboxId, inbox_name: row.inboxName, imported: { job_id: row.jobId } })))); }} onClose={() => { setBulk(null); setOperation(null); }} onRunning={running => setOperation(running ? "import" : null)} execute={id => { const row = bulk.rows.find(row => row.id === id)!; return api(row.path || `${bulkBase}/execute`, { method: "POST", body: JSON.stringify({ ...(row.body || bulk.body), album_ids: [id], confirmed: true }) }); }} onFinish={rows => {
       const imported = new Set(rows.filter(row => row.status === "imported").map(row => row.id));
       notify(`${imported.size} albums imported.`);
       setSelected(current => new Map([...current].filter(([id]) => !imported.has(id))));

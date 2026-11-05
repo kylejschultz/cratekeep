@@ -266,3 +266,11 @@ it("opens a successful preflight from the action details without a second feed e
   fireEvent.click(await screen.findByRole("button", { name: "View preflight checks" }));
   expect(await screen.findByRole("dialog", { name: "Checking album import" })).toBeInTheDocument();
 });
+
+it("attaches each Inbox preview to a mixed import without adding execution steps", async () => {
+  const fetch = vi.fn(async () => ({ ok: true, json: async () => job }));
+  vi.stubGlobal("fetch", fetch);
+  const steps = [{ id: 1, path: "/api/inbox/lidarr/bulk/execute", body: { album_ids: [1] } }];
+  await startActivity(steps, "import", ["left-check", "right-check"]);
+  expect(JSON.parse(String((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body))).toMatchObject({ steps, mode: "import", check_ids: ["left-check", "right-check"] });
+});

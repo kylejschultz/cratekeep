@@ -136,13 +136,15 @@ class Activity:
             self.jobs.pop(job_id, None)
             self.stops.pop(job_id, None)
 
-    def create(self, label, scope, href, request_id, key, rows, *, steps=None, mode=None, inbox_id=None, check_id=None):
+    def create(self, label, scope, href, request_id, key, rows, *, steps=None, mode=None, inbox_id=None, check_ids=None):
         job = dict(id=uuid.uuid4().hex, label=label, scope=scope, href=href, status='queued',
                    stage='Waiting for an available worker', stage_done=None, stage_total=None,
                    stage_unit='files', current=None, processed=0, total=len(rows), rows=rows,
                    created_at=time.time(), updated_at=time.time(), stop_requested=False, work_key=key, automatic_scan=label == 'Scanning Inbox' and steps is None)
-        if check_id:
-            job['check_id'] = check_id
+        if check_ids:
+            job['check_ids'] = check_ids
+            if len(check_ids) == 1:
+                job['check_id'] = check_ids[0]
         if steps is not None:
             presentation_steps = deepcopy(steps)
             for step in presentation_steps:
@@ -166,7 +168,7 @@ class Activity:
         return job
 
     def validate(self, values):
-        if not isinstance(values, dict) or set(values) - {'request_id', 'steps', 'label', 'mode', 'check_id'}:
+        if not isinstance(values, dict) or set(values) - {'request_id', 'steps', 'label', 'mode', 'check_id', 'check_ids'}:
             raise ValueError('Expected an operation request and steps.')
         if not isinstance(values.get('request_id'), str) or not re.fullmatch(r'[a-zA-Z0-9-]{8,80}', values['request_id']):
             raise ValueError('A unique request_id is required.')
@@ -219,15 +221,22 @@ class Activity:
 
     def submit(self, values):
         steps, mode = self.validate(values)
-        check_id = values.get('check_id')
-        if check_id is not None:
+        if 'check_id' in values and 'check_ids' in values:
+            raise ValueError('Use one preflight reference format.')
+        check_ids = values.get('check_ids', [values['check_id']] if values.get('check_id') is not None else [])
+        if not isinstance(check_ids, list) or len(check_ids) > 1000:
+            raise ValueError('Invalid preflight references.')
+        check_paths = set()
+        for check_id in check_ids:
             if not isinstance(check_id, str) or not re.fullmatch('[a-f0-9]{32}', check_id):
                 raise ValueError('Invalid preflight reference.')
             check = self.get(check_id)
-            check_paths = [re.sub(r'/(preview|apply)$', '', step['path']) for step in (check or {}).get('steps', [])]
-            paths = [re.sub(r'/(preview|apply)$', '', step['path']) for step in steps]
-            if not check or not check.get('is_check') or check['status'] != 'complete' or check_paths != paths:
+            if not check or not check.get('is_check') or check['status'] != 'complete':
                 raise ValueError('A successful preflight for this operation is required.')
+            check_paths.update(re.sub(r'/(preview|apply|execute)$', '', step['path']) for step in check.get('steps', []))
+        paths = {re.sub(r'/(preview|apply|execute)$', '', step['path']) for step in steps}
+        if check_ids and not paths <= check_paths:
+            raise ValueError('A successful preflight for this operation is required.')
         key = hashlib.sha256(json.dumps([mode, steps], sort_keys=True).encode()).hexdigest()
         with self.lock:
             with self.db() as db:
@@ -267,7 +276,7 @@ class Activity:
                     source_id = step['path'].split('/')[3] if step['path'].startswith('/api/inbox/') else None
                 row['inbox_id'] = source_id
                 row['inbox_name'] = next((entry['name'] for entry in sources if entry['id'] == source_id), '')
-            job = self.create(label, scope, href, values['request_id'], key, rows, steps=steps, mode=mode, inbox_id=inbox['id'] if inbox else None, check_id=check_id)
+            job = self.create(label, scope, href, values['request_id'], key, rows, steps=steps, mode=mode, inbox_id=inbox['id'] if inbox else None, check_ids=check_ids)
             job['inbox_ids'] = [entry['id'] for entry in sources]
             self.update(job['id'], inbox_ids=job['inbox_ids'])
         threading.Thread(target=self.run, args=(job['id'], steps, mode), daemon=True, name='cratekeep-activity').start()
