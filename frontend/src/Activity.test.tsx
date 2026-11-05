@@ -277,7 +277,8 @@ it("attaches each Inbox preview to a mixed import without adding execution steps
 
 it.each([["unmanage", "Library removal"], ["library-delete", "Library deletion"]])("names %s separately from Inbox actions", async (intent, title) => {
   configureActivity(true);
-  vi.stubGlobal("fetch", vi.fn(activityFetch({ ...job, status: "complete", intent, outcome: "2 tracks removed" })));
+  const completed = { ...job, status: "complete", intent, outcome: "2 tracks removed" };
+  vi.stubGlobal("fetch", vi.fn(activityFetch(completed)));
   render(<ActivityMonitor/>);
   fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
   expect(await screen.findByText(title)).toBeInTheDocument();
