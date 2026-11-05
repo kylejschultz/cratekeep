@@ -17,7 +17,7 @@ import uuid
 from flask import jsonify, request
 from werkzeug.exceptions import HTTPException
 
-from .activity_history import History, group_key, summary
+from .activity_history import History, group_key, summary, operation_details
 
 _current = ContextVar('cratekeep_activity', default=None)
 ACTIVE = {'queued', 'running', 'waiting', 'stopping'}
@@ -128,6 +128,7 @@ class Activity:
             with self.db() as db:
                 db.execute('UPDATE activity_jobs SET snapshot=?,history_group=?,history_status=? WHERE id=?', (json.dumps(job), group_key(job), job['status'], job_id))
                 self.history.compact_scan(db, job)
+                self.history.compact_check(db, job)
         except sqlite3.Error:
             self.app.logger.exception('Activity result persistence failed; retaining live result')
             return
@@ -135,12 +136,22 @@ class Activity:
             self.jobs.pop(job_id, None)
             self.stops.pop(job_id, None)
 
-    def create(self, label, scope, href, request_id, key, rows, *, steps=None, mode=None, inbox_id=None):
+    def create(self, label, scope, href, request_id, key, rows, *, steps=None, mode=None, inbox_id=None, check_id=None):
         job = dict(id=uuid.uuid4().hex, label=label, scope=scope, href=href, status='queued',
                    stage='Waiting for an available worker', stage_done=None, stage_total=None,
                    stage_unit='files', current=None, processed=0, total=len(rows), rows=rows,
                    created_at=time.time(), updated_at=time.time(), stop_requested=False, work_key=key, automatic_scan=label == 'Scanning Inbox' and steps is None)
+        if check_id:
+            job['check_id'] = check_id
         if steps is not None:
+            presentation_steps = deepcopy(steps)
+            for step in presentation_steps:
+                if step['path'].endswith('/actions/apply'):
+                    with self.db() as db:
+                        saved = db.execute('SELECT kind FROM inbox_file_actions WHERE id=?', (step.get('body', {}).get('preview_id'),)).fetchone()
+                    if saved:
+                        step['body']['kind'] = saved[0]
+            job.update(operation_details(presentation_steps, mode))
             job.update(steps=steps, mode=mode, inbox_id=inbox_id)
         with self.db() as db:
             db.execute('INSERT INTO activity_jobs(id,request_id,work_key,snapshot,history_group,history_status) VALUES (?,?,?,?,?,?)', (job['id'], request_id, key, json.dumps(job), group_key(job), job['status']))
@@ -155,7 +166,7 @@ class Activity:
         return job
 
     def validate(self, values):
-        if not isinstance(values, dict) or set(values) - {'request_id', 'steps', 'label', 'mode'}:
+        if not isinstance(values, dict) or set(values) - {'request_id', 'steps', 'label', 'mode', 'check_id'}:
             raise ValueError('Expected an operation request and steps.')
         if not isinstance(values.get('request_id'), str) or not re.fullmatch(r'[a-zA-Z0-9-]{8,80}', values['request_id']):
             raise ValueError('A unique request_id is required.')
@@ -208,6 +219,15 @@ class Activity:
 
     def submit(self, values):
         steps, mode = self.validate(values)
+        check_id = values.get('check_id')
+        if check_id is not None:
+            if not isinstance(check_id, str) or not re.fullmatch('[a-f0-9]{32}', check_id):
+                raise ValueError('Invalid preflight reference.')
+            check = self.get(check_id)
+            check_paths = [re.sub(r'/(preview|apply)$', '', step['path']) for step in (check or {}).get('steps', [])]
+            paths = [re.sub(r'/(preview|apply)$', '', step['path']) for step in steps]
+            if not check or not check.get('is_check') or check['status'] != 'complete' or check_paths != paths:
+                raise ValueError('A successful preflight for this operation is required.')
         key = hashlib.sha256(json.dumps([mode, steps], sort_keys=True).encode()).hexdigest()
         with self.lock:
             with self.db() as db:
@@ -223,8 +243,8 @@ class Activity:
             inbox_id = first.split('/')[3] if first.startswith('/api/inbox/') and first.split('/')[3] not in {'albums', 'candidates', 'reviews', 'scan'} else None
             inbox = next((row for row in self.app.config['INBOXES'] if row['id'] == inbox_id), None)
             album_sources = {}
-            if first == '/api/inbox/candidates':
-                identities = [step['body'].get('album_id') for step in steps]
+            if first == '/api/inbox/candidates' or re.fullmatch(r'/api/inbox/albums/[0-9]+/execute', first):
+                identities = [step['body'].get('album_id') if step['path'] == '/api/inbox/candidates' else int(step['path'].split('/')[4]) for step in steps]
                 with self.db() as db:
                     album_sources = dict(db.execute('SELECT id,source_id FROM album_reviews WHERE id IN (' + ','.join('?' for _ in identities) + ')', identities))
             source_ids = set(album_sources.values()) or {step['path'].split('/')[3] for step in steps if step['path'].startswith('/api/inbox/')}
@@ -240,10 +260,14 @@ class Activity:
                 label = 'Scanning Inbox'
             rows = [dict(id=step.get('id'), album=step.get('album', ''), status='queued', attempts=0) for step in steps]
             for step, row in zip(steps, rows):
-                source_id = album_sources.get(step.get('id')) if album_sources else step['path'].split('/')[3] if step['path'].startswith('/api/inbox/') else None
+                if album_sources:
+                    album_id = step.get('id') if step['path'] == '/api/inbox/candidates' else int(step['path'].split('/')[4])
+                    source_id = album_sources.get(album_id)
+                else:
+                    source_id = step['path'].split('/')[3] if step['path'].startswith('/api/inbox/') else None
                 row['inbox_id'] = source_id
                 row['inbox_name'] = next((entry['name'] for entry in sources if entry['id'] == source_id), '')
-            job = self.create(label, scope, href, values['request_id'], key, rows, steps=steps, mode=mode, inbox_id=inbox['id'] if inbox else None)
+            job = self.create(label, scope, href, values['request_id'], key, rows, steps=steps, mode=mode, inbox_id=inbox['id'] if inbox else None, check_id=check_id)
             job['inbox_ids'] = [entry['id'] for entry in sources]
             self.update(job['id'], inbox_ids=job['inbox_ids'])
         threading.Thread(target=self.run, args=(job['id'], steps, mode), daemon=True, name='cratekeep-activity').start()
@@ -355,7 +379,7 @@ def register(app):
                 if not value.isdecimal() or len(value) > 18:
                     raise ValueError('Invalid history cursor.')
                 return int(value)
-            return jsonify(service.history.page(group=request.args.get('group'), before=cursor('before'), snapshot=cursor('snapshot')))
+            return jsonify(service.history.page(group=request.args.get('group'), before=cursor('before'), snapshot=cursor('snapshot'), priority=cursor('priority')))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
 

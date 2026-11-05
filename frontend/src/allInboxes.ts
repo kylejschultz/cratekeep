@@ -3,9 +3,9 @@ import type { Album } from "./types";
 import type { InboxActionSelection } from "./InboxImportActions";
 
 export type InboxSource = { id: string; name: string };
-export async function runInboxBatch(steps: ActivityStep[], update?: (job: ActivityJob) => void) {
+export async function runInboxBatch(steps: ActivityStep[], update?: (job: ActivityJob) => void, checkId?: string) {
   if (activityEnabled) {
-    const job = await startActivity(steps, "batch"); update?.(job);
+    const job = await startActivity(steps, "batch", checkId); update?.(job);
     const finished = await watchActivity(job.id, update);
     if (finished.rows.length !== steps.length || finished.rows.some(row => !row.result)) throw new Error("Some Inbox results are unavailable. Check Activity before retrying.");
     return finished.rows;

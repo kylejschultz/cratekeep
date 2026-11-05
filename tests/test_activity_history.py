@@ -172,3 +172,102 @@ def test_clear_returns_during_running_mutation_and_later_result_stays_visible(tm
     assert wait(client, job['id'])['result'] == {'files': 4}
     page = client.get('/api/activity/history').json
     assert page['clearable'] == 1 and page['groups'][0]['latest']['id'] == job['id']
+
+
+def test_priority_paging_finds_old_running_and_failed_work_without_losing_history(tmp_path):
+    app = make_app(tmp_path); service = app.extensions['activity']
+    running = service.new_external('Old active job', 'Library', '/library')
+    failure = service.new_external('Old failure', 'Library', '/library')
+    service.finish(failure['id'], 'failed')
+    for index in range(45):
+        job = service.new_external(f'Finished {index}', 'Library', '/library')
+        service.finish(job['id'], 'complete')
+    first = service.history.page()
+    assert [group['latest']['id'] for group in first['groups'][:2]] == [running['id'], failure['id']]
+    seen = [group['key'] for group in first['groups']]
+    page = first
+    while page['next_before'] is not None:
+        page = service.history.page(before=page['next_before'], priority=page['next_priority'], snapshot=first['snapshot'])
+        seen.extend(group['key'] for group in page['groups'])
+    assert len(seen) == len(set(seen)) == 47
+    assert app.test_client().get('/api/activity/history?priority=3').status_code == 400
+
+
+def test_successful_checks_are_quiet_but_failed_checks_and_replay_receipts_survive(tmp_path):
+    app = make_app(tmp_path); service = app.extensions['activity']
+    def create(request_id, check):
+        return service.create('Updating library files', 'Lidarr', '/inbox?source=lidarr', request_id, '', [],
+                              steps=[{'path': '/api/inbox/albums/1/execute', 'body': {'dry_run': check}}], mode='operation')
+    check = create('check-receipt', True)
+    service.finish(check['id'], 'complete', result={'plan': 'untouched'})
+    actual = create('apply-receipt', False)
+    service.finish(actual['id'], 'complete', result={'job_id': 42})
+    other = create('independent-apply', False)
+    service.finish(other['id'], 'complete', result={'job_id': 43})
+    failed = create('failed-check', True)
+    service.finish(failed['id'], 'partial', result={'error': 'Source changed'})
+    groups = service.history.page()['groups']
+    assert [row['latest']['id'] for row in groups] == [failed['id'], other['id'], actual['id']]
+    assert all(row['count'] == 1 for row in groups)
+    assert groups[0]['label'] == 'Checking album import'
+    assert service.get(check['id'])['result'] == {'plan': 'untouched'}
+    assert service.get(actual['id'])['result'] == {'job_id': 42}
+    # Restart reclassification must retain the same visibility and evidence.
+    restarted = Activity(app)
+    assert len(restarted.history.page()['groups']) == 3
+    assert restarted.get(check['id'])['result']['plan'] == 'untouched'
+
+
+def test_known_legacy_preview_migrates_without_losing_failed_checks_or_unknown_jobs(tmp_path):
+    import json
+    from beets_mvp.activity_history import group_key
+    app = make_app(tmp_path); service = app.extensions['activity']
+    for index, status in enumerate(('complete', 'failed')):
+        job = service.new_external('Updating library files', 'Library', '/library')
+        service.finish(job['id'], status, result={'receipt': index})
+        saved = service.get(job['id'])
+        saved['steps'] = [{'path': '/api/library/albums/1/metadata/preview', 'body': {}}]
+        with service.db() as db:
+            db.execute('UPDATE activity_jobs SET snapshot=?,history_group=? WHERE id=?', (json.dumps(saved), group_key(saved), job['id']))
+    restarted = Activity(app)
+    groups = restarted.history.page()['groups']
+    assert len(groups) == 1 and groups[0]['attention'] == 1
+    assert groups[0]['label'] == 'Checking metadata changes'
+    with restarted.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM activity_jobs').fetchone()[0] == 2
+
+
+def test_completed_outcomes_use_actual_rows_not_a_stale_processed_counter(tmp_path):
+    from beets_mvp.activity_history import summary
+    job = dict(id='match', status='complete', mode='matching', processed=0, total=3,
+               rows=[{'status': 'matched'}, {'status': 'cached'}, {'status': 'no-match'}])
+    assert summary(job)['outcome'] == '1 matched · 1 cached · 1 without matches'
+    assert summary({**job, 'mode': 'import', 'rows': [{'status': 'imported', 'jobId': 42}]})['outcome'] == '1 imported'
+    assert summary({**job, 'mode': 'operation', 'intent': 'delete', 'rows': [{'result': {'removed': ['a', 'b']}}, {'result': {'removed': ['c']}}]})['outcome'] == '3 files removed'
+    assert summary({**job, 'mode': 'operation', 'intent': 'metadata', 'rows': []})['outcome'] is None
+
+
+def test_apply_links_its_quiet_check_but_invalid_references_do_not_start_work(tmp_path):
+    from flask import request
+    app = make_app(tmp_path); service = app.extensions['activity']; client = app.test_client(); calls = []
+    def operation(album_review_id):
+        calls.append(request.path)
+        return {'plan': 'fixture'}
+    # Use the registered route endpoint rather than replacing any URL validation.
+    endpoint = app.url_map.bind('').match('/api/inbox/albums/1/execute', method='POST')[0]
+    app.view_functions[endpoint] = operation
+    steps = [{'path': '/api/inbox/albums/1/execute', 'body': {}}]
+    check = service.create('Check', 'Inbox', '/inbox', 'preflight-link', '', [], steps=[{**steps[0], 'body': {'dry_run': True}}], mode='operation')
+    service.finish(check['id'], 'complete', result={'plan': 'checked'})
+    request_body = {'request_id': 'apply-with-preflight', 'steps': steps, 'check_id': check['id']}
+    response = client.post('/api/activity', json=request_body)
+    assert response.status_code == 202
+    finished = wait(client, response.json['id'])
+    assert finished['status'] == 'complete', finished
+    assert finished['check_id'] == check['id']
+    assert service.get(finished['check_id'])['result']['plan'] == 'checked'
+    assert len(calls) == 1
+    for value in ('missing', 'f'*32, 123):
+        assert client.post('/api/activity', json={**request_body, 'request_id': 'invalid-check-ref', 'check_id': value}).status_code == 400
+    assert client.post('/api/activity', json={**request_body, 'steps': [{'path': '/api/inbox/albums/2/execute', 'body': {}}]}).status_code == 400
+    assert len(calls) == 1

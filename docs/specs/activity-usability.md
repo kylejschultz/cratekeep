@@ -14,7 +14,7 @@ Kyle accepted All Inboxes and requested the following candidate adjustments:
   keyboard access. Keep Clear all and pagination accessible outside the scroller.
   All history remains available; this is a viewport bound, not a retention limit.
 
-## Proposed next increment — awaiting Kyle's review and approval
+## Approved next increment — 2026-11-04
 
 The popover should answer: **What is running, and does anything need me?**
 Use the existing Cratekeep type, neutral surfaces, accent and heartbeat control.
@@ -44,4 +44,32 @@ identifiable without reading every row. One import is one feed item; a failed
 preflight remains discoverable. Clearing preserves active jobs and execution
 receipts. Verify desktop/tablet/phone, keyboard, outside click, empty/error/loading
 states and existing pagination/recovery tests. Deliver a local amd64 candidate
-before PR delivery. No redesign implementation is approved by this document.
+before PR delivery. Kyle approved this scope in chat on 2026-11-04. Also fix short source pills (e.g. Lidarr) clipping beside short album titles while retaining long-name bounds.
+
+
+## Implementation evidence
+
+- Server-prioritized active/attention/recent groups, with priority-aware bounded
+  cursor pages and unchanged unlimited retention.
+- Concrete intent labels for import, matching, metadata, explicit file moves,
+  artwork and Inbox actions; independent mutations keep their own entries.
+- Successful internal checks are quiet but retain their request/results. Current
+  import, metadata and Inbox-action flows link them from action details; failed
+  checks remain visible. Existing legacy receipts migrate once without deleting
+  mutation evidence. Unknown jobs keep their honest original labels.
+- Compact SVG state marks and accessible dismiss buttons, meaningful terminal
+  outcomes and quiet timestamps. Cached matches are labeled cached, not assumed
+  to be new matches. Empty scan status and separate arrivals remain.
+- Short source names occupy their natural width; long names stay bounded with a
+  full-name tooltip. Native browser verified Lidarr beside Eve 6 and long titles
+  at 1440/768/390, alongside bounded long source names.
+- Native browser passed real WAV import, inspector-owned progress, old failed
+  checks prioritized over 25 new successes, linked preflight detail access,
+  receipt-preserving clearing, Older/Newer, outside dismissal and keyboard scroll.
+- Taste app inspector passed after SVG status marks replaced text checkmarks.
+  Allowed covered-text because this temporary, dismissible popover intentionally
+  overlays the page underneath; the closed screen is separately checked. The
+  existing inspector blank-band warning remains outside this feed's scope.
+
+Final full gates and registry identity are recorded in the excluded local handoff
+and the dated candidate report; image packaging follows the clean checkpoint.

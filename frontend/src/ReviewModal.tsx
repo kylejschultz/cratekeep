@@ -241,9 +241,10 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
         const saved = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify({ decision: "approved", ...selection }) });
         setAlbum(albumPayload(saved));
       }
-      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption, dry_run: true }) }, setActivity);
+      let checkId: string | undefined;
+      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption, dry_run: true }) }, job => { setActivity(job); checkId = job.id; });
       setStatus(cleanupPending ? "Finishing Inbox cleanup…" : moved ? "Finalizing artwork…" : "Preflight passed. Importing…");
-      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption }) }, setActivity);
+      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption }) }, setActivity, checkId);
       onComplete(result.message || `${album.album || album.name || "Album"} imported successfully.`);
     } catch (reason) {
       const code = reason instanceof ApiError ? reason.code || "" : "";

@@ -32,12 +32,12 @@ export function formatBytes(value: number | null | undefined) {
 }
 
 export type ActivityStep = { path: string; method?: string; body: Record<string, unknown>; id?: number | string; album?: string };
-export type ActivityJob = { created_at?: number; finished_at?: number; automatic_scan?: boolean; is_inbox_status?: boolean; scan_added?: number; id: string; label: string; scope: string; href: string; status: string; stage: string; stage_done?: number; stage_total?: number | null; stage_unit?: string; files_found?: number; current?: string; processed: number; total: number; rows: any[]; result?: any; http_status?: number; error?: string; resume_at?: number; mode?: string; inbox_id?: string; inbox_ids?: string[]; steps?: ActivityStep[] };
+export type ActivityJob = { check_id?: string; intent?: string; is_check?: boolean; outcome?: string | null; created_at?: number; finished_at?: number; automatic_scan?: boolean; is_inbox_status?: boolean; scan_added?: number; id: string; label: string; scope: string; href: string; status: string; stage: string; stage_done?: number; stage_total?: number | null; stage_unit?: string; files_found?: number; current?: string; processed: number; total: number; rows: any[]; result?: any; http_status?: number; error?: string; resume_at?: number; mode?: string; inbox_id?: string; inbox_ids?: string[]; steps?: ActivityStep[] };
 export let activityEnabled = false;
 export function configureActivity(enabled: boolean) { activityEnabled = enabled; }
 export const activityRunning = (job: ActivityJob) => ["queued", "running", "waiting", "stopping"].includes(job.status);
-export async function startActivity(steps: ActivityStep[], mode = "operation") {
-  return rawApi<ActivityJob>("/api/activity", { method: "POST", body: JSON.stringify({ request_id: crypto.randomUUID?.() || Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join(""), steps, mode }) });
+export async function startActivity(steps: ActivityStep[], mode = "operation", checkId?: string) {
+  return rawApi<ActivityJob>("/api/activity", { method: "POST", body: JSON.stringify({ request_id: crypto.randomUUID?.() || Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join(""), steps, mode, ...(checkId ? { check_id: checkId } : {}) }) });
 }
 export async function watchActivity(id: string, update?: (job: ActivityJob) => void): Promise<ActivityJob> {
   let missed = 0;
@@ -58,9 +58,9 @@ export function activityPath(path: string, init?: RequestInit) {
     && !/\/candidates$/.test(path) && !/^\/api\/(?:inbox|library-import)\/albums\/\d+$/.test(path); // Review-choice saves and matching batches retain their caller contracts.
 }
 
-export async function api<T>(url: string, init?: RequestInit, onProgress?: (job: ActivityJob) => void): Promise<T> {
+export async function api<T>(url: string, init?: RequestInit, onProgress?: (job: ActivityJob) => void, checkId?: string): Promise<T> {
   if (!activityPath(url, init)) return rawApi<T>(url, init);
-  const job = await startActivity([{ path: url, method: init?.method, body: JSON.parse(String(init?.body)) }]);
+  const job = await startActivity([{ path: url, method: init?.method, body: JSON.parse(String(init?.body)) }], "operation", checkId);
   onProgress?.(job);
   const result = await watchActivity(job.id, onProgress);
   if ((result.http_status || 200) >= 400 || ["failed", "interrupted"].includes(result.status)) {

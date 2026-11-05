@@ -25,6 +25,7 @@ export type InboxActionSelection = Action & { groups?: Array<Action & { inboxId:
 type Plan = { inboxId: string; inboxName: string; preview: Preview };
 export function InboxActionDialog({ inboxId, kind, groups, jobs, albumIds, albumId, trackId, names, onClose, onDone }: InboxActionSelection & { inboxId: string; onClose: () => void; onDone: (complete: boolean) => void }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const checkId = useRef<string | undefined>(undefined);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [preview, setPreview] = useState<Preview | null>(null), [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -39,7 +40,7 @@ export function InboxActionDialog({ inboxId, kind, groups, jobs, albumIds, album
     const node = ref.current!; node.showModal();
     let current = true;
     const body = (selection: Action) => selection.kind === "delete-albums" ? { kind: selection.kind, album_ids: selection.albumIds } : selection.kind === "delete-track" ? { kind: selection.kind, album_id: selection.albumId, track_id: selection.trackId } : { kind: selection.kind, job_ids: selection.jobs };
-    const progress = (job: ActivityJob) => { if (current) setActivity(job); };
+    const progress = (job: ActivityJob) => { if (current) { setActivity(job); checkId.current = job.id; } };
     const load = async () => {
       if (!groups) return api<Preview>(`${base}/preview`, { method: "POST", body: JSON.stringify(body({ kind, albumIds, albumId, trackId, jobs })) }, progress);
       if (!groups.length) throw new Error("No Inbox files selected. Reload the queue.");
@@ -66,7 +67,7 @@ export function InboxActionDialog({ inboxId, kind, groups, jobs, albumIds, album
     try {
       const rows = await runInboxBatch(plans.map(plan => ({ id: plan.inboxId, album: plan.inboxName,
         path: `/api/inbox/${encodeURIComponent(plan.inboxId)}/actions/apply`,
-        body: { preview_id: plan.preview.preview_id, expected_fingerprint: plan.preview.fingerprint, confirmed: true } })), setActivity);
+        body: { preview_id: plan.preview.preview_id, expected_fingerprint: plan.preview.fingerprint, confirmed: true } })), setActivity, checkId.current);
       results = plans.map(plan => rows.find(row => row.id === plan.inboxId)?.result);
       if (results.some(result => !["complete", "partial"].includes(result?.status))) throw new Error("Read saved results");
     } catch {
@@ -90,7 +91,7 @@ export function InboxActionDialog({ inboxId, kind, groups, jobs, albumIds, album
     setBusy(true); setError("");
     try {
       if (plans.length) { await applyGroups(); return; }
-      finish(await api<any>(`${base}/apply`, { method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, expected_fingerprint: preview.fingerprint, confirmed: true }) }, setActivity));
+      finish(await api<any>(`${base}/apply`, { method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, expected_fingerprint: preview.fingerprint, confirmed: true }) }, setActivity, checkId.current));
     } catch (reason) {
       // A lost response must never resubmit deletion. Read the durable result.
       const controller = new AbortController();

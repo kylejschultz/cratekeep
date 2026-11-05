@@ -26,6 +26,7 @@ export function MetadataEditor({ album, onClose, onSaved, onBusyChange }: {
   album: any; onClose: () => void; onSaved: (album: any) => void; onBusyChange: (busy: boolean) => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null), albumForm = useRef<HTMLFormElement>(null);
+  const checkId = useRef<string | undefined>(undefined);
   const trackForms = useRef(new Map<number, HTMLFormElement>());
   const [tab, setTab] = useState("album"), [selected, setSelected] = useState(album.tracks?.[0]?.id);
   const [dirty, setDirty] = useState(false), [discard, setDiscard] = useState(false);
@@ -63,12 +64,12 @@ export function MetadataEditor({ album, onClose, onSaved, onBusyChange }: {
       tracks: tracks.map((track: any) => ({ id: track.id, ...changedFields(trackForms.current.get(track.id)!, track, trackFields, "artists") })).filter((row: any) => Object.keys(row).length > 1),
     };
     setBusy(true); setError("");
-    try { setReview(await api<any>(`/api/library/albums/${album.id}/metadata/preview`, { method: "POST", body: JSON.stringify(payload) }, setActivity)); setDraft(payload); }
+    try { setReview(await api<any>(`/api/library/albums/${album.id}/metadata/preview`, { method: "POST", body: JSON.stringify(payload) }, job => { setActivity(job); checkId.current = job.id; })); setDraft(payload); }
     catch (reason) { setError((reason as Error).message); } finally { setBusy(false); }
   };
   const save = async () => {
     setBusy(true); setError("");
-    try { const result = await api<any>(`/api/library/albums/${album.id}/metadata/apply`, { method: "POST", body: JSON.stringify({ ...draft, plan_fingerprint: review.plan_fingerprint }) }, setActivity); onSaved(result.album); }
+    try { const result = await api<any>(`/api/library/albums/${album.id}/metadata/apply`, { method: "POST", body: JSON.stringify({ ...draft, plan_fingerprint: review.plan_fingerprint }) }, setActivity, checkId.current); onSaved(result.album); }
     catch (reason) { setError((reason as Error).message); setReview(null); } finally { setBusy(false); }
   };
   return createPortal(<dialog className="metadata-editor" ref={dialog} aria-labelledby="metadata-title" onCancel={event => { event.preventDefault(); close(); }}>

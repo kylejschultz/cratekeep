@@ -8,7 +8,7 @@ import { ActivityHistory } from "./ActivityHistory";
 import { groupInboxActions } from "./allInboxes";
 import { InboxActionDialog, type InboxActionSelection } from "./InboxImportActions";
 
-function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => void }) {
+function Details({ job: initial, onClose, onOpen }: { job: ActivityJob; onClose: () => void; onOpen: (job: ActivityJob) => void }) {
   const [job, setJob] = useState(initial);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -33,7 +33,7 @@ function Details({ job: initial, onClose }: { job: ActivityJob; onClose: () => v
     <div className="dialog-body"><ActivityProgress job={job}/>{(error || job.error) && <p role="alert">{error || job.error}</p>}
       <ul className="activity-results">{job.rows.map((row, index) => <li key={index}><strong>{row.album || job.label}</strong>{job.inbox_ids && job.inbox_ids.length > 1 && <small>{row.inbox_name}</small>}<span>{row.status.replaceAll("-", " ")}</span>{row.reason && <p>{row.reason}</p>}</li>)}</ul>
       {job.result?.errors?.map((row: any, index: number) => <p key={index}>{row.error}</p>)}
-    </div><footer><a href={job.href}>Open {job.scope}</a>{activityRunning(job) && ["matching", "import"].includes(job.mode || "") && <button type="button" className="secondary" disabled={job.status === "stopping"} onClick={() => void stop()}>Stop after current album</button>}
+    </div><footer>{job.check_id && <button type="button" className="text-button" onClick={() => void api<ActivityJob>(`/api/activity/${job.check_id}`).then(onOpen).catch(reason => setError(reason.message))}>View preflight checks</button>}<a href={job.href}>Open {job.scope}</a>{activityRunning(job) && ["matching", "import"].includes(job.mode || "") && <button type="button" className="secondary" disabled={job.status === "stopping"} onClick={() => void stop()}>Stop after current album</button>}
     {!activityRunning(job) && job.mode === "matching" && job.rows.some(row => ["failed", "needs-retry", "not-started"].includes(row.status)) && <button type="button" onClick={() => void api(`/api/activity/${job.id}/resume`, { method: "POST", body: "{}" }).then(onClose).catch(reason => setError(reason.message))}>Resume unfinished</button>}
     {(job.inbox_id || job.inbox_ids?.length) && receipts.length > 0 && <button type="button" className="danger-action" onClick={() => {
       const selection: InboxActionSelection = { kind: "delete-imported", jobs: receipts };
@@ -66,7 +66,7 @@ export function ActivityMonitor() {
   const active = jobs.filter(activityRunning);
   return <div className="activity-monitor" ref={monitor}><button type="button" className={`header-icon${active.length ? " is-running" : ""}`} aria-label={`Activity${active.length ? ` (${active.length})` : ""}`} title={active.length ? `Activity: ${active.length} running` : "Activity"} aria-expanded={open} aria-controls="activity-panel" onClick={() => setOpen(value => !value)}><HeaderIcon name="activity"/></button>
     {(error || detailError) && open && <p role="status">{error || detailError}</p>}<ActivityHistory open={open} onClose={() => setOpen(false)} onOpen={setSelected}/>
-    {selected && <Details key={selected.id} job={selected} onClose={() => setSelected(undefined)}/>}</div>;
+    {selected && <Details key={selected.id} job={selected} onOpen={setSelected} onClose={() => setSelected(undefined)}/>}</div>;
 }
 export function ActivityInline({ scope, excludeId }: { scope: "library" | string; excludeId?: string }) {
   const { jobs, error } = useActivity();

@@ -54,10 +54,10 @@ it("keeps completed activity compact with an inline dismiss action and opens ful
   render(<ActivityMonitor/>);
   fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
   expect(screen.getByRole("button", { name: "Activity" })).not.toHaveClass("is-running");
-  expect(await screen.findByText("complete · 42 tracks found")).toBeInTheDocument();
+  expect(await screen.findByText("Finished · 42 tracks found")).toBeInTheDocument();
   expect(screen.queryByText("Finished")).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Clear Refreshing files" }).closest("article")).toBe(screen.getByText("complete · 42 tracks found").closest("article"));
-  fireEvent.click(screen.getByRole("button", { name: /Refreshing files Library complete/ }));
+  expect(screen.getByRole("button", { name: "Clear Refreshing files" }).closest("article")).toBe(screen.getByText("Finished · 42 tracks found").closest("article"));
+  fireEvent.click(screen.getByRole("button", { name: /Refreshing files Library · Finished/ }));
   expect(await screen.findByRole("dialog", { name: "Refreshing files" })).toBeInTheDocument();
   expect(screen.getByText("Finished")).toBeInTheDocument();
 });
@@ -128,7 +128,7 @@ it("shows a quiet latest success without repeat or empty results, with arrivals 
   expect(screen.queryByText("×109")).not.toBeInTheDocument();
   expect(screen.queryByText(/0 tracks found/)).not.toBeInTheDocument();
   expect(screen.getByText(/2 new tracks/)).toBeInTheDocument();
-  expect(screen.getByText(/^failed/)).toBeInTheDocument();
+  expect(screen.getByText("Needs attention")).toBeInTheDocument();
 });
 
 it("clears busy UI when an automatic success was coalesced before the next poll", async () => {
@@ -214,4 +214,55 @@ it("excludes only the inspector-owned job from page progress and restores it on 
   expect(screen.queryByText("Refreshing files · Library")).not.toBeInTheDocument();
   view.rerender(<><ActivityMonitor/><ActivityInline scope="library"/></>);
   expect(await screen.findByText("Refreshing files · Library")).toBeInTheDocument();
+});
+
+
+it("uses meaningful outcomes and compact accessible clearing without made-up processed totals", async () => {
+  configureActivity(true);
+  const completed = { ...job, label: "Matching albums", status: "complete", mode: "matching", intent: "match", processed: 0, total: 10, outcome: "10 matched" };
+  vi.stubGlobal("fetch", vi.fn(activityFetch(completed)));
+  render(<ActivityMonitor/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+  expect(await screen.findByText("Album matching")).toBeInTheDocument();
+  expect(screen.getByText("10 matched")).toBeInTheDocument();
+  expect(screen.queryByText(/0 \/ 10/)).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Clear Album matching" })).toHaveTextContent("×");
+});
+
+it("passes the priority cursor when opening older history", async () => {
+  configureActivity(true);
+  const fetch = vi.fn(async (url: string) => ({ ok: true, json: async () => url.startsWith("/api/activity/history") ? { ...mockHistory(), next_before: 30, next_priority: 1, snapshot: 50 } : { jobs: [] } }));
+  vi.stubGlobal("fetch", fetch);
+  render(<ActivityMonitor/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Older" }));
+  await waitFor(() => expect(fetch.mock.calls.some(([url]) => url.includes("before=30") && url.includes("priority=1") && url.includes("snapshot=50"))).toBe(true));
+});
+
+it("offers retry after a history error without showing a permanent loading message", async () => {
+  configureActivity(true);
+  let failed = true;
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+    if (url.startsWith("/api/activity/history") && failed) return { ok: false, status: 503, json: async () => ({ error: "History temporarily unavailable" }) };
+    return { ok: true, json: async () => url.startsWith("/api/activity/history") ? mockHistory() : { jobs: [] } };
+  }));
+  render(<ActivityMonitor/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("History temporarily unavailable");
+  expect(screen.queryByText("Loading activity…")).not.toBeInTheDocument();
+  failed = false;
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("region", { name: "Recent activity" })).toBeInTheDocument();
+});
+
+it("opens a successful preflight from the action details without a second feed entry", async () => {
+  configureActivity(true);
+  const actual = { ...job, id: "applied-with-check", status: "complete", check_id: "quiet-check" };
+  const check = { ...job, id: "quiet-check", label: "Checking album import", status: "complete", is_check: true };
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => ({ ok: true, json: async () => url.startsWith("/api/activity/history") ? mockHistory(actual) : url === "/api/activity" ? { jobs: [] } : url.endsWith("quiet-check") ? check : actual })));
+  render(<ActivityMonitor/>);
+  fireEvent.click(await screen.findByRole("button", { name: "Activity" }));
+  fireEvent.click(await screen.findByRole("button", { name: /Refreshing files Library/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "View preflight checks" }));
+  expect(await screen.findByRole("dialog", { name: "Checking album import" })).toBeInTheDocument();
 });

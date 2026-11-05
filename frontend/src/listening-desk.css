@@ -717,9 +717,24 @@ body:has(.modal[data-review-modal]) .page-activity { display: none; }
 
 .desk-album-open .album-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .album-title-line strong { min-width: 0; }
-.inbox-source-pill { display: inline-block; flex: 0 1 auto; min-width: 0; max-width: min(140px, 45%); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; line-height: 18px; font-weight: 400; }
+.desk-album-open:has(.inbox-source-pill)>span:last-child { flex: 1; }
+.inbox-source-pill { display: inline-block; flex: 0 0 auto; min-width: 0; max-width: min(140px, 45%); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; line-height: 18px; font-weight: 400; }
 
 .page-inbox .segmented { max-width: 100%; overflow-x: auto; white-space: nowrap; }
 .page-inbox .segmented button { flex-shrink: 0; }
 
 .activity-feed{max-height:180px;max-height:min(180px,calc(100dvh - 180px));overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+
+.activity-feed article { gap: 6px; min-height: 56px; }
+.activity-feed .activity-open { display: flex; align-items: center; gap: 9px; min-height: 40px; }
+.activity-item-copy { display: grid; min-width: 0; flex: 1; gap: 3px; }
+.activity-item-copy strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; display: block; font-size: 13px; }
+.activity-item-copy .activity-repeat { margin-left: 6px; }
+.activity-item-copy small { color: var(--muted); font-size: 12px; }
+.activity-feed time { flex: none; white-space: nowrap; font-size: 11px; color: var(--muted); }
+.activity-state { flex: none; width: 16px; text-align: center; font-size: 13px; color: var(--muted); }
+.activity-state.running { color: var(--accent); }
+.activity-state.attention { color: var(--warning, #d7ab62); font-weight: 600; }
+.activity-feed .activity-clear { width: 24px; height: 32px; min-height: 32px; font-size: 18px; color: var(--muted); }
+.activity-feed .activity-clear:disabled { visibility: hidden; }
+@media(max-width:640px) { .activity-feed .activity-clear { width: 32px; min-height: 44px; } }
