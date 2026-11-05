@@ -759,11 +759,9 @@ def main() -> None:
             page.get_by_label("Select As Is",exact=True).click()
         assert saved_choice.value.ok
         page.wait_for_function("[...document.querySelectorAll('.as-is input')].some(node=>node.checked)")
-        page.get_by_role("checkbox",name="Select album Copy Lifecycle",exact=True).check()
-        page.get_by_role("button",name="Import selected",exact=True).click()
-        page.get_by_role("button",name="Start import",exact=True).click()
-        page.get_by_role("heading",name="Import results",exact=True).wait_for()
-        page.get_by_role("button",name="Close results",exact=True).click()
+        # Exercise the individual inspector action, including its saved Activity preflight.
+        inspector = page.get_by_role("region", name="Copy Lifecycle", exact=True)
+        inspector.get_by_role("button", name="Import to Library", exact=True).click()
         copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
         assert all(sha256(path)==originals[path] for path in copy_sources)
         imported=page.request.get(inbox_base+"/queue?status=imported&q=Copy+Lifecycle").json()["albums"][0]
@@ -1022,7 +1020,7 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True, "discovery_reconnects_inline": True,
+        "single_inbox_inspector_import": True, "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True, "discovery_reconnects_inline": True,
         "expected_reconnect_console_errors": expected_reconnect_errors,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,

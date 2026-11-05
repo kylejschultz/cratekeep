@@ -320,6 +320,8 @@ code{overflow-wrap:anywhere}
 .dialog>header h2{font-size:20px}
 .notice{background:var(--surface-2);border:1px solid var(--border);border-radius:4px;font-size:13px}
 .notice.error{background:var(--danger);border-color:var(--error)}
+.dialog>footer:has(.review-error){flex-wrap:wrap}
+.dialog>footer .review-error{flex:0 0 100%;margin:0;overflow-wrap:anywhere}
 .notice.success{background:var(--success);border-color:var(--border)}
 .bulk-import-dialog{width:min(720px,calc(100vw - 32px));max-height:85vh;padding:0;color:var(--text);background:var(--surface);border:1px solid var(--control);border-radius:8px;overflow:auto}
 .bulk-import-dialog::backdrop{background:#000a}

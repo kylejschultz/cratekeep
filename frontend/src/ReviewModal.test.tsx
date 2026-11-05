@@ -139,8 +139,11 @@ describe("ReviewModal matching and evidence", () => {
     expect(screen.queryByLabelText("Duplicate decision")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Tag writer temporarily unavailable Retry is available.");
-    expect(screen.getByRole("button", { name: "Retry import" })).toBeEnabled();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Tag writer temporarily unavailable Retry is available.");
+    const retry = screen.getByRole("button", { name: "Retry import" });
+    expect(retry).toBeEnabled();
+    expect(retry.closest("footer")).toContainElement(alert);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(requests).toEqual([
       { url: "/api/library-import/albums/1/execute", body: { candidate_id: 2, dry_run: true } },
