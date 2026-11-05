@@ -119,6 +119,43 @@ def match_selected(page, endpoint, evidence_dir, *, cooldown=False, expected_mat
     return SimpleNamespace(ok=matched.value.ok, request=SimpleNamespace(post_data_json=step["body"]))
 
 
+def check_setup_screen(base, app_library, evidence):
+    # Check the real first-run page before the existing setup POST configures it.
+    with sync_playwright() as playwright:
+        executable = os.environ.get("CHROMIUM_EXECUTABLE")
+        browser = playwright.chromium.launch(executable_path=executable) if executable else playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(base + "/setup")
+        page.get_by_role("heading", name="Set up Cratekeep", exact=True).wait_for()
+        assert page.locator("html").get_attribute("data-theme") == "dark"
+        for theme in ("dark", "light"):
+            if page.locator("html").get_attribute("data-theme") != theme:
+                page.get_by_role("button", name="Dark mode", exact=True).click()
+            for width in (1440, 390):
+                page.set_viewport_size({"width": width, "height": 900})
+                page.wait_for_function('document.fonts.status === "loaded"')
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                assert page.locator("h1").evaluate('n => getComputedStyle(n).fontFamily.includes("Public Sans")')
+                if width == 390:
+                    page.mouse.move(380, 600); page.mouse.wheel(0, 2000)
+                    page.wait_for_function('scrollY > 0')
+                    page.wait_for_function("""(()=>{const n=document.querySelector('button[type="submit"]');const r=n.getBoundingClientRect();return r.top>=0&&r.bottom<=innerHeight})()""")
+                    page.mouse.wheel(0, -3000); page.wait_for_function('scrollY === 0')
+                page.screenshot(path=evidence / f"00-setup-{theme}-{width}.png", full_page=True)
+        page.locator("#library_path").fill(app_library)
+        page.locator('[data-open-picker="library_path"]').click()
+        page.get_by_role("dialog", name="Select a directory", exact=True).wait_for()
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=evidence / "00-setup-directory-browser.png", full_page=True)
+        page.get_by_role("button", name="Close directory browser", exact=True).click()
+        assert page.locator("#library_path").input_value() == app_library
+        assert page.evaluate('localStorage.getItem("cratekeep-theme")') == "light"
+        assert not errors, errors
+        browser.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8788")
@@ -152,6 +189,7 @@ def main() -> None:
             tags.album = f"A Scope {index:02d}"; tags.title = "Song"; tags.save()
     before = {"inbox_untagged": sha256(inbox_untagged), "inbox": sha256(inbox_track), "library": sha256(library_track),
               "library_bulk": sha256(library_bulk_track)}
+    check_setup_screen(base, args.app_library, args.evidence_dir)
     post_form(f"{base}/setup", {"inbox_path": args.app_inbox, "library_path": args.app_library, "match_threshold": "90"})
 
     page_errors: list[str] = []

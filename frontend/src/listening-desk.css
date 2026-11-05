@@ -738,3 +738,5 @@ body:has(.modal[data-review-modal]) .page-activity { display: none; }
 .activity-feed .activity-clear { width: 24px; height: 32px; min-height: 32px; font-size: 18px; color: var(--muted); }
 .activity-feed .activity-clear:disabled { visibility: hidden; }
 @media(max-width:640px) { .activity-feed .activity-clear { width: 32px; min-height: 44px; } }
+
+@media(max-width:640px){.metadata-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 16px;overflow:visible}.metadata-tabs button{text-align:left;min-width:0}}

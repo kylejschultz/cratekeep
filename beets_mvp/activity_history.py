@@ -30,6 +30,8 @@ def operation_details(steps, mode):
         intent, label = 'match', 'Matching albums'
     elif mode == 'import' or path.endswith('/execute') or path.endswith('/bulk/preview'):
         intent, label = 'import', 'Importing albums'
+    elif '/removal/' in path:
+        intent, label = ('library-delete', 'Deleting Library files') if body.get('delete_files') else ('unmanage', 'Removing album from Library')
     elif '/metadata/' in path:
         moving = bool(body.get('location'))
         intent, label = ('move', 'Moving album files') if moving else ('metadata', 'Saving metadata')
@@ -44,7 +46,7 @@ def operation_details(steps, mode):
             intent, label = 'inbox-files', 'Updating Inbox files'
     else:
         return {}
-    return dict(intent=intent, label=('Checking ' + {'import': 'album import', 'metadata': 'metadata changes', 'move': 'file moves', 'artwork': 'album artwork', 'delete': 'Inbox files', 'undo': 'import undo'}.get(intent, 'albums')) if check else label, is_check=check)
+    return dict(intent=intent, label=('Checking ' + {'import': 'album import', 'metadata': 'metadata changes', 'move': 'file moves', 'artwork': 'album artwork', 'delete': 'Inbox files', 'undo': 'import undo', 'unmanage': 'Library removal', 'library-delete': 'Library removal'}.get(intent, 'albums')) if check else label, is_check=check)
 
 
 def outcome(job):
@@ -59,11 +61,12 @@ def outcome(job):
     if job.get('mode') == 'import':
         imported = sum(row.get('status') == 'imported' for row in rows)
         return f'{imported} imported' if imported else None
-    if job.get('intent') in ('delete', 'undo'):
+    if job.get('intent') in ('delete', 'undo', 'unmanage', 'library-delete'):
         removed = [row.get('result', {}).get('removed') for row in rows]
         if removed and all(isinstance(value, list) for value in removed):
             count = sum(map(len, removed))
-            return f'{count} file' + ('' if count == 1 else 's') + ' removed'
+            unit = 'track' if job.get('intent') in ('unmanage', 'library-delete') else 'file'
+            return f'{count} {unit}' + ('' if count == 1 else 's') + ' removed'
     return None
 
 
@@ -100,11 +103,11 @@ class History:
             # Restart interruption is resolved by Activity before history is opened.
             db.execute("UPDATE activity_jobs SET history_status=json_extract(snapshot,'$.status') WHERE history_status IN ('queued','running','waiting','stopping')")
             # Upgrade proven legacy requests once; unrecognized history keeps its labels.
-            for job_id, snapshot in db.execute('SELECT id,snapshot FROM activity_jobs WHERE history_presentation=0'):
+            for job_id, snapshot in db.execute('SELECT id,snapshot FROM activity_jobs WHERE history_presentation<2'):
                 job = json.loads(snapshot)
                 if not job.get('intent'):
                     job.update(operation_details(job.get('steps'), job.get('mode')))
-                db.execute('UPDATE activity_jobs SET snapshot=?,history_group=?,history_presentation=1 WHERE id=?', (json.dumps(job), group_key(job), job_id))
+                db.execute('UPDATE activity_jobs SET snapshot=?,history_group=?,history_presentation=2 WHERE id=?', (json.dumps(job), group_key(job), job_id))
                 self.compact_check(db, job)
             # Existing scan rows are reclassified once. Only proven zero-arrival
             # successes can be compacted; unknown older outcomes remain accessible.

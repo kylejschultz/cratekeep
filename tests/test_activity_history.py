@@ -1,4 +1,5 @@
 """History is unbounded, grouped and clearable without removing execution evidence."""
+import pytest
 from beets_mvp.activity import Activity
 from test_app import make_app
 from test_activity import submit, wait
@@ -301,3 +302,53 @@ def test_multi_inbox_bulk_previews_are_quiet_and_linked_to_one_import(tmp_path):
     assert len(history) == 1 and history[0]['count'] == 1
     assert history[0]['latest']['outcome'] == '3 imported'
     assert all(service.get(check)['result']['ready'] == 'retained' for check in checks)
+
+
+@pytest.mark.parametrize('delete_files', [False, True])
+def test_library_removal_has_one_accurate_entry_with_its_check_and_original_guards(tmp_path, delete_files):
+    from test_app import managed_wav_album
+    app = make_app(tmp_path); client = app.test_client(); service = app.extensions['activity']
+    library, album, paths = managed_wav_album(app, tmp_path)
+    before = {path: path.read_bytes() for path in paths}
+    fingerprint = client.get(f'/api/library/albums/{album.id}').json['fingerprint']
+    check = submit(client, [{'path': f'/api/library/albums/{album.id}/removal/preview', 'body': {'expected_fingerprint': fingerprint}}], request_id='library-removal-check')
+    checked = wait(client, check['id'])
+    assert checked['is_check'] and checked['status'] == 'complete'
+    assert service.history.page()['groups'] == []
+    request_body = {'request_id': 'library-removal-apply', 'check_id': check['id'], 'steps': [{
+        'path': f'/api/library/albums/{album.id}/removal/apply',
+        'body': {'preview_id': checked['result']['preview_id'], 'expected_fingerprint': fingerprint, 'delete_files': delete_files, 'confirmed': True}}]}
+    accepted = client.post('/api/activity', json=request_body)
+    assert accepted.status_code == 202, accepted.json
+    finished = wait(client, accepted.json['id'])
+    assert finished['status'] == 'complete' and finished['check_id'] == check['id']
+    assert finished['intent'] == ('library-delete' if delete_files else 'unmanage')
+    groups = service.history.page()['groups']
+    assert len(groups) == 1 and groups[0]['latest']['outcome'] == '2 tracks removed'
+    assert not list(library.items())
+    if delete_files:
+        assert all(not path.exists() for path in paths)
+    else:
+        assert {path: path.read_bytes() for path in paths} == before
+    repeated = client.post('/api/activity', json=request_body).json
+    assert repeated['id'] == finished['id'] and repeated['result'] == finished['result']
+    assert service.get(check['id'])['result']['preview_id'] == checked['result']['preview_id']
+
+
+def test_library_removal_checks_upgrade_v1_history_but_preserve_failures_and_receipts(tmp_path):
+    import json
+    app = make_app(tmp_path); service = app.extensions['activity']
+    ids = []
+    for state in ['complete', 'failed']:
+        job = service.new_external('Updating library files', 'Library', '/library')
+        service.finish(job['id'], state, result={'receipt': state})
+        saved = service.get(job['id']);saved['steps'] = [{'path': '/api/library/albums/1/removal/preview', 'body': {}}]
+        with service.db() as db:
+            db.execute('UPDATE activity_jobs SET snapshot=?,history_presentation=1 WHERE id=?', (json.dumps(saved), job['id']))
+        ids.append(job['id'])
+    restarted = Activity(app); groups = restarted.history.page()['groups']
+    assert len(groups) == 1 and groups[0]['latest']['id'] == ids[1]
+    assert groups[0]['attention'] == 1 and groups[0]['label'] == 'Checking Library removal'
+    assert restarted.get(ids[0])['result'] == {'receipt': 'complete'}
+    with restarted.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM activity_jobs WHERE history_presentation=2').fetchone()[0] == 2

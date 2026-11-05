@@ -41,6 +41,7 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
   const [removing, setRemoving] = useState(false), [removalResult, setRemovalResult] = useState<any>(null);
   const [pending, setPending] = useState(false);
   const region = useRef<HTMLDivElement>(null);
+  const removalCheck = useRef<string | undefined>(undefined);
   const busy = pending || removing;
   useEffect(() => { onBusyChange(busy); }, [busy, onBusyChange]);
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
@@ -48,14 +49,14 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
   const previewRemoval = async () => {
     setError(""); setDeleteFiles(false); setRemovalResult(null);
     setPending(true);
-    try { setRemoval(await api<any>(`/api/library/albums/${id}/removal/preview`, { method: "POST", body: JSON.stringify({ expected_fingerprint: album.fingerprint }) })); }
+    try { setRemoval(await api<any>(`/api/library/albums/${id}/removal/preview`, { method: "POST", body: JSON.stringify({ expected_fingerprint: album.fingerprint }) }, job => { removalCheck.current = job.id; })); }
     catch (reason) { setError((reason as Error).message); } finally { setPending(false); }
   };
   const removeAlbum = async () => {
     setRemoving(true); setError("");
     setPending(true);
     try {
-      const result = await api<any>(`/api/library/albums/${id}/removal/apply`, { method: "POST", body: JSON.stringify({ preview_id: removal.preview_id, expected_fingerprint: removal.fingerprint, delete_files: deleteFiles, confirmed: true }) });
+      const result = await api<any>(`/api/library/albums/${id}/removal/apply`, { method: "POST", body: JSON.stringify({ preview_id: removal.preview_id, expected_fingerprint: removal.fingerprint, delete_files: deleteFiles, confirmed: true }) }, undefined, removalCheck.current);
       setRemovalResult(result);
       if (result.status === "complete") notify(result.message);
     } catch (reason) { setError((reason as Error).message); } finally { setRemoving(false); setPending(false); }
@@ -88,7 +89,7 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
 
     {preview && <div className="subpanel"><h3>{preview.kind === "artwork" ? "Artwork preview" : "Metadata preview"}</h3>{preview.kind === "artwork" && <img className="art-preview" src={`/api/library/albums/${id}/artwork/previews/${preview.preview_id}`} alt="Proposed cover artwork"/>}<p>{preview.message || (preview.applicable === false ? "This match cannot be applied safely." : "Preview is ready to apply.")}</p></div>}
   </>}</fieldset></div><footer className="record-action-footer" aria-label="Album actions">
-    {removalResult ? <button type="button" disabled={busy} onClick={() => location.reload()}>Refresh Library</button> : removal ? <><button className="secondary" type="button" disabled={busy} onClick={() => setRemoval(null)}>Cancel removal</button><button className="danger-action" type="button" disabled={busy} onClick={() => void removeAlbum()}>{removing ? "Removing…" : deleteFiles ? "Delete listed files and remove album" : "Remove from Cratekeep; keep files"}</button></> : preview ? <><button className="secondary" type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel</button><button type="button" disabled={busy || preview.applicable === false} onClick={preview.kind === "artwork" ? applyArtwork : applyPreview}>Apply {preview.kind === "artwork" ? "artwork" : "rematch"}</button></> : album ? <button className="secondary danger-action" type="button" disabled={busy} onClick={() => void previewRemoval()}>Remove from library</button> : null}
+    {removalResult ? <button type="button" disabled={busy} onClick={() => location.reload()}>Refresh Library</button> : removal ? <><button key="cancel-removal" autoFocus className="secondary" type="button" disabled={busy} onClick={() => setRemoval(null)}>Cancel removal</button><button className="danger-action" type="button" disabled={busy} onClick={() => void removeAlbum()}>{removing ? "Removing…" : deleteFiles ? "Delete listed files and remove album" : "Remove from Cratekeep; keep files"}</button></> : preview ? <><button className="secondary" type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel</button><button type="button" disabled={busy || preview.applicable === false} onClick={preview.kind === "artwork" ? applyArtwork : applyPreview}>Apply {preview.kind === "artwork" ? "artwork" : "rematch"}</button></> : album ? <button className="secondary danger-action" type="button" disabled={busy} onClick={() => void previewRemoval()}>Remove from library</button> : null}
   </footer></div>{editing && album && <MetadataEditor album={album} onClose={() => setEditing(false)} onBusyChange={onBusyChange} onSaved={updated => { setAlbum(updated); setEditing(false); notify("Metadata saved."); }}/>}</div>;
 }
 

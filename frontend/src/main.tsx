@@ -7,6 +7,7 @@ import { Page } from "./pages";
 import type { Bootstrap } from "./types";
 import "./styles.css";
 import "./listening-desk.css";
+import "./setup.css";
 
 declare global { interface Window { __CRATEKEEP_BOOTSTRAP__: Bootstrap } }
 const boot = window.__CRATEKEEP_BOOTSTRAP__;

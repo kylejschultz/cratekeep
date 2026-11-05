@@ -18,11 +18,11 @@ function stateText(job: ActivityJob) {
   if (job.scan_added) return workCount(job);
   if (!job.intent && job.files_found != null) return `Finished · ${workCount(job)}`;
   if (job.is_check) return "Check complete";
-  return job.outcome || ({ import: "Imported", metadata: "Saved", move: "Moved", artwork: "Saved", delete: "Deleted", undo: "Undone" }[job.intent || ""] || (job.status === "complete" ? "Finished" : job.status));
+  return job.outcome || ({ import: "Imported", metadata: "Saved", move: "Moved", artwork: "Saved", delete: "Deleted", undo: "Undone", unmanage: "Removed", "library-delete": "Deleted" }[job.intent || ""] || (job.status === "complete" ? "Finished" : job.status));
 }
 function feedTitle(item: Group) {
   if (item.latest.is_check || !item.latest.intent) return item.label;
-  return ({ import: "Album import", match: "Album matching", metadata: "Metadata changes", move: "File moves", artwork: "Album artwork", delete: "Inbox deletion", undo: "Import undo", "inbox-files": "Inbox files" }[item.latest.intent] || item.label);
+  return ({ import: "Album import", match: "Album matching", metadata: "Metadata changes", move: "File moves", artwork: "Album artwork", delete: "Inbox deletion", undo: "Import undo", "inbox-files": "Inbox files", unmanage: "Library removal", "library-delete": "Library deletion" }[item.latest.intent] || item.label);
 }
 async function clearHistory(values: { group?: string; ids?: string[] }) {
   await api("/api/activity/history/clear", { method: "POST", body: JSON.stringify(values) });
