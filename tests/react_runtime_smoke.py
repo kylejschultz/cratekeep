@@ -605,7 +605,7 @@ def main() -> None:
         assert removed_credit.status == 200, removed_credit.json()
         assert "Alias fixture" not in removed_credit.json()["album"]["albumartists"]
         artist_page.goto(base + "/library?view=artists&q=Alias%20fixture")
-        artist_page.get_by_text("No records in this view", exact=True).wait_for()
+        artist_page.get_by_text("No artists in this view", exact=True).wait_for()
         artist_page.close()
         saved_credit_id = removed_credit.json()["changes"][0]["item_id"]
         saved_credit_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_credit_id)
