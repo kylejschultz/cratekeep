@@ -587,8 +587,9 @@ def main() -> None:
             artist_page.goto(base + "/library?view=artists")
             artist_page.get_by_role("textbox", name="Search library").fill(name)
             artist_page.get_by_role("button", name="Search", exact=True).click()
-            artist_page.wait_for_function("name => window.__CRATEKEEP_BOOTSTRAP__.data.query === name", arg=name)
+            artist_page.wait_for_function("name => window.__CRATEKEEP_BOOTSTRAP__?.data.query === name", arg=name)
             artist_page.locator(".artist-row").filter(has_text=name).click()
+            artist_page.get_by_role("heading", name="Browse albums").wait_for()
             assert artist_page.evaluate("window.__CRATEKEEP_BOOTSTRAP__.data.albums"
                                         ".find(album => album.album === 'Bulk Ready').id") == credited_album["id"]
             artist_page.locator(".album-card").filter(has_text="Bulk Ready").click()
