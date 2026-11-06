@@ -347,7 +347,12 @@ class Activity:
                                 if last_status >= 500:
                                     event.set()
                         else:
-                            rows[index]['status'] = 'complete' if last_status < 400 and not (last_result.get('errors') or last_result.get('failed') or last_result.get('cleanup', {}).get('errors')) else 'failed'
+                            # Refresh reports cleanup errors in an object. Duplicate imports
+                            # return a list of cleanup records as part of their receipt.
+                            cleanup = last_result.get('cleanup')
+                            cleanup_errors = cleanup.get('errors') if isinstance(cleanup, dict) else None
+                            has_errors = last_result.get('errors') or last_result.get('failed') or cleanup_errors
+                            rows[index]['status'] = 'complete' if last_status < 400 and not has_errors else 'failed'
                             if last_status >= 400:
                                 rows[index]['reason'] = last_result.get('error', 'Operation failed.')
                         if mode != 'matching':
