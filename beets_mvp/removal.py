@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 
 from flask import jsonify, request
 
+from .activity import report as report_progress
+
 from . import (
     AUDIO_EXTENSIONS, ManagedMutationError, _album_items, _connect, _library,
     _now, _require_current_album, _validated_library_root, _managed_path,
@@ -44,9 +46,12 @@ def _plan(app, album) -> dict:
     root = _validated_library_root(app)
     tracks, blocked = [], []
     owners = {}
+    report_progress("Checking Library file ownership")
     for item in _library(app).items():
         owners.setdefault(str(Path(os.fsdecode(item.path)).resolve()), []).append(item.id)
-    for item in _album_items(album):
+    items = _album_items(album)
+    for index, item in enumerate(items):
+        report_progress("Checking Library tracks", index, len(items), unit="tracks")
         raw = os.fsdecode(item.path)
         track = {"id": item.id, "title": item.title, "path": raw,
                  "relative_path": os.path.relpath(raw, root), "file_state": None}
@@ -197,11 +202,13 @@ def _apply(app, album_id: int, values: dict) -> dict:
                        (json.dumps(progress), row["id"]))
     save_progress(None)
     if not values["delete_files"]:
+        report_progress("Removing album from catalog")
         with library.transaction():
             album.remove(delete=False)
         removed = plan["tracks"]
     else:
-        for track, item in zip(plan["tracks"], items):
+        for index, (track, item) in enumerate(zip(plan["tracks"], items)):
+            report_progress("Deleting Library tracks", index, len(items), unit="tracks", current=Path(track["path"]).name)
             file_deleted = False
             try:
                 _safe_delete_path(Path(plan["root"]), track["path"])
@@ -217,6 +224,7 @@ def _apply(app, album_id: int, values: dict) -> dict:
             except (OSError, ValueError, sqlite3.Error) as exc:
                 errors.append({"path": track["relative_path"], "file_deleted": file_deleted, "error": str(exc)})
                 break
+    report_progress("Updating Library catalog")
     _reconcile(app, {**plan, "album_id": album_id}, removed)
     if not values["delete_files"]:
         _queue_kept_tracks(app, plan)

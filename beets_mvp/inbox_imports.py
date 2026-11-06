@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 
 from flask import jsonify, request
 
+from .activity import report as report_progress
+
 
 def init_schema(db):
     db.execute("""CREATE TABLE IF NOT EXISTS inbox_copy_imports (
@@ -202,7 +204,9 @@ def _unimported_plan(app, inbox, values, source_root, library_root):
                       for source in json.loads(receipt['manifest_json'])['sources'] if not source.get('deleted')}
     with _connect(app.config['APP_DB']) as db:
         _check_import_idle(db, source_root)
-        for album_id in sorted(set(ids)):
+        album_ids = sorted(set(ids))
+        for index, album_id in enumerate(album_ids):
+            report_progress("Checking selected Inbox albums", index, len(album_ids), unit="albums")
             album = db.execute("SELECT * FROM album_reviews WHERE id=? AND source_kind='inbox' AND source_id=? AND root_path=?",
                                (album_id,inbox['id'],str(source_root))).fetchone()
             if album is None or album['execution_status'] != 'not-run':
@@ -284,7 +288,8 @@ def _plan(app, inbox, values):
     else:
         raise ValueError('Choose an imported job to undo.')
     library = _library(app)
-    for job_id in receipt_ids:
+    for index, job_id in enumerate(receipt_ids):
+        report_progress("Checking import receipts", index, len(receipt_ids), unit="albums")
         receipt = by_id[job_id]
         manifest = json.loads(receipt['manifest_json'])
         versions[str(job_id)] = receipt['manifest_json']
@@ -323,10 +328,12 @@ def _plan(app, inbox, values):
                     if (item is None or Path(os.fsdecode(item.path)).resolve() != library_root / destination['path']
                             or not _path(library_root, destination['path']).is_file()):
                         raise ValueError('A Library copy is missing or unmanaged; keep its Inbox original and inspect the import.')
+                    report_progress('Verifying Library copies', current=Path(destination['path']).name)
                     guards.append({'job_id':job_id,'item_id':item.id,'path':destination['path'], 'identity':identity(_path(library_root, destination['path']))})
             for index, source in enumerate(manifest['sources']):
                 if source.get('deleted'):
                     continue
+                report_progress('Checking Inbox originals', current=Path(source['path']).name)
                 if not _unchanged(receipt['source_root'], source, full=True):
                     raise ValueError('An imported Inbox original changed or is missing; refresh and review it instead.')
                 writes.append({'root': receipt['source_root'], **source, 'job_id':job_id,
@@ -357,6 +364,7 @@ def _folder_companions(root, folders, sources):
         # Files stored directly in Inbox never authorize clearing the Inbox root.
         if folder == Path('.') or any(parent == folder or parent in folder.parents for parent in covered):
             continue
+        report_progress('Checking accompanying files', current=folder.name)
         directory = _path(root, folder.as_posix(), ancillary=True)
         if not directory.exists():  # A completed portion of a partial action may already be pruned.
             continue
@@ -432,7 +440,10 @@ def _apply(app, inbox, values):
                       (json.dumps(result),row['id'])).rowcount != 1:
             raise ValueError('This action is already running.')
     library = _library(app)
-    for target in current['files']:
+    targets = current['files']
+    stage = 'Removing imported Library copies' if current['kind'] == 'undo' else 'Deleting Inbox files'
+    for index, target in enumerate(targets):
+        report_progress(stage, index, len(targets), current=Path(target['path']).name)
         file_deleted = False
         try:
             path = _path(target['root'], target['path'], artwork=target.get('artifact',False), ancillary=target.get('ancillary',False))
@@ -490,6 +501,7 @@ def _apply(app, inbox, values):
                          if (entry['location'],entry['path']) not in removed]
     result['status'] = 'partial' if result['errors'] else 'complete'
     try:
+        report_progress('Refreshing Inbox after removal')
         _scan_inbox_inventory(app, inbox, scopes=current['refresh_scopes'])
         result['directory_cleanup'] = _cleanup_inbox_directories(app,inbox,scopes=current['refresh_scopes'])
     except (OSError,ValueError) as exc:
@@ -499,6 +511,7 @@ def _apply(app, inbox, values):
                          'Import undone; originals are ready in Inbox.' if current['kind']=='undo' else
                          'Selected Inbox files permanently deleted without importing. Library files were kept.' if current['kind'] in {'delete-albums','delete-track'} else
                          'Selected Inbox originals deleted; Library files were kept.')
+    report_progress('Saving removal results')
     with _connect(app.config['APP_DB']) as db:
         db.execute('UPDATE inbox_file_actions SET status=?,result_json=? WHERE id=?', (result['status'],json.dumps(result),row['id']))
     return result

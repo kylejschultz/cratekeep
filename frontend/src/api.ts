@@ -74,6 +74,9 @@ export function workCount(job: ActivityJob) {
   if (job.scan_added) return `${job.scan_added} new ${job.scan_added === 1 ? "track" : "tracks"}`;
   if (job.mode === "batch") return `${job.processed} / ${job.total} Inboxes`;
   if (["matching", "import"].includes(job.mode || "")) return `${job.processed} / ${job.total} albums`;
+  if (activityRunning(job) && job.stage_total != null && job.stage_done != null) {
+    return `${job.stage_done} / ${job.stage_total} ${job.stage_unit || "files"} processed`;
+  }
   if (job.files_found != null) return `${job.files_found} tracks found`;
   if (job.stage_done == null) return "";
   return `${job.stage_done}${job.stage_total != null ? ` / ${job.stage_total}` : ""} ${job.stage_unit || "files"}${job.stage_total == null ? " found" : " processed"}`;

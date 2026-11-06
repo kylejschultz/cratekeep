@@ -2800,6 +2800,7 @@ def _replace_managed_artwork(app: Flask, items: list[Item], jpeg: bytes) -> dict
             )
     sidecar_backups: dict[Path, Path | None] = {}
     embedded_backups: dict[Path, Path] = {}
+    report_progress("Preparing artwork backups")
     try:
         if destinations["sidecar"]:
             for destination in sidecar_paths:
@@ -2821,11 +2822,13 @@ def _replace_managed_artwork(app: Flask, items: list[Item], jpeg: bytes) -> dict
     touched_embedded: list[Path] = []
     try:
         if destinations["sidecar"]:
-            for destination in sidecar_paths:
+            for index, destination in enumerate(sidecar_paths):
+                report_progress("Writing cover files", index, len(sidecar_paths))
                 touched_sidecars.append(destination)
                 _atomic_sidecar_write(destination, jpeg)
         if destinations["embedded"]:
-            for path in paths:
+            for index, path in enumerate(paths):
+                report_progress("Embedding artwork", index, len(paths), unit="tracks", current=path.name)
                 touched_embedded.append(path)
                 media = MediaFile(str(path))
                 media.images = [MediaImage(jpeg, desc="Front cover", type=ImageType.front)]
@@ -3070,20 +3073,24 @@ def _mutate_managed_items(
                 while parent != root and root in parent.parents and not parent.exists():
                     created_dirs.add(parent)
                     parent = parent.parent
-        for item, original, _ in snapshots:
+        for index, (item, original, path) in enumerate(snapshots):
             if original:
+                report_progress("Writing track tags", index, len(snapshots), unit="tracks", current=Path(path).name)
                 _write_metadata(item)
         # Create exclusively: a destination appearing after preflight must never
         # be overwritten. Keep a reverse journal until tags and DB commit.
         audio_moves = [(Path(path), target) for (_, _, path), target in zip(snapshots, destinations)
                        if Path(path) != target]
-        for source, target in companions + audio_moves:
+        moves = companions + audio_moves
+        for index, (source, target) in enumerate(moves):
+            report_progress("Moving Library files", index, len(moves), current=source.name)
             _copy_managed_exclusive(source, target)
             entry = [source, target, False, _file_identity(target)]
             moved.append(entry)
             source.unlink()
             entry[2] = True
-        for source, target in artwork:
+        for index, (source, target) in enumerate(artwork):
+            report_progress("Copying Library artwork", index, len(artwork))
             _copy_managed_exclusive(source, target)
             copied_art.append((target, _file_identity(target)))
         for (item, _, _), target in zip(snapshots, destinations):
@@ -3094,6 +3101,7 @@ def _mutate_managed_items(
             if replacement:
                 album_snapshot["artpath"] = album.artpath
                 album.artpath = os.fsencode(replacement)
+        report_progress("Saving Library metadata")
         for item, _, path in snapshots:
             item.store()
             if relocate_app is None and os.fsdecode(item.path) != path:
@@ -3367,6 +3375,7 @@ def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *,
         album_values["cratekeep_directory"] = chosen_directory
         album["cratekeep_directory"] = chosen_directory
     preview_snapshots = [(_MetadataPreviewItem(item, album), before, old) for item, before, old in snapshots]
+    report_progress("Checking tags and file destinations")
     destinations, companions, artwork = _managed_metadata_destinations(app, preview_snapshots, album, location=location_context)
     root = _validated_library_root(app)
     paths = [{"item_id": item.id, "from": str(Path(old).relative_to(root)), "to": str(target.relative_to(root))}
@@ -4291,13 +4300,13 @@ def _preview_library_inventory(app: Flask) -> dict:
     return summary
 
 
-def _library_audio_stats(root: Path, *, found: set[Path] | None = None) -> list[tuple[Path, os.stat_result]]:
+def _library_audio_stats(root: Path, *, found: set[Path] | None = None, stage="Finding tracks") -> list[tuple[Path, os.stat_result]]:
     if not root.is_dir():
         raise OSError("configured library path is not a directory")
     files = []
     if found is None:
         found = set()
-    report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
+    report_progress(stage, len(found), unit="tracks", files_found=len(found))
     for directory, names, filenames in os.walk(root, followlinks=False, onerror=_raise_os_error):
         names[:] = sorted(name for name in names if not (Path(directory) / name).is_symlink())
         for name in sorted(filenames):
@@ -4306,7 +4315,7 @@ def _library_audio_stats(root: Path, *, found: set[Path] | None = None) -> list[
                 continue
             files.append((path.resolve(), path.stat()))
             found.add(path.resolve())
-            report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
+            report_progress(stage, len(found), unit="tracks", files_found=len(found))
     return files
 
 
@@ -4958,6 +4967,7 @@ def _cleanup_inbox_directories(app: Flask, inbox: dict, *, scopes=None, ignore_a
             (inbox["id"], str(root), ignore_album_id, ignore_album_id),
         ).fetchall()
     protected = {_scope_for_relative_path(row["relative_path"]) for row in rows}
+    report_progress("Removing empty Inbox folders")
     return prune_empty_directories(root, scopes=scopes, protected=protected)
 
 
@@ -5773,7 +5783,8 @@ def _verify_inbox_move(
     problems = []
     seen_files: set[tuple[int, int]] = set()
     seen_path_keys: set[str] = set()
-    for relative in destinations:
+    for index, relative in enumerate(destinations):
+        report_progress("Verifying Library destinations", index, len(destinations), unit="tracks")
         candidate = library_root / relative
         try:
             resolved = candidate.resolve(strict=True)
@@ -5789,6 +5800,7 @@ def _verify_inbox_move(
             verified_paths.append(resolved)
         except OSError as exc:
             problems.append(f"{relative}: {exc}")
+    report_progress("Verifying Library catalog")
     records: dict[str, list[Item]] = {}
     for item in _library(app).items():
         try:
@@ -6526,6 +6538,7 @@ def _execute_inbox_album(
                                      for row, path in zip(rows, paths)]
                     artwork = _artwork_plan(app, provider_data, artwork_plans, skip_artwork=skip_artwork)
                     if artwork["status"] == "ready":
+                        report_progress("Downloading cover artwork")
                         artwork_bytes = app.config["ARTWORK_FETCHER"](provider_data)
                         embedded = _apply_inbox_embedded_artwork(app, paths, rows, artwork_bytes)
                         result["artwork"] = {
@@ -6551,6 +6564,7 @@ def _execute_inbox_album(
             execution_source = working
             staged_paths = paths
             try:
+                report_progress("Importing tracks with Beets")
                 execution = _run_beets_import(app, execution_source)
             except Exception as exc:
                 restored, moved = _restore_inbox_sources(backups, restore_missing=restore_staged_sources)
@@ -6853,7 +6867,7 @@ def _library_import_plans(
         }
     plans = []
     for index, ((position, row), path) in enumerate(zip(rows, paths)):
-        report_progress("Applying track metadata", index, len(paths), current=path.name)
+        report_progress("Checking track metadata", index, len(paths), current=path.name)
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
         if item is not None and Path(os.fsdecode(item.path)).resolve() != path:
             raise LibraryImportExecutionError(
@@ -7087,7 +7101,8 @@ def _apply_artwork(app: Flask, plans: list[dict], jpeg: bytes, summary: dict) ->
 def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
     library = _library(app)
     album_items = []
-    for plan in plans:
+    for index, plan in enumerate(plans):
+        report_progress("Saving tracks to Library", index, len(plans), unit="tracks", current=Path(plan["path"]).name)
         if plan["action"] == "skip":
             continue
         if plan["action"] == "merge":
@@ -7435,9 +7450,9 @@ def _inbox_scope_audio_stats(root: Path, scopes: list[str]) -> list[tuple[Path, 
                 if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS
             )
         else:
-            discovered.extend(_library_audio_stats(root / scope, found=found))
+            discovered.extend(_library_audio_stats(root / scope, found=found, stage="Scanning Inbox folders"))
         found.update(path for path, _ in discovered)
-        report_progress("Finding tracks", len(found), unit="tracks", files_found=len(found))
+        report_progress("Scanning Inbox folders", len(found), unit="tracks", files_found=len(found))
     return sorted(dict(discovered).items(), key=lambda item: str(item[0]).casefold())
 
 
