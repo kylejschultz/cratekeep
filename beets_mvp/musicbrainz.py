@@ -377,7 +377,8 @@ def _request_json(url: str, timeout: int) -> dict:
 
 
 def _normalize_release(release: dict, *, exact: bool) -> dict:
-    artist = _artist_credit_text(release.get("artist-credit"))
+    credits = _artist_credit_parts(release.get("artist-credit"))
+    artist = "".join(name + joinphrase for name, joinphrase, _ in credits).strip()
     media = []
     flattened = []
     for medium_index, source_medium in enumerate(release.get("media") or [], 1):
@@ -418,6 +419,7 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
     return {
         "provider_id": release.get("id", ""), "release_group_id": release_group.get("id"),
         "artist": artist, "album": release.get("title", ""), "date": date,
+        "album_artist_credits": [{"name": name, "id": artist_id} for name, _, artist_id in credits],
         "release_disambiguation": " ".join(str(release.get("disambiguation") or "").split()),
         "year": date[:4] if date else None, "track_count": release.get("track-count", len(flattened)),
         "release_type": release_group.get("primary-type"), "country": release.get("country"),
@@ -426,23 +428,29 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
     }
 
 
-def _artist_credit_text(credit: object) -> str:
-    """Join a MusicBrainz artist-credit without inventing malformed parts."""
+def _artist_credit_parts(credit: object) -> list[tuple[str, str, str]]:
     if not isinstance(credit, list):
-        return ""
+        return []
     pieces = []
     for part in credit:
         if not isinstance(part, dict):
-            return ""
+            return []
+        artist = part.get("artist")
+        artist = artist if isinstance(artist, dict) else {}
         name = part.get("name")
         if not isinstance(name, str) or not name.strip():
-            artist = part.get("artist")
-            name = artist.get("name") if isinstance(artist, dict) else ""
+            name = artist.get("name")
         if not isinstance(name, str) or not name.strip():
-            return ""
+            return []
         joinphrase = part.get("joinphrase")
-        pieces.append(name.strip() + (joinphrase if isinstance(joinphrase, str) else ""))
-    return "".join(pieces).strip()
+        artist_id = artist.get("id")
+        pieces.append((name.strip(), joinphrase if isinstance(joinphrase, str) else "",
+                       artist_id if isinstance(artist_id, str) else ""))
+    return pieces
+
+
+def _artist_credit_text(credit: object) -> str:
+    return "".join(name + joinphrase for name, joinphrase, _ in _artist_credit_parts(credit)).strip()
 
 
 def _genre_evidence(genres: object) -> dict:

@@ -50,6 +50,7 @@ from .duplicates import duplicate_matches
 AUDIO_EXTENSIONS = {".aac", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wv"}
 EDITABLE_FIELDS = {"title", "artist", "album", "albumartist", "genre", "year", "track", "disc", "artists", "albumartists"}
 ALBUM_EDITABLE_FIELDS = {"album", "albumartist", "albumartists", "genre", "year"}
+MATCHED_ALBUM_CREDIT_FIELDS = {"albumartist_credit", "albumartists_credit", "mb_albumartistid", "mb_albumartistids"}
 INTEGER_FIELDS = {"year", "track", "disc"}
 LIBRARY_ALBUM_PAGE_SIZE = 25
 MAX_LEGACY_ALBUM_PROMOTIONS = 100
@@ -2277,6 +2278,11 @@ def _promote_legacy_managed_albums(app: Flask) -> dict[str, int]:
     return {"groups": promoted_groups, "items": promoted_items}
 
 
+def _artist_memberships_json(stored: str | None, fallback: str) -> str:
+    names = [_normalize_metadata(name) for name in Item._fields["albumartists"].parse(stored or "")]
+    return json.dumps([name for name in names if name] or [_normalize_metadata(fallback)])
+
+
 def _library_page_data(
     app: Flask, query: str, sort: str, order: str, artist_filter: str = "",
     album_filter: str = "", page: int = 1, view: str = "albums", recent_limit: int = 5,
@@ -2296,21 +2302,42 @@ def _library_page_data(
         (SELECT NULLIF(fallback_items.artist, '') FROM items fallback_items
           WHERE fallback_items.album_id = albums.id ORDER BY fallback_items.id LIMIT 1),
         'Unknown artist')"""
+    # Expand only the stored album-level list. The first track provides the
+    # same legacy Album Artists fallback as the metadata editor.
+    artist_memberships = f"""WITH artist_memberships AS (
+        SELECT albums.id AS album_id, MIN(credit.value) AS artist, CASEFOLD(credit.value) AS artist_key
+        FROM albums, JSON_EACH(ARTIST_MEMBERSHIPS(
+            COALESCE(NULLIF(albums.albumartists, ''),
+                (SELECT first_item.albumartists FROM items first_item
+                 WHERE first_item.album_id = albums.id
+                 ORDER BY COALESCE(first_item.disc, 0), COALESCE(first_item.track, 0),
+                          METADATA_KEY(first_item.title), first_item.id LIMIT 1)),
+            {artist_expression}
+        )) AS credit
+        GROUP BY albums.id, CASEFOLD(credit.value)
+    )"""
     if query:
         escaped_query = query.casefold().replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped_query}%"
-        clauses.append(f"""(CASEFOLD({artist_expression}) LIKE ? ESCAPE '\\'
-                         OR CASEFOLD(COALESCE(albums.album, '')) LIKE ? ESCAPE '\\'
-                         OR EXISTS (SELECT 1 FROM items search_items
-                                     WHERE search_items.album_id = albums.id
-                                       AND (CASEFOLD(COALESCE(search_items.title, '')) LIKE ? ESCAPE '\\'
-                                            OR CASEFOLD(COALESCE(search_items.artist, '')) LIKE ? ESCAPE '\\')))""")
-        parameters.extend((pattern, pattern, pattern, pattern))
         if view == "artists":
-            clauses[-1] = f"CASEFOLD({artist_expression}) LIKE ? ESCAPE '\\'"
-            parameters = [pattern]
+            clauses.append("credits.artist_key LIKE ? ESCAPE '\\'")
+            parameters.append(pattern)
+        else:
+            clauses.append(f"""(CASEFOLD({artist_expression}) LIKE ? ESCAPE '\\'
+                             OR CASEFOLD(COALESCE(albums.album, '')) LIKE ? ESCAPE '\\'
+                             OR EXISTS (SELECT 1 FROM artist_memberships credits
+                                        WHERE credits.album_id = albums.id AND credits.artist_key LIKE ? ESCAPE '\\')
+                             OR EXISTS (SELECT 1 FROM items search_items
+                                         WHERE search_items.album_id = albums.id
+                                           AND (CASEFOLD(COALESCE(search_items.title, '')) LIKE ? ESCAPE '\\'
+                                                OR CASEFOLD(COALESCE(search_items.artist, '')) LIKE ? ESCAPE '\\')))""")
+            parameters.extend([pattern] * 5)
     if artist_filter:
-        clauses.append(f"CASEFOLD({artist_expression}) = ?")
+        if view == "artists":
+            clauses.append("credits.artist_key = ?")
+        else:
+            clauses.append("""EXISTS (SELECT 1 FROM artist_memberships credits
+                                      WHERE credits.album_id = albums.id AND credits.artist_key = ?)""")
         parameters.append(artist_filter.casefold())
     if album_filter:
         clauses.append("CASEFOLD(COALESCE(albums.album, '')) = ?")
@@ -2326,12 +2353,11 @@ def _library_page_data(
     ordering = ", ".join(f"{column} {direction}" for column in columns[sort])
     with _connect(app.config["BEETS_DB"]) as db:
         db.create_function("CASEFOLD", 1, lambda value: str(value or "").casefold(), deterministic=True)
-        matching = db.execute(f"SELECT COUNT(*) FROM albums{where}", parameters).fetchone()[0]
-        page_count = max(1, math.ceil(matching / LIBRARY_ALBUM_PAGE_SIZE))
-        page = min(page, page_count)
+        db.create_function("METADATA_KEY", 1, _metadata_key, deterministic=True)
+        db.create_function("ARTIST_MEMBERSHIPS", 2, _artist_memberships_json, deterministic=True)
         artists = []
         if view == "artists":
-            artist_groups = f"""SELECT {artist_expression} AS artist,
+            artist_groups = f"""SELECT MIN(credits.artist) AS artist,
                 COUNT(*) AS album_count,
                 JSON_GROUP_ARRAY(DISTINCT COALESCE(
                     NULLIF((SELECT value FROM album_attributes WHERE entity_id=albums.id AND key='genre' LIMIT 1), ''),
@@ -2339,12 +2365,16 @@ def _library_page_data(
                     (SELECT COALESCE(NULLIF((SELECT value FROM item_attributes WHERE entity_id=genre_items.id AND key='genre' LIMIT 1), ''), NULLIF(genre_items.genres, ''))
                      FROM items genre_items WHERE genre_items.album_id=albums.id
                      ORDER BY genre_items.id LIMIT 1))) AS genres
-                FROM albums{where} GROUP BY CASEFOLD({artist_expression})"""
-            matching = db.execute(f"SELECT COUNT(*) FROM ({artist_groups})", parameters).fetchone()[0]
+                FROM albums JOIN artist_memberships credits ON credits.album_id = albums.id
+                {where} GROUP BY credits.artist_key"""
+            matching = db.execute(
+                f"{artist_memberships} SELECT COUNT(*) FROM ({artist_groups})", parameters,
+            ).fetchone()[0]
             page_count = max(1, math.ceil(matching / LIBRARY_ALBUM_PAGE_SIZE))
             page = min(page, page_count)
             artists = [dict(row) for row in db.execute(
-                f"SELECT * FROM ({artist_groups}) ORDER BY CASEFOLD(artist) {direction}, artist {direction} LIMIT ? OFFSET ?",
+                f"{artist_memberships} SELECT * FROM ({artist_groups}) "
+                f"ORDER BY CASEFOLD(artist) {direction}, artist {direction} LIMIT ? OFFSET ?",
                 (*parameters, LIBRARY_ALBUM_PAGE_SIZE, (page-1)*LIBRARY_ALBUM_PAGE_SIZE),
             )]
             for artist in artists:
@@ -2354,22 +2384,29 @@ def _library_page_data(
                 ))
             rows = []  # Artist browsing never loads full album/track payloads.
         else:
+            matching = db.execute(
+                f"{artist_memberships} SELECT COUNT(*) FROM albums{where}", parameters,
+            ).fetchone()[0]
+            page_count = max(1, math.ceil(matching / LIBRARY_ALBUM_PAGE_SIZE))
+            page = min(page, page_count)
             rows = db.execute(
-                f"""SELECT albums.id FROM albums{where}
+                f"""{artist_memberships} SELECT albums.id FROM albums{where}
                      ORDER BY {ordering}, albums.id {direction}
                      LIMIT ? OFFSET ?""",
                 (*parameters, LIBRARY_ALBUM_PAGE_SIZE, (page - 1) * LIBRARY_ALBUM_PAGE_SIZE),
             ).fetchall()
         totals = db.execute(
-            f"""SELECT (SELECT COUNT(*) FROM items), (SELECT COUNT(*) FROM albums),
-                       (SELECT COUNT(DISTINCT CASEFOLD({artist_expression})) FROM albums)"""
+            f"""{artist_memberships}
+                SELECT (SELECT COUNT(*) FROM items), (SELECT COUNT(*) FROM albums),
+                       (SELECT COUNT(DISTINCT artist_key) FROM artist_memberships)"""
         ).fetchone()
         top_rows = db.execute(
-            f"""SELECT {artist_expression} AS artist,
-                      COUNT(DISTINCT albums.id) AS albums, COUNT(items.id) AS tracks
-                 FROM albums LEFT JOIN items ON items.album_id = albums.id
-                GROUP BY CASEFOLD({artist_expression})
-                ORDER BY albums DESC, tracks DESC, CASEFOLD(artist) LIMIT 5"""
+            f"""{artist_memberships}
+                SELECT MIN(credits.artist) AS artist,
+                       COUNT(DISTINCT credits.album_id) AS albums, COUNT(items.id) AS tracks
+                FROM artist_memberships credits LEFT JOIN items ON items.album_id = credits.album_id
+                GROUP BY credits.artist_key
+                ORDER BY albums DESC, tracks DESC, credits.artist_key LIMIT 5"""
         ).fetchall()
         recent_rows = db.execute("SELECT id FROM albums ORDER BY added DESC, id DESC LIMIT ?", (recent_limit,)).fetchall()
     summary_cache: dict[int, dict | None] = {}
@@ -2984,7 +3021,7 @@ def _expanded_artist_edit(model, values, *, populate_missing=True, edit_credits=
         if plural not in model._fields:
             continue
         names = model.get(plural) or []
-        explicit_list = plural in values and edit_credits
+        explicit_list = plural in values
         if explicit_list:
             selected = values[plural]
         elif singular in values:
@@ -2992,7 +3029,7 @@ def _expanded_artist_edit(model, values, *, populate_missing=True, edit_credits=
                 continue
             if len(names) <= 1:
                 selected = [values[singular]] if values[singular] else []
-            elif model.get(singular) in names:
+            elif (singular == "artist" or not edit_credits) and model.get(singular) in names:
                 selected = [values[singular] if name == model.get(singular) else name for name in names]
             else:
                 continue  # A compound display credit does not identify a collaborator.
@@ -3011,11 +3048,12 @@ def _expanded_artist_edit(model, values, *, populate_missing=True, edit_credits=
                  and name == known_names[index] and old_sorts[index] else name
                  for name, index in zip(selected, indices)]
         display = values.get(singular, model.get(singular) or "")
-        if explicit_list and selected != names and display == model.get(singular):
+        if (explicit_list and singular + "_credit" not in values
+                and selected != names and display == model.get(singular)):
             display = ", ".join(selected)
             values[singular] = display
-        values[singular + "_credit"] = display
-        values[plural + "_credit"] = selected
+        values.setdefault(singular + "_credit", display)
+        values.setdefault(plural + "_credit", selected)
         values[singular + "_sort"] = ", ".join(sorts)
         values[plural + "_sort"] = sorts
         if explicit_list:
@@ -3023,8 +3061,8 @@ def _expanded_artist_edit(model, values, *, populate_missing=True, edit_credits=
             if not old_ids and len(known_names) == 1 and model.get("mb_" + singular + "id"):
                 old_ids = [model.get("mb_" + singular + "id")]
             ids = [old_ids[index] if index is not None and index < len(old_ids) else "" for index in indices]
-            values["mb_" + singular + "id"] = ids[0] if ids else ""
-            values["mb_" + singular + "ids"] = ids if all(ids) else []
+            values.setdefault("mb_" + singular + "id", ids[0] if ids else "")
+            values.setdefault("mb_" + singular + "ids", ids if all(ids) else [])
     return values
 
 
@@ -3047,7 +3085,7 @@ def _mutate_managed_items(
             current = _item_genre(item) if field == "genre" else item.get(field)
             if current != value:
                 item_changes[field] = {"from": current, "to": value}
-            _set_item_value(item, field, value)
+        _set_item_values(item, values)
         structured.append({"item_id": item.id, "changes": item_changes})
     album_values = _expanded_artist_edit(album, album_values or {}, edit_credits=True) if album is not None else {}
     album_snapshot = {field: album.get(field) for field in album_values} if album is not None else {}
@@ -3367,8 +3405,7 @@ def _managed_metadata_edit(app: Flask, album_id: int, request_values: object, *,
         diff = {key: {"from": before[key], "to": value} for key, value in expanded.items() if before[key] != value}
         if diff:
             tag_changes.append({"item_id": item.id, "title": item.title, "changes": diff})
-        for key, value in expanded.items():
-            _set_item_value(item, key, value)
+        _set_item_values(item, expanded)
     for key, value in _expanded_artist_edit(album, album_values, edit_credits=True).items():
         album[key] = value
     if "location" in request_values:
@@ -3462,7 +3499,8 @@ def _managed_rematch_plan(app: Flask, album, items: list[Item], raw: dict) -> di
         detail = details.get(position)
         values = _candidate_item_values(effective, detail) if detail else {}
         item_changes = {}
-        for field, value in values.items():
+        reviewed = _expanded_artist_edit(item, values, edit_credits=True)
+        for field, value in reviewed.items():
             current = _item_genre(item) if field == "genre" else item.get(field)
             if current != value:
                 item_changes[field] = {"from": current, "to": value}
@@ -3575,7 +3613,8 @@ def _apply_managed_rematch(app: Flask, album_id: int, preview_id: str, expected:
                                    code="stale_fingerprint", status=409)
     changes = [(by_id[update["item_id"]], update["values"]) for update in plan["updates"]]
     first_values = plan["updates"][0]["values"] if plan["updates"] else {}
-    album_values = {field: first_values[field] for field in ALBUM_EDITABLE_FIELDS if field in first_values}
+    album_values = {field: value for field, value in first_values.items()
+                    if field in ALBUM_EDITABLE_FIELDS | MATCHED_ALBUM_CREDIT_FIELDS}
     with _connect(app.config["APP_DB"]) as db:
         claimed = db.execute(
             "UPDATE managed_album_rematches SET status = 'applying' WHERE id = ? AND status = 'pending'",
@@ -4415,12 +4454,18 @@ def _item_genre(item: Item) -> str:
     return _normalize_metadata(genres)
 
 
-def _set_item_value(item: Item, field: str, value: object) -> None:
-    for key, expanded in _expanded_artist_edit(item, {field: value}, populate_missing=False).items():
-        item[key] = expanded
-    if field == "genre" and "genres" in item._fields:
-        normalized = _normalize_metadata(value)
+def _set_item_values(item: Item, values: dict) -> None:
+    for field, value in values.items():
+        item[field] = value
+    if "genre" in values and "genres" in item._fields:
+        normalized = _normalize_metadata(values["genre"])
         item["genres"] = [normalized] if normalized else []
+
+
+def _apply_candidate_values(item: Item, values: dict) -> None:
+    _set_item_values(item, _expanded_artist_edit(
+        item, values, populate_missing=False, edit_credits="albumartists" in values,
+    ))
 
 
 def _metadata_key(value: object) -> str:
@@ -4733,6 +4778,7 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
     media_types = []
     countries = []
     genres = []
+    album_artist_lists = []
     artwork_url = None
     for row in rows:
         item = library.get_item(row["beets_item_id"]) if row["beets_item_id"] else None
@@ -4774,12 +4820,16 @@ def _album_query(app: Flask, album: sqlite3.Row) -> dict:
                     values.append(str(item.get(field)))
             if _item_genre(item):
                 genres.append(_item_genre(item))
+            if item.get("albumartists"):
+                album_artist_lists.append(item.get("albumartists"))
             if artwork_url is None:
                 artwork_url = _persisted_artwork_source({
                     key: item.get(key) for key in ("artwork_url", "image_url", "cover_url", "cover_art")
                 }, allow_data=True)
         tracks.append(track)
     query = {"artist": _normalize_metadata(album["artist"]), "album": _normalize_metadata(album["album"]), "tracks": tracks}
+    if album_artist_lists and all(names == album_artist_lists[0] for names in album_artist_lists):
+        query["albumartists"] = album_artist_lists[0]
     query["folder_albums"] = list(dict.fromkeys(
         Path(track["path"]).parent.name for track in tracks if Path(track["path"]).parent.name
     ))[:2]
@@ -4908,6 +4958,10 @@ def _candidate_diff(query: dict, candidate: dict) -> dict:
         value = _normalize_metadata(candidate.get(key))
         if value and _metadata_key(value) != _metadata_key(query[key]):
             proposed[key] = {"from": query[key], "to": value}
+    credits = _candidate_album_credits(candidate, _normalize_metadata(candidate.get("artist")))
+    current_credits = query.get("albumartists") or []
+    if credits and credits["albumartists"] != current_credits:
+        proposed["album_artist_credits"] = {"from": current_credits, "to": credits["albumartists"]}
     genre = _candidate_genre(candidate)
     if genre and _genre_presentation_key(genre) != _genre_presentation_key(query.get("genre")):
         proposed["genre"] = {"from": query.get("genre"), "to": genre}
@@ -5654,8 +5708,7 @@ def _inbox_destination_preflight(
     for position, path in zip(positions or range(1, len(paths) + 1), paths):
         item = Item.from_path(path)
         if provider_data:
-            for field, value in _candidate_item_values(provider_data, details.get(position)).items():
-                _set_item_value(item, field, value)
+            _apply_candidate_values(item, _candidate_item_values(provider_data, details.get(position)))
         planned_items.append(item)
     task = ImportTask(None, [], planned_items)
     task.set_choice(Action.ASIS)
@@ -6531,8 +6584,7 @@ def _execute_inbox_album(
                     for position, path in enumerate(paths, 1):
                         report_progress("Writing file tags", position - 1, len(paths), current=path.name)
                         item = Item.from_path(path)
-                        for field, value in _candidate_item_values(effective, details.get(position)).items():
-                            _set_item_value(item, field, value)
+                        _apply_candidate_values(item, _candidate_item_values(effective, details.get(position)))
                         item.write()
                     artwork_plans = [{"artwork_path": path, "target_path": row["relative_path"], "action": "import"}
                                      for row, path in zip(rows, paths)]
@@ -6915,7 +6967,9 @@ def _library_import_plans(
             elif duplicate_action == "merge":
                 action = "merge"
                 comparison_item = duplicate
-        values = _expanded_artist_edit(comparison_item, values, populate_missing=False)
+        values = _expanded_artist_edit(
+            comparison_item, values, populate_missing=False, edit_credits="albumartists" in values,
+        )
         changes = {}
         for field, value in list(values.items()):
             current = _item_genre(comparison_item) if field == "genre" else comparison_item.get(field)
@@ -6957,6 +7011,26 @@ def _validate_duplicate_item(app: Flask, *, root: Path, item: Item) -> Path:
     return path
 
 
+def _candidate_album_credits(candidate: dict, display: str) -> dict:
+    credits = candidate.get("album_artist_credits")
+    if not display or not isinstance(credits, list) or not credits:
+        return {}
+    names, ids = [], []
+    for credit in credits:
+        if not isinstance(credit, dict) or not isinstance(credit.get("name"), str):
+            return {}
+        name = _normalize_metadata(credit["name"])
+        if not name:
+            return {}
+        names.append(name)
+        artist_id = credit.get("id")
+        ids.append(artist_id.strip() if isinstance(artist_id, str) else "")
+    values = {"albumartists": names, "albumartists_credit": names, "albumartist_credit": display}
+    if any(ids):
+        values.update(mb_albumartistid=ids[0], mb_albumartistids=ids if all(ids) else [])
+    return values
+
+
 def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
     values = {}
     unpaired = detail is None or detail.get("proposed") is None or detail.get("status") in {"unmatched", "missing", "extra"}
@@ -6964,6 +7038,7 @@ def _candidate_item_values(candidate: dict, detail: dict | None) -> dict:
     album = _normalize_metadata(candidate.get("album"))
     if artist:
         values["albumartist"] = artist
+        values.update(_candidate_album_credits(candidate, artist))
         if not unpaired:
             values["artist"] = _normalize_metadata(detail.get("proposed_artist")) or artist
     if album:
@@ -7107,22 +7182,24 @@ def _apply_library_import_plans(app: Flask, plans: list[dict]) -> None:
             continue
         if plan["action"] == "merge":
             item = plan["duplicate_item"]
-            for field, value in plan["values"].items():
-                _set_item_value(item, field, value)
+            _set_item_values(item, plan["values"])
             if plan["changes"]:
                 item.write()
                 item.store()
             continue
         item = plan["item"]
-        for field, value in plan["values"].items():
-            _set_item_value(item, field, value)
+        _set_item_values(item, plan["values"])
         if plan["action"] == "replace":
             replacement = plan["duplicate_item"]
-            for field in ("title", "artist", "album", "albumartist", "genre", "year", "month", "day", "track", "disc"):
-                current = _item_genre(item) if field == "genre" else item.get(field)
-                _set_item_value(replacement, field, current)
-            for field, value in plan["values"].items():
-                _set_item_value(replacement, field, value)
+            copied = {field: item.get(field) for field in (
+                "title", "artist", "album", "albumartist", "year", "month", "day", "track", "disc",
+            )}
+            copied["genre"] = _item_genre(item)
+            if item.get("albumartists"):
+                copied.update({field: item.get(field) for field in MATCHED_ALBUM_CREDIT_FIELDS | {
+                    "albumartists", "albumartist_sort", "albumartists_sort",
+                }})
+            _apply_candidate_values(replacement, {**copied, **plan["values"]})
             replacement.path = os.fsencode(plan["absolute_path"])
             replacement.write()
             replacement.store()
@@ -7237,7 +7314,7 @@ def _inbox_tag_snapshot(path: Path) -> dict:
     values = {"kind": "source-tags"}
     if item is not None:
         for field in (
-            "title", "artist", "album", "albumartist", "genre", "year", "month", "day",
+            "title", "artist", "album", "albumartist", "albumartists", "genre", "year", "month", "day",
             "track", "disc", "length", "mb_trackid", "mb_albumid", "mb_releasegroupid", "albumtype", "media", "country",
         ):
             value = _item_genre(item) if field == "genre" else item.get(field)
