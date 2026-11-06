@@ -52,7 +52,7 @@ it("offers cleanup only for successful retained Inbox copies from this batch", a
   expect(screen.queryByRole("button",{name:"Clear imported from Inbox"})).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button",{name:"Start import"}));
   fireEvent.click(await screen.findByRole("button",{name:"Clear imported from Inbox"}));
-  expect(remove).toHaveBeenCalledWith([77]);
+  expect(remove).toHaveBeenCalledWith([77], [expect.objectContaining({ id: 1, status: "imported", jobId: 77 }), expect.objectContaining({ id: 2, status: "failed" })]);
 });
 it.each(["library-import","inbox"] as const)("omits cleanup for %s without retained originals", async source => {
   show(vi.fn(async id => ({imported:[{album_review_id:id,...(source==="library-import"?{job_id:77}:{})}]})),{source,onRemoveImported:vi.fn()});

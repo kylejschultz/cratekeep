@@ -398,7 +398,7 @@ def _normalize_release(release: dict, *, exact: bool) -> dict:
             normalized = {
                 "position": source_track.get("position") or track_index,
                 "number": source_track.get("number"),
-                "title": recording.get("title") or source_track.get("title", ""),
+                "title": source_track.get("title") or recording.get("title", ""),
                 "recording_id": recording.get("id"),
                 "length_ms": source_track.get("length") if source_track.get("length") is not None else recording.get("length"),
                 "track_artist": track_artist,

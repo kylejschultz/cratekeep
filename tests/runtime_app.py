@@ -173,4 +173,21 @@ def create_app():
     def provider_calls():
         with PROVIDER_LOCK:
             return {"calls": dict(PROVIDER_CALLS), "total": sum(PROVIDER_CALLS.values())}
+    # Deliberately slow only synthetic background-lifecycle fixtures.
+    from flask import request
+    import sqlite3
+    @app.before_request
+    def slow_background_fixture():
+        if request.path.endswith('/candidates') and request.method == 'POST':
+            album_id = (request.get_json(silent=True) or {}).get('album_id')
+            with sqlite3.connect(app.config['APP_DB']) as db:
+                row = db.execute('SELECT album FROM album_reviews WHERE id=?', (album_id,)).fetchone()
+            if row and row[0].startswith('Background fixture'):
+                time.sleep(2)
+        if request.path.endswith('/bulk/execute') and request.method == 'POST':
+            album_ids = (request.get_json(silent=True) or {}).get('album_ids') or []
+            with sqlite3.connect(app.config['APP_DB']) as db:
+                row = db.execute('SELECT album FROM album_reviews WHERE id=?', (album_ids[0] if album_ids else 0,)).fetchone()
+            if row and row[0].startswith('Background fixture'):
+                time.sleep(2)
     return app

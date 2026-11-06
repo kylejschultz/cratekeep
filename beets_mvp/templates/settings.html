@@ -211,7 +211,12 @@
       .review-footer button { width:100%; }
     }
   </style>
+  {% if first_run %}
+  <script>(() => { let theme = 'dark'; try { if (localStorage.getItem('cratekeep-theme') === 'light') theme = 'light'; } catch {} document.documentElement.dataset.theme = theme; })();</script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='ui/cratekeep.css', v=build_sha) }}">
+  {% else %}
   <link rel="stylesheet" href="{{ url_for('static', filename='app-shell.css') }}">
+  {% endif %}
   {% if not first_run %}<link rel="stylesheet" href="{{ url_for('static', filename='review-presentation.css') }}">{% endif %}
 </head>
 <body{% if first_run %} class="setup-mode"{% endif %}>
@@ -233,8 +238,12 @@
 {% endif %}
 <main id="main-content">
   {% if first_run %}
-    <img class="logo" src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt="Cratekeep">
-    <h1>Set up Cratekeep</h1>
+    <header class="setup-header"><div class="setup-brand"><img class="logo" src="{{ url_for('static', filename='cratekeep-logo.png') }}" alt="Cratekeep">
+    <h1>Set up Cratekeep</h1></div>
+    <button id="setup-theme-toggle" class="header-icon" type="button" aria-label="Dark mode" aria-pressed="true" title="Switch to light mode">
+      <svg class="setup-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5"/></svg>
+      <svg class="setup-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20.8 14a9 9 0 0 1-10.8-10.8A9 9 0 1 0 20.8 14Z"/></svg>
+    </button></header>
     <p>Choose the inbox and library folders for this installation. You can fine-tune integrations later from the in-app Settings page.</p>
   {% else %}
     <header class="page-head"><h1>{{ 'Inbox' if page == 'inbox' else 'Settings' }}</h1><p>{{ 'Review pending library selections and apply approved albums.' if page == 'inbox' else 'Manage storage, integrations, and the active beets configuration.' }}</p></header>
@@ -384,6 +393,19 @@
 </main>
 {% if not first_run %}</div><script src="{{ url_for('static', filename='review-presentation.js') }}"></script><script src="{{ url_for('static', filename='review-workflow.js') }}"></script><script src="{{ url_for('static', filename='folder-workflow.js') }}"></script>{% endif %}
   <script>
+    {% if first_run %}
+    (() => {
+      const toggle = document.getElementById('setup-theme-toggle');
+      const sync = () => { const dark = document.documentElement.dataset.theme === 'dark'; toggle.setAttribute('aria-pressed', String(dark)); toggle.title = dark ? 'Switch to light mode' : 'Switch to dark mode'; };
+      sync();
+      toggle.addEventListener('click', () => {
+        const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+        document.documentElement.dataset.theme = theme;
+        try { localStorage.setItem('cratekeep-theme', theme); } catch {}
+        sync();
+      });
+    })();
+    {% endif %}
     async function readApiResponse(response, fallbackMessage, {acceptedStatuses = [], deferHttpError = false} = {}) {
       const contentType = (response.headers.get('content-type') || '').toLowerCase();
       const body = await response.text();

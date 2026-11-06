@@ -139,8 +139,11 @@ describe("ReviewModal matching and evidence", () => {
     expect(screen.queryByLabelText("Duplicate decision")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Tag writer temporarily unavailable Retry is available.");
-    expect(screen.getByRole("button", { name: "Retry import" })).toBeEnabled();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Tag writer temporarily unavailable Retry is available.");
+    const retry = screen.getByRole("button", { name: "Retry import" });
+    expect(retry).toBeEnabled();
+    expect(retry.closest("footer")).toContainElement(alert);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(requests).toEqual([
       { url: "/api/library-import/albums/1/execute", body: { candidate_id: 2, dry_run: true } },
@@ -163,8 +166,9 @@ describe("ReviewModal matching and evidence", () => {
 
     const decision = screen.getByLabelText("Duplicate decision");
     expect(decision).toBeRequired();
-    fireEvent.click(screen.getByRole("button", { name: "Import to Library" }));
-    expect(screen.getByRole("alert")).toHaveTextContent("Choose a duplicate decision");
+    expect(decision.compareDocumentPosition(screen.getByRole("group", { name: "Metadata choice" }))
+      & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Choose a duplicate decision" })).toBeDisabled();
     expect(fetchMock).not.toHaveBeenCalled();
 
     fireEvent.change(decision, { target: { value: "keep-both" } });
@@ -316,6 +320,7 @@ it("offers actual Inbox duplicate policies and resumes cleanup without reapprovi
   const onComplete = vi.fn();
   const album = { ...richAlbum, candidates: [{ ...richAlbum.candidates[0], duplicate_preflight: { status: "possible" as const } }] };
   const view = render(<ReviewModal source="inbox" onClose={() => undefined} onComplete={onComplete} album={album}/>);
+  expect(screen.getByRole("button", { name: "Choose a duplicate decision" })).toBeDisabled();
   expect(screen.getByRole("option", { name: "Keep existing; retain Inbox originals" })).toBeInTheDocument();
   expect(screen.getByRole("option", { name: "Replace with incoming files" })).toBeInTheDocument();
   expect(screen.queryByRole("option", { name: "Merge" })).not.toBeInTheDocument();

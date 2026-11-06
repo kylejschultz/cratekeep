@@ -167,20 +167,41 @@ def test_undoing_addition_preserves_other_tracks_in_same_album(app,tmp_path):
 
 @pytest.mark.parametrize('policy',['keep-existing','replace'])
 def test_duplicate_copy_receipts_preserve_originals_and_existing_ownership(tmp_path,monkeypatch,policy):
+    from test_activity import submit, wait
     from test_app import duplicate_inbox_fixture
     app,client,library,album,managed,sources,base=duplicate_inbox_fixture(tmp_path,policy,monkeypatch,mixed=True)
     originals={path:path.read_bytes() for path in sources}
+    managed_before = managed.read_bytes()
+    cover = managed.parent / 'cover.jpg'
+    cover.write_bytes(b'existing-artwork')
     existing_id=next(iter(album.items())).id
-    result=client.post(base+'/execute',json={})
-    assert result.status_code==201,result.json
+    steps = [{'path': base + '/execute', 'body': {}}]
+    check = submit(client, [{**steps[0], 'body': {'dry_run': True}}], 'duplicate-copy-preview')
+    preview = wait(client, check['id'])
+    assert preview['status'] == 'complete', preview
+    assert preview['result']['status'] == 'preview'
+    assert managed.read_bytes() == managed_before
+    assert all(path.read_bytes() == data for path, data in originals.items())
+    response = client.post('/api/activity', json={
+        'request_id': 'duplicate-copy-apply', 'steps': steps, 'check_id': check['id'],
+    })
+    assert response.status_code == 202, response.json
+    done = wait(client, response.json['id'])
+    assert done['status'] == 'complete' and done['http_status'] == 201, done
+    result = done['result']
+    assert (managed.read_bytes() == managed_before) is (policy == 'keep-existing')
+    assert {item.album_id for item in library.items()} == {album.id}
+    assert len(list(library.items())) == 2
+    assert library.get_item(existing_id).album_id == album.id
+    assert cover.read_bytes() == b'existing-artwork'
     assert all(path.read_bytes()==data for path,data in originals.items())
     imports=imports_base(app);row=client.get(imports+'/imports').json['imports'][0]
     assert row['undoable'] is (policy=='keep-existing')
     if policy=='replace':
-        assert client.post(imports+'/actions/preview',json={'kind':'undo','job_ids':[result.json['id']]}).status_code==409
+        assert client.post(imports+'/actions/preview',json={'kind':'undo','job_ids':[result['id']]}).status_code==409
     else:
         managed_bytes=managed.read_bytes()
-        action(client,imports,{'kind':'undo','job_ids':[result.json['id']]})
+        action(client,imports,{'kind':'undo','job_ids':[result['id']]})
         assert managed.read_bytes()==managed_bytes
         assert [item.id for item in library.items()]==[existing_id]
 

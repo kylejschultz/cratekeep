@@ -318,3 +318,66 @@ def test_instant_root_loss_records_scoped_error_before_safety_interval(tmp_path)
     assert count(app, inbox) == 1
     assert clock.value < 300
     service.stop()
+
+
+@pytest.mark.parametrize('mode', ['instant', '5'])
+def test_stable_album_progresses_while_neighbor_grows_including_nested_disc_folders(tmp_path, monkeypatch, mode):
+    import beets_mvp
+    app, service, clock, roots = setup(tmp_path, (mode,))
+    settle(service, clock)
+    inbox = app.config['INBOXES'][0]
+    inbox['auto_match'] = True
+    scheduled = []
+    monkeypatch.setattr(beets_mvp, '_start_inbox_auto_match', lambda app, ids: scheduled.extend(ids))
+    ready = roots[0] / 'Artist/Ready/CD1/Song.wav'
+    busy = roots[0] / 'Artist/Downloading/CD1/Song.wav'
+    tagged_inbox_wav(ready, album='Ready')
+    tagged_inbox_wav(busy, album='Downloading')
+    # Start a due interval; Instant also receives continuous real write hints.
+    clock.advance(300)
+    for index in range(8):
+        tagged_inbox_wav(busy, album=f'Downloading {index}')
+        service.hint(inbox['id'])
+        clock.advance(3)
+        service.step()
+    assert count(app, inbox) == 1
+    with _connect(app.config['APP_DB']) as db:
+        assert [row[0] for row in db.execute('SELECT album FROM album_reviews WHERE id IN (%s)' % ','.join('?' for _ in set(scheduled)), sorted(set(scheduled)))] == ['Ready']
+    assert not list((tmp_path / 'library').iterdir())
+    clock.advance(3)
+    service.step()
+    assert count(app, inbox) == 2
+    service.stop()
+
+
+def test_partial_settling_keeps_existing_busy_inventory_and_settles_deletions(tmp_path):
+    app, service, clock, roots = setup(tmp_path, ('instant',))
+    inbox = app.config['INBOXES'][0]
+    ready = roots[0] / 'Ready/Song.wav'
+    busy = roots[0] / 'Busy/Song.wav'
+    tagged_inbox_wav(ready, album='Ready')
+    tagged_inbox_wav(busy, album='Busy')
+    settle(service, clock)
+    ready.unlink()
+    for index in range(4):
+        tagged_inbox_wav(busy, album=f'Busy {index}')
+        service.hint(inbox['id']); clock.advance(3); service.step()
+    assert count(app, inbox) == 1
+    with _connect(app.config['APP_DB']) as db:
+        rows = {row['relative_path']:row for row in db.execute('SELECT * FROM library_inventory')}
+        assert rows['Ready/Song.wav']['present'] == 0
+        assert rows['Busy/Song.wav']['present'] == 1
+    service.stop()
+
+
+def test_repeated_hints_cannot_shorten_the_two_sample_settling_window(tmp_path):
+    app, service, clock, roots = setup(tmp_path, ('instant',))
+    settle(service, clock)
+    inbox = app.config['INBOXES'][0]
+    tagged_inbox_wav(roots[0] / 'Ready/Song.wav', album='Ready')
+    service.hint(inbox['id']); clock.advance(2); service.step()
+    service.hint(inbox['id']); clock.advance(1); service.step()
+    assert count(app, inbox) == 0
+    service.hint(inbox['id']); clock.advance(1); service.step()
+    assert count(app, inbox) == 1
+    service.stop()

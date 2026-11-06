@@ -48,7 +48,7 @@ class InboxDiscovery:
         with self.lock:
             state = self.states.get(inbox_id)
             if state and state["mode"] == "instant":
-                state["event_due"] = self.clock() + 2
+                state["event_due"] = min(state.get("event_due") or float("inf"), self.clock() + 2)
         self.wake.set()
 
     def _stop_observer(self, state):
@@ -115,7 +115,7 @@ class InboxDiscovery:
     def step(self):
         """One bounded scheduling pass; tests drive this with a fake clock."""
         from . import (_connect, _library_audio_stats, _scan_inbox_inventory,
-                       _start_inbox_auto_match, MAX_INBOX_AUTO_MATCH_PENDING)
+                       _start_inbox_auto_match, _inbox_album_folder, MAX_INBOX_AUTO_MATCH_PENDING)
         app = self.app
         # Same outer lock as mutating HTTP requests: no stale root/settings writes.
         with ExitStack() as locks:
@@ -147,35 +147,55 @@ class InboxDiscovery:
                     event_due = state["event_due"]
                     if now < state["due"] and (event_due is None or now < event_due):
                         continue
-                    # An active event burst must settle even if its safety scan is due.
-                    if event_due is not None and now < event_due:
-                        continue
+                    # Consume this hint before sampling; later hints must not
+                    # shorten the next two-second settling sample or be lost.
+                    state["event_due"] = None
                 try:
                     # Two stable snapshots protect partially written files from
                     # background discovery/matching. This is not a downloader protocol.
                     root = Path(inbox["path"])
                     if root.is_symlink():
                         raise ValueError("Inbox root must not be a symlink.")
-                    snapshot = [(str(path), stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_dev)
-                                for path, stat in _library_audio_stats(root)]
-                    if state.get("snapshot") != snapshot:
-                        state["snapshot"] = snapshot
+                    snapshot = {}
+                    for path, stat in _library_audio_stats(root):
+                        relative = path.relative_to(root).as_posix()
+                        folder = _inbox_album_folder(relative) or "."
+                        snapshot.setdefault(folder, []).append((relative, stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_dev))
+                    previous = state.get("snapshot")
+                    committed = state.get("committed", {})
+                    # Missing folders need two samples too, before their old
+                    # inventory may be retired. Unstable folders stay untouched.
+                    for folder in (previous or {}).keys() | committed.keys():
+                        snapshot.setdefault(folder, [])
+                    stable = {folder for folder in snapshot if previous is not None and previous.get(folder) == snapshot[folder]}
+                    all_stable = previous is not None and len(stable) == len(snapshot)
+                    ready = {folder for folder in stable if committed.get(folder) != snapshot[folder]}
+                    state["snapshot"] = snapshot
+                    state["settling"] = not all_stable
+                    if not all_stable and not ready:
                         state["due"] = now + 2
                         continue
-                    with self.lock:
-                        state["event_due"] = None
-                    _scan_inbox_inventory(app, inbox, trigger="background")
+                    _scan_inbox_inventory(app, inbox, trigger="background",
+                                          settled_folders=None if all_stable else ready)
+                    state["committed"] = {**committed, **{folder: snapshot[folder] for folder in stable}}
                     if inbox.get("auto_match"):
                         with _connect(app.config["APP_DB"]) as db:
-                            ids = [row[0] for row in db.execute(
-                                """SELECT id FROM album_reviews WHERE source_kind='inbox' AND source_id=?
-                                     AND root_path=? AND state='pending'
-                                     AND candidate_status IN ('not-run','stale')
-                                     AND execution_status='not-run' ORDER BY id LIMIT ?""",
-                                (inbox_id, inbox["path"], MAX_INBOX_AUTO_MATCH_PENDING))]
+                            pending = db.execute(
+                                """SELECT albums.id, inventory.relative_path FROM album_reviews albums
+                                     JOIN album_review_tracks tracks ON tracks.album_review_id=albums.id
+                                     JOIN library_inventory inventory ON inventory.id=tracks.inventory_id
+                                     WHERE albums.source_kind='inbox' AND albums.source_id=?
+                                     AND albums.root_path=? AND albums.state='pending'
+                                     AND albums.candidate_status IN ('not-run','stale')
+                                     AND albums.execution_status='not-run' AND inventory.present=1
+                                     ORDER BY albums.id""", (inbox_id, inbox["path"])).fetchall()
+                            unstable = {row["id"] for row in pending
+                                        if (_inbox_album_folder(row["relative_path"]) or ".") not in stable}
+                            ids = sorted({row["id"] for row in pending} - unstable)[:MAX_INBOX_AUTO_MATCH_PENDING]
                         if ids:
                             _start_inbox_auto_match(app, ids)
                 except Exception as exc:
+                    state["settling"] = False
                     # A failed root is not an empty root. Persist scoped status,
                     # preserve its last inventory and let other sources progress.
                     with _connect(app.config["APP_DB"]) as db:
@@ -185,8 +205,12 @@ class InboxDiscovery:
                                    (inbox["path"], str(exc)[:1000], now_text, now_text))
                     self.changed(inbox_id)
                     app.logger.warning("Inbox background scan failed for source %s (%s)", inbox_id, type(exc).__name__)
-                state.pop("snapshot", None)
-                state["due"] = self.clock() + (300 if state["mode"] == "instant" else int(state["mode"]) * 60)
+                if state.pop("settling", False):
+                    state["due"] = self.clock() + 2
+                else:
+                    state.pop("snapshot", None)
+                    state["committed"] = {folder: values for folder, values in state.get("committed", {}).items() if values}
+                    state["due"] = self.clock() + (300 if state["mode"] == "instant" else int(state["mode"]) * 60)
                 with self.lock:
                     # Keep any hint received while scanning for a follow-up pass.
                     if state["event_due"] is not None and state["event_due"] <= now:

@@ -228,6 +228,23 @@ it("selects the configured Inbox requested by the source link", async () => {
 
 
 describe("About settings", () => {
+  it("follows same-page disclosure links and browser history without remounting settings", () => {
+    history.replaceState(null, "", "/settings");
+    render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { settings: {} } }}/>);
+    expect(screen.getByRole("tab", { name: "General" })).toHaveAttribute("aria-selected", "true");
+    history.replaceState(null, "", "/settings#about");
+    fireEvent(window, new HashChangeEvent("hashchange"));
+    expect(screen.getByRole("tab", { name: "About" })).toHaveAttribute("aria-selected", "true");
+    const consent = screen.getByRole("checkbox", { name: "Share anonymous install analytics" });
+    fireEvent.click(consent);
+    for (const [hash, tab] of [["matching", "Metadata"], ["", "General"], ["about", "About"]]) {
+      history.replaceState(null, "", `/settings#${hash}`);
+      fireEvent(window, new HashChangeEvent("hashchange"));
+      expect(screen.getByRole("tab", { name: tab })).toHaveAttribute("aria-selected", "true");
+    }
+    expect(consent).toBeChecked();
+    history.replaceState(null, "", "/settings");
+  });
   it("shows the real build, community links and an explicit default-off analytics choice", () => {
     location.hash = "about";
     render(<Page boot={{ page: "settings", buildSha: "abcdef1234567890", threshold: 90, data: { settings: {}, about: { build: "abcdef1234567890", discord_url: "https://discord.gg/cratekeep-test" } } }}/>);
@@ -259,46 +276,6 @@ describe("About settings", () => {
   });
 });
 
-it("summarizes discovery independently and submits static values without custom intervals", () => {
-  location.hash = "";
-  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Instant source", path: "/one", discovery: "instant" }, { id: "two", name: "Slow downloads", path: "/two" }] } }}/>);
-  expect(screen.getByText("Discovery: Instant")).toBeInTheDocument();
-  expect(screen.getByText("Discovery: Every 5 minutes")).toBeInTheDocument();
-  const table = screen.getByRole("table", { name: "Configured Inboxes" });
-  expect(within(table).queryByRole("combobox")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Edit Slow downloads" }));
-  const slow = screen.getByRole("combobox", { name: "Discovery for Slow downloads" });
-  expect(slow).toHaveValue("5");
-  expect(screen.queryByRole("option", { name: /Custom/ })).not.toBeInTheDocument();
-  fireEvent.change(slow, { target: { value: "manual" } });
-  fireEvent.click(screen.getByRole("button", { name: "Done" }));
-  expect(screen.getByText("Discovery: Instant")).toBeInTheDocument();
-  expect(screen.getByText("Discovery: Manual only")).toBeInTheDocument();
-  const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
-  expect(new FormData(form).getAll("inbox_discovery")).toEqual(["instant", "manual"]);
-});
-
-it("edits matching independently and preserves hidden values when saving another tab", () => {
-  location.hash = "";
-  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/one", auto_match: true, discovery: "instant" }, { id: "two", name: "Slow", path: "/two", auto_match: false, discovery: "15" }] } }}/>);
-  const table = screen.getByRole("table", { name: "Configured Inboxes" });
-  expect(within(table).queryByRole("checkbox")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Edit Downloads" }));
-  const first = screen.getByRole("checkbox", { name: "Automatically find matches for Downloads" });
-  expect(first).toBeChecked(); fireEvent.click(first);
-  fireEvent.click(screen.getByRole("button", { name: "Done" }));
-  fireEvent.click(screen.getByRole("button", { name: "Edit Slow" }));
-  const second = screen.getByRole("checkbox", { name: "Automatically find matches for Slow" });
-  expect(second).not.toBeChecked(); fireEvent.click(second);
-  fireEvent.click(screen.getByRole("button", { name: "Done" }));
-  expect(within(table).getByText("Discovery: Instant")).toBeInTheDocument();
-  expect(within(table).getByText("Discovery: Every 15 minutes")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
-  const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
-  expect(new FormData(form).getAll("inbox_auto_match_id")).toEqual(["two"]);
-  expect(new FormData(form).getAll("inbox_discovery")).toEqual(["instant", "15"]);
-});
-
 it("groups all Inbox fields in one editor and cancels the entire draft", () => {
   location.hash = "";
   render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", discovery: "15", auto_match: false }] } }}/>);
@@ -315,21 +292,30 @@ it("groups all Inbox fields in one editor and cancels the entire draft", () => {
   expect(screen.getByText("Auto-match: Off")).toBeInTheDocument();
 });
 
-it("applies the full Inbox editor draft on Done before the settings form saves", () => {
+it("saves a full Inbox draft without changing the other source or losing values on another tab", () => {
   location.hash = "";
-  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", discovery: "15", auto_match: false }] } }}/>);
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", auto_match: false }, { id: "two", name: "Manual", path: "/manual", discovery: "manual", auto_match: false }] } }}/>);
+  const table = screen.getByRole("table", { name: "Configured Inboxes" });
+  expect(within(table).queryByRole("combobox")).not.toBeInTheDocument();
+  expect(within(table).queryByRole("checkbox")).not.toBeInTheDocument();
+  expect(screen.getByText("Discovery: Every 5 minutes")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Edit Downloads" }));
+  expect(screen.getByRole("combobox", { name: "Discovery for Downloads" })).toHaveValue("5");
+  expect(screen.queryByRole("option", { name: /Custom/ })).not.toBeInTheDocument();
   fireEvent.change(screen.getByLabelText("Name for Downloads"), { target: { value: "Renamed" } });
   fireEvent.change(screen.getByLabelText("Inbox path for Downloads"), { target: { value: "/renamed" } });
   fireEvent.change(screen.getByRole("combobox", { name: "Discovery for Downloads" }), { target: { value: "instant" } });
   fireEvent.click(screen.getByRole("checkbox", { name: "Automatically find matches for Downloads" }));
   expect(screen.getByRole("button", { name: "Save settings" })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  expect(screen.getByText("Discovery: Instant")).toBeInTheDocument();
+  expect(screen.getByText("Discovery: Manual only")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
   const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
   const payload = new FormData(form);
-  expect(payload.getAll("inbox_id")).toEqual(["one"]);
-  expect(payload.getAll("inbox_name")).toEqual(["Renamed"]);
-  expect(payload.getAll("inbox_path")).toEqual(["/renamed"]);
-  expect(payload.getAll("inbox_discovery")).toEqual(["instant"]);
+  expect(payload.getAll("inbox_id")).toEqual(["one", "two"]);
+  expect(payload.getAll("inbox_name")).toEqual(["Renamed", "Manual"]);
+  expect(payload.getAll("inbox_path")).toEqual(["/renamed", "/manual"]);
+  expect(payload.getAll("inbox_discovery")).toEqual(["instant", "manual"]);
   expect(payload.getAll("inbox_auto_match_id")).toEqual(["one"]);
 });

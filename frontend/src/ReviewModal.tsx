@@ -2,11 +2,12 @@ import { ArtworkPlaceholder } from "./ArtworkPlaceholder";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useToast } from "./toastContext";
-import { api, ApiError } from "./api";
+import { ActivityProgress } from "./ActivityProgress";
+import { api, ApiError, activityRunning, type ActivityJob } from "./api";
 import { formatMatchPercent } from "./status";
 import type { Album, Candidate, DuplicatePreflight } from "./types";
 
-type Props = { onDeleteAlbum?: () => void; onDeleteTrack?: (trackId: number, title: string) => void; album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onSelectionChange?: (album: Album) => void };
+type Props = { onDeleteAlbum?: () => void; onDeleteTrack?: (trackId: number, title: string) => void; album: Album; source: "inbox" | "library-import"; onClose: () => void; onComplete: (message: string) => void; embedded?: boolean; onBusyChange?: (busy: boolean) => void; onActivityChange?: (id: string | undefined) => void; onSelectionChange?: (album: Album) => void };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -142,11 +143,12 @@ function CandidateCard({ album, candidate, chosen, expanded, busy, choose, onExp
   </article>;
 }
 
-export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onSelectionChange, onDeleteAlbum, onDeleteTrack }: Props) {
+export function ReviewModal({ album: seed, source, onClose, onComplete, embedded = false, onBusyChange, onActivityChange, onSelectionChange, onDeleteAlbum, onDeleteTrack }: Props) {
   const [album, setAlbum] = useState(seed);
   const notify = useToast();
   const [operation, setOperation] = useState<"match" | "search" | "import" | "selection" | null>(null);
   const busy = operation !== null;
+  const [activity, setActivity] = useState<ActivityJob | null>(null);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [mbidOpen, setMbidOpen] = useState(false);
@@ -159,6 +161,10 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
   const [expanded, setExpanded] = useState<number | string | null>(initialExpanded);
   const dialog = useRef<HTMLDivElement>(null);
   const base = source === "inbox" ? "/api/inbox/albums" : "/api/library-import/albums";
+  useEffect(() => {
+    onActivityChange?.(busy && activity && activityRunning(activity) ? activity.id : undefined);
+    return () => onActivityChange?.(undefined);
+  }, [busy, activity, onActivityChange]);
   useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
   useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
   useEffect(() => { if (embedded) dialog.current?.focus(); }, [embedded]);
@@ -223,10 +229,13 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
       const refreshed = albumPayload(response); setAlbum(refreshed); onSelectionChange?.(refreshed); setChosen(initialChoice(refreshed)); setRecovery(""); setExpanded(initialChoice(refreshed) ?? "as-is"); setStatus(""); notify("Exact MusicBrainz release loaded. Review it before importing."); setMbidOpen(false);
     } catch (reason) { setError((reason as Error).message); setStatus(""); } finally { setOperation(null); }
   };
+  const duplicate: DuplicatePreflight = moved ? { status: "clear" } : duplicatePreflight(album, chosen);
+  const duplicateAction = album.duplicate_action || "";
+  const duplicateChoices = source === "inbox" ? ["keep-existing", "replace", "keep-both"] : ["keep-existing", "skip", "keep-both"];
+  const needsDuplicateDecision = duplicate.status === "possible" && !duplicateChoices.includes(duplicateAction);
   const execute = async (skipArtwork = false) => {
-    const duplicate: DuplicatePreflight = moved ? { status: "clear" } : duplicatePreflight(album, chosen);
     if (duplicate.status === "ambiguous") { setError("Import is blocked because managed recording identity is ambiguous."); return; }
-    if (duplicate.status === "possible" && (!album.duplicate_action || !(source === "inbox" ? ["keep-existing", "replace", "keep-both"] : ["keep-existing", "skip", "keep-both"]).includes(album.duplicate_action))) { setError("Choose a duplicate decision before importing this album."); return; }
+    if (needsDuplicateDecision) return;
     const selection = { candidate_id: chosen ?? null, ...(duplicate.status === "possible" ? { duplicate_action: album.duplicate_action } : {}) };
     const artworkOption = skipArtwork ? { skip_artwork: true } : {};
     setOperation("import"); setError(""); setStatus("Running preflight…");
@@ -235,9 +244,10 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
         const saved = await api<any>(`${base}/${album.id}`, { method: "PATCH", body: JSON.stringify({ decision: "approved", ...selection }) });
         setAlbum(albumPayload(saved));
       }
-      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption, dry_run: true }) });
+      let checkId: string | undefined;
+      await api(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption, dry_run: true }) }, job => { setActivity(job); checkId = job.id; });
       setStatus(cleanupPending ? "Finishing Inbox cleanup…" : moved ? "Finalizing artwork…" : "Preflight passed. Importing…");
-      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption }) });
+      const result = await api<any>(`${base}/${album.id}/execute`, { method: "POST", body: JSON.stringify({ ...(source === "library-import" ? selection : {}), ...artworkOption }) }, setActivity, checkId);
       onComplete(result.message || `${album.album || album.name || "Album"} imported successfully.`);
     } catch (reason) {
       const code = reason instanceof ApiError ? reason.code || "" : "";
@@ -251,11 +261,25 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
       setStatus(""); setOperation(null);
     }
   };
-  const duplicate: DuplicatePreflight = moved ? { status: "clear" } : duplicatePreflight(album, chosen);
   return <div className={embedded ? "embedded-review" : "modal"} data-review-modal data-busy={busy} onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }}>
     <div className="dialog" role={embedded ? "region" : "dialog"} aria-modal={embedded ? undefined : "true"} aria-labelledby="review-title" tabIndex={-1} ref={dialog} data-review-dialog>
       <header><div><p className="eyebrow">Album review</p><h2 id="review-title" data-review-title>{album.album || album.name || album.path || "Album"}</h2></div><button type="button" onClick={onClose} disabled={busy} aria-label="Close review" data-review-close>×</button></header>
       <div className="dialog-body">
+        {busy && activity && activityRunning(activity) && <ActivityProgress job={activity}/>}
+        {duplicate.status !== "clear" && <div className={`notice${duplicate.status === "ambiguous" ? " error" : ""}`} data-duplicate-warning>
+          <strong>{duplicate.message || (duplicate.status === "ambiguous" ? "Managed recording identity is ambiguous." : "This match may duplicate an existing library item.")}</strong>
+          {duplicate.status === "possible" && <label className="select-label">Duplicate decision
+            <select required
+              value={needsDuplicateDecision ? "" : duplicateAction === "skip" ? "keep-existing" : duplicateAction}
+              disabled={busy}
+              onChange={event => { setAlbum({ ...album, duplicate_action: event.target.value }); setError(""); void saveDuplicate(event.target.value); }}>
+              <option value="">Choose what to do before importing</option>
+              <option value="keep-existing">{source === "inbox" ? "Keep existing; retain Inbox originals" : "Keep existing; leave duplicate files untouched"}</option>
+              {source === "inbox" && <option value="replace">Replace with incoming files</option>}
+              <option value="keep-both">Keep both</option>
+            </select>
+          </label>}
+        </div>}
         <div className="review-tools"><button type="button" onClick={() => void match()} disabled={busy || moved} aria-busy={operation === "match"}>{operation === "match" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches" : "Match"}</button><button className="secondary" type="button" onClick={() => { setMbidOpen(value => !value); setError(""); }} disabled={busy || moved} aria-expanded={mbidOpen}>Search MBID</button></div>
         {mbidOpen && <form className="mbid-search" onSubmit={searchMbid}><label>MusicBrainz release UUID<input value={mbid} onChange={event => setMbid(event.target.value)} placeholder="123e4567-e89b-42d3-a456-426614174000" disabled={busy} autoFocus/></label><button type="submit" disabled={busy} aria-busy={operation === "search"}>{operation === "search" && <span className="spinner"/>}Search exact release</button></form>}
         {source === "inbox" && onDeleteTrack && <details className="inbox-local-tracks"><summary>Inbox files ({(album.tracks || []).length})</summary><ul className="track-list">{(album.tracks || []).map(track => <li key={track.id}><div><strong>{track.title || fileName(track.path)}</strong><small>{track.path}</small></div><button type="button" className="danger-action" disabled={busy || moved || !Number.isInteger(track.id)} aria-label={`Delete track ${track.title || fileName(track.path)}`} onClick={() => onDeleteTrack(track.id, String(track.title || fileName(track.path)))}>Delete track</button></li>)}</ul></details>}
@@ -264,13 +288,11 @@ export function ReviewModal({ album: seed, source, onClose, onComplete, embedded
           <article className={`candidate-card as-is${chosen === null ? " selected" : ""}`}><div className="candidate-heading"><label><input type="radio" name="candidate" checked={chosen === null} disabled={busy || moved} onChange={() => { choose(null); setExpanded("as-is"); }}/><span className="sr-only">Select As Is</span></label><span className="candidate-artwork"><ArtworkPlaceholder/></span><button className="candidate-summary" type="button" aria-expanded={expanded === "as-is"} onClick={() => setExpanded(current => current === "as-is" ? null : "as-is")}><span className="candidate-title"><strong>As Is</strong><small>Retain incoming/local metadata unchanged</small></span><span className="candidate-change-icons" aria-label="No MusicBrainz association">—</span><span aria-hidden="true">{expanded === "as-is" ? "⌃" : "⌄"}</span></button></div>{expanded === "as-is" && <p className="as-is-detail">Do not associate a MusicBrainz release.</p>}</article>
         </fieldset>
         {!busy && !error && album.candidate_status === "complete" && !candidates(album).length && <p className="notice" role="status" data-no-matches>No matches found. Try Search MBID or choose As Is to keep the current metadata.</p>}
-        {duplicate.status !== "clear" && <div className={`notice${duplicate.status === "ambiguous" ? " error" : ""}`} data-duplicate-warning><strong>{duplicate.message || (duplicate.status === "ambiguous" ? "Managed recording identity is ambiguous." : "This match may duplicate an existing library item.")}</strong></div>}
-        {duplicate.status === "possible" && <label className="select-label">Duplicate decision<select required value={source === "library-import" && album.duplicate_action === "skip" ? "keep-existing" : !(source === "inbox" ? ["keep-existing", "replace", "keep-both"] : ["keep-existing", "keep-both"]).includes(album.duplicate_action || "") ? "" : album.duplicate_action || ""} disabled={busy || moved} onChange={event => { setAlbum({ ...album, duplicate_action: event.target.value }); setError(""); void saveDuplicate(event.target.value); }}><option value="">Choose a decision</option>{source === "inbox" ? <><option value="keep-existing">Keep existing; retain Inbox originals</option><option value="replace">Replace with incoming files</option><option value="keep-both">Keep both</option></> : <><option value="keep-existing">Keep existing; leave duplicate files untouched</option><option value="keep-both">Keep both</option></>}</select></label>}
         {moved && <p className="notice">{cleanupPending ? "Library destinations are verified. Retry only finishes incoming file cleanup; it will not import or replace audio again." : "Audio has already been imported. Recovery only handles the pending artwork; it will not move or import the audio again."}</p>}
         {["artwork_fetch_failed", "artwork_finalize_failed"].includes(recovery) && <div className="notice"><p>{moved ? "You can retry the pending sidecar, or finish without it when no incoming artwork needs recovery. Already embedded artwork is retained." : "You can retry artwork retrieval or continue with the selected metadata while preserving existing artwork. This applies only to this import."}</p><button type="button" className="secondary" disabled={busy} onClick={() => void execute(true)}>{moved ? "Finish without new sidecar" : "Continue without new artwork"}</button></div>}
-        {status && <p className="notice" aria-live="polite" data-review-status>{status}</p>}{error && <p className="notice error" role="alert" data-review-status>{error}</p>}
+        {status && <p className="notice" aria-live="polite" data-review-status>{status}</p>}
       </div>
-      <footer><button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button>{onDeleteAlbum && <button type="button" className="danger-action" disabled={busy || moved} onClick={onDeleteAlbum}>Delete from Inbox</button>}<button type="button" onClick={() => void execute()} disabled={busy || chosen === undefined || ["candidate_stale", "candidate_unavailable"].includes(recovery)} aria-busy={operation === "import"} data-review-execute>{operation === "import" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches before importing" : cleanupPending ? "Finish Inbox cleanup" : moved ? "Retry artwork finalization" : error ? "Retry import" : "Import to Library"}</button></footer>
+      <footer>{error && <p className="notice error review-error" role="alert" data-review-status>{error}</p>}<button type="button" className="secondary" onClick={onClose} disabled={busy} data-review-cancel>Cancel</button>{onDeleteAlbum && <button type="button" className="danger-action" disabled={busy || moved} onClick={onDeleteAlbum}>Delete from Inbox</button>}<button type="button" onClick={() => void execute()} disabled={busy || chosen === undefined || needsDuplicateDecision || ["candidate_stale", "candidate_unavailable"].includes(recovery)} aria-busy={operation === "import"} data-review-execute>{operation === "import" && <span className="spinner"/>}{["candidate_stale", "candidate_unavailable"].includes(recovery) ? "Refresh matches before importing" : needsDuplicateDecision ? "Choose a duplicate decision" : cleanupPending ? "Finish Inbox cleanup" : moved ? "Retry artwork finalization" : error ? "Retry import" : "Import to Library"}</button></footer>
     </div>
   </div>;
 }

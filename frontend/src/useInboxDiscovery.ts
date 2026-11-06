@@ -8,6 +8,7 @@ export type DiscoveryStatus = { mode: string; revision: string; scanned_at: stri
 export function useInboxDiscovery(inboxId: string | undefined, paused: boolean, onChange: () => Promise<void>) {
   const [status, setStatus] = useState<DiscoveryStatus | null>(null);
   const [pending, setPending] = useState(false);
+  const [connection, setConnection] = useState<{ inboxId: string; failed: boolean } | null>(null);
   const latest = useRef({ paused, onChange });
   useEffect(() => { latest.current = { paused, onChange }; }, [paused, onChange]);
   useEffect(() => {
@@ -15,6 +16,7 @@ export function useInboxDiscovery(inboxId: string | undefined, paused: boolean, 
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     let applied = "";
+    let failures = 0;
     let controller = new AbortController();
     const poll = async () => {
       let delay = 2000;
@@ -25,6 +27,8 @@ export function useInboxDiscovery(inboxId: string | undefined, paused: boolean, 
         try { next = await api<DiscoveryStatus>(`/api/inbox/${encodeURIComponent(inboxId)}/discovery`, { signal: controller.signal }); }
         finally { clearTimeout(timeout); }
         if (stopped) return;
+        failures = 0;
+        setConnection(current => current?.inboxId === inboxId && !current.failed ? current : { inboxId, failed: false });
         setStatus(next);
         if (next.mode === "manual") { setPending(false); delay = 30000; } // Pick up settings changed in another tab.
         if (next.mode !== "manual" && next.revision !== applied) {
@@ -36,11 +40,15 @@ export function useInboxDiscovery(inboxId: string | undefined, paused: boolean, 
             setPending(false);
           }
         }
-      } catch { delay = 5000; } // The next status request catches up after reconnect.
+      } catch {
+        if (stopped) return;
+        if (++failures >= 2) setConnection(current => current?.inboxId === inboxId && current.failed ? current : { inboxId, failed: true });
+        delay = 5000;
+      } // The next status request catches up after reconnect.
       if (!stopped) timer = setTimeout(() => { void poll(); }, delay);
     };
     timer = setTimeout(() => { void poll(); }, 2000);
     return () => { stopped = true; clearTimeout(timer); controller.abort(); };
   }, [inboxId]);
-  return { status, pending };
+  return { status, pending, reconnecting: Boolean(connection && connection.inboxId === inboxId && connection.failed) };
 }

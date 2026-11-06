@@ -1,4 +1,5 @@
 import { MetadataEditor } from "./MetadataEditor";
+import { ActivityInline } from "./Activity";
 import { useInspectorResize } from "./useInspectorResize";
 import { ArtworkPlaceholder } from "./ArtworkPlaceholder";
 import { useEffect, useRef, useState } from "react";
@@ -19,11 +20,11 @@ export function Overview({ data }: { data: Record<string, any> }) {
 
 export function Inbox({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const inboxes = data.inboxes || [];
-  const [selected, setSelected] = useState(() => { const requested = new URLSearchParams(location.search).get("source"); return inboxes.find((row: any) => row.id === requested)?.id || inboxes[0]?.id || ""; });
+  const [selected, setSelected] = useState(() => { const requested = new URLSearchParams(location.search).get("source"); return (requested === "all" && inboxes.length > 1 ? "all" : inboxes.find((row: any) => row.id === requested)?.id) || inboxes[0]?.id || ""; });
   const [busy, setBusy] = useState(false);
   return <><PageHeader eyebrow="A place for every record" title="Incoming music">Review the details. Give every album its place.</PageHeader>
-    {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{inboxes.map((inbox: any) => <button role="tab" disabled={busy} aria-selected={selected === inbox.id} onClick={() => { setSelected(inbox.id); history.replaceState(null, "", `?source=${encodeURIComponent(inbox.id)}`); }} key={inbox.id}>{inbox.name}</button>)}</div>}
-    {selected ? <Queue key={selected} source="inbox" threshold={threshold} inboxId={selected} onBusyChange={setBusy} sourceName={inboxes.find((row: any) => row.id === selected)?.name}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
+    {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{[{ id: "all", name: "All Inboxes" }, ...inboxes].map((inbox: any) => <button role="tab" disabled={busy} aria-selected={selected === inbox.id} onClick={() => { setSelected(inbox.id); history.replaceState(null, "", `?source=${encodeURIComponent(inbox.id)}`); }} key={inbox.id}>{inbox.name}</button>)}</div>}
+    {selected ? <Queue key={selected} source="inbox" threshold={threshold} inboxId={selected} inboxes={inboxes} onBusyChange={setBusy} sourceName={inboxes.find((row: any) => row.id === selected)?.name}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
   </>;
 }
 
@@ -40,6 +41,7 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
   const [removing, setRemoving] = useState(false), [removalResult, setRemovalResult] = useState<any>(null);
   const [pending, setPending] = useState(false);
   const region = useRef<HTMLDivElement>(null);
+  const removalCheck = useRef<string | undefined>(undefined);
   const busy = pending || removing;
   useEffect(() => { onBusyChange(busy); }, [busy, onBusyChange]);
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
@@ -47,14 +49,14 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
   const previewRemoval = async () => {
     setError(""); setDeleteFiles(false); setRemovalResult(null);
     setPending(true);
-    try { setRemoval(await api<any>(`/api/library/albums/${id}/removal/preview`, { method: "POST", body: JSON.stringify({ expected_fingerprint: album.fingerprint }) })); }
+    try { setRemoval(await api<any>(`/api/library/albums/${id}/removal/preview`, { method: "POST", body: JSON.stringify({ expected_fingerprint: album.fingerprint }) }, job => { removalCheck.current = job.id; })); }
     catch (reason) { setError((reason as Error).message); } finally { setPending(false); }
   };
   const removeAlbum = async () => {
     setRemoving(true); setError("");
     setPending(true);
     try {
-      const result = await api<any>(`/api/library/albums/${id}/removal/apply`, { method: "POST", body: JSON.stringify({ preview_id: removal.preview_id, expected_fingerprint: removal.fingerprint, delete_files: deleteFiles, confirmed: true }) });
+      const result = await api<any>(`/api/library/albums/${id}/removal/apply`, { method: "POST", body: JSON.stringify({ preview_id: removal.preview_id, expected_fingerprint: removal.fingerprint, delete_files: deleteFiles, confirmed: true }) }, undefined, removalCheck.current);
       setRemovalResult(result);
       if (result.status === "complete") notify(result.message);
     } catch (reason) { setError((reason as Error).message); } finally { setRemoving(false); setPending(false); }
@@ -87,7 +89,7 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
 
     {preview && <div className="subpanel"><h3>{preview.kind === "artwork" ? "Artwork preview" : "Metadata preview"}</h3>{preview.kind === "artwork" && <img className="art-preview" src={`/api/library/albums/${id}/artwork/previews/${preview.preview_id}`} alt="Proposed cover artwork"/>}<p>{preview.message || (preview.applicable === false ? "This match cannot be applied safely." : "Preview is ready to apply.")}</p></div>}
   </>}</fieldset></div><footer className="record-action-footer" aria-label="Album actions">
-    {removalResult ? <button type="button" disabled={busy} onClick={() => location.reload()}>Refresh Library</button> : removal ? <><button className="secondary" type="button" disabled={busy} onClick={() => setRemoval(null)}>Cancel removal</button><button className="danger-action" type="button" disabled={busy} onClick={() => void removeAlbum()}>{removing ? "Removing…" : deleteFiles ? "Delete listed files and remove album" : "Remove from Cratekeep; keep files"}</button></> : preview ? <><button className="secondary" type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel</button><button type="button" disabled={busy || preview.applicable === false} onClick={preview.kind === "artwork" ? applyArtwork : applyPreview}>Apply {preview.kind === "artwork" ? "artwork" : "rematch"}</button></> : album ? <button className="secondary danger-action" type="button" disabled={busy} onClick={() => void previewRemoval()}>Remove from library</button> : null}
+    {removalResult ? <button type="button" disabled={busy} onClick={() => location.reload()}>Refresh Library</button> : removal ? <><button key="cancel-removal" autoFocus className="secondary" type="button" disabled={busy} onClick={() => setRemoval(null)}>Cancel removal</button><button className="danger-action" type="button" disabled={busy} onClick={() => void removeAlbum()}>{removing ? "Removing…" : deleteFiles ? "Delete listed files and remove album" : "Remove from Cratekeep; keep files"}</button></> : preview ? <><button className="secondary" type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel</button><button type="button" disabled={busy || preview.applicable === false} onClick={preview.kind === "artwork" ? applyArtwork : applyPreview}>Apply {preview.kind === "artwork" ? "artwork" : "rematch"}</button></> : album ? <button className="secondary danger-action" type="button" disabled={busy} onClick={() => void previewRemoval()}>Remove from library</button> : null}
   </footer></div>{editing && album && <MetadataEditor album={album} onClose={() => setEditing(false)} onBusyChange={onBusyChange} onSaved={updated => { setAlbum(updated); setEditing(false); notify("Metadata saved."); }}/>}</div>;
 }
 
@@ -104,7 +106,7 @@ export function Library({ data }: { data: Record<string, any> }) {
   const artistView = data.view === "artists";
   const recordCount = artistView ? data.matching_artists ?? data.artists?.length ?? 0 : data.matching_albums ?? data.albums?.length ?? 0;
   const pageUrl = (number: number) => `/library?${new URLSearchParams({ q: data.query || "", sort: data.sort || (artistView ? "artist" : "recent"), order: data.order || (artistView ? "asc" : "desc"), artist: data.artist_filter || "", album: data.album_filter || "", ...(artistView ? { view: "artists" } : {}), page: String(number) })}`;
-  return <div className="library-collection"><PageHeader eyebrow="The listening desk / Library" title="Managed collection">The records you've made room for.</PageHeader>
+  return <div className="library-collection"><ActivityInline scope="library"/><PageHeader eyebrow="The listening desk / Library" title="Managed collection">The records you've made room for.</PageHeader>
     <div className="collection-bar"><dl className="collection-counts"><div><dt>Albums</dt><dd>{summary.albums || 0}</dd></div><div><dt>Tracks</dt><dd>{summary.tracks || 0}</dd></div><div><dt>Artists</dt><dd>{summary.artists || 0}</dd></div><div><dt>Size</dt><dd>{formatBytes(summary.bytes)}</dd></div></dl><a className="library-import-link" href="/library-import">Import existing files →</a></div>
     <div ref={workspaceRef} style={splitStyle} className={`desk-workspace library-workspace${artistView ? " is-artists" : ""}${open != null ? " is-detail-open" : ""}`}><div className="desk-queue"><nav className="library-views" aria-label="Library view"><a href="/library" aria-current={!artistView ? "page" : undefined}>Albums</a><a href="/library?view=artists" aria-current={artistView ? "page" : undefined}>Artists</a></nav>{data.artist_filter && <p className="artist-breadcrumb"><a href="/library?view=artists">All artists</a><span aria-hidden="true"> / </span>{data.artist_filter}</p>}<form className="collection-search" method="get" onSubmit={event => { if (busy) event.preventDefault(); }}><label><span className="sr-only">Search library</span><input name="q" defaultValue={data.query} placeholder={artistView ? "Find an artist" : "Find an artist, album or song"}/>{artistView && <input type="hidden" name="view" value="artists"/>}{data.artist_filter && <input type="hidden" name="artist" value={data.artist_filter}/>}</label>{!artistView && <label><span className="sr-only">Sort library</span><select name="sort" defaultValue={data.sort || (artistView ? "artist" : "recent")}><option value="artist">Artist</option><option value="album">Album</option><option value="year">Year</option><option value="recent">Recently added</option></select></label>}<label><span className="sr-only">Sort order</span><select name="order" defaultValue={data.order || (artistView ? "asc" : "desc")}><option value="asc">Ascending</option><option value="desc">Descending</option></select></label><button type="submit" className="secondary collection-search-submit">Search</button></form>
     <section className="record-catalog" aria-labelledby="browse-title"><header><h2 id="browse-title">{artistView ? "Browse artists" : "Browse albums"}</h2><p>{recordCount} {artistView ? recordCount === 1 ? "artist" : "artists" : recordCount === 1 ? "record" : "records"}{data.artist_filter ? ` · ${data.artist_filter}` : ""}{data.album_filter ? ` · ${data.album_filter}` : ""}</p>{(data.query || data.artist_filter || data.album_filter) && <a href={artistView ? "/library?view=artists" : "/library"}>Clear filters</a>}</header>
@@ -123,6 +125,11 @@ type InboxSetting = { key: string; id: string; name: string; path: string; auto_
 type InboxDraft = InboxSetting & { isNew?: boolean };
 const inboxDiscoveryOptions = [["manual", "Manual only"], ["instant", "Instant"], ["5", "Every 5 minutes"], ["15", "Every 15 minutes"], ["30", "Every 30 minutes"], ["60", "Every hour"], ["360", "Every 6 hours"], ["1440", "Every 24 hours"]];
 
+function settingsTabFromHash() {
+  const hash = location.hash.slice(1);
+  return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
+}
+
 export function Settings({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const settings = data.settings || {}, initial = data.inboxes || [];
   const notify = useToast(), flashed = useRef(false);
@@ -135,10 +142,12 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
   const [inboxes, setInboxes] = useState<InboxSetting[]>(() => initial.map((inbox: InboxSetting) => ({ ...inbox, key: inbox.id })));
   const [draft, setDraft] = useState<InboxDraft | null>(null);
   const editor = useRef<HTMLDivElement>(null);
-  const [tab, setTab] = useState(() => {
-    const hash = location.hash.slice(1);
-    return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
-  });
+  const [tab, setTab] = useState(settingsTabFromHash);
+  useEffect(() => {
+    const syncTab = () => setTab(settingsTabFromHash());
+    window.addEventListener("hashchange", syncTab);
+    return () => window.removeEventListener("hashchange", syncTab);
+  }, []);
   function finishInbox() {
     if (!draft || !Array.from(editor.current?.querySelectorAll("input:not([type=hidden])") || []).every(input => (input as HTMLInputElement).reportValidity())) return;
     setInboxes(rows => rows.map(row => row.key === draft.key ? { ...row, name: draft.name.trim(), path: draft.path.trim(), discovery: draft.discovery || "5", auto_match: Boolean(draft.auto_match) } : row));

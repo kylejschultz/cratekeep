@@ -12,6 +12,7 @@ from mediafile import MediaFile
 
 from beets.library import Item
 
+from .activity import report as report_progress
 from .duplicates import duplicate_matches
 
 from . import (
@@ -45,7 +46,9 @@ def finish_cleanup(app, album, *, dry_run):
     job_id = result["id"]
     try:
         library = _library(app)
-        for record in result["verified_destinations"]:
+        destinations = result["verified_destinations"]
+        for index, record in enumerate(destinations):
+            report_progress("Verifying Library tracks", index, len(destinations), unit="tracks")
             item = library.get_item(record["beets_item_id"])
             if item is None or str(_managed_path(app, item.path)) != record["path"] or _identity(Path(record["path"])) != record["identity"]:
                 raise OSError("A verified managed destination changed; incoming files were retained for inspection.")
@@ -60,6 +63,7 @@ def finish_cleanup(app, album, *, dry_run):
                 raise OSError("A source file changed after destination verification; cleanup stopped.")
         if dry_run:
             return {**result, "status": "preview", "dry_run": True}
+        report_progress("Finishing import")
         for record in result["cleanup"]:
             if record.get("cleaned"):
                 continue
@@ -103,6 +107,7 @@ def execute(app, album, rows, paths, provider, job_id, *, dry_run):
     duplicates, new = [], []
     seen = set()
     for position, (row, path) in enumerate(zip(rows, paths), 1):
+        report_progress("Checking duplicate files", position - 1, len(paths), unit="tracks", current=path.name)
         values = _candidate_item_values(provider, details.get(position)) if provider else {}
         recording = str(values.get("mb_trackid") or query["tracks"][position - 1].get("recording_id") or "")
         local = query["tracks"][position - 1]
@@ -156,6 +161,7 @@ def execute(app, album, rows, paths, provider, job_id, *, dry_run):
     try:
         # Originals remain intact throughout preparation and Beets execution.
         for index, entry in enumerate([*new, *duplicates]):
+            report_progress("Preparing track copies", index, len(paths), unit="tracks", current=entry["path"].name)
             path = _validate_inventory_file(Path(album["root_path"]), entry["row"])
             if _identity(path) != entry["source_identity"]:
                 raise OSError("Incoming audio changed after preview")
@@ -182,12 +188,15 @@ def execute(app, album, rows, paths, provider, job_id, *, dry_run):
                 shutil.copy2(entry["target"], backup)
                 entry["backup"] = backup
         if new:
+            report_progress("Importing new tracks")
             process = _run_beets_import(app, staging)
             if process.returncode:
                 raise OSError(f"Beets could not import the nonduplicate tracks ({process.returncode})")
             verified_new = _verify_inbox_move(app, [e["staged"] for e in new], new_destinations)
         with library.transaction():
-            for entry in duplicates:
+            stage = "Replacing Library tracks" if album["duplicate_action"] == "replace" else "Checking retained Library tracks"
+            for index, entry in enumerate(duplicates):
+                report_progress(stage, index, len(duplicates), unit="tracks", current=entry["target"].name)
                 item = entry["item"]
                 if _identity(entry["target"]) != entry["target_identity"]:
                     raise OSError("Managed duplicate changed during execution")

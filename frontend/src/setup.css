@@ -1,0 +1,48 @@
+/* First-run keeps the server form and browser, using the app's shared tokens. */
+html:has(body.setup-mode){height:auto;min-height:100%;overflow:auto}
+html:has(body.setup-mode.modal-open){overflow:hidden}
+body.setup-mode{height:auto;min-height:100dvh;overflow:visible;width:min(820px,100%);max-width:none;margin:0 auto;padding:32px 24px;font:14px/1.5 "Public Sans",sans-serif;--font-sans:"Public Sans",sans-serif;--modal-surface:var(--surface);--modal-panel:var(--surface);--modal-border:var(--control);--modal-subtle:var(--surface-2);--modal-accent:var(--text);--modal-accent-hover:var(--text);--focus:var(--accent);--overlay:#0008}
+body.setup-mode.modal-open{overflow:hidden}
+.setup-mode main{padding:0;background:none;border:0;border-radius:0;box-shadow:none}
+.setup-header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}
+.setup-brand{display:flex;align-items:center;gap:12px;min-width:0}
+.setup-brand .logo{width:48px;height:48px;margin:0;object-fit:contain}
+.setup-brand h1{margin:0;color:var(--text);font-size:24px;font-weight:500;letter-spacing:-.02em}
+.setup-mode .header-icon{display:flex;align-items:center;justify-content:center;flex:none;width:40px;height:40px;min-height:40px;padding:0;margin:0;color:var(--muted);background:none;border-color:transparent}
+.setup-mode .header-icon:hover{color:var(--text);background:var(--surface-2)}
+:root[data-theme=dark] .setup-moon,:root:not([data-theme=dark]) .setup-sun{display:none}
+.setup-mode main>p{color:var(--muted);margin:0 0 24px}
+.setup-mode .settings-section{display:block;margin:0 0 16px;padding:20px;border:0;border-radius:6px;background:var(--surface);box-shadow:none}
+.setup-mode .settings-section>h2{font-size:16px;font-weight:500;color:var(--text)}
+.setup-mode .settings-section>p,.setup-mode small{color:var(--muted);font-size:12px}
+.setup-mode fieldset{min-width:0;padding:0;margin:0;border:0}
+.setup-mode legend{padding:0;font-weight:500;font-size:16px}
+.setup-mode label{font-size:14px;font-weight:500;margin-top:16px}
+.setup-mode input:not([type=checkbox]):not([type=hidden]),.setup-mode select{min-width:0;width:100%;height:40px;padding:8px 10px;margin-top:6px;border:1px solid var(--control);border-radius:5px;font:inherit;color:var(--text);background:var(--surface)}
+.setup-mode input::placeholder{color:var(--muted)}
+.setup-mode .inbox-list{margin-top:16px;gap:16px}
+.setup-mode .inbox-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:end;padding:0 0 16px;border:0;border-bottom:1px solid var(--border);border-radius:0}
+.setup-mode .inbox-row label{margin:0}
+.setup-mode .inbox-row>button{justify-self:start}
+.setup-mode .check-label{align-items:center;gap:8px;min-height:40px}
+.setup-mode input[type=checkbox]{flex:none;width:16px;height:16px;margin:0}
+.setup-mode button{min-height:34px;margin:0;padding:6px 13px;border:1px solid var(--control);border-radius:999px;font:500 13px "Public Sans",sans-serif;color:var(--text);background:var(--surface-2)}
+.setup-mode button:hover:not(:disabled){color:var(--text);background:var(--surface-2);border-color:var(--text)}
+.setup-mode button:disabled{opacity:.55}
+.setup-mode .add-inbox{margin-top:16px}
+.setup-mode .path-picker{align-items:end;min-width:0}
+.setup-mode .path-picker input{margin-top:0}
+.setup-mode form>button[type=submit]{display:block;margin-left:auto;min-height:40px;background:var(--text);color:var(--page);border-color:var(--text)}
+.setup-mode .flash{padding:12px 16px;border-radius:5px;background:var(--success);color:var(--text)}
+.setup-mode .flash.error{background:var(--danger);border:1px solid var(--error)}
+.setup-mode .browser-dialog{border-radius:6px;max-height:calc(100dvh - 32px);box-shadow:0 10px 28px #0003}
+.setup-mode .browser-header h2{color:var(--text);font-size:18px;font-weight:500}
+.setup-mode .browser-close{color:var(--text);background:none;border-color:transparent}
+.setup-mode .browser-body button:not(.directory-row){color:var(--text);background:var(--surface-2);border-color:var(--control)}
+.setup-mode .browser-actions button:not(.secondary){color:var(--page);background:var(--text);border-color:var(--text)}
+.setup-mode .browser-body button.breadcrumb{color:var(--text);background:none;border-color:transparent}
+.setup-mode .browser-body .directory-row{color:var(--text);background:none;border:0;border-bottom:1px solid var(--border);border-radius:0}
+.setup-mode .browser-body .directory-row:hover,.setup-mode .directory-row[aria-selected=true]{background:var(--surface-2)}
+.setup-mode .browser-status.error-text{color:var(--error)}
+.setup-mode .browser-path-form{align-items:end}
+@media(max-width:640px){body.setup-mode{padding:20px 16px}.setup-brand h1{font-size:22px}.setup-brand .logo{width:40px;height:40px}.setup-mode .settings-section{padding:16px}.setup-mode .inbox-row{grid-template-columns:minmax(0,1fr);gap:12px}.setup-mode button,.setup-mode input:not([type=checkbox]):not([type=hidden]),.setup-mode select,.setup-mode .check-label{min-height:44px}.setup-mode .header-icon{width:44px;height:44px}.setup-mode .browser-path-form{flex-wrap:wrap}.setup-mode .browser-path-form input{flex-basis:100%}.setup-mode .path-picker{flex-wrap:wrap}.setup-mode .path-picker input{flex-basis:100%}}
