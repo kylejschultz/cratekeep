@@ -740,17 +740,27 @@ def main() -> None:
         # Copy imports retain original bytes; exercise Undo and explicit source purge in the UI.
         copy_folder = args.fixture_root / "inbox" / "Copy Lifecycle"
         copy_sources = [copy_folder / "01 First.wav", copy_folder / "02 Second.wav"]
-        for number, path in enumerate(copy_sources, 1):
-            write_wav(path)
-            tags=MediaFile(str(path))
-            tags.artist=tags.albumartist="Copy Artist"
-            tags.album="Copy Lifecycle"; tags.title=path.stem[3:]; tags.track=number; tags.save()
+        def write_copy_sources(*, replacement=False):
+            for number, path in enumerate(copy_sources, 1):
+                write_wav(path)
+                tags = MediaFile(str(path))
+                tags.artist = tags.albumartist = "Copy Artist"
+                tags.album, tags.title, tags.track = "Copy Lifecycle", path.stem[3:], number
+                tags.mb_albumid = "123e4567-e89b-42d3-a456-426614174099"
+                tags.mb_trackid = f"123e4567-e89b-42d3-a456-42661417409{number}"
+                tags.save()
+                if replacement:
+                    with path.open("ab") as audio:
+                        audio.write(b"replacement-fixture")
+        write_copy_sources()
         originals={path:sha256(path) for path in copy_sources}
         page.goto(base+"/inbox",wait_until="networkidle")
         with expect_operation(page, lambda response: response.url.endswith("/scopes/refresh")) as copied_refresh:
             page.get_by_role("button", name="Refresh", exact=True).click()
         assert copied_refresh.value.ok
         page.get_by_role("searchbox",name="Find an album").fill("Copy Lifecycle")
+        copy_rows = page.request.get(inbox_base + "/queue?q=Copy+Lifecycle").json()["albums"]
+        assert [row["album"] for row in copy_rows] == ["Copy Lifecycle"], copy_rows
         copy_row=page.locator(".desk-album").filter(has_text="Copy Lifecycle")
         copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
         assert page.get_by_role("button",name="Review import",exact=True).count()==0
@@ -775,18 +785,19 @@ def main() -> None:
         copy_row.locator(".desk-decision").filter(has_text="Matched").wait_for()
         assert all(sha256(path)==originals[path] for path in copy_sources)
         assert not any(path.exists() for path in targets)
-        copy_row.get_by_role("checkbox").check()
-        page.get_by_role("button",name="Import selected",exact=True).click()
-        page.get_by_role("button",name="Start import",exact=True).click()
-        page.get_by_role("heading",name="Import results",exact=True).wait_for()
+        # Set up the cleanup fixture through the API. The browser already
+        # exercises bulk confirmation elsewhere and will exercise Replace below.
+        restored = page.request.post(base + f"/api/inbox/albums/{imported['id']}/execute", data={})
+        assert restored.status == 201, restored.json()
+        page.reload(wait_until="networkidle")
+        page.get_by_role("searchbox", name="Find an album").fill("Copy Lifecycle")
+        copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
         saved={path:sha256(path) for path in targets}
         # Download-client sidecars must leave with the cleared album folder.
         (copy_folder/"album.nfo").write_text("download metadata")
         (copy_folder/"folder.jpg").write_bytes(b"disposable cover")
         (copy_folder/"artwork").mkdir()
         (copy_folder/"artwork"/"large.jpg").write_bytes(b"disposable artwork")
-        page.screenshot(path=args.evidence_dir/"10a-copy-import-results.png",full_page=True)
-        page.get_by_role("button",name="Close results",exact=True).click()
         copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
         imported_inspector=page.get_by_role("complementary",name="Album inspector",exact=True)
         remove_originals=imported_inspector.get_by_role("button",name="Remove originals",exact=True)
@@ -809,6 +820,35 @@ def main() -> None:
         assert not any(path.exists() for path in copy_sources) and not copy_folder.exists()
         assert all(sha256(path)==saved[path] for path in targets)
         page.screenshot(path=args.evidence_dir/"10b-imported-originals-removed.png",full_page=True)
+        # Same recording IDs in a new download must require an explicit
+        # duplicate decision and run through the real Activity preflight.
+        write_copy_sources(replacement=True)
+        replacement_hashes = {path: sha256(path) for path in copy_sources}
+        page.get_by_role("button", name="Refresh", exact=True).click()
+        copy_row.locator(".desk-decision").filter(has_text="Pending").wait_for()
+        page.set_viewport_size({"width": 390, "height": 844})
+        copy_row.get_by_role("button", name="Review Copy Lifecycle", exact=True).click()
+        inspector = page.get_by_role("region", name="Copy Lifecycle", exact=True)
+        choice = inspector.get_by_role("combobox", name=re.compile("Duplicate decision"))
+        choice.wait_for()
+        assert choice.evaluate("node => { const r = node.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; }")
+        assert inspector.get_by_role("button", name="Choose a duplicate decision", exact=True).is_disabled()
+        with expect_operation(page, lambda response: "/api/inbox/albums/" in response.url and response.request.method == "PATCH") as saved_choice:
+            inspector.get_by_label("Select As Is", exact=True).click()
+        assert saved_choice.value.ok
+        choice.select_option("replace")
+        with expect_operation(page, lambda response: response.url.endswith("/execute")
+                              and not response.request.post_data_json.get("dry_run")) as replaced:
+            inspector.get_by_role("button", name="Import to Library", exact=True).click()
+        assert replaced.value.status == 201, replaced.value.json()
+        result = replaced.value.json()
+        assert result["replaced"] == len(targets) and result["added"] == 0
+        assert {entry["path"] for entry in result["items"]} == {f"{args.app_library}/{path.relative_to(args.fixture_root / 'library')}" for path in targets}
+        assert all(sha256(path) != saved[path] for path in targets)
+        saved = {path: sha256(path) for path in targets}
+        assert all(sha256(path) == replacement_hashes[path] for path in copy_sources)
+        page.set_viewport_size(desktop_viewport)
+        copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
         # Unimported deletion: inspector cancellation, exact track, then page batch.
         delete_folders=[args.fixture_root/"inbox"/name for name in ("Delete Download","Delete Other")]
         delete_sources=[]
@@ -1020,7 +1060,7 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "single_inbox_inspector_import": True, "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True, "discovery_reconnects_inline": True,
+        "single_inbox_inspector_import": True, "inbox_sidebar_duplicate_replacement": True, "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True, "discovery_reconnects_inline": True,
         "expected_reconnect_console_errors": expected_reconnect_errors,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,

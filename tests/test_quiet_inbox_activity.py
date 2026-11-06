@@ -115,23 +115,31 @@ def test_restart_keeps_interrupted_scan_separate_from_success_status(tmp_path):
     assert next(row for row in groups if row['key'] == 'inbox-scans')['latest']['stage'] == 'Success'
 
 
-def test_history_reads_remain_consistent_during_automatic_compaction(tmp_path):
-    import threading
-    app = make_app(tmp_path); service = app.extensions['activity']
-    stop = threading.Event(); errors = []
-    def read():
-        try:
-            while not stop.is_set():
-                service.history.page()
-        except Exception as exc:
-            errors.append(exc)
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    try:
-        for _ in range(40):
-            finish_scan(service)
-    finally:
-        stop.set(); reader.join(5)
-    assert not reader.is_alive() and not errors
+def test_history_read_keeps_its_snapshot_during_automatic_compaction(tmp_path, monkeypatch):
+    import sqlite3
+
+    app = make_app(tmp_path)
+    service = app.extensions['activity']
+    finish_scan(service)
+    old_timestamp = service.history.page()['groups'][0]['timestamp']
+    compacted = False
+
+    class InterleavedRead(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal compacted
+            if not compacted and sql.startswith('SELECT snapshot FROM activity_jobs WHERE rowid='):
+                # The history query already picked a rowid. Commit a replacement
+                # on another connection before resolving that exact rowid.
+                compacted = True
+                finish_scan(service)
+            return super().execute(sql, parameters)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, 'db', lambda: sqlite3.connect(app.config['APP_DB'], factory=InterleavedRead))
+        page = service.history.page()
+
+    assert compacted
+    assert page['groups'][0]['timestamp'] == old_timestamp
+    assert service.history.page()['groups'][0]['timestamp'] > old_timestamp
     with service.db() as db:
         assert db.execute('SELECT COUNT(*) FROM activity_jobs').fetchone()[0] == 1
