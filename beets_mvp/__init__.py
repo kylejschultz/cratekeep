@@ -6376,6 +6376,7 @@ def _execute_inbox_album(
     if provider_data:
         effective = _effective_candidate(app, provider_data, query)
         details = _candidate_match(query, effective)["track_details"]
+    report_progress("Checking for Library duplicates")
     duplicate = _duplicate_preflight(app, rows, query, details, candidate=effective if provider_data else None)
     if duplicate["warnings"]:
         if album["duplicate_action"] is None:
