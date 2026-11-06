@@ -7,6 +7,7 @@ they rank retrieval results, not the quality of a release-to-library match.
 
 from __future__ import annotations
 
+from collections import Counter
 from difflib import SequenceMatcher
 import re
 import unicodedata
@@ -148,20 +149,51 @@ def _pair_metrics(local: object, canonical: object, local_index: int, canonical_
             "status": status, "issues": issues}
 
 
+def _explicit_position(track: object) -> tuple[int, int] | None:
+    if not isinstance(track, dict):
+        return None
+    try:
+        position = int(track.get("position") or track.get("track") or 0)
+        disc = int(track.get("medium_position") or track.get("disc") or 1)
+        return (disc, position) if disc > 0 and position > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _symbol_title(track: object) -> bool:
+    # Featured artists do not turn an emoji base title into a textual title.
+    title = _track_title_key(track)
+    return (any(unicodedata.category(char).startswith("S") for char in title)
+            and not any(char.isalnum() for char in title))
+
+
 def _assign_tracks(local_tracks: list, canonical_tracks: list, release_artist: object = "") -> tuple[list[dict], float]:
+    local_positions = Counter(_explicit_position(track) for track in local_tracks)
+    canonical_positions = Counter(_explicit_position(track) for track in canonical_tracks)
     edges = []
     for local_index, local in enumerate(local_tracks):
         for canonical_index, canonical in enumerate(canonical_tracks):
             metrics = _pair_metrics(local, canonical, local_index, canonical_index)
+            position = _explicit_position(local)
+            # Symbol-only titles carry no comparable words. Unique explicit
+            # positions plus agreeing durations can still establish the pair.
+            metrics["symbol_title_pair"] = (
+                len(local_tracks) == len(canonical_tracks)
+                and (_symbol_title(local) or _symbol_title(canonical))
+                and position is not None and position == _explicit_position(canonical)
+                and local_positions[position] == canonical_positions[position] == 1
+                and (_duration(local) or 0) > 0 and (_duration(canonical) or 0) > 0
+                and metrics["duration_delta"] is not None and metrics["duration_delta"] <= 3
+            )
             edges.append((metrics["distance"], local_index, canonical_index, metrics))
     assigned_local, assigned_canonical, pairs = set(), set(), []
-    for _, local_index, canonical_index, metrics in sorted(edges, key=lambda edge: edge[:3]):
+    for _, local_index, canonical_index, metrics in sorted(edges, key=lambda edge: (not edge[3]["symbol_title_pair"], *edge[:3])):
         if local_index in assigned_local or canonical_index in assigned_canonical:
             continue
         # Very weak pairs are clearer as unmatched than as a misleading match.
         # A coincidental duration or position must not turn unrelated titles
         # into positive track evidence.
-        if metrics["distance"] > 0.78 or metrics["title_distance"] > 0.65:
+        if not metrics["symbol_title_pair"] and (metrics["distance"] > 0.78 or metrics["title_distance"] > 0.65):
             continue
         assigned_local.add(local_index)
         assigned_canonical.add(canonical_index)

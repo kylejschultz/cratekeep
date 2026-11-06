@@ -7,6 +7,8 @@ touches non-fixture media.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from types import SimpleNamespace
 import argparse
 import hashlib
 import json
@@ -14,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import time
 import sys
 import urllib.parse
 import urllib.request
@@ -42,12 +45,58 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def match_selected(page, endpoint, evidence_dir, *, cooldown=False):
+def wait_activity(page, base, job_id, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = page.request.get(base + '/api/activity/' + job_id).json()
+        if job['status'] not in {'queued', 'running', 'waiting', 'stopping'}:
+            return job
+        page.wait_for_timeout(200)
+    raise AssertionError(f'Activity {job_id} did not finish within {timeout}s')
+
+
+@contextmanager
+def expect_operation(page, predicate):
+    """Assert the real handler result whether returned directly or by Activity.
+
+    Async responses retain the validated step body and each handler's JSON/status;
+    this adapter changes transport expectations, not filesystem/result assertions.
+    """
+    captured = SimpleNamespace(value=None)
+    def matches(response):
+        if predicate(response):
+            captured.value = response
+            return True
+        if '/api/activity' not in response.url or response.status >= 400:
+            return False
+        try:
+            job = response.json()
+        except Exception:
+            return False
+        if job.get('status') in {None, 'queued', 'running', 'waiting', 'stopping'}:
+            return False
+        for index, step in enumerate(job.get('steps', [])):
+            rows = job.get('rows', [])
+            row = rows[index] if index < len(rows) else {}
+            result = row.get('result', job.get('result', {}))
+            status = row.get('http_status', job.get('http_status', 500))
+            operation = SimpleNamespace(url=step['path'], status=status, ok=status < 400,
+                request=SimpleNamespace(method=step.get('method', 'POST'), post_data_json=step.get('body', {})),
+                json=lambda result=result: result)
+            if predicate(operation):
+                captured.value = operation
+                return True
+        return False
+    with page.expect_response(matches):
+        yield captured
+
+
+def match_selected(page, endpoint, evidence_dir, *, cooldown=False, expected_matches=1):
     page.get_by_role("button", name="Match Selected", exact=True).click()
     confirmation=page.get_by_role("dialog",name="Match selected albums",exact=True)
     confirmation.wait_for()
     assert confirmation.evaluate("node => node.matches(':modal')")
-    with page.expect_response(lambda response: response.url.endswith(endpoint)) as matched:
+    with page.expect_response(lambda response: response.url.endswith("/api/activity") and response.request.method == "POST" and response.request.post_data_json.get("mode") == "matching") as matched:
         confirmation.get_by_role("button",name="Start matching",exact=True).click()
     if cooldown:
         page.get_by_text("Fixture MusicBrainz cooldown",exact=True).wait_for()
@@ -58,10 +107,53 @@ def match_selected(page, endpoint, evidence_dir, *, cooldown=False):
         page.set_viewport_size({"width":1440,"height":1000})
     results=page.get_by_role("dialog",name="Matching results",exact=True)
     results.wait_for(timeout=60000)
-    assert results.get_by_text("Matched",exact=True).is_visible()
+    matched_rows=results.get_by_text("Matched",exact=True)
+    assert matched_rows.count()==expected_matches
+    assert all(row.is_visible() for row in matched_rows.all())
     page.screenshot(path=evidence_dir/("06-inbox-matching-results.png" if cooldown else "06-library-matching-results.png"),full_page=True)
     results.get_by_role("button",name="Close results",exact=True).click()
-    return matched.value
+    accepted = matched.value.json()
+    assert accepted["id"]
+    step = matched.value.request.post_data_json["steps"][0]
+    assert step["path"] == endpoint
+    return SimpleNamespace(ok=matched.value.ok, request=SimpleNamespace(post_data_json=step["body"]))
+
+
+def check_setup_screen(base, app_library, evidence):
+    # Check the real first-run page before the existing setup POST configures it.
+    with sync_playwright() as playwright:
+        executable = os.environ.get("CHROMIUM_EXECUTABLE")
+        browser = playwright.chromium.launch(executable_path=executable) if executable else playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(base + "/setup")
+        page.get_by_role("heading", name="Set up Cratekeep", exact=True).wait_for()
+        assert page.locator("html").get_attribute("data-theme") == "dark"
+        for theme in ("dark", "light"):
+            if page.locator("html").get_attribute("data-theme") != theme:
+                page.get_by_role("button", name="Dark mode", exact=True).click()
+            for width in (1440, 390):
+                page.set_viewport_size({"width": width, "height": 900})
+                page.wait_for_function('document.fonts.status === "loaded"')
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                assert page.locator("h1").evaluate('n => getComputedStyle(n).fontFamily.includes("Public Sans")')
+                if width == 390:
+                    page.mouse.move(380, 600); page.mouse.wheel(0, 2000)
+                    page.wait_for_function('scrollY > 0')
+                    page.wait_for_function("""(()=>{const n=document.querySelector('button[type="submit"]');const r=n.getBoundingClientRect();return r.top>=0&&r.bottom<=innerHeight})()""")
+                    page.mouse.wheel(0, -3000); page.wait_for_function('scrollY === 0')
+                page.screenshot(path=evidence / f"00-setup-{theme}-{width}.png", full_page=True)
+        page.locator("#library_path").fill(app_library)
+        page.locator('[data-open-picker="library_path"]').click()
+        page.get_by_role("dialog", name="Select a directory", exact=True).wait_for()
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=evidence / "00-setup-directory-browser.png", full_page=True)
+        page.get_by_role("button", name="Close directory browser", exact=True).click()
+        assert page.locator("#library_path").input_value() == app_library
+        assert page.evaluate('localStorage.getItem("cratekeep-theme")') == "light"
+        assert not errors, errors
+        browser.close()
 
 
 def main() -> None:
@@ -97,17 +189,28 @@ def main() -> None:
             tags.album = f"A Scope {index:02d}"; tags.title = "Song"; tags.save()
     before = {"inbox_untagged": sha256(inbox_untagged), "inbox": sha256(inbox_track), "library": sha256(library_track),
               "library_bulk": sha256(library_bulk_track)}
+    check_setup_screen(base, args.app_library, args.evidence_dir)
     post_form(f"{base}/setup", {"inbox_path": args.app_inbox, "library_path": args.app_library, "match_threshold": "90"})
 
     page_errors: list[str] = []
     console_errors: list[str] = []
+    expected_reconnect_errors: list[str] = []
+    testing_reconnect = False
     route_results = {}
     with sync_playwright() as playwright:
         executable = os.environ.get("CHROMIUM_EXECUTABLE")
         browser = playwright.chromium.launch(executable_path=executable) if executable else playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
         page.on("pageerror", lambda error: page_errors.append(str(error)))
-        page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
+        def collect_console(message):
+            if message.type != "error":
+                return
+            if (testing_reconnect and "/discovery" in message.location.get("url", "")
+                    and "503" in message.text):
+                expected_reconnect_errors.append(message.text)
+            else:
+                console_errors.append(message.text)
+        page.on("console", collect_console)
         for index, (path, heading) in enumerate((("/", "Library overview"), ("/inbox", "Incoming music"),
                                                   ("/library-import", "Adoption queue"), ("/library", "Managed collection"),
                                                   ("/settings", "Cratekeep settings")), 1):
@@ -116,7 +219,8 @@ def main() -> None:
             asset_build = page.evaluate("window.__CRATEKEEP_BOOTSTRAP__.buildSha")
             assert page.locator('script[type="module"]').get_attribute('src') == f"/static/ui/cratekeep.js?v={asset_build}"
             assert page.locator('link[rel="stylesheet"]').get_attribute('href') == f"/static/ui/cratekeep.css?v={asset_build}"
-            assert page.get_by_role("navigation", name="Primary navigation").get_by_role("link").all_inner_texts() == ["Overview", "Inbox", "Library", "Settings"]
+            assert page.get_by_role("navigation", name="Primary navigation").get_by_role("link").all_inner_texts() == ["Overview", "Inbox", "Library"]
+            assert page.get_by_role("link", name="Settings", exact=True).get_attribute("href") == "/settings"
             assert page.evaluate("document.documentElement.scrollHeight <= innerHeight"), f"document scrolls on {path}"
             desktop_ok = page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
             desktop_fill = page.locator(".app-content").evaluate("node => document.body.getBoundingClientRect().height >= innerHeight")
@@ -171,11 +275,18 @@ def main() -> None:
         page.screenshot(path=args.evidence_dir / "05-settings-metadata-mobile.png", full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.get_by_label("Matched threshold (%)").fill("50")
-        match_inboxes = page.get_by_role("listbox", name="Automatically find matches for", exact=True)
-        page.get_by_role("button", name="Select all", exact=True).click()
-        assert match_inboxes.evaluate("node => node.selectedOptions.length") == 1
-        page.get_by_role("button", name="Clear selection", exact=True).click()
-        assert match_inboxes.evaluate("node => node.selectedOptions.length") == 0
+        page.get_by_role("tab", name="General").click()
+        summary_row = page.get_by_role("button", name="Edit Inbox", exact=True).locator("xpath=ancestor::tr")
+        assert summary_row.get_by_role("combobox").count() == 0
+        assert summary_row.get_by_role("checkbox").count() == 0
+        page.get_by_role("button", name="Edit Inbox", exact=True).click()
+        match_inbox = page.get_by_role("checkbox", name="Automatically find matches for Inbox", exact=True)
+        assert match_inbox.locator("xpath=ancestor::tr").get_by_role("combobox", name="Discovery for Inbox", exact=True).count() == 1
+        match_inbox.check()
+        assert match_inbox.is_checked()
+        match_inbox.uncheck()
+        assert not match_inbox.is_checked()
+        page.get_by_role("button", name="Done", exact=True).click()
         page.get_by_role("tab", name="Metadata").click()
         page.get_by_label("Fetch Cover Art Archive artwork").check()
         page.get_by_label("Save cover.jpg sidecars").check()
@@ -199,7 +310,9 @@ def main() -> None:
         assert page.get_by_label("Save cover.jpg sidecars").is_checked()
         page.get_by_role("tab", name="Metadata").click()
         assert page.get_by_label("Matched threshold (%)").input_value() == "50"
-        assert page.get_by_role("listbox", name="Automatically find matches for", exact=True).evaluate("node => node.selectedOptions.length") == 0
+        page.get_by_role("tab", name="General").click()
+        assert page.get_by_text("Auto-match: Off", exact=True).count() == 1
+        assert page.get_by_role("table", name="Configured Inboxes").get_by_role("checkbox").count() == 0
 
         page.goto(base + "/inbox", wait_until="networkidle")
         assert page.get_by_role("button", name="Match Selected").count() == 0
@@ -216,10 +329,10 @@ def main() -> None:
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).check()
         page.get_by_role("button", name="Next", exact=True).click()
         page.get_by_text(re.compile("Page 2 of 2")).wait_for()
-        assert page.get_by_text("1 selected", exact=True).is_visible()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
         page.get_by_role("button", name="Previous", exact=True).click()
         page.get_by_text(re.compile("Page 1 of 2")).wait_for()
-        assert page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).is_checked()
+        assert not page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).is_checked()
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).uncheck()
         page.get_by_role("searchbox", name="Find an album").fill("Inbox Ready")
         page.get_by_role("checkbox", name="Select album Inbox Ready", exact=True).check()
@@ -261,7 +374,7 @@ def main() -> None:
         tagged_return.title = "First"
         tagged_return.save()
         returned_before = [sha256(path) for path in returned_paths]
-        with page.expect_response(lambda response: response.url.endswith("/scopes/refresh")) as disk_refresh:
+        with expect_operation(page, lambda response: response.url.endswith("/scopes/refresh")) as disk_refresh:
             page.get_by_role("button", name="Refresh", exact=True).click()
         assert disk_refresh.value.ok, disk_refresh.value.json()
         assert disk_refresh.value.request.method == "POST"
@@ -281,7 +394,7 @@ def main() -> None:
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).check()
         page.get_by_role("button", name="Next", exact=True).click()
         page.get_by_text(re.compile("Page 2 of 2")).wait_for()
-        assert page.get_by_text("1 selected", exact=True).is_visible()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
         page.get_by_role("button", name="Previous", exact=True).click()
         page.get_by_text(re.compile("Page 1 of 2")).wait_for()
         page.get_by_role("checkbox", name="Select album A Scope 00", exact=True).uncheck()
@@ -304,14 +417,14 @@ def main() -> None:
         page.get_by_role("button", name="Search exact release").click()
         assert "canonical MusicBrainz release UUID" in page.get_by_role("alert").inner_text()
         page.get_by_label("MusicBrainz release UUID").fill("123e4567-e89b-42d3-a456-426614174002")
-        with page.expect_response(lambda response: response.url.endswith("/rematch")) as mbid_match:
+        with expect_operation(page, lambda response: response.url.endswith("/rematch")) as mbid_match:
             page.get_by_role("button", name="Search exact release").click()
         assert mbid_match.value.ok
         mbid_payload = mbid_match.value.json()
         assert any(candidate.get("artwork_url") for candidate in mbid_payload.get("candidates", [])), mbid_payload
         candidate_choice = page.locator("[data-review-candidates] input[type=radio]").first
         if not candidate_choice.is_checked():
-            with page.expect_response(lambda response: "/api/library-import/albums/" in response.url and response.request.method == "PATCH") as candidate_selection:
+            with expect_operation(page, lambda response: "/api/library-import/albums/" in response.url and response.request.method == "PATCH") as candidate_selection:
                 candidate_choice.click()
             assert candidate_selection.value.ok, candidate_selection.value.json()
         page.locator(".candidate-artwork").first.wait_for()
@@ -337,6 +450,10 @@ def main() -> None:
         assert page.locator(".track-evidence-row").get_by_role("img", name=re.compile(r"Metadata (changed|unchanged)")).first.is_visible()
         assert page.locator(".candidate-fact").get_by_role("img", name=re.compile(r"Artist (changed|unchanged)")).is_visible()
         assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        coverage = page.locator(".review-track-coverage")
+        assert "On disk / MusicBrainz" in coverage.inner_text()
+        assert "Track matches" in coverage.inner_text() and " / " in coverage.inner_text()
+        assert "Release tracks present" not in coverage.inner_text()
         page.screenshot(path=args.evidence_dir / "06-review-modal-desktop.png", full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
         page.wait_for_function("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
@@ -361,8 +478,12 @@ def main() -> None:
         page.get_by_role("button", name="Duplicates", exact=True).click()
         page.get_by_text("No albums match this view", exact=True).wait_for()
         page.get_by_role("button", name="All albums", exact=True).click()
-        page.get_by_role("checkbox", name="Select album Bulk Ready", exact=True).wait_for()
-        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
+        bulk_checkbox = page.get_by_role("checkbox", name="Select album Bulk Ready", exact=True)
+        bulk_checkbox.wait_for()
+        assert not bulk_checkbox.is_checked()
+        assert page.get_by_text("1 selected", exact=True).count() == 0
+        bulk_checkbox.check()
+        with expect_operation(page, lambda response: response.url.endswith("/api/library-import/bulk/preview")) as bulk_preview:
             page.locator(".toolbar-actions").get_by_role("button", name="Import selected", exact=True).click()
         confirmation = page.get_by_role("dialog", name="Import selected albums", exact=True)
         confirmation.wait_for()
@@ -372,7 +493,7 @@ def main() -> None:
         assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
         page.screenshot(path=args.evidence_dir / "08-bulk-confirmation-mobile.png", full_page=True)
         page.set_viewport_size({"width":1440,"height":1000})
-        with page.expect_response(lambda response: response.url.endswith("/api/library-import/bulk/execute")) as bulk_import:
+        with expect_operation(page, lambda response: response.url.endswith("/api/library-import/bulk/execute")) as bulk_import:
             confirmation.get_by_role("button", name="Start import", exact=True).click()
         results = page.get_by_role("dialog", name="Import results", exact=True)
         results.wait_for()
@@ -438,45 +559,116 @@ def main() -> None:
         assert page.get_by_text("MusicBrainz release MBID", exact=True).is_visible()
         assert page.get_by_role("button", name="Edit metadata").is_visible()
         assert page.get_by_label("Upload replacement").is_visible()
-        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as direct_upload:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/upload-preview")) as direct_upload:
             page.get_by_label("Upload replacement").set_input_files({"name":"direct-cover.jpg", "mimeType":"image/jpeg", "buffer":EXISTING_ARTWORK_JPEG})
         assert direct_upload.value.status == 201, direct_upload.value.json()
         assert page.get_by_label("Genre", exact=True).count() == 0
         page.get_by_role("button", name="Cancel", exact=True).click()
+        def review_and_save():
+            with expect_operation(page, lambda response: response.url.endswith("/metadata/preview")) as reviewed:
+                page.get_by_role("button", name="Review changes", exact=True).click()
+            assert reviewed.value.status == 200, reviewed.value.json()
+            with expect_operation(page, lambda response: response.url.endswith("/metadata/apply")) as saved:
+                page.get_by_role("button", name="Save changes", exact=True).click()
+            return saved.value
+
         page.get_by_role("button", name="Edit metadata").click()
-        assert page.get_by_label("Upload replacement").is_visible()
-        assert page.get_by_role("table", name="Tracks on Bulk Ready").is_visible()
-        page.get_by_role("button", name=re.compile("^Edit track ")).first.click()
-        assert page.get_by_label("Title", exact=True).input_value()
-        inline_row = page.locator(".record-tracks tr.is-editing")
-        assert inline_row.locator("input").count() == 4
-        assert page.locator(".track-editor").count() == 0
-        assert page.get_by_label("Title", exact=True).evaluate("el => el.form.id") == "track-form"
-        page.screenshot(path=args.evidence_dir / "08-track-editor-desktop.png", full_page=True)
+        editor = page.get_by_role("dialog", name="Edit metadata", exact=True)
+        editor.wait_for()
+        assert page.evaluate("document.querySelector('.metadata-editor').matches(':modal')")
+        page.get_by_role("button", name="Add artist", exact=True).click()
+        page.get_by_label("Album artist credits 2", exact=True).fill("Alias fixture")
+        added_credit = review_and_save()
+        assert added_credit.status == 200, added_credit.json()
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.screenshot(path=args.evidence_dir / "08-metadata-album-desktop.png", full_page=True)
         page.set_viewport_size({"width":390,"height":844})
         page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
-        inline_row.scroll_into_view_if_needed()
-        assert inline_row.evaluate("el => [...el.querySelectorAll('input')].every(input => { const r = input.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; })")
-        page.screenshot(path=args.evidence_dir / "08-track-editor-mobile.png", full_page=True)
-        original_title = page.get_by_label("Title", exact=True).input_value()
-        page.get_by_label("Title", exact=True).fill("Discard this title")
-        page.get_by_role("button", name="Cancel", exact=True).click()
+        page.screenshot(path=args.evidence_dir / "08-metadata-album-mobile.png", full_page=True)
         page.set_viewport_size({"width":1440,"height":1000})
-        page.get_by_role("button", name=re.compile("^Edit track ")).first.click()
-        assert page.get_by_label("Title", exact=True).input_value() == original_title
-        page.get_by_label("Title", exact=True).fill("Edited fixture title")
-        page.get_by_label("Artist", exact=True).fill("Fixture Guest")
-        page.get_by_label("Track", exact=True).fill("3")
-        page.get_by_label("Disc", exact=True).fill("2")
-        with page.expect_response(lambda response: "/tracks/" in response.url and response.request.method == "PATCH") as saved_track:
-            page.get_by_role("button", name="Save track", exact=True).click()
+        page.get_by_role("button", name="Remove Alias fixture", exact=True).click()
+        removed_credit = review_and_save()
+        assert removed_credit.status == 200, removed_credit.json()
+        assert "Alias fixture" not in removed_credit.json()["album"]["albumartists"]
+        saved_credit_id = removed_credit.json()["changes"][0]["item_id"]
+        saved_credit_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_credit_id)
+        library_bulk_track = args.fixture_root / "library" / Path(saved_credit_item["path"]).relative_to(args.app_library)
+        assert "Alias fixture" not in str(MediaFile(library_bulk_track).albumartists_credit)
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name=re.compile("^Tracks ")).click()
+        original_title = editor.get_by_label("Title", exact=True).filter(visible=True).input_value()
+        page.screenshot(path=args.evidence_dir / "08-metadata-track-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
+        assert editor.evaluate("el => [...el.querySelectorAll('input')].filter(input => input.offsetParent).every(input => { const r = input.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; })")
+        page.screenshot(path=args.evidence_dir / "08-metadata-track-mobile.png", full_page=True)
+        editor.get_by_label("Title", exact=True).filter(visible=True).fill("Discard this title")
+        page.get_by_role("button", name="Cancel changes", exact=True).click()
+        page.get_by_role("button", name="Keep editing", exact=True).click()
+        assert editor.get_by_label("Title", exact=True).filter(visible=True).input_value() == "Discard this title"
+        page.keyboard.press("Escape")
+        page.get_by_role("button", name="Discard changes", exact=True).click()
+        assert page.get_by_role("button", name="Edit metadata", exact=True).evaluate("el => el === document.activeElement")
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name=re.compile("^Tracks ")).click()
+        assert editor.get_by_label("Title", exact=True).filter(visible=True).input_value() == original_title
+        editor.get_by_label("Title", exact=True).filter(visible=True).fill("Edited fixture title")
+        editor.get_by_label("Artist", exact=True).filter(visible=True).fill("Fixture Guest")
+        editor.get_by_label("Track", exact=True).filter(visible=True).fill("3")
+        editor.get_by_label("Disc", exact=True).filter(visible=True).fill("2")
+        with expect_operation(page, lambda response: response.url.endswith("/metadata/preview")) as reviewed:
+            page.get_by_role("button", name="Review changes", exact=True).click()
+        assert reviewed.value.status == 200, reviewed.value.json()
+        assert reviewed.value.json()["paths"], reviewed.value.json()
+        page.screenshot(path=args.evidence_dir / "08-metadata-review.png", full_page=True)
+        with expect_operation(page, lambda response: response.url.endswith("/metadata/apply")) as saved_track:
+            page.get_by_role("button", name="Save changes", exact=True).click()
         assert saved_track.value.status == 200, saved_track.value.json()
+        saved_id = saved_track.value.json()["changes"][0]["item_id"]
+        saved_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        previous_track = library_bulk_track
+        library_bulk_track = args.fixture_root / "library" / Path(saved_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track != previous_track and not previous_track.exists()
+        assert MediaFile(str(library_bulk_track)).artists == ["Fixture Guest"]
         page.reload(wait_until="networkidle")
         page.locator(".library-record").filter(has_text="Bulk Ready").click()
         page.get_by_role("table", name="Tracks on Bulk Ready").get_by_text("Edited fixture title", exact=True).wait_for()
         assert MediaFile(str(library_bulk_track)).title == "Edited fixture title"
+        # Explicit location-only move: stage a new folder, preview, save, and pin it.
         page.get_by_role("button", name="Edit metadata", exact=True).click()
-        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
+        page.get_by_role("button", name="File location", exact=True).click()
+        page.get_by_role("button", name="Browse folders", exact=True).click()
+        page.get_by_label("New album folder", exact=True).fill("Manual fixture album")
+        page.get_by_role("button", name="Use new folder", exact=True).click()
+        assert not (args.fixture_root / "library" / "Manual fixture album").exists()
+        page.screenshot(path=args.evidence_dir / "08-location-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        page.wait_for_function("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=args.evidence_dir / "08-location-mobile.png", full_page=True)
+        page.set_viewport_size({"width":1440,"height":1000})
+        before_move = sha256(library_bulk_track)
+        moved_album = review_and_save()
+        assert moved_album.status == 200, moved_album.json()
+        moved_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        library_bulk_track = args.fixture_root / "library" / Path(moved_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track.parent.name == "Manual fixture album"
+        assert sha256(library_bulk_track) == before_move
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_label("Genre", exact=True).fill("Fixture genre")
+        saved_pinned = review_and_save()
+        assert saved_pinned.status == 200, saved_pinned.json()
+        pinned_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        assert Path(pinned_item["path"]).parent.name == "Manual fixture album"
+        page.get_by_role("button", name="Edit metadata", exact=True).click()
+        page.get_by_role("button", name="File location", exact=True).click()
+        page.get_by_role("button", name="Use Beets naming", exact=True).click()
+        organized = review_and_save()
+        assert organized.status == 200, organized.json()
+        organized_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_id)
+        library_bulk_track = args.fixture_root / "library" / Path(organized_item["path"]).relative_to(args.app_library)
+        assert library_bulk_track.parent.name != "Manual fixture album"
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
             page.get_by_label("Upload replacement").set_input_files({
                 "name": "replacement.jpg", "mimeType": "image/jpeg", "buffer": EXISTING_ARTWORK_JPEG,
             })
@@ -486,13 +678,13 @@ def main() -> None:
         page.get_by_role("button", name="Apply artwork", exact=True).wait_for()
         page.get_by_role("button", name="Cancel", exact=True).click()
         assert page.get_by_role("button", name="Apply artwork", exact=True).count() == 0
-        with page.expect_response(lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/upload-preview")) as upload:
             page.get_by_label("Upload replacement").set_input_files({
                 "name": "replacement-again.jpg", "mimeType": "image/jpeg", "buffer": EXISTING_ARTWORK_JPEG,
             })
         assert upload.value.status == 201, upload.value.json()
         artwork_preview = upload.value.json()
-        with page.expect_response(lambda response: response.url.endswith("/artwork/apply")) as applied:
+        with expect_operation(page, lambda response: response.url.endswith("/artwork/apply")) as applied:
             page.get_by_role("button", name="Apply artwork", exact=True).click()
         assert applied.value.request.post_data_json == {
             "preview_id": artwork_preview["preview_id"], "expected_fingerprint": artwork_preview["fingerprint"],
@@ -501,7 +693,7 @@ def main() -> None:
         assert applied.value.json()["sha256"] == artwork_preview["sha256"]
         assert applied.value.json()["sidecars_written"] == 1
         assert page.get_by_role("alert").count() == 0
-        page.get_by_role("button", name="Cancel changes").click()
+        assert page.get_by_role("dialog", name="Edit metadata", exact=True).count() == 0
         assert page.get_by_label("Upload replacement").is_visible()
         assert page.get_by_role("heading", name="MusicBrainz rematch").is_visible()
         page.screenshot(path=args.evidence_dir / "08-managed-album-read-only.png", full_page=True)
@@ -517,7 +709,7 @@ def main() -> None:
         page.get_by_role("button", name="Cancel removal").click()
         assert sha256(library_bulk_track) == kept_hash
         page.get_by_role("button", name="Remove from library", exact=True).click()
-        with page.expect_response(lambda response: response.url.endswith("/removal/apply")) as removed:
+        with expect_operation(page, lambda response: response.url.endswith("/removal/apply")) as removed:
             page.get_by_role("button", name="Remove from Cratekeep; keep files", exact=True).click()
         assert removed.value.status == 200 and removed.value.json()["status"] == "complete"
         assert not removed.value.request.post_data_json["delete_files"]
@@ -537,7 +729,7 @@ def main() -> None:
         page.locator(".album-card").filter(has_text="Bulk Ready").click()
         page.get_by_role("button", name="Remove from library", exact=True).click()
         page.get_by_label("Also delete files").check()
-        with page.expect_response(lambda response: response.url.endswith("/removal/apply")) as removed:
+        with expect_operation(page, lambda response: response.url.endswith("/removal/apply")) as removed:
             page.get_by_role("button", name="Delete listed files and remove album", exact=True).click()
         assert removed.value.status == 200 and removed.value.json()["status"] == "complete"
         assert removed.value.request.post_data_json["delete_files"]
@@ -548,30 +740,38 @@ def main() -> None:
         # Copy imports retain original bytes; exercise Undo and explicit source purge in the UI.
         copy_folder = args.fixture_root / "inbox" / "Copy Lifecycle"
         copy_sources = [copy_folder / "01 First.wav", copy_folder / "02 Second.wav"]
-        for number, path in enumerate(copy_sources, 1):
-            write_wav(path)
-            tags=MediaFile(str(path))
-            tags.artist=tags.albumartist="Copy Artist"
-            tags.album="Copy Lifecycle"; tags.title=path.stem[3:]; tags.track=number; tags.save()
+        def write_copy_sources(*, replacement=False):
+            for number, path in enumerate(copy_sources, 1):
+                write_wav(path)
+                tags = MediaFile(str(path))
+                tags.artist = tags.albumartist = "Copy Artist"
+                tags.album, tags.title, tags.track = "Copy Lifecycle", path.stem[3:], number
+                tags.mb_albumid = "123e4567-e89b-42d3-a456-426614174099"
+                tags.mb_trackid = f"123e4567-e89b-42d3-a456-42661417409{number}"
+                tags.save()
+                if replacement:
+                    with path.open("ab") as audio:
+                        audio.write(b"replacement-fixture")
+        write_copy_sources()
         originals={path:sha256(path) for path in copy_sources}
         page.goto(base+"/inbox",wait_until="networkidle")
-        with page.expect_response(lambda response: response.url.endswith("/scopes/refresh")) as copied_refresh:
+        with expect_operation(page, lambda response: response.url.endswith("/scopes/refresh")) as copied_refresh:
             page.get_by_role("button", name="Refresh", exact=True).click()
         assert copied_refresh.value.ok
         page.get_by_role("searchbox",name="Find an album").fill("Copy Lifecycle")
+        copy_rows = page.request.get(inbox_base + "/queue?q=Copy+Lifecycle").json()["albums"]
+        assert [row["album"] for row in copy_rows] == ["Copy Lifecycle"], copy_rows
         copy_row=page.locator(".desk-album").filter(has_text="Copy Lifecycle")
         copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
         assert page.get_by_role("button",name="Review import",exact=True).count()==0
         assert page.get_by_role("button",name="Review selected",exact=True).count()==0
-        with page.expect_response(lambda response: "/api/inbox/albums/" in response.url and response.request.method=="PATCH") as saved_choice:
+        with expect_operation(page, lambda response: "/api/inbox/albums/" in response.url and response.request.method=="PATCH") as saved_choice:
             page.get_by_label("Select As Is",exact=True).click()
         assert saved_choice.value.ok
         page.wait_for_function("[...document.querySelectorAll('.as-is input')].some(node=>node.checked)")
-        page.get_by_role("checkbox",name="Select album Copy Lifecycle",exact=True).check()
-        page.get_by_role("button",name="Import selected",exact=True).click()
-        page.get_by_role("button",name="Start import",exact=True).click()
-        page.get_by_role("heading",name="Import results",exact=True).wait_for()
-        page.get_by_role("button",name="Close results",exact=True).click()
+        # Exercise the individual inspector action, including its saved Activity preflight.
+        inspector = page.get_by_role("region", name="Copy Lifecycle", exact=True)
+        inspector.get_by_role("button", name="Import to Library", exact=True).click()
         copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
         assert all(sha256(path)==originals[path] for path in copy_sources)
         imported=page.request.get(inbox_base+"/queue?status=imported&q=Copy+Lifecycle").json()["albums"][0]
@@ -585,25 +785,260 @@ def main() -> None:
         copy_row.locator(".desk-decision").filter(has_text="Matched").wait_for()
         assert all(sha256(path)==originals[path] for path in copy_sources)
         assert not any(path.exists() for path in targets)
-        copy_row.get_by_role("checkbox").check()
-        page.get_by_role("button",name="Import selected",exact=True).click()
-        page.get_by_role("button",name="Start import",exact=True).click()
-        page.get_by_role("heading",name="Import results",exact=True).wait_for()
-        page.get_by_role("button",name="Close results",exact=True).click()
-        copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
+        # Set up the cleanup fixture through the API. The browser already
+        # exercises bulk confirmation elsewhere and will exercise Replace below.
+        restored = page.request.post(base + f"/api/inbox/albums/{imported['id']}/execute", data={})
+        assert restored.status == 201, restored.json()
         page.reload(wait_until="networkidle")
-        page.get_by_role("button",name="Imported",exact=True).click()
-        page.get_by_role("searchbox",name="Find an album").fill("Copy Lifecycle")
-        copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
+        page.get_by_role("searchbox", name="Find an album").fill("Copy Lifecycle")
+        copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
         saved={path:sha256(path) for path in targets}
-        page.screenshot(path=args.evidence_dir/"10a-copy-imported-undo.png",full_page=True)
-        page.get_by_role("button",name="Remove imported",exact=True).click()
-        page.get_by_role("button",name="Permanently remove Inbox originals",exact=True).click()
+        # Download-client sidecars must leave with the cleared album folder.
+        (copy_folder/"album.nfo").write_text("download metadata")
+        (copy_folder/"folder.jpg").write_bytes(b"disposable cover")
+        (copy_folder/"artwork").mkdir()
+        (copy_folder/"artwork"/"large.jpg").write_bytes(b"disposable artwork")
+        copy_row.get_by_role("button",name="Review Copy Lifecycle",exact=True).click()
+        imported_inspector=page.get_by_role("complementary",name="Album inspector",exact=True)
+        remove_originals=imported_inspector.get_by_role("button",name="Remove originals",exact=True)
+        remove_originals.click()
+        confirm_originals=imported_inspector.get_by_role("button",name="Permanently remove Inbox originals",exact=True)
+        imported_inspector.get_by_role("list",name="Folders to clear",exact=True).wait_for()
+        assert page.get_by_role("dialog",name="Remove imported originals",exact=True).count()==0
+        assert imported_inspector.get_by_role("button",name="Cancel",exact=True).evaluate("node => node === document.activeElement")
+        imported_inspector.get_by_role("button",name="Cancel",exact=True).click()
+        assert all(sha256(path)==originals[path] for path in copy_sources)
+        assert all(sha256(path)==saved[path] for path in targets)
+        desktop_viewport=page.viewport_size
+        page.set_viewport_size({"width":390,"height":844})
+        remove_originals.click()
+        imported_inspector.get_by_role("list",name="Folders to clear",exact=True).wait_for()
+        page.screenshot(path=args.evidence_dir/"10b-remove-originals-sidebar-mobile.png",full_page=True)
+        confirm_originals.click()
+        page.set_viewport_size(desktop_viewport)
         copy_row.wait_for(state="hidden")
         assert not any(path.exists() for path in copy_sources) and not copy_folder.exists()
         assert all(sha256(path)==saved[path] for path in targets)
         page.screenshot(path=args.evidence_dir/"10b-imported-originals-removed.png",full_page=True)
+        # Same recording IDs in a new download must require an explicit
+        # duplicate decision and run through the real Activity preflight.
+        write_copy_sources(replacement=True)
+        replacement_hashes = {path: sha256(path) for path in copy_sources}
+        page.get_by_role("button", name="Refresh", exact=True).click()
+        copy_row.locator(".desk-decision").filter(has_text="Pending").wait_for()
+        page.set_viewport_size({"width": 390, "height": 844})
+        copy_row.get_by_role("button", name="Review Copy Lifecycle", exact=True).click()
+        inspector = page.get_by_role("region", name="Copy Lifecycle", exact=True)
+        choice = inspector.get_by_role("combobox", name=re.compile("Duplicate decision"))
+        choice.wait_for()
+        assert choice.evaluate("node => { const r = node.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; }")
+        assert inspector.get_by_role("button", name="Choose a duplicate decision", exact=True).is_disabled()
+        with expect_operation(page, lambda response: "/api/inbox/albums/" in response.url and response.request.method == "PATCH") as saved_choice:
+            inspector.get_by_label("Select As Is", exact=True).click()
+        assert saved_choice.value.ok
+        choice.select_option("replace")
+        with expect_operation(page, lambda response: response.url.endswith("/execute")
+                              and not response.request.post_data_json.get("dry_run")) as replaced:
+            inspector.get_by_role("button", name="Import to Library", exact=True).click()
+        assert replaced.value.status == 201, replaced.value.json()
+        result = replaced.value.json()
+        assert result["replaced"] == len(targets) and result["added"] == 0
+        assert {entry["path"] for entry in result["items"]} == {f"{args.app_library}/{path.relative_to(args.fixture_root / 'library')}" for path in targets}
+        assert all(sha256(path) != saved[path] for path in targets)
+        saved = {path: sha256(path) for path in targets}
+        assert all(sha256(path) == replacement_hashes[path] for path in copy_sources)
+        page.set_viewport_size(desktop_viewport)
+        copy_row.locator(".desk-decision").filter(has_text="Imported").wait_for()
+        # Unimported deletion: inspector cancellation, exact track, then page batch.
+        delete_folders=[args.fixture_root/"inbox"/name for name in ("Delete Download","Delete Other")]
+        delete_sources=[]
+        for folder in delete_folders:
+            for index in range(2 if folder.name=="Delete Download" else 1):
+                path=folder/f"{index+1}.wav";write_wav(path)
+                media=MediaFile(path);media.album=folder.name;media.artist="Delete fixture"
+                media.title="Bad song" if index==0 else "Keep song";media.track=index+1;media.save()
+                delete_sources.append(path)
+            (folder/"album.nfo").write_bytes(b"disposable metadata")
+            (folder/"artwork").mkdir();(folder/"artwork"/"back.jpg").write_bytes(b"disposable artwork")
+        expected={path:sha256(path) for path in delete_sources}
+        page.get_by_role("searchbox",name="Find an album").fill("Delete")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Delete Download",exact=True).click()
+        inspector=page.get_by_role("region",name="Delete Download",exact=True)
+        inspector.get_by_role("button",name="Delete from Inbox",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        deletion.get_by_role("button",name="Delete permanently",exact=True).wait_for()
+        assert "without importing" in deletion.inner_text()
+        deletion.get_by_role("button",name="Cancel",exact=True).click()
+        assert all(sha256(path)==expected[path] for path in delete_sources)
+        inspector.get_by_text("Inbox files (2)",exact=True).click()
+        page.screenshot(path=args.evidence_dir/"11-inbox-files-desktop.png",full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        inspector.get_by_role("button",name="Delete track Bad song",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete track from Inbox",exact=True)
+        deletion.locator("li").filter(has_text="Delete Download/1.wav").wait_for()
+        assert "Delete Download/1.wav" in deletion.inner_text()
+        page.screenshot(path=args.evidence_dir/"11a-delete-track-mobile.png",full_page=True)
+        deletion.get_by_role("button",name="Delete permanently",exact=True).click()
+        page.wait_for_function("!document.querySelector('dialog[open]')")
+        page.get_by_role("button",name="Review Delete Download",exact=True).wait_for()
+        assert not delete_sources[0].exists() and sha256(delete_sources[1])==expected[delete_sources[1]]
+        assert (delete_folders[0]/"album.nfo").is_file()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        held_action_status = []
+        action_status_pattern = re.compile(r"/api/activity/[0-9a-f]{32}$")
+        def hold_action_status(route):
+            held_action_status.append(route)
+        page.route(action_status_pattern, hold_action_status)
+        page.locator('[aria-label="Selected album actions"]').get_by_role("button",name="Delete from Inbox",exact=True).click()
+        deletion=page.get_by_role("dialog",name="Delete from Inbox",exact=True)
+        deletion.get_by_role("progressbar").wait_for()
+        assert not page.locator(".page-activity").is_visible()
+        page.screenshot(path=args.evidence_dir/"11b-delete-preview-progress.png",full_page=True)
+        for route in held_action_status:
+            route.continue_()
+        page.unroute(action_status_pattern, hold_action_status)
+        deletion.locator("li").first.wait_for()
+        assert "Delete Download" in deletion.inner_text() and "Delete Other" in deletion.inner_text()
+        assert "2 folders · 6 files" in deletion.inner_text()
+        assert not deletion.get_by_text("Delete Download/2.wav",exact=True).is_visible()
+        page.screenshot(path=args.evidence_dir/"11b-delete-batch-mobile.png",full_page=True)
+        deletion.get_by_text("Show files",exact=True).click()
+        assert deletion.get_by_text("Delete Download/2.wav",exact=True).is_visible()
+        deletion.get_by_text("Show files",exact=True).click()
+        assert page.locator("html").evaluate("node => node.scrollWidth <= node.clientWidth")
+        held_action_status.clear()
+        page.route(action_status_pattern, hold_action_status)
+        deletion.get_by_role("button",name="Delete permanently",exact=True).click()
+        deletion.get_by_role("progressbar").wait_for()
+        assert not page.locator(".page-activity").is_visible()
+        assert not deletion.get_by_role("button",name="Working…",exact=True).is_enabled()
+        page.screenshot(path=args.evidence_dir/"11b-delete-apply-progress.png",full_page=True)
+        for route in held_action_status:
+            route.continue_()
+        page.unroute(action_status_pattern, hold_action_status)
+        page.get_by_text("No albums match this view",exact=True).wait_for()
+        assert not any(folder.exists() for folder in delete_folders)
+        assert all(sha256(path)==saved[path] for path in targets)
+        assert page.get_by_text(re.compile("Inbox updates waiting")).count()==0
+        # Symbol title changes must not block the actual selected bulk path.
+        symbol_sources=[]
+        for album_index, album_title in enumerate(("Symbol Pair One","Symbol Pair Two"),1):
+            for index,title in enumerate(("Opening","Human Heart","Rainbow"),1):
+                path=args.fixture_root/"inbox"/album_title/f"{index}.wav";write_wav(path)
+                media=MediaFile(path);media.album=album_title;media.artist=f"Symbol fixture {album_index}"
+                media.title=title;media.track=index;media.disc=1;media.save();symbol_sources.append(path)
+        symbol_before={path:sha256(path) for path in symbol_sources}
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.get_by_role("searchbox",name="Find an album").fill("Symbol Pair")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Symbol Pair One",exact=True).wait_for()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        match_selected(page,"/api/inbox/candidates",args.evidence_dir,expected_matches=2)
+        page.get_by_role("button",name="Review Symbol Pair One",exact=True).click()
+        coverage=page.locator(".review-track-coverage")
+        assert "3 / 3" in coverage.inner_text() and "2 / 3" not in coverage.inner_text()
+        page.get_by_text("Compare tracks (3)",exact=True).click()
+        assert page.get_by_text("Match needs review",exact=True).count()==0
+        assert page.get_by_text("Unpaired · keeps local track tags",exact=True).count()==0
+        assert page.get_by_role("table",name="Current and proposed track metadata").get_by_text("🌈",exact=True).is_visible()
+        page.screenshot(path=args.evidence_dir/"12-symbol-title-review.png",full_page=True)
+        page.locator("[data-review-close]").click()
+        page.get_by_role("button",name="Import selected",exact=True).click()
+        page.get_by_role("button",name="Start import",exact=True).click()
+        page.get_by_text("2 of 2 albums imported.",exact=True).wait_for()
+        page.screenshot(path=args.evidence_dir/"12a-symbol-bulk-results.png",full_page=True)
+        assert all(sha256(path)==symbol_before[path] for path in symbol_sources)
+        receipts=page.request.get(inbox_base+"/imports").json()["imports"]
+        symbol_receipts=[row for row in receipts if row['album'].startswith("Symbol Pair")]
+        assert len(symbol_receipts)==2
+        for receipt in symbol_receipts:
+            assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"Opening","❤️ feat. We Are KING & Jacob Collier","🌈"}
+        # Metadata warnings remain advisory for an explicitly started import.
+        page.get_by_role("button",name="Close results",exact=True).click()
+        warning_sources=[]
+        for index,title in enumerate(("First","Second","Third"),1):
+            path=args.fixture_root/"inbox"/"Warning Import"/f"{index}.wav";write_wav(path)
+            media=MediaFile(path);media.album="Warning Import";media.artist="Warning fixture"
+            media.title=title;media.track=index;media.save();warning_sources.append(path)
+        warning_before={path:sha256(path) for path in warning_sources}
+        page.get_by_role("searchbox",name="Find an album").fill("Warning Import")
+        page.get_by_role("button",name="Refresh",exact=True).click()
+        page.get_by_role("button",name="Review Warning Import",exact=True).wait_for()
+        page.get_by_role("checkbox",name="Select this page",exact=True).check()
+        match_selected(page,"/api/inbox/candidates",args.evidence_dir)
+        page.get_by_role("button",name="Import selected",exact=True).click()
+        confirmation=page.get_by_role("dialog",name="Import selected albums",exact=True)
+        confirmation.get_by_text(re.compile("Warning: Track counts differ")).wait_for()
+        assert confirmation.get_by_text("Blocked",exact=True).count()==0
+        assert confirmation.get_by_role("button",name="Start import",exact=True).is_enabled()
+        page.screenshot(path=args.evidence_dir/"13-metadata-warning-confirmation.png",full_page=True)
+        confirmation.get_by_role("button",name="Start import",exact=True).click()
+        page.get_by_text("1 of 1 albums imported.",exact=True).wait_for()
+        assert all(sha256(path)==warning_before[path] for path in warning_sources)
+        receipt=next(row for row in page.request.get(inbox_base+"/imports").json()["imports"] if row['album']=="Warning Import")
+        assert {MediaFile(args.fixture_root/"library"/relative).title for relative in receipt['destinations']}=={"First","Second","Third"}
+        assert {MediaFile(args.fixture_root/"library"/relative).album for relative in receipt['destinations']}=={"Warning Import Chosen"}
+        page.get_by_role("button",name="Close results",exact=True).click()
+        # A simulated discovery outage is inline, survives review pause, and clears.
+        testing_reconnect = True
+        discovery_route = "**/api/inbox/*/discovery"
+        page.route(discovery_route, lambda route: route.fulfill(status=503, json={"error":"Simulated outage"}))
+        reconnecting = page.get_by_text("Live updates disconnected · Reconnecting…",exact=True)
+        reconnecting.wait_for(timeout=15000)
+        assert page.get_by_role("dialog").count()==0
+        page.screenshot(path=args.evidence_dir/"14-discovery-reconnecting.png",full_page=True)
+        page.unroute(discovery_route)
+        reconnecting.wait_for(state="hidden",timeout=10000)
+        testing_reconnect = False
         browser_version = browser.version
+        # A confirmed batch survives closing its view, navigation and reload.
+        for number in (1, 2):
+            path = args.fixture_root / "inbox" / f"Background fixture {number}" / "01 Song.wav"
+            write_wav(path)
+            tags = MediaFile(path); tags.artist = tags.albumartist = "Background Artist"
+            tags.album = f"Background fixture {number}"; tags.title = "Song"; tags.track = 1; tags.save()
+        page.goto(base + "/inbox", wait_until="networkidle")
+        page.get_by_role("searchbox", name="Find an album").fill("Background fixture")
+        page.get_by_role("button", name="Refresh", exact=True).click()
+        page.get_by_role("checkbox", name="Select album Background fixture 1", exact=True).wait_for()
+        page.get_by_role("checkbox", name="Select this page", exact=True).check()
+        page.get_by_role("button", name="Match Selected", exact=True).click()
+        with page.expect_response(lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'matching') as accepted:
+            page.get_by_role("button", name="Start matching", exact=True).click()
+        matching_job = accepted.value.json()['id']
+        page.get_by_role("button", name="Continue in background", exact=True).click()
+        # Stay on the same selected queue: completion must patch match results
+        # without requiring navigation/reload or clearing the import selection.
+        same_page_match = wait_activity(page, base, matching_job)
+        for row in same_page_match['rows']:
+            page.locator(f'.desk-album[data-album-id="{row["id"]}"] .desk-decision.matched').wait_for()
+            assert page.locator(f'.desk-album[data-album-id="{row["id"]}"] input[type="checkbox"]').is_checked()
+        page.goto(base + "/", wait_until="networkidle")
+        page.get_by_role("button", name=re.compile(r"^Activity")).click()
+        page.locator(f'[data-activity-id="{matching_job}"]').get_by_role("button", name=re.compile(r"^Album matching")).wait_for()
+        page.screenshot(path=args.evidence_dir / "15-activity-desktop.png", full_page=True)
+        page.set_viewport_size({"width":390,"height":844})
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=args.evidence_dir / "15-activity-mobile.png", full_page=True)
+        page.reload(wait_until="networkidle")
+        matched_job = wait_activity(page, base, matching_job)
+        assert [row['status'] for row in matched_job['rows']] == ['matched','matched'], matched_job
+        page.set_viewport_size({"width":1440,"height":1000})
+        page.goto(base + "/inbox", wait_until="networkidle")
+        page.get_by_role("searchbox", name="Find an album").fill("Background fixture")
+        page.get_by_role("checkbox", name="Select album Background fixture 1", exact=True).wait_for()
+        page.get_by_role("checkbox", name="Select this page", exact=True).check()
+        page.get_by_role("button", name="Import selected", exact=True).click()
+        with page.expect_response(lambda response: response.url.endswith('/api/activity') and response.request.method == 'POST' and response.request.post_data_json.get('mode') == 'import') as accepted:
+            page.get_by_role("button", name="Start import", exact=True).click()
+        importing_job = accepted.value.json()['id']
+        page.get_by_role("button", name="Continue in background", exact=True).click()
+        page.goto(base + "/library", wait_until="networkidle")
+        page.reload(wait_until="networkidle")
+        imported_job = wait_activity(page, base, importing_job)
+        assert [row['status'] for row in imported_job['rows']] == ['imported','imported'], imported_job
+        assert all(row.get('jobId') for row in imported_job['rows'])
         browser.close()
 
     after = {"inbox_untagged": sha256(inbox_untagged), "inbox": sha256(inbox_track), "library": sha256(library_track),
@@ -625,7 +1060,8 @@ def main() -> None:
         "compact_album_track_editor_desktop_mobile": True,
         "library_inspector_without_modal_overview_library_size_source_cards": True,
         "album_removal_keep_files_readopt_delete": True,
-        "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True,
+        "single_inbox_inspector_import": True, "inbox_sidebar_duplicate_replacement": True, "copy_import_retains_originals_undo_reimport_remove_originals": True, "simplified_pending_matched_imported_queue": True, "unimported_album_track_batch_deletion": True, "symbol_title_bulk_import": True, "metadata_warnings_do_not_block_import": True, "discovery_reconnects_inline": True,
+        "expected_reconnect_console_errors": expected_reconnect_errors,
         "fixture_sha256_before": before, "fixture_sha256_after": after,
         "page_errors": page_errors, "console_errors": console_errors,
     }

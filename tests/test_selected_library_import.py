@@ -61,12 +61,14 @@ def test_selected_import_preserves_as_is_and_track_exclusions(tmp_path):
     assert len(list(Library(app.config['BEETS_DB'], directory=app.config['LIBRARY_PATH']).items())) == 1
 
 
-def test_selected_import_keeps_unpaired_or_excluded_albums_and_files(tmp_path):
+def test_selected_import_warns_for_unpaired_but_respects_excluded_albums(tmp_path):
     app, client, album, body, path = fixture(tmp_path,partial=True)
     before = path.read_bytes()
-    result = client.post('/api/library-import/bulk/execute',json={**body,'confirmed':True}).json
-    assert not result['imported'] and 'pairing' in result['skipped'][0]['reason']
-    client.patch(f"/api/library-import/albums/{album['id']}",json={'decision':'rejected'})
+    preview = client.post('/api/library-import/bulk/preview',json=body).json
+    assert preview['importable_album_count'] == 1 and not preview['exceptions']
+    assert preview['importable_albums'][0]['warnings']
+    assert path.read_bytes() == before
+    assert client.patch(f"/api/library-import/albums/{album['id']}",json={'decision':'rejected'}).status_code == 200
     result = client.post('/api/library-import/bulk/execute',json={**body,'confirmed':True}).json
     assert 'excluded' in result['skipped'][0]['reason']
     assert path.read_bytes() == before and not list(Library(app.config['BEETS_DB'], directory=app.config['LIBRARY_PATH']).items())

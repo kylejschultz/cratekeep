@@ -78,6 +78,14 @@ def deterministic_musicbrainz_provider(query: dict, *, limit: int) -> list[dict]
                         "length_ms": round(float(track.get("duration") or 1) * 1000)}
                        for index, track in enumerate(query.get("tracks", []), 1)],
         }
+        if query["album"] == "Warning Import":
+            base.update(provider_id="warning-import",album="Warning Import Chosen")
+            base["tracks"]=base["tracks"][:2]
+            base["tracks"][1]["title"]="Unrelated release recording"
+        if query["album"].startswith("Symbol Pair"):
+            base["provider_id"] = "symbol-" + query["album"]
+            for track in base["tracks"]:
+                track["title"] = {"Human Heart":"❤️ feat. We Are KING & Jacob Collier", "Rainbow":"🌈"}.get(track["title"],track["title"])
         if query["album"] == "Shared Selection":
             base["provider_id"] = "123e4567-e89b-42d3-a456-426614174013"
             base["tracks"][0]["length_ms"] += 10_000
@@ -165,4 +173,21 @@ def create_app():
     def provider_calls():
         with PROVIDER_LOCK:
             return {"calls": dict(PROVIDER_CALLS), "total": sum(PROVIDER_CALLS.values())}
+    # Deliberately slow only synthetic background-lifecycle fixtures.
+    from flask import request
+    import sqlite3
+    @app.before_request
+    def slow_background_fixture():
+        if request.path.endswith('/candidates') and request.method == 'POST':
+            album_id = (request.get_json(silent=True) or {}).get('album_id')
+            with sqlite3.connect(app.config['APP_DB']) as db:
+                row = db.execute('SELECT album FROM album_reviews WHERE id=?', (album_id,)).fetchone()
+            if row and row[0].startswith('Background fixture'):
+                time.sleep(2)
+        if request.path.endswith('/bulk/execute') and request.method == 'POST':
+            album_ids = (request.get_json(silent=True) or {}).get('album_ids') or []
+            with sqlite3.connect(app.config['APP_DB']) as db:
+                row = db.execute('SELECT album FROM album_reviews WHERE id=?', (album_ids[0] if album_ids else 0,)).fetchone()
+            if row and row[0].startswith('Background fixture'):
+                time.sleep(2)
     return app

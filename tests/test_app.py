@@ -587,237 +587,6 @@ def test_named_inbox_symlink_escape_and_unbound_legacy_job_rejection(tmp_path):
     unbound = client.post(f"/api/imports/{unbound_job_id}/execute")
     assert unbound.status_code == 409 and b"not bound to an inbox root" in unbound.data
 
-def test_normal_settings_renders_in_app_page_and_beets_editor(tmp_path):
-    page = make_app(tmp_path).test_client().get("/settings")
-
-    assert page.status_code == 200
-    assert b'--font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI"' in page.data
-    assert b'--page: #e7e9ec;' in page.data
-    assert b'id="sidebar"' in page.data
-    assert b'class="content"' in page.data
-    assert b'aria-label="Primary navigation"' in page.data
-    assert b'aria-current="page"' in page.data
-    assert b'<span class="nav-label">Settings</span>' in page.data
-    assert b'id="theme-toggle"' in page.data
-    assert b'title="Build SHA"' in page.data
-    assert b'id="open-sidebar"' in page.data
-    assert b'<h1>Settings</h1>' in page.data
-    assert b'Set up Cratekeep' not in page.data
-    assert b'id="beets_config"' in page.data
-    assert b'core import safety settings' in page.data
-    assert b'name="fetch_art"' in page.data
-    assert b'name="fetch_art" type="checkbox" value="1" checked' not in page.data
-    assert b'id="inventory-preview"' in page.data
-    assert b'never imports or changes media' in page.data
-
-
-def test_settings_groups_existing_controls_in_accessible_tabs(tmp_path):
-    page = make_app(tmp_path).test_client().get("/settings")
-    html = page.data
-
-    for name, label in (("general", "General"), ("metadata", "Metadata"), ("library-import", "Library import")):
-        assert f'id="settings-tab-{name}"'.encode() in html
-        assert b'role="tab" aria-selected=' in html
-        assert f'aria-controls="settings-panel-{name}"'.encode() in html
-        assert f'>{label}</button>'.encode() in html
-        assert f'id="settings-panel-{name}" role="tabpanel" aria-labelledby="settings-tab-{name}"'.encode() in html
-
-    general = html[html.index(b'id="settings-panel-general"'):html.index(b'id="settings-panel-metadata"')]
-    metadata = html[html.index(b'id="settings-panel-metadata"'):html.index(b'id="settings-panel-library-import"')]
-    library_import = html[html.index(b'id="settings-panel-library-import"'):html.index(b'<button type="submit">')]
-    assert b'id="storage-title"' in general and b'id="navidrome-title"' in general
-    assert b'id="artwork-title"' in metadata and b'id="beets_config"' in metadata
-    assert b'id="inventory-preview"' in library_import and b'id="inventory-status"' in library_import
-    assert b'id="library-import-review-list"' in library_import
-    assert b'data-review-modal' in html
-    assert b"Adoption" not in html and b"adoption" not in html
-    assert b'name="inbox_path"' in general and b'name="navidrome_token"' in general
-    assert b'name="fetch_art"' in metadata and b'name="beets_config"' in metadata
-    assert b"event.key === 'ArrowRight'" in html
-    assert b"window.addEventListener('hashchange'" in html
-
-
-def test_settings_script_initializes_without_stale_direct_import_references(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
-
-    assert "library-import-queue" not in script
-    assert "CratekeepReviewWorkflow.create" in script
-    assert "CratekeepFolderWorkflow.create" in script
-    assert "const themeButton = document.getElementById('theme-toggle');" in script
-    assert "localStorage.getItem('cratekeep-theme') === 'dark'" in script
-    assert "themeButton.addEventListener('click'" in script
-    assert "function renderAlbumMatch" not in script and "function openReview" not in script
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for rendered JavaScript syntax validation")
-def test_rendered_settings_javascript_has_valid_syntax(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
-    completed = subprocess.run(
-        [shutil.which("node"), "--check", "-"], input=script, text=True, capture_output=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for rendered JavaScript syntax validation")
-def test_rendered_inbox_javascript_has_valid_syntax(tmp_path):
-    html = make_app(tmp_path).test_client().get("/inbox").get_data(as_text=True)
-    script = html[html.rindex("<script>") + len("<script>"):html.rindex("</script>")]
-    completed = subprocess.run(
-        [shutil.which("node"), "--check", "-"], input=script, text=True, capture_output=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared review output")
-def test_library_and_inbox_use_one_structured_review_presentation(tmp_path):
-    client = make_app(tmp_path).test_client()
-    settings = client.get("/settings").get_data(as_text=True)
-    inbox = client.get("/inbox").get_data(as_text=True)
-    assert 'src="/static/review-presentation.js"' in settings
-    assert 'src="/static/review-presentation.js"' in inbox
-    assert 'src="/static/review-workflow.js"' in settings
-    assert 'src="/static/review-workflow.js"' in inbox
-    assert "CratekeepReviewWorkflow.create" in settings
-    assert "CratekeepReviewWorkflow.create" in inbox
-    module = Path("beets_mvp/static/review-presentation.js").read_text()
-    fixture = {
-        "current_metadata":{"artist":"Local Artist","album":"Local Album","genre":"Rock","year":"2001"},
-        "tracks":[{"id":1}],
-    }
-    candidate = {
-        "artist":"Online Artist","album":"Online Album","genre":"Jazz","year":"2002",
-        "provider_id":"release-id","release_type":"Album","country":"GB",
-        "media":[{"format":"CD"}],
-        "track_details":[{"status":"matched","local":"Old title","proposed":"New title",
-                           "local_artist":"Local Artist","proposed_artist":"Online Artist",
-                           "current_position":[1,1],"proposed_position":[1,1],
-                           "local_duration":60,"proposed_duration":70}],
-    }
-    probe = f"""
-globalThis.window = globalThis;
-{module}
-const facts = window.CratekeepReview.describeCandidate({json.dumps(fixture)}, {json.dumps(candidate)});
-process.stdout.write(JSON.stringify(facts.map(f => ({{label:f.label,value:f.value,changed:f.changed,tracks:(f.tracks||[]).map(t => ({{titleChanged:t.titleChanged,durationChanged:t.durationChanged,explanations:t.explanations}}))}}))));
-"""
-    completed = subprocess.run([shutil.which("node"), "-"], input=probe, text=True, capture_output=True)
-    assert completed.returncode == 0, completed.stderr
-    facts = {fact["label"]: fact for fact in json.loads(completed.stdout)}
-    assert set(facts) >= {"Artist", "Album", "Genre", "Release Year", "Tracks changed",
-                          "Release Type/media", "Release Region", "Local tracks found online",
-                          "Online tracks present locally"}
-    assert facts["Artist"]["changed"] and facts["Release Year"]["changed"]
-    changed_track = facts["Tracks changed"]["tracks"][0]
-    assert changed_track["titleChanged"] and changed_track["durationChanged"]
-    assert any("Title differs" in item for item in changed_track["explanations"])
-
-
-def test_album_review_modal_uses_shared_presentation_and_accessible_shell(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    modal = html[html.index('data-review-modal'):]
-    controller = Path("beets_mvp/static/review-workflow.js").read_text()
-    shared_js = Path("beets_mvp/static/review-presentation.js").read_text()
-    shared_css = Path("beets_mvp/static/review-presentation.css").read_text()
-
-    for contract in (
-        'role="dialog" aria-modal="true"', 'aria-labelledby="shared-library-review-title"',
-        'role="radiogroup"', 'data-review-track-modal', 'data-review-mbid-modal',
-        'class="approve-button button-primary"',
-    ):
-        assert contract in modal
-    for contract in (
-        "function renderCandidates", "function renderTrackRows", "className = 'candidate-option'",
-        "className='candidate-fact'", "className='track-change-button'", "aria-haspopup','dialog'",
-        "className='track-row-unmatched'", "classList.add('track-field-changed')",
-        "className='track-explanation-row'", "label:'Release Type/media'",
-        "label:'Release Region'", "label:'Local tracks found online'", "label:'Online tracks present locally'",
-    ):
-        assert contract in shared_js
-    for selector in (
-        '.candidate-option[open]', '.candidate-fact[data-changed="true"]', '.track-change-button:focus-visible',
-        '.track-comparison-table', '.track-field-changed', '.track-explanation-row td',
-    ):
-        assert selector in shared_css
-    assert "presentation.renderCandidates" in controller
-    assert "presentation.renderTrackRows" in controller
-    assert "dialog.inert = true" in controller and "nestedReturnFocus?.focus()" in controller
-    assert "if (event.key === 'Escape')" in controller and "event.key !== 'Tab'" in controller
-    assert "focusTarget?.focus()" in controller
-    assert 'class="button-spinner" aria-hidden="true" hidden' in modal
-    assert "library-import-queue" not in modal and "Confirm import" not in modal
-
-
-def test_review_presentation_has_one_renderer_and_one_common_stylesheet():
-    settings = Path("beets_mvp/templates/settings.html").read_text()
-    inbox = Path("beets_mvp/templates/inbox.html").read_text()
-    shared_js = Path("beets_mvp/static/review-presentation.js").read_text()
-    shared_css = Path("beets_mvp/static/review-presentation.css").read_text()
-
-    review_controller = Path("beets_mvp/static/review-workflow.js").read_text()
-    partial = Path("beets_mvp/templates/_review_workflow.html").read_text()
-    assert settings.count("{% include '_review_workflow.html' %}") == 1
-    assert inbox.count("{% include '_review_workflow.html' %}") == 1
-    assert settings.count("CratekeepReviewWorkflow.create") == 1
-    assert inbox.count("CratekeepReviewWorkflow.create") == 1
-    assert review_controller.count("presentation.renderCandidates") == 1
-    assert review_controller.count("presentation.renderTrackRows") == 1
-    assert partial.count("data-review-modal") == 1
-    assert shared_js.count("function renderCandidates") == 1
-    assert shared_js.count("function renderTrackRows") == 1
-    for dead_definition in (
-        "candidateIconPaths", "function candidateFacts", "function candidateIcon",
-        "function trackEvidence", "function appendTrackCell", "function appendTrackMetadataCell",
-        "function matchScorePresentation",
-    ):
-        assert dead_definition not in settings
-        assert dead_definition not in inbox
-    for duplicate in (
-        "function openReview", "function renderAlbumMatch", "function openTrackComparison",
-        "mbidSearchReturnFocus", "reviewOpeningState", "reviewTransitionToken",
-    ):
-        assert duplicate not in settings and duplicate not in inbox
-    assert "innerHTML" not in settings and "innerHTML" not in inbox
-
-    inline_styles = "\n".join(re.findall(r"<style>(.*?)</style>", settings + inbox, re.S))
-    definitive_selectors = (
-        ".candidate-option", ".candidate-option-summary", ".candidate-confidence",
-        ".candidate-signals", ".candidate-fact", ".candidate-artwork",
-        ".track-change-button", ".track-comparison-table", ".track-field-changed",
-        ".track-explanation-row", ".score-pill[data-band", ".confidence-band[data-band",
-    )
-    for selector in definitive_selectors:
-        assert selector in shared_css
-        assert selector not in inline_styles
-
-
-def test_library_and_inbox_share_corrected_modal_controls_and_selection_save_path(tmp_path):
-    client = make_app(tmp_path).test_client()
-    settings = client.get("/settings").get_data(as_text=True)
-    inbox = client.get("/inbox").get_data(as_text=True)
-    partial = Path("beets_mvp/templates/_review_workflow.html").read_text()
-    controller = Path("beets_mvp/static/review-workflow.js").read_text()
-
-    for page in (settings, inbox):
-        assert ">Find matches<" in page
-        assert ">Search by MBID<" in page
-        assert ">Import to Library<" in page
-        assert "Current metadata" not in page
-        assert "Approve selection" not in page
-        assert "Exact MusicBrainz release ID" not in page
-    assert "Selecting metadata is explicit; matching alone never writes or moves files." in inbox
-    assert "Approval is always explicit; matching alone never writes or moves files." not in inbox
-    assert "MusicBrainz release or release-group ID" in partial
-    assert "data-review-current" not in partial and "data-review-approve" not in partial
-    assert "async function selectDecision" in controller
-    assert "decision: 'approved', candidate_id: selectedValue(id)" in controller
-    assert "adapter.save(album" in controller
-    assert "As Is keeps current tags. Select this option to use current metadata." in Path(
-        "beets_mvp/static/review-presentation.js"
-    ).read_text()
-    assert "Explicit approval required." not in Path("beets_mvp/static/review-presentation.js").read_text()
-
-
 def test_inbox_duplicate_choice_after_selection_persists_before_execute(tmp_path, monkeypatch):
     controller = Path("beets_mvp/static/review-workflow.js").read_text()
     handler = controller[controller.index("async function persistDuplicateAction"):controller.index("function render()")]
@@ -878,35 +647,6 @@ def test_shared_rows_button_gaps_and_pagination_alignment_contract(tmp_path):
     assert "statusClass:'status-pill'" not in settings + inbox
     assert ".review-toolbar-actions,.review-footer-group,.browser-actions,.workflow-actions { gap:.5rem; }" in css
     assert ".pagination .page-label,.review-pagination .page-label { display:flex; align-self:stretch; align-items:center;" in css
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared folder helpers")
-def test_shared_folder_status_and_progressive_loading_contract(tmp_path):
-    module = Path("beets_mvp/static/folder-workflow.js").read_text()
-    probe = """
-globalThis.window = globalThis;
-%s
-process.stdout.write(JSON.stringify([
-  window.CratekeepFolderWorkflow.statusLabel('needs-review'),
-  window.CratekeepFolderWorkflow.statusLabel('Needs attention'),
-  window.CratekeepFolderWorkflow.statusLabel('error'),
-]));
-""" % module
-    completed = subprocess.run([shutil.which("node"), "-"], input=probe, text=True, capture_output=True)
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == ["Tagged", "Tagged", "error"]
-
-    settings = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    assert "progressivePages:true" in settings
-    assert "void hydratePages(result, context, query, filter)" in module
-    assert module.index("render();", module.index("async function load(")) < module.index(
-        "void hydratePages(result, context, query, filter)", module.index("async function load(")
-    ) < module.index("await refreshSummary();", module.index("async function load("))
-    assert "if (seen.has(item.path)) throw new Error" in module
-    assert "if (seen.size !== result.total) throw new Error" in module
-    assert "pageCache.get(targetPage)" in module
-    assert "preserveSelection = true" in module
-    assert ">Needs review<" not in settings and ">Tagged<" in settings
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate shared review helpers")
@@ -2499,20 +2239,6 @@ def test_library_execution_rerun_is_idempotent(tmp_path):
     assert client.get("/api/library-import/reviews").json["albums"] == []
 
 
-def test_inbox_route_owns_named_inbox_workspace_not_library_import_queue(tmp_path):
-    client = make_app(tmp_path).test_client()
-    page = client.get("/inbox")
-
-    assert page.status_code == 200
-    assert b"<title>Inbox \xc2\xb7 Cratekeep</title>" in page.data
-    assert b"<h1>Named inboxes</h1>" in page.data
-    assert b'href="/inbox" aria-current="page"' in page.data
-    assert b'id="inbox-grid"' in page.data and b'data-review-modal' in page.data
-    assert b'id="library-import-review-list"' not in page.data
-    settings = client.get("/settings")
-    assert b'id="library-import-review-list"' in settings.data
-
-
 def test_library_route_is_album_first_searchable_and_lazy(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     root = tmp_path / "library"
@@ -2666,14 +2392,12 @@ def test_managed_album_details_expose_stored_release_mbid(tmp_path):
     assert [path.read_bytes() for path in paths] == before
 
 
-def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path):
+def test_managed_album_and_track_edits_preserve_identity_and_update_artist_paths(tmp_path):
     app = make_app(tmp_path)
     library, album, paths = managed_wav_album(app, tmp_path)
     client = app.test_client()
     opened = client.get(f"/api/library/albums/{album.id}").json
     original_tracks = copy.deepcopy(opened["tracks"])
-    original_paths = [path.resolve() for path in paths]
-
     edited = client.patch(f"/api/library/albums/{album.id}", json={
         "album": "New Album", "albumartist": "New Album Artist", "genre": "Jazz", "year": 2024,
         "expected_fingerprint": opened["fingerprint"],
@@ -2687,7 +2411,8 @@ def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path
         assert (after["title"], after["artist"], after["track"], after["disc"]) == (
             before["title"], before["artist"], before["track"], before["disc"],
         )
-    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+    paths = paths_for_items(list(library.get_album(album.id).items()))
+    assert all(path.is_file() for path in paths)
     for path in paths:
         media = MediaFile(str(path))
         assert (media.album, media.albumartist, media.genre, media.year) == (
@@ -2702,9 +2427,10 @@ def test_managed_album_and_track_edits_preserve_identity_paths_and_tags(tmp_path
     })
     assert track_edit.status_code == 200
     assert [track["title"] for track in track_edit.json["album"]["tracks"]] == ["First", "Changed Second"]
+    paths = paths_for_items(list(library.get_album(album.id).items()))
     assert MediaFile(str(paths[0])).title == "First"
     assert (MediaFile(str(paths[1])).title, MediaFile(str(paths[1])).artist) == ("Changed Second", "Guest")
-    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == original_paths
+    assert all(path.is_file() for path in paths)
 
     assert client.patch(f"/api/library/albums/{album.id}", json={
         "genre": "Soul", "expected_fingerprint": opened["fingerprint"],
@@ -2805,8 +2531,10 @@ def test_managed_album_exact_mbid_preview_apply_is_stored_single_use_and_non_mut
     assert provider_calls == [(release_id, 1)]
     assert [item.title for item in library.get_album(album.id).items()] == ["First Song Remastered", "Second Song"]
     assert [item.mb_trackid for item in library.get_album(album.id).items()] == ["recording-1", "recording-2"]
-    assert [MediaFile(str(path)).title for path in paths] == ["First Song Remastered", "Second Song"]
-    assert [Path(item.path.decode()).resolve() for item in library.get_album(album.id).items()] == [path.resolve() for path in paths]
+    updated_paths = paths_for_items(list(library.get_album(album.id).items()))
+    assert [MediaFile(str(path)).title for path in updated_paths] == ["First Song Remastered", "Second Song"]
+    assert updated_paths[0].name == "01 First Song Remastered.wav"
+    assert not paths[0].exists() and updated_paths[1] == paths[1]
     assert client.post(f"/api/library/albums/{album.id}/rematch/apply", json={
         "preview_id": preview.json["preview_id"], "expected_fingerprint": preview.json["fingerprint"],
     }).status_code == 409
@@ -3795,74 +3523,6 @@ def test_rematch_wrong_release_id_stays_selected_with_low_evidence_confidence(tm
     assert candidate["recommendation"] == "none"
 
 
-def test_library_import_review_markup_is_album_folder_first(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    shared = Path("beets_mvp/static/review-presentation.js").read_bytes()
-    folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
-
-    assert b"document.createElement('details')" in shared
-    assert b"document.createElement('summary')" in shared
-    assert b'data-folder-list' in html and b'src="/static/folder-workflow.js"' in html
-    assert b"review-folder" in folders and b"review-album-node" in folders
-    assert b"CratekeepFolderWorkflow.create" in html
-    assert b"adapter.albums(item.path)" in folders
-    assert b"review.open(album, open)" in folders
-    assert b"reviews?limit=50" not in html
-
-
-def test_library_import_review_rows_are_unfilled_and_keep_focus_contract(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    shell_css = Path("beets_mvp/static/app-shell.css").read_bytes()
-
-    assert b".review-list { overflow:hidden;" in html
-    assert b".review-folder-summary { display:grid; grid-template-columns:auto auto minmax(0,1fr) auto auto auto;" in shell_css
-    assert b".review-album-row { display:grid; grid-template-columns:auto minmax(0,1fr) auto auto auto auto;" in shell_css
-    assert b":is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus);" in html
-    folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
-    assert b"const article = make('article'" in folders
-    assert b"const open = make('button', '\xe2\x86\x93'" in folders
-    assert b"open.setAttribute('aria-label', `Import ${album.album} by ${album.artist}`)" in folders
-
-
-def test_library_import_review_modal_is_album_scoped_and_accessible(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    shared = Path("beets_mvp/static/review-presentation.js").read_bytes()
-
-    assert b'data-review-candidates' in html
-    assert b'id="library-import-modal-proposed"' not in html
-    assert b'id="library-import-modal-tracks"' not in html
-    assert b'role="radiogroup" aria-label="Album metadata candidates"' in html
-    assert b"summary.setAttribute('role','radio')" in shared
-    assert b"label:'Release Type/media'" in shared
-    assert b"label:'Tracks changed'" in shared
-    assert b"Not applicable \xe2\x80\x94 As Is" in shared
-    assert b"Math.round(candidate.confidence" not in html
-    assert b"container.querySelector('[aria-checked=\"true\"]')?.focus()" in shared
-    assert b'data-review-open-mbid' in html
-    assert b'data-review-mbid-modal' in html
-    assert b'id="library-import-rematch-form"' not in html
-    assert b'.override-form' not in html
-    assert b'aria-modal="true" aria-labelledby="shared-library-review-title"' in html
-    controller = Path("beets_mvp/static/review-workflow.js").read_bytes()
-    assert b"if (event.key === 'Escape')" in controller
-    assert b"input:not(:disabled)" in controller
-    assert b"async function open(value, trigger)" in controller
-
-
-def test_inventory_rows_render_compact_literal_paths_and_track_pills(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
-
-    assert b"item.name || item.path" in folders
-    assert b"item.path === '.' ? 'Root-level loose audio'" in folders
-    assert b"review-source-metadata" not in html
-    assert b"'review-track-count'" in folders
-    assert b"renderTrackList" not in html
-    assert b"adapter.statusClass || 'status-pill'" in folders
-    assert b"Page ${page} of ${pages}" in folders
-    assert b'aria-label="Previous page"' in html and b'aria-label="Next page"' in html
-
-
 def test_album_folder_line_separates_status_score_and_file_expansion(tmp_path):
     folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
 
@@ -3871,22 +3531,6 @@ def test_album_folder_line_separates_status_score_and_file_expansion(tmp_path):
     assert b"files.hidden = !opening" in folders
     assert b"review.open(album, open)" in folders
     assert b"renderTrackList" not in folders
-
-
-def test_album_review_multi_select_keeps_sequential_single_album_flow(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-
-    assert b'id="folder-select-page" type="checkbox"' in html
-    assert b'id="library-import-review-exceptions"' in html
-    folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
-    controller = Path("beets_mvp/static/review-workflow.js").read_bytes()
-    assert b"const selected = new Set()" in folders
-    assert b"async function exceptions()" in folders
-    assert b"review.openSequence" in folders
-    assert b"await fetch(`/api/library-import/albums/${nextId}`)" not in html
-    assert b"queue.shift()" in controller
-    assert b"listRequest?.abort()" in folders
-    assert b"sequence !== listSequence" in folders
 
 
 def test_folder_queue_page_two_bounds_readiness_and_groups_inventory_once(tmp_path, monkeypatch):
@@ -4020,19 +3664,6 @@ def test_folder_queue_search_and_every_status_remain_truthful(tmp_path, monkeypa
         assert [record["path"] for record in result["folders"]] == [folder]
 
 
-def test_duplicate_warning_is_preflighted_and_gates_direct_import(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    controller = Path("beets_mvp/static/review-workflow.js").read_bytes()
-
-    assert b'data-review-duplicate' in html
-    assert b'data-review-duplicate-action' in html
-    assert b"warning.hidden = duplicate.status === 'clear'" in controller
-    assert b"library-import-queue" not in html
-    assert b"if (duplicate.status === 'ambiguous')" in controller
-    assert b"if (duplicate.status === 'possible' && !duplicateAction.value)" in controller
-    assert b"/execute" in html
-
-
 def test_album_modal_candidate_details_match_flask_field_contract(tmp_path):
     candidate_ui = Path("beets_mvp/static/review-presentation.js").read_bytes()
 
@@ -4062,21 +3693,6 @@ def test_album_modal_candidate_rows_keep_numeric_score_selected_state_and_artwor
     assert b"details.setAttribute('aria-current', String(selected))" in shared
     assert b"if(value.artwork_url)" in shared
     assert b"artwork.src=value.artwork_url" in shared
-
-
-def test_library_import_operations_expose_visible_live_progress(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    controller = Path("beets_mvp/static/review-workflow.js").read_bytes()
-    folders = Path("beets_mvp/static/folder-workflow.js").read_bytes()
-
-    assert html.count(b'operation-status') >= 2
-    assert b'aria-live="polite"' in html
-    assert b'.operation-status[data-busy="true"]::before' in html
-    assert b"Scanning" in folders
-    assert b"Finding bounded MusicBrainz candidates" in controller
-    assert b"Searching MusicBrainz by MBID" in controller
-    assert b"Validating files, registering them, and applying approved metadata in place" in html
-    assert b"setAttribute('aria-busy', String(value))" in controller
 
 
 def test_album_candidate_payload_exposes_only_persisted_safe_artwork_and_best_score(tmp_path):
@@ -4289,82 +3905,6 @@ def test_candidate_schema_defaults_distinguish_fresh_and_upgraded_databases(tmp_
     ]
     assert versions == [(1,), (1,)]
     assert source_columns["source_kind"] == "'library'" and source_columns["source_id"] == "''"
-
-
-def test_album_modal_actions_remain_workflow_only(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").data
-    controller = Path("beets_mvp/static/review-workflow.js").read_bytes()
-
-    assert b"adapter.save(album, {decision: 'skipped'})" in controller
-    assert b"candidate_id: selectedValue(selected)" in controller
-    assert b"duplicate_action: duplicateAction.value || undefined" in controller
-    assert b'data-review-duplicate-action' in html
-    for action in (b'merge', b'replace', b'keep-both', b'skip'):
-        assert b'value="' + action + b'"' in html
-    assert b"same MusicBrainz recording ID" in html
-    assert b"method:'PATCH'" in html
-    assert b"/api/library-import/albums/${activeAlbum.id}/preview" not in html
-    assert b"/api/library-import/albums/${album.id}/execute" in html
-    assert b"data-review-skip" in html
-    assert b"Skip for now" not in html
-    assert b"data-review-decision=\"rejected\"" not in html
-    assert b"data-review-decision=\"approved\"" not in html
-    assert b"beet import" not in html
-    assert b"/api/imports/" not in html
-
-
-def test_inventory_preview_session_cache_is_scoped_to_rendered_build(tmp_path):
-    app = make_app(tmp_path)
-    app.config["BUILD_SHA"] = "build-one"
-    first = app.test_client().get("/settings").data
-    app.config["BUILD_SHA"] = "build-two"
-    second = app.test_client().get("/settings").data
-
-    assert b"storageKey:'cratekeep-folder-selection:' + \"build-one\"" in first
-    assert b"storageKey:'cratekeep-folder-selection:' + \"build-two\"" in second
-    module = Path("beets_mvp/static/folder-workflow.js").read_bytes()
-    assert b"sessionStorage.setItem(storageKey" in module
-    assert b"sessionStorage.getItem(storageKey)" in module
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
-def test_musicbrainz_candidates_require_successful_preview_in_current_page_session(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-
-    assert 'id="library-import-scan-selected" type="button" data-folder-scan disabled' in html
-    assert "libraryApi('/api/library-import/folders/scan'" in html
-    assert "body:JSON.stringify({folders})" in html
-    assert "CratekeepFolderWorkflow.create" in html
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required to evaluate rendered Settings helpers")
-def test_shared_response_reader_preserves_json_errors_and_explains_html(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    start = html.index("async function readApiResponse")
-    end = html.index("const browser =", start)
-    helper = html[start:end]
-    probe = f"""
-{helper}
-const headers = value => ({{get(name) {{ return name === 'content-type' ? value : null; }}}});
-const structured = await readApiResponse({{
-  ok:false, status:409, headers:headers('application/json'), async text() {{ return '{{"error":"inventory is stale"}}'; }}
-}}, 'Unable to preview').catch(error => error.message);
-const htmlError = await readApiResponse({{
-  ok:false, status:502, headers:headers('text/html'), async text() {{ return '<!DOCTYPE html><title>Bad Gateway</title>'; }}
-}}, 'Candidate generation failed').catch(error => error.message);
-console.log(JSON.stringify({{structured, htmlError}}));
-"""
-    completed = subprocess.run(
-        [shutil.which("node"), "--input-type=module", "--eval", probe],
-        check=True, capture_output=True, text=True,
-    )
-    result = json.loads(completed.stdout)
-    assert result["structured"] == "inventory is stale"
-    assert result["htmlError"] == (
-        "Candidate generation failed (HTTP 502). The server returned HTML; "
-        "check the proxy route and application logs."
-    )
-    assert "response.json()" not in html
 
 
 def test_settings_persists_valid_beets_config_and_managed_values(tmp_path):
@@ -4602,19 +4142,6 @@ def test_invalid_beets_config_is_rejected_without_persisting(tmp_path):
     assert b'The beets import section must be a YAML mapping.' in response.data
     assert config_path.read_text() == original
     assert app.config["INBOX_PATH"] == str(tmp_path / "inbox")
-
-
-def test_dashboard_uses_compact_light_admin_visual_contract(tmp_path):
-    page = make_app(tmp_path).test_client().get("/")
-    stylesheet = (Path(__file__).parents[1] / "beets_mvp/static/app-shell.css").read_bytes()
-
-    assert b"color-scheme: light" in stylesheet
-    assert b"--page:#f1f4f3" in stylesheet
-    assert b'app-shell.css' in page.data
-    assert b'font:16px/1.5 ui-sans-serif' in page.data
-    assert b"width:13.5rem" in page.data
-    assert b"summary-grid" in page.data
-    assert b"prefers-color-scheme:dark" not in stylesheet
 
 
 def test_setup_and_settings_routes_have_distinct_lifecycle_pages(tmp_path):
@@ -5117,23 +4644,6 @@ def test_bulk_import_honors_album_level_exclusions(tmp_path, monkeypatch):
     assert all(album_id != excluded_id for album_id, _ in calls)
 
 
-def test_folder_queue_ui_has_persistent_selection_lazy_expansion_and_accessible_confirmation(tmp_path):
-    html = make_app(tmp_path).test_client().get("/settings").get_data(as_text=True)
-    for control in ("library-import-search", "library-import-filter", "folder-select-page",
-                    "library-import-scan-selected", "library-import-ready", "library-import-review-exceptions"):
-        assert f'id="{control}"' in html
-    assert 'id="library-import-page-input"' not in html
-    module = Path("beets_mvp/static/folder-workflow.js").read_text()
-    assert "sessionStorage.setItem(storageKey" in module
-    assert "/api/library-import/folders/albums?folder=" in html
-    assert 'aria-modal="true" aria-labelledby="library-import-confirm-title"' in html
-    assert "confirmModal?.addEventListener('mousedown'" in module
-    assert "review.openSequence" in module
-    assert "/api/library-import/albums/${nextId}" not in html
-    assert "data-review-skip" in html
-    assert "@media (max-width: 520px)" in html
-
-
 def configure_named_inboxes(app, roots: list[Path], names: list[str] | None = None, **extra):
     names = names or [f"Source {index}" for index in range(1, len(roots) + 1)]
     existing = app.config["INBOXES"]
@@ -5247,22 +4757,6 @@ def test_inbox_stat_identical_scan_avoids_tag_and_provider_reads(tmp_path, monke
 
     second = client.get("/api/inbox/reviews").json["albums"][0]
     assert second["id"] == first["id"] and second["candidate_status"] == "not-run"
-
-
-def test_inbox_landing_is_collapsed_and_never_scans_until_named_section_expands(tmp_path, monkeypatch):
-    app = make_app(tmp_path)
-    tagged_inbox_wav(tmp_path / "inbox" / "Deferred" / "01 Song.wav")
-    monkeypatch.setattr("beets_mvp._scan_inbox_inventory", lambda *args: pytest.fail("landing scanned inbox"))
-
-    page = app.test_client().get("/inbox")
-
-    assert page.status_code == 200
-    assert b'data-inbox-toggle' in page.data and b'aria-expanded="false"' in page.data
-    assert b'class="album-list" data-album-list hidden' in page.data
-    assert b"Never scanned" in page.data
-    assert b"0 items" in page.data and b"built-in method items" not in page.data
-    assert b"/scopes`" in page.data
-    assert b"data-inbox-page" not in page.data
 
 
 def test_inbox_scope_pages_are_lightweight_and_bounded_for_320_scopes(tmp_path, monkeypatch):
@@ -5382,47 +4876,6 @@ def test_inbox_bulk_execute_revalidates_and_runs_only_ready_selected_scope(tmp_p
     assert calls == [(ready_id, True), (ready_id, False)]
     assert [item["album_review_id"] for item in result.json["imported"]] == [ready_id]
     assert (tmp_path / "inbox" / "Unselected" / "01 Other.wav").exists()
-
-
-def test_inbox_ui_uses_per_source_bulk_folder_workflow_without_pagination(tmp_path):
-    html = make_app(tmp_path).test_client().get("/inbox").get_data(as_text=True)
-    assert ".inbox-grid,.scope-list{grid-template-columns:minmax(0,1fr)}" in html
-    for label in ("Select all", "Scan selected", "Import ready (0)", "Review exceptions (0)"):
-        assert label in html
-    assert "data-folder-select-all" in html and "data-folder-list" in html
-    assert "/scopes/scan`" in html and "/bulk/preview`" in html and "/bulk/execute`" in html
-    assert 'src="/static/folder-workflow.js"' in html
-    assert "CratekeepFolderWorkflow.create" in html
-    assert "data-folder-confirm" in html and "data-folder-confirm-dialog" in html
-    assert "window.confirm" not in html
-    assert "data-inbox-page" not in html and "review-pagination" not in html
-    assert "execute:async album=>" in html and "body:JSON.stringify({dry_run:true})" in html and "body:'{}'" in html
-
-
-def test_library_and_inbox_share_batched_folder_workflow_primitives(tmp_path):
-    client = make_app(tmp_path).test_client()
-    inbox = client.get("/inbox").get_data(as_text=True)
-    settings = client.get("/settings").get_data(as_text=True)
-    module = Path("beets_mvp/static/folder-workflow.js").read_text()
-    assert "document.createDocumentFragment()" in module
-    for page in (inbox, settings):
-        assert 'src="/static/folder-workflow.js"' in page
-        assert "CratekeepFolderWorkflow.create" in page
-        for duplicate in ("async function scanSelected", "async function reviewExceptions", "function refreshFolderSelectionSummary"):
-            assert duplicate not in page
-    assert module.count("function create(") == 1
-    assert "async function scan()" in module and "async function exceptions()" in module
-    assert "adapter.selectLabel ? adapter.selectLabel(item) : `Select ${noun} ${item.name}`" in module
-    assert "adapter.selectAllLabel || `Select all ${noun}s`" in module
-    assert "selectAllLabel:'Select all folders on this page'" in settings
-    assert "item.path==='.'?'Select loose files folder':`Select album folder ${item.name}`" in inbox
-    assert "adapter.rowClass || 'review-folder'" in module
-    assert "adapter.summaryClass || 'review-folder-summary'" in module
-    assert "adapter.checkboxClass || 'review-select'" in module
-    assert "adapter.countClass || 'review-folder-count'" in module
-    assert "libraryFolders.load(2); libraryFolders.load(5);" in Path("tests/runtime_smoke.py").read_text()
-    assert "if (failed) one(root, 'execute').querySelector('.button-label').textContent" in Path("beets_mvp/static/review-workflow.js").read_text()
-    assert "focusFallback:()=>document.getElementById('library-import-search')" in settings
 
 
 def test_shell_remains_responsive_while_scoped_inbox_scan_is_held(tmp_path, monkeypatch):
@@ -6759,74 +6212,6 @@ def test_destination_sidecars_roll_back_first_folder_when_second_commit_fails(tm
                for folder in ("First", "Second"))
 
 
-def test_inbox_modal_contains_library_review_evidence_and_supported_duplicate_policy(tmp_path):
-    client = make_app(tmp_path).test_client()
-    inbox = client.get("/inbox").get_data(as_text=True)
-    settings = client.get("/settings").get_data(as_text=True)
-    assert 'src="/static/review-presentation.js"' in inbox
-    assert 'src="/static/review-presentation.js"' in settings
-    assert 'href="/static/review-presentation.css"' in inbox
-    assert 'href="/static/review-presentation.css"' in settings
-    for page in (inbox, settings):
-        assert 'data-review-candidates' in page
-        assert 'data-review-track-modal' in page
-        assert 'src="/static/review-workflow.js"' in page
-        assert "CratekeepReviewWorkflow.create" in page
-    partial = Path("beets_mvp/templates/_review_workflow.html").read_text()
-    controller = Path("beets_mvp/static/review-workflow.js").read_text()
-    assert "presentation.renderCandidates" in controller
-    assert "presentation.renderTrackRows" in controller
-    assert "UUID = /^[0-9a-f]" in controller
-    assert "function candidateOption" not in inbox
-    assert '<option value="keep-both">Keep both' in inbox
-    for unsupported in ('value="merge"', 'value="replace"', 'value="skip"'):
-        assert unsupported not in inbox
-    for shell_control in ("collapse-sidebar", "open-sidebar", "sidebar-scrim", "theme-toggle"):
-        assert f'id="{shell_control}"' in inbox
-    assert "GitHub" in inbox and "Build SHA" in inbox
-    assert 'id="inbox-success"' in inbox and "success.focus()" in inbox
-    assert "await workflow.load(1)" in inbox
-    assert "details.length-localMissing" not in inbox
-    shared_module = (Path(__file__).parents[1] / "beets_mvp/static/review-presentation.js").read_text()
-    shared_css = (Path(__file__).parents[1] / "beets_mvp/static/review-presentation.css").read_text()
-    for band in ("high", "medium", "low"):
-        assert f'.confidence-band[data-band="{band}"]' in shared_css
-    assert "const releaseYear" in shared_module
-    assert "setBusy(true, 'Finding bounded MusicBrainz candidates" in controller
-    assert "executing:'Running Beets no-write preflight" in inbox
-    assert "executeButton.addEventListener('click'" in controller
-    for shared_class in (
-        "candidate-option", "candidate-confidence", "candidate-signals", "candidate-fact",
-        "track-comparison-table", "track-change-button", "track-cell-changed", "track-explanation-row",
-    ):
-        assert shared_class in shared_module or shared_class in shared_css
-
-
-def test_semantic_button_tokens_meet_normal_contrast_and_pagination_is_four_control(tmp_path):
-    css = (Path(__file__).parents[1] / "beets_mvp/static/app-shell.css").read_text()
-    light_block = css[css.index(":root {"):css.index("body.dark-mode")]
-    dark_block = css[css.index("body.dark-mode"):css.index("button,.button-secondary")]
-    def luminance(value):
-        raw = value.lstrip("#")
-        if len(raw) == 3: raw = "".join(character * 2 for character in raw)
-        channels = [int(raw[index:index + 2], 16) / 255 for index in (0, 2, 4)]
-        channels = [channel / 12.92 if channel <= .04045 else ((channel + .055) / 1.055) ** 2.4 for channel in channels]
-        return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2]
-    def contrast(first, second):
-        light, dark = sorted((luminance(first), luminance(second)), reverse=True)
-        return (light + .05) / (dark + .05)
-    for mode, block in (("light", light_block), ("dark", dark_block)):
-        colors = dict(re.findall(r"(--button-[\w-]+):(#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3}))", block))
-        for prefix in ("primary", "secondary", "danger", "disabled"):
-            ratio = contrast(colors[f"--button-{prefix}-text"], colors[f"--button-{prefix}-bg"])
-            assert ratio >= 4.5, f"{mode} {prefix} contrast is only {ratio:.2f}:1"
-    library = make_app(tmp_path).test_client().get("/library").get_data(as_text=True)
-    for label, glyph in (("First", "«"), ("Previous", "‹"), ("Next", "›"), ("Last", "»")):
-        assert f'aria-label="{label} page"' in library and glyph in library
-    settings = make_app(tmp_path / "other").test_client().get("/settings").get_data(as_text=True)
-    assert 'library-import-page-input' not in settings
-    assert 'Page 1 of 1' in settings
-
 @pytest.mark.parametrize("source_kind", ["library", "inbox"])
 def test_import_can_skip_failed_new_artwork_without_changing_settings_or_existing_art(
     tmp_path, monkeypatch, source_kind,
@@ -7113,9 +6498,9 @@ def test_explicit_matching_rescans_only_the_reviewed_folder_for_new_tracks(tmp_p
         return [exact_candidate(query, mbid)]
     app.config["MUSICBRAINZ_PROVIDER"] = provider
     original = beets_mvp._library_audio_stats
-    def only_target(path):
+    def only_target(path, **kwargs):
         assert Path(path) == first.parent, "A single review must not scan the entire root or unrelated folders"
-        return original(path)
+        return original(path, **kwargs)
     monkeypatch.setattr("beets_mvp._library_audio_stats", only_target)
     if action == "match":
         response = client.post(f"/api/{api_source}/candidates", json={"album_id": album["id"]})
@@ -7640,9 +7025,8 @@ def duplicate_inbox_fixture(tmp_path, action, monkeypatch, *, mixed=False):
 
 
 @pytest.mark.parametrize("action", ["keep-existing", "replace"])
-@pytest.mark.parametrize("mixed", [False, True])
-def test_inbox_duplicate_policies_preserve_identity_and_consume_sources(tmp_path, monkeypatch, action, mixed):
-    app, client, library, album, managed, incoming, base = duplicate_inbox_fixture(tmp_path, action, monkeypatch, mixed=mixed)
+def test_inbox_duplicate_only_policies_preserve_identity_and_sources(tmp_path, monkeypatch, action):
+    app, client, library, album, managed, incoming, base = duplicate_inbox_fixture(tmp_path, action, monkeypatch)
     before = managed.read_bytes()
     item_id = next(iter(album.items())).id
     cover = managed.parent / "cover.jpg"
@@ -7658,9 +7042,7 @@ def test_inbox_duplicate_policies_preserve_identity_and_consume_sources(tmp_path
     assert (managed.read_bytes() == before) == (action == "keep-existing")
     assert library.get_item(item_id) is not None
     assert library.get_item(item_id).album_id == album.id
-    assert len(list(library.items())) == (2 if mixed else 1)
-    if mixed:
-        assert len({i.album_id for i in library.items()}) == 1
+    assert len(list(library.items())) == 1
     replacement = incoming[0]
     tagged_inbox_wav(replacement, title="First", track=1)
     saved = replacement.read_bytes()

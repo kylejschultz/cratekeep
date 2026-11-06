@@ -1,3 +1,5 @@
+import { MetadataEditor } from "./MetadataEditor";
+import { ActivityInline } from "./Activity";
 import { useInspectorResize } from "./useInspectorResize";
 import { ArtworkPlaceholder } from "./ArtworkPlaceholder";
 import { useEffect, useRef, useState } from "react";
@@ -18,11 +20,11 @@ export function Overview({ data }: { data: Record<string, any> }) {
 
 export function Inbox({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const inboxes = data.inboxes || [];
-  const [selected, setSelected] = useState(() => { const requested = new URLSearchParams(location.search).get("source"); return inboxes.find((row: any) => row.id === requested)?.id || inboxes[0]?.id || ""; });
+  const [selected, setSelected] = useState(() => { const requested = new URLSearchParams(location.search).get("source"); return (requested === "all" && inboxes.length > 1 ? "all" : inboxes.find((row: any) => row.id === requested)?.id) || inboxes[0]?.id || ""; });
   const [busy, setBusy] = useState(false);
   return <><PageHeader eyebrow="A place for every record" title="Incoming music">Review the details. Give every album its place.</PageHeader>
-    {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{inboxes.map((inbox: any) => <button role="tab" disabled={busy} aria-selected={selected === inbox.id} onClick={() => { setSelected(inbox.id); history.replaceState(null, "", `?source=${encodeURIComponent(inbox.id)}`); }} key={inbox.id}>{inbox.name}</button>)}</div>}
-    {selected ? <Queue key={selected} source="inbox" threshold={threshold} inboxId={selected} onBusyChange={setBusy} sourceName={inboxes.find((row: any) => row.id === selected)?.name}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
+    {inboxes.length > 1 && <div className="segmented" role="tablist" aria-label="Inbox source">{[{ id: "all", name: "All Inboxes" }, ...inboxes].map((inbox: any) => <button role="tab" disabled={busy} aria-selected={selected === inbox.id} onClick={() => { setSelected(inbox.id); history.replaceState(null, "", `?source=${encodeURIComponent(inbox.id)}`); }} key={inbox.id}>{inbox.name}</button>)}</div>}
+    {selected ? <Queue key={selected} source="inbox" threshold={threshold} inboxId={selected} inboxes={inboxes} onBusyChange={setBusy} sourceName={inboxes.find((row: any) => row.id === selected)?.name}/> : <div className="empty-state"><strong>No inboxes configured</strong><a href="/settings">Open Settings</a></div>}
   </>;
 }
 
@@ -33,12 +35,13 @@ export function LibraryImport({ threshold }: { threshold: number }) {
 function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: () => void; onBusyChange: (value: boolean) => void }) {
   const notify = useToast();
   const [album, setAlbum] = useState<any>(null), [error, setError] = useState("");
-  const [track, setTrack] = useState<any>(null), [preview, setPreview] = useState<any>(null);
+  const [preview, setPreview] = useState<any>(null);
   const [editing, setEditing] = useState(false);
   const [removal, setRemoval] = useState<any>(null), [deleteFiles, setDeleteFiles] = useState(false);
   const [removing, setRemoving] = useState(false), [removalResult, setRemovalResult] = useState<any>(null);
   const [pending, setPending] = useState(false);
   const region = useRef<HTMLDivElement>(null);
+  const removalCheck = useRef<string | undefined>(undefined);
   const busy = pending || removing;
   useEffect(() => { onBusyChange(busy); }, [busy, onBusyChange]);
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
@@ -46,29 +49,19 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
   const previewRemoval = async () => {
     setError(""); setDeleteFiles(false); setRemovalResult(null);
     setPending(true);
-    try { setRemoval(await api<any>(`/api/library/albums/${id}/removal/preview`, { method: "POST", body: JSON.stringify({ expected_fingerprint: album.fingerprint }) })); }
+    try { setRemoval(await api<any>(`/api/library/albums/${id}/removal/preview`, { method: "POST", body: JSON.stringify({ expected_fingerprint: album.fingerprint }) }, job => { removalCheck.current = job.id; })); }
     catch (reason) { setError((reason as Error).message); } finally { setPending(false); }
   };
   const removeAlbum = async () => {
     setRemoving(true); setError("");
     setPending(true);
     try {
-      const result = await api<any>(`/api/library/albums/${id}/removal/apply`, { method: "POST", body: JSON.stringify({ preview_id: removal.preview_id, expected_fingerprint: removal.fingerprint, delete_files: deleteFiles, confirmed: true }) });
+      const result = await api<any>(`/api/library/albums/${id}/removal/apply`, { method: "POST", body: JSON.stringify({ preview_id: removal.preview_id, expected_fingerprint: removal.fingerprint, delete_files: deleteFiles, confirmed: true }) }, undefined, removalCheck.current);
       setRemovalResult(result);
       if (result.status === "complete") notify(result.message);
     } catch (reason) { setError((reason as Error).message); } finally { setRemoving(false); setPending(false); }
   };
   useEffect(() => { void api<any>(`/api/library/albums/${id}`).then(setAlbum).catch(reason => setError(reason.message)); }, [id]);
-  const save = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); const form = new FormData(event.currentTarget);
-    setPending(true); setError("");
-    try { const result = await api<any>(`/api/library/albums/${id}`, { method: "PATCH", body: JSON.stringify({ expected_fingerprint: album.fingerprint, album: form.get("album"), albumartist: form.get("albumartist"), genre: form.get("genre"), year: Number(form.get("year") || 0) }) }); setAlbum(result.album || result); setEditing(false); setTrack(null); notify("Album metadata saved."); } catch (reason) { setError((reason as Error).message); } finally { setPending(false); }
-  };
-  const saveTrack = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); const form = new FormData(event.currentTarget);
-    setPending(true); setError("");
-    try { const result = await api<any>(`/api/library/albums/${id}/tracks/${track.id}`, { method: "PATCH", body: JSON.stringify({ expected_fingerprint: album.fingerprint, title: form.get("title"), artist: form.get("artist"), track: Number(form.get("track") || 0), disc: Number(form.get("disc") || 0) }) }); setAlbum(result.album || result); setTrack(null); notify("Track metadata saved."); } catch (reason) { setError((reason as Error).message); } finally { setPending(false); }
-  };
   const rematch = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const musicbrainzId = String(new FormData(event.currentTarget).get("musicbrainz_id") || "");
     setPending(true); setError("");
@@ -87,27 +80,17 @@ function LibraryInspector({ id, onClose, onBusyChange }: { id: number; onClose: 
     setPending(true); setError("");
     try { const result = await api<any>(`/api/library/albums/${id}/artwork/apply`, { method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, expected_fingerprint: preview.fingerprint }) }); setAlbum(result.album || result); setPreview(null); notify("Album updated."); } catch (reason) { setError((reason as Error).message); } finally { setPending(false); }
   };
-  return <div className="managed-record-inspector"><div className="dialog" role="region" aria-labelledby={album ? "managed-album-title" : "managed-record-title"} tabIndex={-1} ref={region}><header><div><p className="eyebrow">Your collection / {editing ? "Edit record" : "Record details"}</p><h2 id="managed-record-title">{editing ? "Edit metadata" : "Album details"}</h2></div><div className="record-header-actions"><button className="inspector-back text-button" type="button" disabled={busy} onClick={onClose}>Back to albums</button>{album && !editing && !removal && !removalResult && <button type="button" className="metadata-edit text-button" disabled={busy} onClick={() => { setEditing(true); setError(""); }}><span aria-hidden="true">✎</span> Edit metadata</button>}<button disabled={busy} onClick={() => removalResult ? location.reload() : onClose()} aria-label="Close album">×</button></div></header><div className="dialog-body"><fieldset className="record-controls" disabled={busy} aria-busy={busy}>{error && <Notice kind="error">{error}</Notice>}{removalResult ? <>{removalResult.status !== "complete" && <Notice kind="error">{removalResult.message}</Notice>}{removalResult.attempting && <p>Outcome requires inspection: {removalResult.attempting}</p>}<p>{removalResult.removed.length} tracks removed from Cratekeep; {removalResult.remaining.length} remain.</p>{removalResult.errors.map((row: any) => <p key={row.path}>{row.path}: {row.error}{row.file_deleted ? " (audio already deleted; database cleanup needs review)" : ""}</p>)}</> : removal ? <section aria-label="Remove album confirmation"><h3>Remove from library</h3><p>{removal.tracks.length} managed tracks will be removed from Cratekeep.</p><ul>{removal.tracks.map((row: any) => <li key={row.id}>{row.title} — {row.relative_path}</li>)}</ul><label className="check"><input type="checkbox" checked={deleteFiles} disabled={removing || !removal.delete_allowed} onChange={event => setDeleteFiles(event.target.checked)}/>Also delete files</label>{removal.delete_error && <Notice kind="error">File deletion unavailable: {removal.delete_error}</Notice>}<p>{deleteFiles ? "The listed audio files will be permanently deleted. Artwork, other files and folders will be kept. This cannot be undone." : "Audio files, tags and artwork will be kept. Other music players will still see these files. You can explicitly adopt them again through Library Import."}</p></section> : !album ? <p>Loading…</p> : <>
+  return <div className="managed-record-inspector"><div className="dialog" role="region" aria-labelledby={album ? "managed-album-title" : "managed-record-title"} tabIndex={-1} ref={region}><header><div><p className="eyebrow">Your collection / Record details</p><h2 id="managed-record-title">Album details</h2></div><div className="record-header-actions"><button className="inspector-back text-button" type="button" disabled={busy} onClick={onClose}>Back to albums</button>{album && !removal && !removalResult && <button type="button" className="metadata-edit text-button" disabled={busy} onClick={() => { setEditing(true); setError(""); }}><span aria-hidden="true">✎</span> Edit metadata</button>}<button disabled={busy} onClick={() => removalResult ? location.reload() : onClose()} aria-label="Close album">×</button></div></header><div className="dialog-body"><fieldset className="record-controls" disabled={busy} aria-busy={busy}>{error && <Notice kind="error">{error}</Notice>}{removalResult ? <>{removalResult.status !== "complete" && <Notice kind="error">{removalResult.message}</Notice>}{removalResult.attempting && <p>Outcome requires inspection: {removalResult.attempting}</p>}<p>{removalResult.removed.length} tracks removed from Cratekeep; {removalResult.remaining.length} remain.</p>{removalResult.errors.map((row: any) => <p key={row.path}>{row.path}: {row.error}{row.file_deleted ? " (audio already deleted; database cleanup needs review)" : ""}</p>)}</> : removal ? <section aria-label="Remove album confirmation"><h3>Remove from library</h3><p>{removal.tracks.length} managed tracks will be removed from Cratekeep.</p><ul>{removal.tracks.map((row: any) => <li key={row.id}>{row.title} — {row.relative_path}</li>)}</ul><label className="check"><input type="checkbox" checked={deleteFiles} disabled={removing || !removal.delete_allowed} onChange={event => setDeleteFiles(event.target.checked)}/>Also delete files</label>{removal.delete_error && <Notice kind="error">File deletion unavailable: {removal.delete_error}</Notice>}<p>{deleteFiles ? "The listed audio files will be permanently deleted. Artwork, other files and folders will be kept. This cannot be undone." : "Audio files, tags and artwork will be kept. Other music players will still see these files. You can explicitly adopt them again through Library Import."}</p></section> : !album ? <p>Loading…</p> : <>
     <div className="album-detail-head"><span className="album-detail-art">{album.artwork_url ? <img src={album.artwork_url} alt={`Artwork for ${album.album}`}/> : <ArtworkPlaceholder/>}{<label className="artwork-control"><span>Replace artwork</span><input type="file" aria-label="Upload replacement" accept="image/*" onChange={event => event.target.files?.[0] && void previewArtwork(event.target.files[0])}/></label>}</span><div><h3 id="managed-album-title" className="managed-album-title">{album.album}</h3><strong>{album.albumartist || "Unknown artist"}</strong><span>{album.genre || "No genre"} · {album.year || "No year"}</span><small>{(album.tracks || album.items || []).length} {(album.tracks || album.items || []).length === 1 ? "track" : "tracks"}</small></div></div>
     <div className="managed-release-id"><span>MusicBrainz release MBID</span>{album.mb_albumid ? <a href={`https://musicbrainz.org/release/${encodeURIComponent(album.mb_albumid)}`} target="_blank" rel="noreferrer"><code>{album.mb_albumid}</code></a> : <span>Not associated with a MusicBrainz release</span>}</div>
-    {editing && <form className="edit-grid subpanel" onSubmit={save} id="album-form"><h3 className="editor-heading">Edit album metadata</h3><label>Album<input name="album" defaultValue={album.album}/></label><label>Album artist<input name="albumartist" defaultValue={album.albumartist}/></label><label>Genre<input name="genre" defaultValue={album.genre}/></label><label>Year<input name="year" type="number" defaultValue={album.year || ""}/></label></form>}
-    <div className="record-tracks-heading"><h3>Tracks</h3><small>{(album.tracks || album.items || []).length} in this record{editing ? " · Select a title to edit its tags" : ""}</small></div>
-    {track && <form id="track-form" key={track.id} onSubmit={saveTrack}/>}
-    <table className={`record-tracks${editing ? " record-tracks-editable" : ""}`}><caption className="sr-only">Tracks on {album.album}</caption><thead><tr><th scope="col">{editing ? "Track" : "#"}</th>{editing && <th scope="col">Disc</th>}<th scope="col">Title</th><th scope="col">Artist</th></tr></thead><tbody>{(album.tracks || album.items || []).map((row: any) => {
-      const active = track?.id === row.id;
-      return <tr key={row.id} className={active ? "is-editing" : undefined}>
-        <td>{active ? <input form="track-form" aria-label="Track" name="track" type="number" min="0" step="1" defaultValue={row.track}/> : <>{!editing && row.disc > 1 ? `${row.disc}.` : ""}{row.track || "—"}</>}</td>
-        {editing && <td>{active ? <input form="track-form" aria-label="Disc" name="disc" type="number" min="0" step="1" defaultValue={row.disc}/> : row.disc || "—"}</td>}
-        <th scope="row">{active ? <input form="track-form" aria-label="Title" name="title" defaultValue={row.title} autoFocus/> : editing ? <button className="track-edit" type="button" aria-label={`Edit track ${row.title}`} onClick={() => setTrack(row)}>{row.title}</button> : row.title}</th>
-        <td>{active ? <input form="track-form" aria-label="Artist" name="artist" defaultValue={row.artist}/> : row.artist || "—"}</td>
-      </tr>;
-    })}</tbody></table>
+    <div className="record-tracks-heading"><h3>Tracks</h3><small>{(album.tracks || []).length} in this record</small></div>
+    <table className="record-tracks"><caption className="sr-only">Tracks on {album.album}</caption><thead><tr><th scope="col">#</th><th scope="col">Title</th><th scope="col">Artist</th></tr></thead><tbody>{(album.tracks || []).map((row: any) => <tr key={row.id}><td>{row.disc > 1 ? `${row.disc}.` : ""}{row.track || "—"}</td><th scope="row">{row.title}</th><td>{row.artist || "—"}</td></tr>)}</tbody></table>
     <form className="record-rematch" onSubmit={rematch}><div><h3>MusicBrainz rematch</h3><p>Preview a different release before applying its metadata.</p></div><label>Release UUID<input name="musicbrainz_id" required placeholder="MusicBrainz release ID"/></label><button type="submit" className="secondary">Preview rematch</button></form>
 
     {preview && <div className="subpanel"><h3>{preview.kind === "artwork" ? "Artwork preview" : "Metadata preview"}</h3>{preview.kind === "artwork" && <img className="art-preview" src={`/api/library/albums/${id}/artwork/previews/${preview.preview_id}`} alt="Proposed cover artwork"/>}<p>{preview.message || (preview.applicable === false ? "This match cannot be applied safely." : "Preview is ready to apply.")}</p></div>}
   </>}</fieldset></div><footer className="record-action-footer" aria-label="Album actions">
-    {removalResult ? <button type="button" disabled={busy} onClick={() => location.reload()}>Refresh Library</button> : removal ? <><button className="secondary" type="button" disabled={busy} onClick={() => setRemoval(null)}>Cancel removal</button><button className="danger-action" type="button" disabled={busy} onClick={() => void removeAlbum()}>{removing ? "Removing…" : deleteFiles ? "Delete listed files and remove album" : "Remove from Cratekeep; keep files"}</button></> : preview ? <><button className="secondary" type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel</button><button type="button" disabled={busy || preview.applicable === false} onClick={preview.kind === "artwork" ? applyArtwork : applyPreview}>Apply {preview.kind === "artwork" ? "artwork" : "rematch"}</button></> : track ? <><button className="secondary" type="button" disabled={busy} onClick={() => setTrack(null)}>Cancel</button><button type="submit" form="track-form" disabled={busy}>Save track</button></> : editing ? <><button className="secondary" type="button" disabled={busy} onClick={() => { setEditing(false); setTrack(null); }}>Cancel changes</button><button type="submit" form="album-form" disabled={busy}>Save album</button></> : album ? <button className="secondary danger-action" type="button" disabled={busy} onClick={() => void previewRemoval()}>Remove from library</button> : null}
-  </footer></div></div>;
+    {removalResult ? <button type="button" disabled={busy} onClick={() => location.reload()}>Refresh Library</button> : removal ? <><button key="cancel-removal" autoFocus className="secondary" type="button" disabled={busy} onClick={() => setRemoval(null)}>Cancel removal</button><button className="danger-action" type="button" disabled={busy} onClick={() => void removeAlbum()}>{removing ? "Removing…" : deleteFiles ? "Delete listed files and remove album" : "Remove from Cratekeep; keep files"}</button></> : preview ? <><button className="secondary" type="button" disabled={busy} onClick={() => setPreview(null)}>Cancel</button><button type="button" disabled={busy || preview.applicable === false} onClick={preview.kind === "artwork" ? applyArtwork : applyPreview}>Apply {preview.kind === "artwork" ? "artwork" : "rematch"}</button></> : album ? <button className="secondary danger-action" type="button" disabled={busy} onClick={() => void previewRemoval()}>Remove from library</button> : null}
+  </footer></div>{editing && album && <MetadataEditor album={album} onClose={() => setEditing(false)} onBusyChange={onBusyChange} onSaved={updated => { setAlbum(updated); setEditing(false); notify("Metadata saved."); }}/>}</div>;
 }
 
 function Help({ label, children }: { label: string; children: string }) {
@@ -123,7 +106,7 @@ export function Library({ data }: { data: Record<string, any> }) {
   const artistView = data.view === "artists";
   const recordCount = artistView ? data.matching_artists ?? data.artists?.length ?? 0 : data.matching_albums ?? data.albums?.length ?? 0;
   const pageUrl = (number: number) => `/library?${new URLSearchParams({ q: data.query || "", sort: data.sort || (artistView ? "artist" : "recent"), order: data.order || (artistView ? "asc" : "desc"), artist: data.artist_filter || "", album: data.album_filter || "", ...(artistView ? { view: "artists" } : {}), page: String(number) })}`;
-  return <div className="library-collection"><PageHeader eyebrow="The listening desk / Library" title="Managed collection">The records you've made room for.</PageHeader>
+  return <div className="library-collection"><ActivityInline scope="library"/><PageHeader eyebrow="The listening desk / Library" title="Managed collection">The records you've made room for.</PageHeader>
     <div className="collection-bar"><dl className="collection-counts"><div><dt>Albums</dt><dd>{summary.albums || 0}</dd></div><div><dt>Tracks</dt><dd>{summary.tracks || 0}</dd></div><div><dt>Artists</dt><dd>{summary.artists || 0}</dd></div><div><dt>Size</dt><dd>{formatBytes(summary.bytes)}</dd></div></dl><a className="library-import-link" href="/library-import">Import existing files →</a></div>
     <div ref={workspaceRef} style={splitStyle} className={`desk-workspace library-workspace${artistView ? " is-artists" : ""}${open != null ? " is-detail-open" : ""}`}><div className="desk-queue"><nav className="library-views" aria-label="Library view"><a href="/library" aria-current={!artistView ? "page" : undefined}>Albums</a><a href="/library?view=artists" aria-current={artistView ? "page" : undefined}>Artists</a></nav>{data.artist_filter && <p className="artist-breadcrumb"><a href="/library?view=artists">All artists</a><span aria-hidden="true"> / </span>{data.artist_filter}</p>}<form className="collection-search" method="get" onSubmit={event => { if (busy) event.preventDefault(); }}><label><span className="sr-only">Search library</span><input name="q" defaultValue={data.query} placeholder={artistView ? "Find an artist" : "Find an artist, album or song"}/>{artistView && <input type="hidden" name="view" value="artists"/>}{data.artist_filter && <input type="hidden" name="artist" value={data.artist_filter}/>}</label>{!artistView && <label><span className="sr-only">Sort library</span><select name="sort" defaultValue={data.sort || (artistView ? "artist" : "recent")}><option value="artist">Artist</option><option value="album">Album</option><option value="year">Year</option><option value="recent">Recently added</option></select></label>}<label><span className="sr-only">Sort order</span><select name="order" defaultValue={data.order || (artistView ? "asc" : "desc")}><option value="asc">Ascending</option><option value="desc">Descending</option></select></label><button type="submit" className="secondary collection-search-submit">Search</button></form>
     <section className="record-catalog" aria-labelledby="browse-title"><header><h2 id="browse-title">{artistView ? "Browse artists" : "Browse albums"}</h2><p>{recordCount} {artistView ? recordCount === 1 ? "artist" : "artists" : recordCount === 1 ? "record" : "records"}{data.artist_filter ? ` · ${data.artist_filter}` : ""}{data.album_filter ? ` · ${data.album_filter}` : ""}</p>{(data.query || data.artist_filter || data.album_filter) && <a href={artistView ? "/library?view=artists" : "/library"}>Clear filters</a>}</header>
@@ -138,8 +121,14 @@ export function Library({ data }: { data: Record<string, any> }) {
   </div>;
 }
 
-type InboxSetting = { key: string; id: string; name: string; path: string; auto_match: boolean };
-type InboxDraft = Pick<InboxSetting, "key" | "name" | "path"> & { isNew?: boolean };
+type InboxSetting = { key: string; id: string; name: string; path: string; auto_match: boolean; discovery?: string };
+type InboxDraft = InboxSetting & { isNew?: boolean };
+const inboxDiscoveryOptions = [["manual", "Manual only"], ["instant", "Instant"], ["5", "Every 5 minutes"], ["15", "Every 15 minutes"], ["30", "Every 30 minutes"], ["60", "Every hour"], ["360", "Every 6 hours"], ["1440", "Every 24 hours"]];
+
+function settingsTabFromHash() {
+  const hash = location.hash.slice(1);
+  return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
+}
 
 export function Settings({ data, threshold }: { data: Record<string, any>; threshold: number }) {
   const settings = data.settings || {}, initial = data.inboxes || [];
@@ -152,14 +141,16 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
   const nextInbox = useRef(0);
   const [inboxes, setInboxes] = useState<InboxSetting[]>(() => initial.map((inbox: InboxSetting) => ({ ...inbox, key: inbox.id })));
   const [draft, setDraft] = useState<InboxDraft | null>(null);
-  const editor = useRef<HTMLTableRowElement>(null);
-  const [tab, setTab] = useState(() => {
-    const hash = location.hash.slice(1);
-    return hash === "matching" ? "metadata" : ["general", "metadata", "advanced", "about"].includes(hash) ? hash : "general";
-  });
+  const editor = useRef<HTMLDivElement>(null);
+  const [tab, setTab] = useState(settingsTabFromHash);
+  useEffect(() => {
+    const syncTab = () => setTab(settingsTabFromHash());
+    window.addEventListener("hashchange", syncTab);
+    return () => window.removeEventListener("hashchange", syncTab);
+  }, []);
   function finishInbox() {
     if (!draft || !Array.from(editor.current?.querySelectorAll("input:not([type=hidden])") || []).every(input => (input as HTMLInputElement).reportValidity())) return;
-    setInboxes(rows => rows.map(row => row.key === draft.key ? { ...row, name: draft.name.trim(), path: draft.path.trim() } : row));
+    setInboxes(rows => rows.map(row => row.key === draft.key ? { ...row, name: draft.name.trim(), path: draft.path.trim(), discovery: draft.discovery || "5", auto_match: Boolean(draft.auto_match) } : row));
     setDraft(null);
   }
   function cancelInbox() {
@@ -167,7 +158,7 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
     setDraft(null);
   }
   function addInbox() {
-    const inbox = { key: `new-${nextInbox.current++}`, id: "", name: `Inbox ${inboxes.length + 1}`, path: data.default_inbox || "", auto_match: false };
+    const inbox = { key: `new-${nextInbox.current++}`, id: "", name: `Inbox ${inboxes.length + 1}`, path: data.default_inbox || "", auto_match: false, discovery: "5" };
     setInboxes(rows => [...rows, inbox]);
     setDraft({ ...inbox, isNew: true });
   }
@@ -181,20 +172,38 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
       <input type="hidden" name="settings_tab" value={tab}/>
       <section hidden={tab !== "general"} className="settings-section">
         <div className="settings-card inbox-settings-card">
-          <h2>Inboxes <Help label="Inboxes">Named source folders where new music waits before review and import. Each Inbox must be a separate container-visible path outside the managed Library. Edit or delete configuration rows, then Save settings. Deleting a row does not delete files.</Help></h2>
+          <h2>Inboxes <Help label="Inboxes">Named source folders where new music waits before review and import. Each Inbox must be a separate container-visible path outside the managed Library. Edit or delete configuration rows, then Save settings. Deleting a row does not delete files. Discovery is independent per Inbox. Choose a timed interval or Manual only for downloads that arrive one file at a time. Instant waits briefly for files to settle and keeps a five-minute safety scan; it cannot know whether a download is complete.</Help></h2>
           <table className="inbox-settings-table"><caption className="sr-only">Configured Inboxes</caption>
             <thead><tr><th scope="col">Name</th><th scope="col">Inbox path</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
-            <tbody>{inboxes.map(inbox => <tr data-inbox-row key={inbox.key} ref={draft?.key === inbox.key ? editor : undefined}>
-              <td><input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/>
-                {draft?.key === inbox.key ? <label><span className="sr-only">Name for {inbox.name}</span><input autoFocus value={draft.name} pattern=".*\S.*" onChange={event => setDraft({ ...draft, name: event.target.value })} required/></label> : <strong>{inbox.name}</strong>}
+            <tbody>{inboxes.map(inbox => draft?.key === inbox.key ? <tr data-inbox-row className="inbox-editor-row" key={inbox.key}>
+              <td colSpan={3}>
+                <input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/><input type="hidden" name="inbox_path" value={inbox.path}/><input type="hidden" name="inbox_discovery" value={inbox.discovery || "5"}/>
+                {inbox.auto_match && inbox.id && <input type="hidden" name="inbox_auto_match_id" value={inbox.id}/>}
+                <div ref={editor} className="inbox-editor" role="group" aria-label={draft.isNew ? "Add Inbox" : `Edit ${inbox.name}`}>
+                  <h3>{draft.isNew ? "Add Inbox" : `Edit ${inbox.name}`}</h3>
+                  <div className="inbox-editor-fields">
+                    <label>Name<input aria-label={`Name for ${inbox.name}`} autoFocus value={draft.name} pattern=".*\S.*" onChange={event => setDraft({ ...draft, name: event.target.value })} required/></label>
+                    <label>Inbox path<input aria-label={`Inbox path for ${inbox.name}`} value={draft.path} pattern=".*\S.*" onChange={event => setDraft({ ...draft, path: event.target.value })} required/></label>
+                    <label>Discovery<select aria-label={`Discovery for ${inbox.name}`} value={draft.discovery || "5"} onChange={event => setDraft({ ...draft, discovery: event.target.value })}>
+                      {inboxDiscoveryOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                    </select></label>
+                    <div className="inbox-editor-matching"><span>Matching</span><label className="check"><input type="checkbox" aria-label={`Automatically find matches for ${inbox.name}`} checked={Boolean(draft.auto_match)} disabled={!inbox.id} onChange={event => setDraft({ ...draft, auto_match: event.target.checked })}/>Automatically find matches</label><small>{!inbox.id ? "Save this Inbox before enabling automatic matching." : "Find MusicBrainz suggestions without importing or changing tags."}</small></div>
+                  </div>
+                  <div className="inbox-editor-footer"><small>Changes apply when you save settings.</small><div className="inbox-row-actions"><button type="button" onClick={finishInbox}>Done</button><button className="text-button" type="button" onClick={cancelInbox}>Cancel</button></div></div>
+                </div>
               </td>
-              <td><input type="hidden" name="inbox_path" value={inbox.path}/>
-                {draft?.key === inbox.key ? <label><span className="sr-only">Inbox path for {inbox.name}</span><input value={draft.path} pattern=".*\S.*" onChange={event => setDraft({ ...draft, path: event.target.value })} required/></label> : <code className="inbox-printed-path">{inbox.path}</code>}
+            </tr> : <tr data-inbox-row key={inbox.key}>
+              <td><input type="hidden" name="inbox_id" value={inbox.id}/><input type="hidden" name="inbox_name" value={inbox.name}/><strong>{inbox.name}</strong></td>
+              <td><input type="hidden" name="inbox_path" value={inbox.path}/><code className="inbox-printed-path">{inbox.path}</code>
+                <input type="hidden" name="inbox_discovery" value={inbox.discovery || "5"}/>
+                {inbox.auto_match && inbox.id && <input type="hidden" name="inbox_auto_match_id" value={inbox.id}/>}
+                <div className="inbox-preferences-summary"><span>Discovery: {inboxDiscoveryOptions.find(([value]) => value === (inbox.discovery || "5"))?.[1]}</span><span>Auto-match: {inbox.auto_match ? "On" : "Off"}</span></div>
               </td>
-              <td><div className="inbox-row-actions">{draft?.key === inbox.key ? <><button className="text-button" type="button" onClick={finishInbox}>Done</button><button className="text-button" type="button" onClick={cancelInbox}>Cancel</button></> : <><button className="text-button" type="button" aria-label={`Edit ${inbox.name}`} disabled={draft !== null} onClick={() => setDraft({ key: inbox.key, name: inbox.name, path: inbox.path })}>Edit</button><button className="text-button" type="button" aria-label={`Delete ${inbox.name}`} disabled={draft !== null} onClick={() => setInboxes(rows => rows.filter(row => row.key !== inbox.key))}>Delete</button></>}</div></td>
+              <td><div className="inbox-row-actions"><button className="text-button" type="button" aria-label={`Edit ${inbox.name}`} disabled={draft !== null} onClick={() => setDraft({ ...inbox })}>Edit</button><button className="text-button" type="button" aria-label={`Delete ${inbox.name}`} disabled={draft !== null} onClick={() => setInboxes(rows => rows.filter(row => row.key !== inbox.key))}>Delete</button></div></td>
             </tr>)}</tbody>
           </table>
           <button className="text-button" type="button" disabled={draft !== null} onClick={addInbox}>+ Add inbox</button>
+
         </div>
         <div className="settings-card"><h2>Library <Help label="Library path">The managed destination where Cratekeep stores approved albums.</Help></h2><label>Library path<input name="library_path" defaultValue={settings.library_path || data.default_library} required/></label></div>
         <div className="settings-card"><h2>Notifications <Help label="Notifications">Automatically dismiss notifications after the configured interval. Timing pauses while a notification is hovered or focused.</Help></h2><label>Toast duration (seconds)<input className="short-setting" type="number" name="toast_duration_seconds" min="1" max="300" step="1" defaultValue={settings.toast_duration_seconds || 5} required/></label></div>
@@ -215,8 +224,7 @@ export function Settings({ data, threshold }: { data: Record<string, any>; thres
         </div>
         <div className="settings-card"><h2>Matching <Help label="Match threshold">The minimum candidate confidence treated as ready for safe bulk import when all other safety checks pass. Lower scores remain for review. Library Import selected actions can explicitly approve saved matches regardless of score.</Help></h2>
           <label>Matched threshold (%)<input className="short-setting" name="match_threshold" type="number" min="1" max="100" step="1" defaultValue={threshold} required/></label>
-          <label>Automatically find matches for<select multiple className="inbox-match-select" name="inbox_auto_match_id" size={Math.min(6, Math.max(3, inboxes.length))} value={inboxes.filter(row => row.auto_match && row.id).map(row => row.id)} onChange={event => { const selected = new Set(Array.from(event.target.selectedOptions, option => option.value)); setInboxes(rows => rows.map(row => ({ ...row, auto_match: selected.has(row.id) }))); }}>{inboxes.map(inbox => <option key={inbox.key} value={inbox.id} disabled={!inbox.id}>{inbox.name}{!inbox.id ? " (save first)" : ""}</option>)}</select></label>
-          <div className="match-selection-actions"><button className="text-button" type="button" onClick={() => setInboxes(rows => rows.map(row => ({ ...row, auto_match: Boolean(row.id) })))}>Select all</button><button className="text-button" type="button" onClick={() => setInboxes(rows => rows.map(row => ({ ...row, auto_match: false })))}>Clear selection</button><Help label="Automatic Inbox matching">Select the named Inboxes to match automatically during discovery. This does not import music. Use Command or Control to select multiple entries, or Select all / Clear selection. Save new Inboxes first to enable automatic matching for them.</Help></div>
+
         </div>
       </section>
       <section hidden={tab !== "advanced"} className="advanced-settings"><div className="settings-card"><h2>Beets YAML <Help label="Beets YAML">Advanced beets configuration. Invalid YAML is rejected and the saved configuration remains unchanged.</Help></h2><p>Folder and file names come from <code>paths:</code> in this YAML. <a href="https://beets.readthedocs.io/en/stable/reference/pathformat.html" target="_blank" rel="noreferrer">Beets naming guide ↗</a></p><details><summary>Naming examples</summary><p><code>$albumartist/$album/$track $title</code> puts each album in its artist’s folder.</p><p><code>$albumartist/$year - $album/$track $title</code> adds the year before the album name.</p><p>Use <code>$albumartist</code> to keep compilation tracks together. Beets adds the file extension. Saving these settings does not rename existing files.</p></details><label className="sr-only" htmlFor="beets-config">Beets configuration</label><textarea id="beets-config" name="beets_config" defaultValue={data.beets_config}/></div></section>

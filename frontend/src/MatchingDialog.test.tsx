@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import * as network from "./api";
 import { MatchingDialog } from "./MatchingDialog";
 const albums=[{id:1,album:"First"},{id:2,album:"Second"}];
 const success=(id: number, count=1, cached=false)=>({already_matched:cached,album:{id,candidate_status:"complete",candidates:count ? [{id:20}] : []}});
@@ -7,7 +8,7 @@ function show(execute: (id: number,reuse: boolean)=>Promise<any>) {
   const onFinish=vi.fn();render(<MatchingDialog albums={albums} execute={execute} onRunning={vi.fn()} onFinish={onFinish} onClose={vi.fn()}/>);
   return onFinish;
 }
-afterEach(()=>{cleanup();vi.useRealTimers();});
+afterEach(()=>{cleanup();vi.useRealTimers();vi.restoreAllMocks();});
 it("waits for explicit start, reuses saved results, and distinguishes no matches",async()=>{
   const execute=vi.fn(async id=>success(id,id===1?1:0,true));show(execute);
   expect(execute).not.toHaveBeenCalled();
@@ -89,4 +90,23 @@ it("does not retry an album the server confirms is gone",async()=>{
   await screen.findByRole("heading",{name:"Matching results"});
   expect(execute.mock.calls.map(call=>call[0])).toEqual([1,2]);
   expect(screen.getByText(/Album is no longer available/)).toBeInTheDocument();
+});
+
+
+it("announces a fast detached match even if shared polling never saw it running", async () => {
+  const job: network.ActivityJob = { id: "fast", mode: "matching", label: "Matching albums", scope: "Inbox", href: "/inbox", stage: "Matching", status: "running", processed: 0, total: 1, rows: [{ id: 1, status: "matching" }] };
+  let finish!: (job: network.ActivityJob) => void;
+  vi.spyOn(network, "startActivity").mockResolvedValue(job);
+  vi.spyOn(network, "watchActivity").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  const event = vi.fn();
+  window.addEventListener("cratekeep:activity-finished", event);
+  const view = render(<MatchingDialog activity={{ path: "/api/inbox/candidates", body: {} }} albums={[albums[0]]} execute={vi.fn()} onRunning={vi.fn()} onFinish={vi.fn()} onClose={() => view.unmount()}/>);
+  try {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Start matching" })));
+    fireEvent.click(screen.getByRole("button", { name: "Continue in background" }));
+    const completed = { ...job, status: "complete", rows: [{ id: 1, status: "matched" }] };
+    await act(async () => finish(completed));
+    expect(event).toHaveBeenCalledTimes(1);
+    expect(event.mock.calls[0][0].detail).toEqual(completed);
+  } finally { window.removeEventListener("cratekeep:activity-finished", event); }
 });

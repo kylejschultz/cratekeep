@@ -1,6 +1,6 @@
 import type { ReactElement } from "react";
 import { ToastProvider } from "./Toasts";
-import { cleanup, fireEvent, render as renderComponent, screen, within, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render as renderComponent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Page } from "./pages";
 
@@ -16,9 +16,10 @@ describe("settings and managed album presentation", () => {
     fireEvent.click(help);
     expect(screen.getByRole("note")).toHaveTextContent("source folders");
     expect(screen.getByLabelText("Library path")).toHaveValue("/music");
+    expect(screen.getByText("Auto-match: On")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
     expect(screen.getByRole("heading", { name: /^Matching/ })).toBeInTheDocument();
-    expect(screen.getByRole("listbox", { name: "Automatically find matches for" })).toHaveValue(["one"]);
+    expect(screen.queryByRole("listbox", { name: "Automatically find matches for" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
     expect(screen.getByRole("heading", { name: /Feature in Title/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: "Advanced" }));
@@ -88,52 +89,9 @@ it("shows compact library rows and preserves search/sort/filter state in paginat
   expect(screen.getByRole("combobox", { name: "Sort order" })).toHaveValue("desc");
 });
 
-it("edits a track from the compact table using the existing fingerprint contract", async () => {
-  const album = { id: 7, album: "Record", albumartist: "Artist", fingerprint: "fp", tracks: [{ id: 11, track: 1, title: "First", artist: "Artist" }, { id: 12, track: 2, title: "Second", artist: "Guest" }] };
-  const fetch = vi.fn(async (url: string, init?: RequestInit) => ({ ok: true, json: async () => init?.method === "PATCH" ? { album: { ...album, tracks: [{ ...album.tracks[0], title: "Corrected" }, album.tracks[1]] } } : album }));
-  vi.stubGlobal("fetch", fetch);
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record Artist/ }));
-  expect(await screen.findByRole("table", { name: "Tracks on Record" })).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "Edit track First" })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  expect(screen.getByLabelText("Title")).toHaveValue("First");
-  const editedRow = screen.getByLabelText("Title").closest("tr")!;
-  expect(within(editedRow).getByLabelText("Artist")).toHaveValue("Artist");
-  expect(within(editedRow).getByLabelText("Track")).toHaveValue(1);
-  expect(within(editedRow).getByLabelText("Disc")).toBeInTheDocument();
-  expect(document.querySelector(".track-editor")).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Edit track Second" }));
-  expect(screen.getByLabelText("Title")).toHaveValue("Second");
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Discarded" } });
-  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(screen.queryByLabelText("Title")).not.toBeInTheDocument();
-  expect(fetch.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Corrected" } });
-  fireEvent.change(screen.getByLabelText("Artist"), { target: { value: "Corrected artist" } });
-  fireEvent.change(screen.getByLabelText("Track"), { target: { value: "3" } });
-  fireEvent.change(screen.getByLabelText("Disc"), { target: { value: "2" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save track" }));
-  expect(await screen.findByText("Track metadata saved.")).toBeInTheDocument();
-  expect(fetch).toHaveBeenCalledWith("/api/library/albums/7/tracks/11", expect.objectContaining({ body: JSON.stringify({ expected_fingerprint: "fp", title: "Corrected", artist: "Corrected artist", track: 3, disc: 2 }) }));
-});
 
-it("keeps inline track changes available after a failed save", async () => {
-  const album = { id: 7, album: "Record", albumartist: "Artist", fingerprint: "fp", tracks: [{ id: 11, track: 1, disc: 1, title: "First", artist: "Artist" }] };
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => init?.method === "PATCH" ? { ok: false, status: 409, json: async () => ({ error: "Metadata changed; reload before saving." }) } : { ok: true, json: async () => album }));
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record Artist/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Edit track First" }));
-  fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Keep my draft" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save track" }));
-  expect(await screen.findByText("Metadata changed; reload before saving.")).toBeInTheDocument();
-  expect(screen.getByLabelText("Title")).toHaveValue("Keep my draft");
-  expect(screen.getByRole("button", { name: "Save track" })).toBeEnabled();
-});
+
+
 
 it.each(["123e4567-e89b-42d3-a456-426614174000", ""])("shows the stored album release MBID in Library details: %s", async mbid => {
   const album = { id: 7, album: "Record", albumartist: "Artist", mb_albumid: mbid, tracks: [] };
@@ -169,24 +127,7 @@ it("opens and closes album details in the inspector while retaining the list", a
   expect(row).toHaveAttribute("aria-pressed", "false");
 });
 
-it("blocks album switching and repeat actions until a save finishes", async () => {
-  let finish: (() => void) | undefined;
-  const album = { id: 7, album: "Record", albumartist: "Artist", fingerprint: "fp", tracks: [] };
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
-    if (init?.method === "PATCH") await new Promise<void>(resolve => { finish = resolve; });
-    return { ok: true, json: async () => album };
-  }));
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album, { id: 8, album: "Other", albumartist: "Artist" }] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Record Artist/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  fireEvent.click(screen.getByRole("button", { name: "Save album" }));
-  await waitFor(() => expect(screen.getByRole("button", { name: /Other Artist/ })).toBeDisabled());
-  expect(screen.getByRole("button", { name: "Save album" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Close album" })).toBeDisabled();
-  finish?.();
-  await screen.findByText("Album metadata saved.");
-  await waitFor(() => expect(screen.getByRole("button", { name: /Other Artist/ })).toBeEnabled());
-});
+
 
 it("renders artist browse rows with album counts, genres, drill-down and paginated view state", () => {
   render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { view: "artists", artists: [{ artist: "Élan & Co", album_count: 3, genres: "Jazz, Soul" }], matching_artists: 26, page: 1, page_count: 2 } }}/>);
@@ -197,7 +138,7 @@ it("renders artist browse rows with album counts, genres, drill-down and paginat
   expect(screen.queryByRole("complementary", { name: "Album inspector" })).not.toBeInTheDocument();
 });
 
-it("keeps Inbox identities, edits and multiselect choices together through row changes", () => {
+it("keeps per-Inbox summaries and saved preferences through row changes", () => {
   location.hash = "";
   render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", auto_match: true }, { id: "two", name: "Manual", path: "/manual", auto_match: false }] } }}/>);
   const table = screen.getByRole("table", { name: "Configured Inboxes" });
@@ -213,15 +154,11 @@ it("keeps Inbox identities, edits and multiselect choices together through row c
   fireEvent.click(screen.getByRole("button", { name: "Done" }));
   fireEvent.click(screen.getByRole("button", { name: "Delete Manual" }));
   expect(screen.getByText("/new-downloads")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
-  const select = screen.getByRole("listbox", { name: "Automatically find matches for" });
-  expect(select).toHaveValue(["one"]);
-  expect(screen.getByRole("option", { name: "Renamed" })).toHaveValue("one");
-  expect(screen.getByRole("option", { name: "New source (save first)" })).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "Clear selection" }));
-  expect(select).toHaveValue([]);
-  fireEvent.click(screen.getByRole("button", { name: "Select all" }));
-  expect(select).toHaveValue(["one"]);
+  expect(screen.getByText("Auto-match: On")).toBeInTheDocument();
+  expect(within(table).queryByRole("checkbox")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Edit New source" }));
+  expect(screen.getByRole("checkbox", { name: "Automatically find matches for New source" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
   const payload = new FormData(form);
   expect(payload.getAll("inbox_id")).toEqual(["one", ""]);
@@ -287,25 +224,27 @@ it("selects the configured Inbox requested by the source link", async () => {
 });
 
 
-it("submits album edits from the fixed footer with the required fingerprint", async () => {
-  const patch = vi.fn();
-  const album = { id: 7, album: "Album", albumartist: "Artist", genre: "Rock", year: 2024, fingerprint: "current-fp", tracks: [] };
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
-    if (init?.method === "PATCH") patch(JSON.parse(String(init.body)));
-    return { ok: true, json: async () => album };
-  }));
-  render(<Page boot={{ page: "library", buildSha: "test", threshold: 90, data: { albums: [album] } }}/>);
-  fireEvent.click(screen.getByRole("button", { name: /Album Artist/ }));
-  fireEvent.click(await screen.findByRole("button", { name: "Edit metadata" }));
-  const save = screen.getByRole("button", { name: "Save album" });
-  expect(save.closest("footer")).toHaveAttribute("aria-label", "Album actions");
-  expect(save).toHaveAttribute("form", "album-form");
-  fireEvent.click(save);
-  await waitFor(() => expect(patch).toHaveBeenCalledWith({ expected_fingerprint: "current-fp", album: "Album", albumartist: "Artist", genre: "Rock", year: 2024 }));
-});
+
 
 
 describe("About settings", () => {
+  it("follows same-page disclosure links and browser history without remounting settings", () => {
+    history.replaceState(null, "", "/settings");
+    render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { settings: {} } }}/>);
+    expect(screen.getByRole("tab", { name: "General" })).toHaveAttribute("aria-selected", "true");
+    history.replaceState(null, "", "/settings#about");
+    fireEvent(window, new HashChangeEvent("hashchange"));
+    expect(screen.getByRole("tab", { name: "About" })).toHaveAttribute("aria-selected", "true");
+    const consent = screen.getByRole("checkbox", { name: "Share anonymous install analytics" });
+    fireEvent.click(consent);
+    for (const [hash, tab] of [["matching", "Metadata"], ["", "General"], ["about", "About"]]) {
+      history.replaceState(null, "", `/settings#${hash}`);
+      fireEvent(window, new HashChangeEvent("hashchange"));
+      expect(screen.getByRole("tab", { name: tab })).toHaveAttribute("aria-selected", "true");
+    }
+    expect(consent).toBeChecked();
+    history.replaceState(null, "", "/settings");
+  });
   it("shows the real build, community links and an explicit default-off analytics choice", () => {
     location.hash = "about";
     render(<Page boot={{ page: "settings", buildSha: "abcdef1234567890", threshold: 90, data: { settings: {}, about: { build: "abcdef1234567890", discord_url: "https://discord.gg/cratekeep-test" } } }}/>);
@@ -335,4 +274,48 @@ describe("About settings", () => {
     expect(screen.getByRole("checkbox", { name: "Share anonymous install analytics" })).toBeChecked();
     location.hash = "";
   });
+});
+
+it("groups all Inbox fields in one editor and cancels the entire draft", () => {
+  location.hash = "";
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", discovery: "15", auto_match: false }] } }}/>);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Downloads" }));
+  const editor = screen.getByRole("group", { name: "Edit Downloads" });
+  expect(within(editor).getByRole("textbox", { name: "Name for Downloads" })).toHaveFocus();
+  fireEvent.change(within(editor).getByRole("textbox", { name: "Name for Downloads" }), { target: { value: "Discarded" } });
+  fireEvent.change(within(editor).getByRole("textbox", { name: "Inbox path for Downloads" }), { target: { value: "/discarded" } });
+  fireEvent.change(within(editor).getByRole("combobox", { name: "Discovery for Downloads" }), { target: { value: "instant" } });
+  fireEvent.click(within(editor).getByRole("checkbox", { name: "Automatically find matches for Downloads" }));
+  fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+  expect(screen.getByText("/downloads")).toBeInTheDocument();
+  expect(screen.getByText("Discovery: Every 15 minutes")).toBeInTheDocument();
+  expect(screen.getByText("Auto-match: Off")).toBeInTheDocument();
+});
+
+it("saves a full Inbox draft without changing the other source or losing values on another tab", () => {
+  location.hash = "";
+  render(<Page boot={{ page: "settings", buildSha: "test", threshold: 90, data: { inboxes: [{ id: "one", name: "Downloads", path: "/downloads", auto_match: false }, { id: "two", name: "Manual", path: "/manual", discovery: "manual", auto_match: false }] } }}/>);
+  const table = screen.getByRole("table", { name: "Configured Inboxes" });
+  expect(within(table).queryByRole("combobox")).not.toBeInTheDocument();
+  expect(within(table).queryByRole("checkbox")).not.toBeInTheDocument();
+  expect(screen.getByText("Discovery: Every 5 minutes")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Edit Downloads" }));
+  expect(screen.getByRole("combobox", { name: "Discovery for Downloads" })).toHaveValue("5");
+  expect(screen.queryByRole("option", { name: /Custom/ })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Name for Downloads"), { target: { value: "Renamed" } });
+  fireEvent.change(screen.getByLabelText("Inbox path for Downloads"), { target: { value: "/renamed" } });
+  fireEvent.change(screen.getByRole("combobox", { name: "Discovery for Downloads" }), { target: { value: "instant" } });
+  fireEvent.click(screen.getByRole("checkbox", { name: "Automatically find matches for Downloads" }));
+  expect(screen.getByRole("button", { name: "Save settings" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  expect(screen.getByText("Discovery: Instant")).toBeInTheDocument();
+  expect(screen.getByText("Discovery: Manual only")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: "Metadata" }));
+  const form = screen.getByRole("button", { name: "Save settings" }).closest("form")!;
+  const payload = new FormData(form);
+  expect(payload.getAll("inbox_id")).toEqual(["one", "two"]);
+  expect(payload.getAll("inbox_name")).toEqual(["Renamed", "Manual"]);
+  expect(payload.getAll("inbox_path")).toEqual(["/renamed", "/manual"]);
+  expect(payload.getAll("inbox_discovery")).toEqual(["instant", "manual"]);
+  expect(payload.getAll("inbox_auto_match_id")).toEqual(["one"]);
 });

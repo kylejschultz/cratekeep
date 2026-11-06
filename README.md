@@ -84,7 +84,39 @@ Open **http://localhost:8788**, or use your server's address. During setup, choo
 
 Use **Inbox** for downloads and **Library → Import existing files** for music already in your Library folder. Inbox imports copy files and tag the copies; Library Import leaves files in place. Choose a match, review the changes and import individually or in batches.
 
+The header's **Activity** monitor shows active and recent work from any page. Scans
+and refreshes report their current stage and measured counts; an unknown file total
+stays indeterminate. Matching shows provider cooldowns rather than looking stuck.
+Confirmed matching/import batches run on the server: choose **Continue in background**
+or navigate elsewhere, then reopen Activity to check progress and results. **Stop
+after current album** preserves completed work. After a server restart, interrupted
+runs require checking saved results; uncertain imports are never retried automatically.
+
+Each Inbox has its own discovery mode in Settings: Manual only, Instant, or a timed interval (five minutes by default). Choose an interval or Manual only for clients that download an album one file at a time. Instant briefly lets files settle and keeps a five-minute safety scan for missed events. It cannot tell whether a downloader has finished an album. Enabled Inboxes scan once at startup, and arrivals update the open Inbox after discovery. Background scans honor each Inbox's automatic matching setting without importing or tagging files. Manual Refresh remains available in every mode.
+
 Eligible copy imports can be undone; replacements cannot. **Remove imported** deletes the Inbox originals and keeps the Library copies.
+
+Library metadata saves update the music files and catalog together, keeping
+Artist/Artists and Album Artist/Album Artists consistent. Artist and Album Artist
+remain separate credits. In Edit metadata, use **Album artist credits** to remove
+an extra credited name; each track's **Track artist credits** list can be edited too.
+The editor keeps album and track drafts together. Choose **Review changes** to
+inspect tag updates and exact Beets file destinations, then **Save changes** to
+apply them together. **File location** shows existing files and configured Beets
+destinations. Browse Library folders to select an exact album folder, or stage a
+new folder; nothing is created until save. Manual folders are remembered for the
+album, preserving filenames and disc subfolders during relocation. Later metadata
+edits can rename track files inside that folder. Choose **Use Beets naming** to
+return to your configured layout, including for already-renamed albums.
+Cancel asks before discarding unsaved work; switching between
+tracks keeps the draft. **Stored details** shows read-only IDs and file paths.
+Explicit list changes update associated credit/sort tags and retain known IDs for
+kept names. Display-name edits alone preserve collaborators. Saves and rematches also update folder/file names using
+`paths:` in your Beets configuration: album/artist fields control folders and title/
+track fields control filenames wherever your template uses them. Owned lyric
+sidecars and artwork follow the audio; existing destination files are never overwritten.
+Re-saving a corrected name repairs older companion tags and paths. Existing files
+are not automatically reorganized just by upgrading or changing configuration.
 
 ## Analytics
 
