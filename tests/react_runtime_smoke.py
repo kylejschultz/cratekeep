@@ -580,6 +580,20 @@ def main() -> None:
         page.get_by_label("Album artist credits 2", exact=True).fill("Alias fixture")
         added_credit = review_and_save()
         assert added_credit.status == 200, added_credit.json()
+        credited_album = added_credit.json()["album"]
+        assert len(credited_album["albumartists"]) == 2
+        artist_page = browser.new_page()
+        for name in credited_album["albumartists"]:
+            artist_page.goto(base + "/library?view=artists")
+            artist_page.get_by_role("textbox", name="Search library").fill(name)
+            artist_page.get_by_role("button", name="Search", exact=True).click()
+            artist_page.wait_for_function("name => window.__CRATEKEEP_BOOTSTRAP__?.data.query === name", arg=name)
+            artist_page.locator(".artist-row").filter(has_text=name).click()
+            artist_page.get_by_role("heading", name="Browse albums").wait_for()
+            assert artist_page.evaluate("window.__CRATEKEEP_BOOTSTRAP__.data.albums"
+                                        ".find(album => album.album === 'Bulk Ready').id") == credited_album["id"]
+            artist_page.locator(".album-card").filter(has_text="Bulk Ready").click()
+            artist_page.get_by_role("region", name="Bulk Ready", exact=True).wait_for()
         page.get_by_role("button", name="Edit metadata", exact=True).click()
         page.screenshot(path=args.evidence_dir / "08-metadata-album-desktop.png", full_page=True)
         page.set_viewport_size({"width":390,"height":844})
@@ -590,6 +604,9 @@ def main() -> None:
         removed_credit = review_and_save()
         assert removed_credit.status == 200, removed_credit.json()
         assert "Alias fixture" not in removed_credit.json()["album"]["albumartists"]
+        artist_page.goto(base + "/library?view=artists&q=Alias%20fixture")
+        artist_page.get_by_text("No artists in this view", exact=True).wait_for()
+        artist_page.close()
         saved_credit_id = removed_credit.json()["changes"][0]["item_id"]
         saved_credit_item = next(item for item in page.request.get(base + "/api/items").json() if item["id"] == saved_credit_id)
         library_bulk_track = args.fixture_root / "library" / Path(saved_credit_item["path"]).relative_to(args.app_library)
