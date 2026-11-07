@@ -16,10 +16,10 @@ from .activity import report as report_progress
 from .duplicates import duplicate_matches
 
 from . import (
-    LibraryImportExecutionError, _album_query, _attach_inbox_release_items, _candidate_item_values,
+    LibraryImportExecutionError, _album_query, _apply_candidate_values, _attach_inbox_release_items, _candidate_item_values,
     _candidate_match, _complete_inbox_execution, _connect, _effective_candidate, _existing_release_album,
     _inbox_destination_preflight, _library, _managed_path, _now, _run_beets_import,
-    _set_item_value, _validate_inventory_file, _validated_library_root, _verify_inbox_move,
+    _validate_inventory_file, _validated_library_root, _verify_inbox_move,
 )
 
 
@@ -176,8 +176,7 @@ def execute(app, album, rows, paths, provider, job_id, *, dry_run):
                     media.images = images
                     media.save()
             incoming = Item.from_path(staged)
-            for field, value in entry["values"].items():
-                _set_item_value(incoming, field, value)
+            _apply_candidate_values(incoming, entry["values"])
             if entry["values"]:
                 incoming.write()
             entry["staged"] = staged

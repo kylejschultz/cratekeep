@@ -23,7 +23,7 @@ from PIL import Image as PillowImage
 from beets_mvp import (
     LibraryImportExecutionError, _album_bulk_readiness, _candidate_diff, _fetch_and_normalize_artwork, _format_bytes,
     _format_genre, _genre_presentation_key, _group_library_import_review_items, _init_db,
-    _effective_candidate, _item_genre, _set_item_value, _SafeArtworkRedirect, create_app,
+    _effective_candidate, _item_genre, _set_item_values, _SafeArtworkRedirect, create_app,
 )
 from beets_mvp.musicbrainz import (
     ProviderError, _artist_credit_text, _cover_art_evidence, _genre_evidence,
@@ -1024,7 +1024,7 @@ def test_genre_write_skips_undeclared_flex_alias_and_keeps_scalar(monkeypatch):
     monkeypatch.delitem(Item._fields, "genres", raising=False)
     item = Item()
 
-    _set_item_value(item, "genre", "Alternative Rock")
+    _set_item_values(item, {"genre": "Alternative Rock"})
 
     assert item.genre == "Alternative Rock"
     assert item.get("genres") is None
@@ -1035,7 +1035,7 @@ def test_genre_write_mirrors_declared_list_field(tmp_path, monkeypatch):
     library = Library(str(tmp_path / "declared-genres.db"), directory=str(tmp_path))
     item = Item(title="Song", path=str(tmp_path / "song.wav"))
 
-    _set_item_value(item, "genre", "Alternative Rock")
+    _set_item_values(item, {"genre": "Alternative Rock"})
     library.add(item)
     item.store()
 
